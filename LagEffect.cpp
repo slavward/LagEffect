@@ -530,7 +530,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -859,10 +859,28 @@ static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
 {
-    GetModuleFileNameW(nullptr, gIni, MAX_PATH);
-    wchar_t* slash = wcsrchr(gIni, L'\\');
-    if (slash) slash[1] = 0; else gIni[0] = 0;
-    lstrcatW(gIni, L"LagEffect.ini");
+    // Settings live in %APPDATA%\LagEffect\LagEffect.ini, so every copy of the app (any folder,
+    // any version, after updates) shares them. The first time, settings saved next to the exe by
+    // older versions are copied over.
+    wchar_t local[MAX_PATH];
+    GetModuleFileNameW(nullptr, local, MAX_PATH);
+    wchar_t* slash = wcsrchr(local, L'\\');
+    if (slash) slash[1] = 0; else local[0] = 0;
+    lstrcatW(local, L"LagEffect.ini");
+
+    wchar_t dir[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH);
+    if (n > 0 && n < MAX_PATH - 32) {
+        lstrcatW(dir, L"\\LagEffect");
+        CreateDirectoryW(dir, nullptr);         // fine if it already exists
+        lstrcpynW(gIni, dir, MAX_PATH);
+        lstrcatW(gIni, L"\\LagEffect.ini");
+        if (GetFileAttributesW(gIni) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES)
+            CopyFileW(local, gIni, TRUE);
+        if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) lstrcpynW(gIni, local, MAX_PATH);   // no AppData: old place
+    } else {
+        lstrcpynW(gIni, local, MAX_PATH);
+    }
 
     #define INI_INT(k, d) (int)GetPrivateProfileIntW(L"settings", k, d, gIni)
     for (Range& r : gRanges) *r.var = Iclamp(INI_INT(r.key, *r.var), r.lo, r.hi);
@@ -2451,6 +2469,8 @@ static void CreateUI()
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
 
     Ctl(L"STATIC", L"Lag Effect " APP_VERSION, 0, 30, 283, 300, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 303, 420, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 298, 84, 26, IDC_OPENSET);
 
     gBuildPage = -1;
     gUiReady = true;
@@ -2633,6 +2653,14 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
         break;
     case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_OPENSET:
+        if (code == BN_CLICKED) {
+            SaveSettings();                     // so the file is there and up to date
+            wchar_t args[MAX_PATH + 16];
+            wsprintfW(args, L"/select,\"%s\"", gIni);
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", args, nullptr, SW_SHOWNORMAL);
+        }
+        break;
     case IDC_TAB3:
         if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
         break;
