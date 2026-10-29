@@ -293,10 +293,12 @@ void rnn_pitch_search(const opus_val16 *x_lp, opus_val16 *y,
    celt_assert(len>0);
    celt_assert(max_pitch>0);
    lag = len+max_pitch;
+   celt_assert((len>>2)<=256 && (lag>>2)<=512 && (max_pitch>>1)<=512);
 
-   opus_val16 x_lp4[len>>2];
-   opus_val16 y_lp4[lag>>2];
-   opus_val32 xcorr[max_pitch>>1];
+   /* LagEffect: fixed sizes instead of VLAs (MSVC); called with len=960, max_pitch=588 */
+   opus_val16 x_lp4[256];
+   opus_val16 y_lp4[512];
+   opus_val32 xcorr[512];
 
    /* Downsample by 2 again */
    for (j=0;j<len>>2;j++)
@@ -440,7 +442,7 @@ opus_val16 rnn_remove_doubling(opus_val16 *x, int maxperiod, int minperiod,
       *T0_=maxperiod-1;
 
    T = T0 = *T0_;
-   opus_val32 yy_lookup[maxperiod+1];
+   opus_val32 yy_lookup[512];   /* LagEffect: was yy_lookup[maxperiod+1] (VLA); maxperiod = 384 here */
    dual_inner_prod(x, x, x-T0, N, &xx, &xy);
    yy_lookup[0] = xx;
    yy=xx;

@@ -29,11 +29,10 @@ jobs:
       - name: Compile
         shell: cmd
         run: |
-          rc /nologo LagEffect.rc || exit /b 1
-          cl /nologo /O2 /MT /utf-8 /EHsc /W3 /D_USE_MATH_DEFINES LagEffect.cpp ^
-            rnnoise\src\denoise.c rnnoise\src\rnn.c rnnoise\src\rnn_data.c rnnoise\src\pitch.c ^
-            rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c ^
-            LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe || exit /b 1
+          set RN=rnnoise\src\denoise.c rnnoise\src\rnn.c rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
+          rc /nologo LagEffect.rc > build.log 2>&1 || (type build.log & exit /b 1)
+          cl /nologo /O2 /MT /utf-8 /EHsc /W3 /D_USE_MATH_DEFINES LagEffect.cpp %RN% LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe >> build.log 2>&1 || (type build.log & exit /b 1)
+          type build.log
 
       - name: Check the exe
         shell: pwsh
@@ -71,3 +70,18 @@ jobs:
           git add "$ref"
           git commit -qm "Build $ref @ $sha"
           git push origin build-output
+
+      # If the build fails, save the compiler output where it can be read with plain git.
+      - name: Save build log on failure
+        if: failure()
+        shell: bash
+        run: |
+          ref="${GITHUB_REF_NAME//\//-}"
+          cp build.log "$RUNNER_TEMP/build.log" 2>/dev/null || echo "no build.log" > "$RUNNER_TEMP/build.log"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --depth 1 origin build-output && git checkout -f -B build-output FETCH_HEAD
+          git clean -fdxq
+          mkdir -p "$ref"
+          cp "$RUNNER_TEMP/build.log" "$ref/build-failed.log"
+          git add "$ref" && git commit -qm "Failed build log $ref" && git push origin build-output

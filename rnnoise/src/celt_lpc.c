@@ -101,8 +101,8 @@ int rnn_autocorr(
    int fastN=n-lag;
    int shift;
    const opus_val16 *xptr;
-   opus_val16 xx[n];
-   celt_assert(n>0);
+   opus_val16 xx[1024];   /* LagEffect: fixed size instead of xx[n] (MSVC has no VLAs); n <= 864 */
+   celt_assert(n>0 && n<=1024);
    celt_assert(overlap>=0);
    if (overlap == 0)
    {
