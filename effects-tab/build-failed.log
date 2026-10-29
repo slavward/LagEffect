@@ -1,0 +1,15 @@
+LagEffect.cpp
+D:\a\LagEffect\LagEffect\miniaudio.h(80532): warning C4244: '=': conversion from 'ma_uint64' to 'ma_uint32', possible loss of data
+Generating Code...
+Compiling...
+denoise.c
+rnnoise\src\denoise.c(38): fatal error C1083: Cannot open include file: 'rnnoise.h': No such file or directory
+rnn.c
+D:\a\LagEffect\LagEffect\rnnoise\src\rnn.h(30): fatal error C1083: Cannot open include file: 'rnnoise.h': No such file or directory
+rnn_data.c
+D:\a\LagEffect\LagEffect\rnnoise\src\rnn.h(30): fatal error C1083: Cannot open include file: 'rnnoise.h': No such file or directory
+pitch.c
+rnnoise\src\pitch.c(417): warning C4244: 'return': conversion from 'double' to 'opus_val16', possible loss of data
+kiss_fft.c
+celt_lpc.c
+Generating Code...
