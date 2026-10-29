@@ -114,18 +114,20 @@ static inline float RowSignal(int mode, float effect, float everything)
     return mode == MODE_EFFECT ? effect : mode == MODE_ALL ? everything : 0.0f;
 }
 
-// True while every key in the hotkey combination is held down.
-static bool ComboDown()
+// True while every key in a hotkey combination is held down (false if the combination is empty).
+static bool KeysDown(const volatile int* keys)
 {
     bool any = false;
     for (int i = 0; i < MAX_KEYS; i++) {
-        int vk = gHotkeys[i];
+        int vk = keys[i];
         if (!vk) continue;
         any = true;
         if (!(GetAsyncKeyState(vk) & 0x8000)) return false;
     }
     return any;
 }
+
+static bool ComboDown() { return KeysDown(gHotkeys); }
 
 // ======================= voice effects (Voice FX page) =======================
 // Run on the live mic right after the noise gate, so they're on everything you send, and the
@@ -408,9 +410,9 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_VERSION,
-    IDC_FXON,
+    IDC_FXON, IDC_FXKEY_MASTER,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
-    IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480,   // + group / knob index
+    IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
 };
 #define SPIN_UD(id)        ((id) + 100)      // up-down control paired with a number box
@@ -422,6 +424,7 @@ enum {
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
 #define TIMER_CLEANUP   4
+#define TIMER_FXKEYS    5
 
 static HINSTANCE gInst; static HWND gWnd, gStatus; static HFONT gFont, gFontBold; static HICON gIcon;
 static ma_context gCtx; static ma_device gDev, gExtraDev[MAX_OUT];
@@ -445,12 +448,18 @@ static Range gRanges[] = {
 };
 
 // Voice FX page: one group (section) per effect, each with an on/off box and a row of knobs.
-struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bool def; };
+struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bool def; const wchar_t* hotkeyKey; };
 static FxGroup gFxGroups[] = {
-    { L"Pitch",  &gFxPitchOn, L"fx_pitch_on",  true },
-    { L"Reverb", &gFxRevOn,   L"fx_reverb_on", true },
+    { L"Pitch",  &gFxPitchOn, L"fx_pitch_on",  true, L"fx_pitch_hotkey"  },
+    { L"Reverb", &gFxRevOn,   L"fx_reverb_on", true, L"fx_reverb_hotkey" },
 };
 #define FX_GROUPS ((int)(sizeof(gFxGroups) / sizeof(gFxGroups[0])))
+
+// Optional hotkeys that switch Voice FX on/off: slot 0 = the whole page, slot 1+g = effect group g.
+// Each is a combination of up to MAX_KEYS keys (0 = unused). Polled by the window (TIMER_FXKEYS).
+#define FX_KEY_SLOTS (1 + FX_GROUPS)
+static int  gFxKeys[FX_KEY_SLOTS][MAX_KEYS];
+static bool gFxKeyWasDown[FX_KEY_SLOTS];
 
 struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar; };
 static Knob gKnobs[] = {
@@ -712,6 +721,8 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 }
 
 // ======================= settings =======================
+static const wchar_t* FxKeyIniName(int slot) { return slot == 0 ? L"fx_hotkey" : gFxGroups[slot - 1].hotkeyKey; }
+
 static wchar_t gUpdateRepo[200];
 static bool    gUpdateOnStart = true;
 
@@ -739,6 +750,16 @@ static void LoadSettings()
     UpdateGateLin();
 
     gFxOn = INI_INT(L"fx_on", 0) != 0;
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+        wchar_t b[64];
+        GetPrivateProfileStringW(L"settings", FxKeyIniName(slot), L"", b, 64, gIni);
+        const wchar_t* q = b;
+        for (int i = 0; i < MAX_KEYS; i++) {
+            gFxKeys[slot][i] = *q ? Iclamp(_wtoi(q), 0, 255) : 0;
+            while (*q && *q != L',') q++;
+            if (*q == L',') q++;
+        }
+    }
     for (FxGroup& g : gFxGroups) *g.on = INI_INT(g.key, g.def) != 0;
     for (Knob& k : gKnobs) {                    // read as text: knob values can be negative
         wchar_t b[32];
@@ -797,6 +818,11 @@ static void SaveSettings()
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+        wchar_t b[64];
+        wsprintfW(b, L"%d,%d,%d", gFxKeys[slot][0], gFxKeys[slot][1], gFxKeys[slot][2]);
+        WritePrivateProfileStringW(L"settings", FxKeyIniName(slot), b, gIni);
+    }
     for (FxGroup& g : gFxGroups) SaveInt(g.key, *g.on);
     for (Knob& k : gKnobs) SaveInt(k.key, *k.var);
     WritePrivateProfileStringW(L"settings", L"update_repo", gUpdateRepo, gIni);
@@ -1198,7 +1224,7 @@ static void DrawFxSwitch(DRAWITEMSTRUCT* d)
     SelectObject(dc, gFont);
     SetTextColor(dc, gDark ? DK_DIM : RGB(105, 105, 105));
     RECT sr = { px + pw + 14, rc.top + 23, rc.right - 70, rc.bottom - 4 };
-    DrawTextW(dc, L"Change your live voice with the effects below. The stutter loop picks them up too.", -1, &sr,
+    DrawTextW(dc, L"Changes your live voice (and the loop).", -1, &sr,
               DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
     SelectObject(dc, gFontBold);
     SetTextColor(dc, on ? ACCENT : gDark ? DK_DIM : RGB(120, 120, 120));
@@ -1219,6 +1245,37 @@ static void SetFxOn(bool on)
     gFxOn = on;
     InvalidateRect(GetDlgItem(gWnd, IDC_FXON), nullptr, FALSE);
     RedrawKnobs();
+}
+
+static void UpdateStatus(bool force);
+
+static void SetFxGroupOn(int g, bool on)
+{
+    if (on && !*gFxGroups[g].on) gFxResetReq = true;
+    *gFxGroups[g].on = on;
+    CheckDlgButton(gWnd, IDC_FXGRP_ON + g, on ? BST_CHECKED : BST_UNCHECKED);
+    RedrawKnobs();
+}
+
+// Voice FX hotkeys: the page key flips the master switch; an effect's key flips that effect
+// (and turns the master switch on with it, so the key always does something you can hear).
+static void PollFxKeys()
+{
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+        bool down = !gCapturingKey && KeysDown(gFxKeys[slot]);
+        bool pressed = down && !gFxKeyWasDown[slot];
+        gFxKeyWasDown[slot] = down;
+        if (!pressed) continue;
+        if (slot == 0) {
+            SetFxOn(!gFxOn);
+        } else {
+            int g = slot - 1;
+            bool on = !(*gFxGroups[g].on && gFxOn);
+            SetFxGroupOn(g, on);
+            if (on && !gFxOn) SetFxOn(true);
+        }
+        UpdateStatus(true);
+    }
 }
 
 static void ResetFxGroup(int g)
@@ -1736,6 +1793,8 @@ static void ShowHelp()
         L"VOICE FX\n"
         L"Flip the switch at the top, then tick the effects you want. Drag a knob up or down, scroll it, "
         L"or use the arrow keys (hold Shift for fine steps). Double-click a knob to reset it.\n"
+        L"Hotkeys: click \"Set hotkey\" next to the switch, Pitch or Reverb and press a key or combo. "
+        L"They work from anywhere, even in a game. Right-click a hotkey button (or press Backspace while setting it) to clear it.\n"
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
         L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n\n"
         L"HOTKEY\n"
@@ -1762,12 +1821,40 @@ static void ShowHelp()
 }
 
 // ======================= hotkey picker =======================
-static void BeginKeyCapture()
+// One picker for every hotkey: the stutter hotkey (IDC_HOTKEY) and the Voice FX on/off keys.
+static volatile int* gCapTarget = gHotkeys;    // where the captured combination is stored
+static int           gCapButton = IDC_HOTKEY;  // button that shows it
+
+static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 {
+    ComboName(gFxKeys[slot], MAX_KEYS, buf, cap);
+    if (!buf[0]) lstrcpynW(buf, L"Set hotkey", cap);
+}
+
+static int FxKeyButtonId(int slot) { return slot == 0 ? IDC_FXKEY_MASTER : IDC_FXGRP_KEY + slot - 1; }
+
+static void ShowCaptureTarget()
+{
+    wchar_t name[120];
+    if (gCapButton == IDC_HOTKEY) HotkeyName(name, 120);
+    else {
+        int slot = gCapButton == IDC_FXKEY_MASTER ? 0 : gCapButton - IDC_FXGRP_KEY + 1;
+        FxKeyButtonText(slot, name, 120);
+    }
+    SetDlgItemTextW(gWnd, gCapButton, name);
+}
+
+static void EndKeyCapture();
+
+static void BeginKeyCapture(volatile int* target, int button)
+{
+    if (gCapturingKey) EndKeyCapture();         // only one picker at a time
+    gCapTarget = target;
+    gCapButton = button;
     gCapturingKey = true;
     gCapKeyCount = 0;
     for (int vk = 0; vk < 256; vk++) gKeyWasDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-    SetDlgItemTextW(gWnd, IDC_HOTKEY, L"Hold your key(s), then let go");
+    SetDlgItemTextW(gWnd, button, button == IDC_HOTKEY ? L"Hold your key(s), then let go" : L"Press keys...");
     SetTimer(gWnd, TIMER_KEY, 15, nullptr);
 }
 
@@ -1775,9 +1862,17 @@ static void EndKeyCapture()
 {
     gCapturingKey = false;
     KillTimer(gWnd, TIMER_KEY);
-    wchar_t name[120]; HotkeyName(name, 120);
-    SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+    ShowCaptureTarget();
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) gFxKeyWasDown[slot] = KeysDown(gFxKeys[slot]);   // no instant toggle
     UpdateStatus(true);
+}
+
+static void ClearFxKey(int slot)
+{
+    if (gCapturingKey) EndKeyCapture();
+    for (int i = 0; i < MAX_KEYS; i++) gFxKeys[slot][i] = 0;
+    wchar_t name[120]; FxKeyButtonText(slot, name, 120);
+    SetDlgItemTextW(gWnd, FxKeyButtonId(slot), name);
 }
 
 // Left/right Shift, Ctrl and Alt are stored as plain Shift/Ctrl/Alt so either side works.
@@ -1813,6 +1908,11 @@ static void PollKeyCapture()
         gKeyWasDown[vk] = d;
         if (!pressed) continue;
         if (vk == VK_ESCAPE) { EndKeyCapture(); return; }    // cancel, keep the old hotkey
+        if (vk == VK_BACK && gCapKeyCount == 0 && gCapButton != IDC_HOTKEY) {   // Backspace clears an FX hotkey
+            for (int i = 0; i < MAX_KEYS; i++) gCapTarget[i] = 0;
+            EndKeyCapture();
+            return;
+        }
         int key = NormalizeKey(vk);
         bool have = false;
         for (int i = 0; i < gCapKeyCount; i++) if (gCapKeys[i] == key) have = true;
@@ -1831,13 +1931,13 @@ static void PollKeyCapture()
         wchar_t name[140];
         ComboName(gCapKeys, gCapKeyCount, name, 120);
         lstrcatW(name, L" ...");
-        SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+        SetDlgItemTextW(gWnd, gCapButton, name);
     }
 
     for (int i = 0; i < gCapKeyCount; i++)
         if (GetAsyncKeyState(gCapKeys[i]) & 0x8000) return;   // still holding: wait
 
-    for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = i < gCapKeyCount ? gCapKeys[i] : 0;
+    for (int i = 0; i < MAX_KEYS; i++) gCapTarget[i] = i < gCapKeyCount ? gCapKeys[i] : 0;
     EndKeyCapture();
 }
 
@@ -1980,7 +2080,11 @@ static void CreateUI()
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
     // Sections stack downward (FX_SEC_STEP apart); there's room below for more effects.
     gBuildPage = PAGE_FX;
-    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 56, 532, 48, IDC_FXON);
+    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 56, 410, 48, IDC_FXON);
+    {
+        wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 66, 114, 30, IDC_FXKEY_MASTER);
+    }
     const int FX_SEC_Y0 = 126, FX_SEC_STEP = 146, FX_SEC_H = 126;
     for (int g = 0; g < FX_GROUPS; g++) {
         int y = FX_SEC_Y0 + FX_SEC_STEP * g;
@@ -1988,15 +2092,19 @@ static void CreateUI()
         int col = 0;
         for (int i = 0; i < KNOB_N; i++) {
             if (gKnobs[i].group != g) continue;
-            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 102, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 98, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
             col++;
         }
-        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 446, y + 30, 84, 20, IDC_FXGRP_ON + g);
+        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_FXGRP_ON + g);
         CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
-        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 446, y + 66, 84, 28, IDC_FXGRP_RESET + g);
+        wchar_t kn[120]; FxKeyButtonText(1 + g, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 44, 104, 28, IDC_FXGRP_KEY + g);
+        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 80, 104, 28, IDC_FXGRP_RESET + g);
     }
     Ctl(L"STATIC", L"Drag a knob up/down or scroll it  -  Shift = fine steps  -  double-click resets.", 0,
         30, FX_SEC_Y0 + FX_SEC_STEP * FX_GROUPS - 4, 500, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Hotkeys switch an effect on/off from anywhere. Right-click one (or press Backspace) to clear it.", 0,
+        30, FX_SEC_Y0 + FX_SEC_STEP * FX_GROUPS + 16, 516, 18, IDC_HDR);
 
     // ---------------- Settings page ----------------
     gBuildPage = PAGE_SETTINGS;
@@ -2173,11 +2281,11 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_FXGRP_ON && id < IDC_FXGRP_ON + FX_GROUPS) {
-        int g = id - IDC_FXGRP_ON;
-        bool on = Checked(id);
-        if (on && !*gFxGroups[g].on) gFxResetReq = true;
-        *gFxGroups[g].on = on;
-        RedrawKnobs();
+        SetFxGroupOn(id - IDC_FXGRP_ON, Checked(id));
+        return;
+    }
+    if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) {
+        if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[1 + id - IDC_FXGRP_KEY], id);
         return;
     }
     if (id >= IDC_FXGRP_RESET && id < IDC_FXGRP_RESET + FX_GROUPS) {
@@ -2213,7 +2321,10 @@ static void OnCommand(int id, int code)
     case IDC_CHECKUPD: if (code == BN_CLICKED) StartUpdateCheck(true); break;
     case IDC_HOLD:
     case IDC_TOGGLE:   gToggleMode = Checked(IDC_TOGGLE); UpdateStatus(true); break;
-    case IDC_HOTKEY:   if (code == BN_CLICKED) BeginKeyCapture(); break;
+    case IDC_HOTKEY:   if (code == BN_CLICKED) BeginKeyCapture(gHotkeys, IDC_HOTKEY); break;
+    case IDC_FXKEY_MASTER:
+        if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[0], IDC_FXKEY_MASTER);
+        break;
     case IDC_THEME:
         if (code == CBN_SELCHANGE) {
             gThemeMode = (int)SendDlgItemMessageW(gWnd, IDC_THEME, CB_GETCURSEL, 0, 0);
@@ -2256,11 +2367,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         UpdateUi();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
+        SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
         if (w == TIMER_STATUS) UpdateStatus();
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) CleanupOldExe();
+        else if (w == TIMER_FXKEYS) PollFxKeys();
         else if (w == TIMER_RECONNECT) {
             if (!gWantRunning || gRunning || StartAudio(true)) KillTimer(h, TIMER_RECONNECT);
             UpdateUi();
@@ -2296,6 +2409,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
+    case WM_CONTEXTMENU: {                      // right-click a Voice FX hotkey button to clear it
+        int id = GetDlgCtrlID((HWND)w);
+        if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
+        if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
+        break;
+    }
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MINIMIZE) { ToTray(); return 0; }   // minimize goes to the tray
         break;
