@@ -1,0 +1,70 @@
+# Builds LagEffect.exe on GitHub's Windows machines.
+# Runs on every push to a branch other than build-output, and can be started by hand from the Actions tab.
+# The exe is kept as a downloadable artifact and also committed to the "build-output" branch
+# (build-output/<branch>/LagEffect.exe) so it can be fetched with plain git.
+name: Build
+
+on:
+  push:
+    branches-ignore: [build-output]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get miniaudio 0.11.25
+        shell: bash
+        run: git clone --depth 1 --branch 0.11.25 https://github.com/mackron/miniaudio _miniaudio && cp _miniaudio/miniaudio.h .
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile
+        shell: cmd
+        run: |
+          rc /nologo LagEffect.rc || exit /b 1
+          cl /nologo /O2 /MT /utf-8 /EHsc /W3 LagEffect.cpp LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe || exit /b 1
+
+      - name: Check the exe
+        shell: pwsh
+        run: |
+          $f = Get-Item LagEffect.exe
+          "Built $($f.Name): $($f.Length) bytes"
+          "SHA-256: $((Get-FileHash LagEffect.exe -Algorithm SHA256).Hash)"
+          if ($f.Length -lt 100000) { throw "exe is suspiciously small" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LagEffect-${{ github.ref_name }}
+          path: LagEffect.exe
+
+      - name: Save to build-output branch
+        shell: bash
+        run: |
+          set -e
+          ref="${GITHUB_REF_NAME//\//-}"
+          sha="$(git rev-parse --short HEAD)"
+          cp LagEffect.exe "$RUNNER_TEMP/LagEffect.exe"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code origin build-output >/dev/null 2>&1; then
+            git fetch --depth 1 origin build-output
+            git checkout -f -B build-output FETCH_HEAD
+          else
+            git checkout -f --orphan build-output
+            git rm -rfq . || true
+          fi
+          git clean -fdxq
+          mkdir -p "$ref"
+          cp "$RUNNER_TEMP/LagEffect.exe" "$ref/LagEffect.exe"
+          echo "$sha" > "$ref/SOURCE_COMMIT"
+          git add "$ref"
+          git commit -qm "Build $ref @ $sha"
+          git push origin build-output
