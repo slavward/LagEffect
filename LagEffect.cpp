@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.9.1"
+#define APP_VERSION L"1.9.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -222,6 +222,8 @@ static volatile bool gFxVocOn = false;
 // Vocoder (Voloco-style): style, key (0 = C .. 11 = B), scale, and knobs.
 enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_STYLES };
 static volatile int  gVocStyle = VOC_HARMONY, gVocKey = 0, gVocScale = 1;
+enum { VR_AUTO = 0, VR_HIGH = 1, VR_LOW = 2 };     // voice range (Vocoder): who's singing
+static volatile int  gVocRange = VR_AUTO;
 static volatile int  gVocRetuneMs = 15, gVocSynth = 60, gVocMix = 100;
 static volatile bool gFxRadioOn = false;
 static volatile int  gRadioPreset = 0, gRadioDrive = 50, gRadioStatic = 50, gRadioSquelch = 70;
@@ -253,14 +255,14 @@ static inline float PsRead(const PShift& p, double d)
                    p.buf[(i0 + 1) & (PS_SIZE - 1)], p.buf[(i0 + 2) & (PS_SIZE - 1)], t);
 }
 
-static double PsGrainStart(const PShift& p, int k, int base)
+static double PsGrainStart(const PShift& p, int k, int base, int search = PS_SEARCH, int corr = PS_CORR)
 {
     int other = (int)(p.delay[1 - k] + 0.5);
     float best = -1e30f; int bestD = 0;
-    for (int d = 0; d < PS_SEARCH; d += 2) {
+    for (int d = 0; d < search; d += 2) {
         int cand = base + d;
         float dot = 0, e = 0;
-        for (int j = 0; j < PS_CORR; j += 2) {
+        for (int j = 0; j < corr; j += 2) {
             float x = p.buf[(p.w - other - j) & (PS_SIZE - 1)];
             float y = p.buf[(p.w - cand - j) & (PS_SIZE - 1)];
             dot += x * y; e += y * y;
@@ -274,7 +276,8 @@ static double PsGrainStart(const PShift& p, int k, int base)
 // centered = false: lowest delay; each grain sweeps the whole span in one direction (big shifts).
 // centered = true: grains start mid-span and may drift either way, so the ratio can swing above
 // and below 1 smoothly (used for auto-tune, where small corrections flip direction all the time).
-static float PitchShift(PShift& p, float x, double ratio, int span, float mix, bool centered = false)
+static float PitchShift(PShift& p, float x, double ratio, int span, float mix, bool centered = false,
+                        int search = PS_SEARCH, int corr = PS_CORR)
 {
     p.buf[p.w] = x;
     float out = x;
@@ -289,10 +292,10 @@ static float PitchShift(PShift& p, float x, double ratio, int span, float mix, b
             p.frac[0] = 0.0; p.frac[1] = 0.5;
             p.primed = true;
         }
-        const double maxD = PS_SIZE - PS_CORR - 4;
+        const double maxD = PS_SIZE - corr - 4;
         float wet = 0.0f;
         for (int k = 0; k < 2; k++) {
-            if (p.frac[k] >= 1.0) { p.frac[k] -= 1.0; p.delay[k] = PsGrainStart(p, k, base); }
+            if (p.frac[k] >= 1.0) { p.frac[k] -= 1.0; p.delay[k] = PsGrainStart(p, k, base, search, corr); }
             if (p.delay[k] < 2.0)  p.delay[k] = 2.0;
             if (p.delay[k] > maxD) p.delay[k] = maxD;
             float sn = (float)sin(3.141592653589793 * p.frac[k]);
@@ -308,7 +311,7 @@ static float PitchShift(PShift& p, float x, double ratio, int span, float mix, b
         out = (PsRead(p, p.delay[0]) * sn0 * sn0 + PsRead(p, p.delay[1]) * sn1 * sn1);
         out = x + (out - x) * mix;
         p.frac[0] += 1.0 / RATE; p.frac[1] += 1.0 / RATE;
-        for (int k = 0; k < 2; k++) if (p.frac[k] >= 1.0) { p.frac[k] -= 1.0; p.delay[k] = PsGrainStart(p, k, 2 + span / 2); }
+        for (int k = 0; k < 2; k++) if (p.frac[k] >= 1.0) { p.frac[k] -= 1.0; p.delay[k] = PsGrainStart(p, k, 2 + span / 2, search, corr); }
     }
     p.w = (p.w + 1) & (PS_SIZE - 1);
     return out;
@@ -370,9 +373,8 @@ static const char VOC_SCALE_STEPS[VOC_SCALES][12] = {
 
 #define PD_DS     4                            // detector runs at 48 kHz / 4 = 12 kHz
 #define PD_RATE   (RATE / PD_DS)
-#define PD_MAXLAG 200                          // lowest pitch: 12000 / 200 = 60 Hz
-#define PD_MINLAG 12                           // highest: 1000 Hz
-#define PD_WIN    320                          // ~27 ms analysis window
+#define PD_MAXLAG 240                          // lowest pitch it can hear: 12000 / 240 = 50 Hz
+#define PD_WIN    480                          // longest analysis window (40 ms; low voices need a few cycles)
 #define PD_BUF    1024
 #define PD_HOP    64                           // analyse every ~5 ms
 #define VOC_BANDS 28
@@ -420,20 +422,34 @@ static struct VocState {
     float  modEnv[VOC_BANDS], carEnv[VOC_BANDS];
     Biquad sibHp[2];
     bool   ready;
+    // voice range
+    bool   low;                                // using the low-voice settings right now
+    bool   bandsLow;                           // which band layout the vocoder filters are set to
+    float  rangeAvg;                           // Auto: average sung note (MIDI), decides high/low
+    float  jumpF; int jumpCount;               // octave-jump guard
+    float  conf;                               // last detection's YIN dip (lower = more certain)
 } gVoc;
 
-static void VocReset()                         // audio thread / before start
+// Vocoder bands: 28 bands from 110 Hz (or 70 Hz for low voices) to 7.6 kHz.
+static void VocBands(bool low)
 {
-    memset(&gVoc, 0, sizeof(gVoc));
-    for (int i = 0; i < 2; i++) BqSet(gVoc.dsLp[i], 0, 2600.0, i ? 1.3066 : 0.5412);   // 4th-order Butterworth
-    const double lo = 110.0, hi = 7600.0, r = pow(hi / lo, 1.0 / (VOC_BANDS - 1));
+    const double lo = low ? 70.0 : 110.0, hi = 7600.0, r = pow(hi / lo, 1.0 / (VOC_BANDS - 1));
     const double Q = 1.0 / (sqrt(r) - 1.0 / sqrt(r));
     for (int b = 0; b < VOC_BANDS; b++) {
         double fc = lo * pow(r, b);
         for (int i = 0; i < 2; i++) { BqSet(gVoc.modBp[b][i], 1, fc, Q); BqSet(gVoc.carBp[b][i], 1, fc, Q); }
     }
+    gVoc.bandsLow = low;
+}
+
+static void VocReset()                         // audio thread / before start
+{
+    memset(&gVoc, 0, sizeof(gVoc));
+    for (int i = 0; i < 2; i++) BqSet(gVoc.dsLp[i], 0, 2600.0, i ? 1.3066 : 0.5412);   // 4th-order Butterworth
+    VocBands(false);
     for (int i = 0; i < 2; i++) BqSet(gVoc.sibHp[i], 2, 5000.0, i ? 1.3066 : 0.5412);
     gVoc.targetNote = -1;
+    gVoc.rangeAvg = 55.0f;                      // start in the middle (G3)
     gVoc.ready = true;
 }
 
@@ -466,38 +482,61 @@ static int VocScaleStep(int note, int steps, int key, int scale)   // move up/do
     return n;
 }
 
-// YIN pitch detection on the last PD_WIN + PD_MAXLAG samples of the 12 kHz buffer.
-static float VocDetect()
+// YIN pitch detection on the newest `win` samples of the 12 kHz buffer, looking for periods
+// between minLag and maxLag samples. Tolerant of real voices (jitter, breath, a weak fundamental):
+//  - a clear dip below 0.2 wins, as in standard YIN;
+//  - otherwise the first dip almost as deep as the deepest is accepted, if reasonably periodic (< 0.45);
+//  - it prefers staying near the previous pitch; a guard in Vocoder() also stops one-off octave jumps.
+static float VocDetect(int minLag, int maxLag, int win, float prevF0)
 {
     float* d = gVoc.pdD;
-    const int base = gVoc.pdW - PD_WIN - PD_MAXLAG;
+    const int base = gVoc.pdW - win - maxLag;
     float energy = 0;
-    for (int j = 0; j < PD_WIN; j++) { float x = gVoc.pdBuf[(base + PD_MAXLAG + j) & (PD_BUF - 1)]; energy += x * x; }
-    gVoc.level = sqrtf(energy / PD_WIN);
+    for (int j = 0; j < win; j++) { float x = gVoc.pdBuf[(base + maxLag + j) & (PD_BUF - 1)]; energy += x * x; }
+    gVoc.level = sqrtf(energy / win);
     if (gVoc.level < 0.002f) return 0;         // too quiet to have a pitch (about -54 dBFS)
 
     d[0] = 1; float run = 0;
-    for (int tau = 1; tau <= PD_MAXLAG; tau++) {
+    for (int tau = 1; tau <= maxLag; tau++) {
         float sum = 0;
-        for (int j = 0; j < PD_WIN; j++) {
-            float a = gVoc.pdBuf[(base + PD_MAXLAG + j) & (PD_BUF - 1)];
-            float b = gVoc.pdBuf[(base + PD_MAXLAG + j - tau) & (PD_BUF - 1)];
+        for (int j = 0; j < win; j++) {
+            float a = gVoc.pdBuf[(base + maxLag + j) & (PD_BUF - 1)];
+            float b = gVoc.pdBuf[(base + maxLag + j - tau) & (PD_BUF - 1)];
             sum += (a - b) * (a - b);
         }
         run += sum;
         d[tau] = run > 0 ? sum * tau / run : 1;   // cumulative mean normalised difference
     }
     int tau = -1;
-    for (int t = PD_MINLAG; t < PD_MAXLAG; t++)
-        if (d[t] < 0.15f) { while (t + 1 < PD_MAXLAG && d[t + 1] < d[t]) t++; tau = t; break; }
-    if (tau < 0) return 0;                      // no clear pitch: breath, "s", noise
+    for (int t = minLag; t < maxLag; t++)
+        if (d[t] < 0.2f) { while (t + 1 < maxLag && d[t + 1] < d[t]) t++; tau = t; break; }
+    if (tau < 0) {                              // no clear dip (breathy voice): find the deepest one...
+        int best = minLag;
+        for (int t = minLag + 1; t < maxLag; t++) if (d[t] < d[best]) best = t;
+        if (d[best] > 0.45f) return 0;          // no pitch: breath, "s", noise
+        // ...but take the first dip that's nearly as deep: the deepest is often at twice the period
+        for (int t = minLag + 1; t < best; t++)
+            if (d[t] < d[best] + 0.06f && d[t] <= d[t - 1] && d[t] <= d[t + 1]) { best = t; break; }
+        tau = best;
+    }
+    // Voices glide, they don't jump: if there's a dip almost as good near the last pitch, stay with it.
+    // (Stops breathy voices flipping to a vowel resonance or to twice/three times the period.)
+    if (prevF0 > 0) {
+        float pp = (float)PD_RATE / prevF0;
+        int lo = Imax(minLag, (int)(pp * 0.93f)), hi = Imin(maxLag - 1, (int)(pp * 1.07f) + 1);
+        int nearT = -1;
+        for (int t = lo; t <= hi; t++) if (nearT < 0 || d[t] < d[nearT]) nearT = t;
+        if (nearT > 0 && nearT != tau && d[nearT] < d[tau] + 0.1f && d[nearT] < 0.45f) tau = nearT;
+    }
+    if (tau < 1 || tau >= maxLag) return 0;
+    gVoc.conf = d[tau];
     float a = d[tau - 1], b = d[tau], c = d[tau + 1], den = a - 2 * b + c;
     float t = tau + (fabsf(den) > 1e-9f ? 0.5f * (a - c) / den : 0.0f);   // parabolic refinement
     return (float)PD_RATE / t;
 }
 
 // Which notes the synth plays, as offsets in scale steps from the tuned note (99 = unused).
-static void VocVoices(int style, int* steps, float* gains, int* octaves)
+static void VocVoices(int style, bool low, int* steps, float* gains, int* octaves)
 {
     for (int i = 0; i < VOC_OSC; i++) { steps[i] = 99; gains[i] = 0; octaves[i] = 0; }
     switch (style) {
@@ -519,6 +558,8 @@ static void VocVoices(int style, int* steps, float* gains, int* octaves)
         steps[5] = 0; gains[5] = 0.35f; octaves[5] = 1;
         break;
     }
+    if (low)                                    // deep voices: an octave below gets muddy, so go above instead
+        for (int i = 0; i < VOC_OSC; i++) if (octaves[i] < 0) { octaves[i] = 1; gains[i] *= 0.7f; }
 }
 
 static inline float PolyBlep(double t, double dt)   // removes the aliasing a plain sawtooth would have
@@ -529,7 +570,7 @@ static inline float PolyBlep(double t, double dt)   // removes the aliasing a pl
 }
 
 // Per-block settings, read once per audio callback.
-static struct VocParams { int style, key, scale; float retuneCoef, synth, mix; } gVp;
+static struct VocParams { int style, key, scale, range; float retuneCoef, synth, mix; } gVp;
 
 static void VocBlock()
 {
@@ -540,6 +581,7 @@ static void VocBlock()
     gVp.retuneCoef = ms <= 0 ? 1.0f : 1.0f - expf(-1.0f / (ms * 0.001f * RATE));
     gVp.synth = gVocSynth / 100.0f;
     gVp.mix   = gVocMix / 100.0f;
+    gVp.range = Iclamp(gVocRange, 0, 2);
 }
 
 static float Vocoder(float x)
@@ -555,7 +597,19 @@ static float Vocoder(float x)
         v.pdW++;
         if (++v.pdHop >= PD_HOP) {
             v.pdHop = 0;
-            float f = VocDetect();
+            // High: 80-1000 Hz, 27 ms window. Low: 50-500 Hz, 40 ms window. Auto: listens to both.
+            v.low = gVp.range == VR_LOW || (gVp.range == VR_AUTO && v.low);
+            if (gVp.range == VR_HIGH) v.low = false;
+            int minLag = gVp.range == VR_LOW ? PD_RATE / 500 : PD_RATE / 1000;
+            int maxLag = gVp.range == VR_HIGH ? PD_RATE / 80 : PD_MAXLAG;
+            int win    = gVp.range == VR_HIGH ? 320 : PD_WIN;
+            float f = VocDetect(minLag, maxLag, win, v.f0);
+            if (f > 0 && v.f0 > 0) {                // octave-jump guard: needs 3 readings in a row to jump
+                float r = f / v.f0;
+                bool jump = (r > 1.85f && r < 2.15f) || (r > 0.465f && r < 0.54f);
+                if (jump && ++v.jumpCount < 3) f = v.f0;
+                else if (!jump) v.jumpCount = 0;
+            }
             if (f > 0) {
                 v.f0 = f; v.unvoicedHops = 0;
                 float note = 69.0f + 12.0f * log2f(f / 440.0f);
@@ -565,23 +619,30 @@ static float Vocoder(float x)
                     fabsf(note - v.targetNote) > fabsf(note - cand) + 0.25f)
                     v.targetNote = cand;
                 v.wantShift = (float)v.targetNote - note;
-            } else if (++v.unvoicedHops > 4) {  // ~20 ms of no pitch
+            } else if (++v.unvoicedHops > 8) {  // ~40 ms of no pitch (rides over short dropouts)
                 v.f0 = 0;
                 v.wantShift = 0;
             }
+            if (f > 0 && v.conf < 0.2f && gVp.range == VR_AUTO) {   // Auto (confident readings only): low below ~D3 (147 Hz), high above ~F3 (175 Hz)
+                v.rangeAvg += (69.0f + 12.0f * log2f(v.f0 / 440.0f) - v.rangeAvg) * 0.03f;
+                if (v.rangeAvg < 50.0f) v.low = true; else if (v.rangeAvg > 53.0f) v.low = false;
+            }
+            if (v.low != v.bandsLow) VocBands(v.low);
         }
     }
 
     // --- tune ---
     v.shift += (v.wantShift - v.shift) * (v.f0 > 0 ? gVp.retuneCoef : 0.002f);
-    float tuned = PitchShift(gPsTune, x, pow(2.0, v.shift / 12.0), 960, 1.0f, true);   // 20 ms span, centered
+    // 20 ms grains for high voices; 42 ms with a wider search for low ones (a grain needs a few voice cycles)
+    float tuned = v.low ? PitchShift(gPsTune, x, pow(2.0, v.shift / 12.0), 2000, 1.0f, true, 960, 384)
+                        : PitchShift(gPsTune, x, pow(2.0, v.shift / 12.0), 960, 1.0f, true);
     if (v.f0 > 0) v.outNote = 69.0f + 12.0f * log2f(v.f0 / 440.0f) + v.shift;
     if (gVp.style == VOC_TUNE) return x + (tuned - x) * gVp.mix;
 
     // --- synth carrier ---
     v.voiced += ((v.f0 > 0 ? 1.0f : 0.0f) - v.voiced) * 0.002f;   // ~10 ms fade
     int steps[VOC_OSC], octs[VOC_OSC]; float gains[VOC_OSC];
-    VocVoices(gVp.style, steps, gains, octs);
+    VocVoices(gVp.style, v.low, steps, gains, octs);
     float car = 0;
     if (v.targetNote >= 0) {
         float bend = v.outNote - (float)v.targetNote;              // follow vibrato and slides
@@ -1086,7 +1147,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -1484,6 +1545,7 @@ static void LoadSettings()
     gVocStyle     = Iclamp(INI_INT(L"voc_style", VOC_HARMONY), 0, VOC_STYLES - 1);
     gVocKey       = Iclamp(INI_INT(L"voc_key", 0), 0, 11);
     gVocScale     = Iclamp(INI_INT(L"voc_scale", 1), 0, VOC_SCALES - 1);
+    gVocRange     = Iclamp(INI_INT(L"voc_range", VR_AUTO), 0, 2);
     gRadioPreset  = Iclamp(INI_INT(L"radio_preset", 0), 0, RADIO_N - 1);
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
@@ -1542,7 +1604,7 @@ static void SaveSettings()
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
-    SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale);
+    SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
     SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
@@ -2075,6 +2137,9 @@ static void AddTips()
     TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
                         L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you.");
     TipId(IDC_VOCKEY,   L"The key of the song (its home note). Not sure? Try C with Major, or A with Minor.");
+    TipId(IDC_VOCRANGE, L"How high your voice is. Auto works it out as you sing. "
+                        L"Low / deep: for bass and baritone voices; hears notes down to 50 Hz, uses longer, smoother slices "
+                        L"for tuning, and puts harmonies above you instead of below (adds ~15 ms delay). High: tenor, alto, soprano.");
     TipId(IDC_VOCSCALE, L"Which notes are allowed. Major = happy, Minor = darker, Pentatonic = safe for most songs, "
                         L"Chromatic = every note (just smooths your pitch).");
     TipId(IDC_GATEMODE, L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech "
@@ -2847,7 +2912,7 @@ static void ShowHelp()
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
         L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n"
         L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices. Pick the key of the song; "
-        L"Retune 0 ms gives the hard auto-tune sound.\n"
+        L"Retune 0 ms gives the hard auto-tune sound. Deep voice? Set Voice to Low / deep (Auto usually picks it for you).\n"
         L"Radio: sound like a walkie-talkie, phone call, megaphone, old radio, space radio, drive-thru, 8-bit or the next room. "
         L"Drive = distortion, Static = background noise, Squelch = start/stop sounds.\n\n"
         L"HOTKEY\n"
@@ -3186,21 +3251,24 @@ static void CreateUI()
         AddSection(14, y, 532, FX_SEC_H, gFxGroups[g].title);
         int kx = 26, kstep = 98, kw = KNOB_W;
         if (g == KG_VOCODER) {                  // dropdowns on the left, narrower knobs after them
-            Ctl(L"STATIC", L"Style", 0, 28, y + 10, 150, 16, IDC_HDR);
-            HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 27, 152, 300, IDC_VOCSTYLE);
+            // three dropdowns stacked: style, key + scale, voice range (hover each for help)
+            HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 10, 152, 300, IDC_VOCSTYLE);
             const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir" };
             for (const wchar_t* n : styleNames) SendMessageW(st, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(st, CB_SETCURSEL, gVocStyle, 0);
-            Ctl(L"STATIC", L"Key / scale", 0, 28, y + 56, 150, 16, IDC_HDR);
-            HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 73, 56, 300, IDC_VOCKEY);
+            HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 40, 56, 300, IDC_VOCKEY);
             const wchar_t* keyNames[12] = { L"C", L"C#", L"D", L"D#", L"E", L"F", L"F#", L"G", L"G#", L"A", L"A#", L"B" };
             for (const wchar_t* n : keyNames) SendMessageW(ky, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(ky, CB_SETCURSEL, gVocKey, 0);
-            HWND sc = Ctl(L"COMBOBOX", L"", COMBO, 86, y + 73, 92, 300, IDC_VOCSCALE);
+            HWND sc = Ctl(L"COMBOBOX", L"", COMBO, 86, y + 40, 92, 300, IDC_VOCSCALE);
             const wchar_t* scaleNames[VOC_SCALES] = { L"Chromatic", L"Major", L"Minor", L"Major pentatonic", L"Minor pentatonic", L"Blues" };
             for (const wchar_t* n : scaleNames) SendMessageW(sc, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(sc, CB_SETCURSEL, gVocScale, 0);
             SendMessageW(sc, CB_SETDROPPEDWIDTH, 140, 0);
+            HWND vr = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 70, 152, 300, IDC_VOCRANGE);
+            const wchar_t* rangeNames[3] = { L"Voice: Auto", L"Voice: High", L"Voice: Low / deep" };
+            for (const wchar_t* n : rangeNames) SendMessageW(vr, CB_ADDSTRING, 0, (LPARAM)n);
+            SendMessageW(vr, CB_SETCURSEL, gVocRange, 0);
             kx = 186; kstep = 80; kw = 80;
         } else if (g == KG_RADIO) {             // preset dropdown + a line about it
             Ctl(L"STATIC", L"Preset", 0, 28, y + 10, 150, 16, IDC_HDR);
@@ -3451,10 +3519,11 @@ static void OnCommand(int id, int code)
             RedrawKnobs();                      // dims knobs the preset doesn't use
         }
         break;
-    case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE:
+    case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE: case IDC_VOCRANGE:
         if (code == CBN_SELCHANGE) {
             int v = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
-            if (id == IDC_VOCSTYLE) gVocStyle = v; else if (id == IDC_VOCKEY) gVocKey = v; else gVocScale = v;
+            if (id == IDC_VOCSTYLE) gVocStyle = v; else if (id == IDC_VOCKEY) gVocKey = v;
+            else if (id == IDC_VOCSCALE) gVocScale = v; else gVocRange = Iclamp(v, 0, 2);
             RedrawKnobs();                      // Synth dims in the Tune style
         }
         break;
