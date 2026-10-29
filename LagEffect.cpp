@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.8.0"
+#define APP_VERSION L"1.9.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -223,6 +223,8 @@ static volatile bool gFxVocOn = false;
 enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_STYLES };
 static volatile int  gVocStyle = VOC_HARMONY, gVocKey = 0, gVocScale = 1;
 static volatile int  gVocRetuneMs = 15, gVocSynth = 60, gVocMix = 100;
+static volatile bool gFxRadioOn = false;
+static volatile int  gRadioPreset = 0, gRadioDrive = 50, gRadioStatic = 50, gRadioSquelch = 70;
 
 // Pitch shifter: two read taps glide through a short delay line at the new speed and crossfade
 // (Hann windows, half a grain apart). Each new grain starts where the waveform best lines up with
@@ -623,9 +625,229 @@ static float Vocoder(float x)
     return x + (out - x) * gVp.mix;
 }
 
+// ======================= radio (walkie-talkie, phone, megaphone...) =======================
+// Each preset is a row in RADIO_PRESETS: the band the device lets through, a resonance (speaker
+// or horn), how hard it distorts, digital crunch (phone codec / 8-bit), background noise, an echo,
+// and the sounds it makes when you start/stop talking. Add a row to add a preset.
+// The knobs scale the preset: Drive (distortion), Static (noise), Squelch (start/stop sounds).
+enum { SQ_NONE = 0, SQ_WALKIE = 1, SQ_QUINDAR = 2, SQ_CLICK = 3 };
+enum { CLIP_SOFT = 0, CLIP_HARD = 1, CLIP_RATTLE = 2 };
+struct RadioPreset {
+    const wchar_t* name;
+    float hp, lp;                              // band edges in Hz (4th-order filters)
+    float peakHz, peakDb, peakQ;               // speaker / horn resonance
+    float driveDb; int clip;                   // distortion (at Drive 50%)
+    float comp;                                // compression (0..1): radios and phones squash your voice
+    int   srDiv, bits; bool mulaw;             // digital crunch: sample-rate divider, bit depth, phone codec curve
+    float hiss, crackle, hum;                  // background noise (at Static 50%)
+    float slapMs, slapGain;                    // echo off walls (megaphone)
+    int   squelch;                             // start/stop sound
+    float outDb;                               // level match: a normal voice (-22 dBFS) comes out as loud as it went in
+                                               // (Megaphone +2 dB on purpose). Radios squash: quiet gets louder, loud quieter.
+};
+#define RADIO_N 8
+static const RadioPreset RADIO_PRESETS[RADIO_N] = {
+    //  name               hp    lp     peak   dB   Q    drive clip         comp  sr bits mulaw  hiss    crackle hum     slap  gain  squelch      out
+    { L"Walkie-talkie",    450,  2800,  1800,  6,   1.0f, 14, CLIP_SOFT,   0.8f, 1, 0,  false, 0.012f, 0.0f,   0.0f,   0,    0,    SQ_WALKIE,   -4.4 },
+    { L"Phone call",       320,  3400,  1500,  3,   0.8f, 6,  CLIP_SOFT,   0.5f, 6, 0,  true,  0.002f, 0.0f,   0.0f,   0,    0,    SQ_NONE,     1.8 },
+    { L"Megaphone",        600,  4500,  1400,  9,   2.0f, 20, CLIP_HARD,   0.7f, 1, 0,  false, 0.0f,   0.0f,   0.0f,   70,   0.3f, SQ_NONE,     -9.6 },
+    { L"Old radio",        250,  3800,  900,   3,   0.7f, 8,  CLIP_SOFT,   0.4f, 1, 0,  false, 0.006f, 0.5f,   0.004f, 0,    0,    SQ_NONE,     -1.8 },
+    { L"Space radio",      400,  3000,  2000,  4,   1.0f, 10, CLIP_SOFT,   0.7f, 1, 0,  false, 0.010f, 0.0f,   0.0f,   0,    0,    SQ_QUINDAR,  -0.8 },
+    { L"Drive-thru",       700,  2600,  1100,  8,   3.0f, 18, CLIP_RATTLE, 0.8f, 1, 0,  false, 0.006f, 0.0f,   0.0f,   0,    0,    SQ_CLICK,    -5.7 },
+    { L"Lo-fi 8-bit",      150,  6000,  0,     0,   1.0f, 3,  CLIP_SOFT,   0.3f, 4, 7,  false, 0.0f,   0.0f,   0.0f,   0,    0,    SQ_NONE,     4.3 },
+    { L"Next room",        60,   450,   200,   3,   0.7f, 0,  CLIP_SOFT,   0.2f, 1, 0,  false, 0.0f,   0.0f,   0.0f,   18,   0.25f,SQ_NONE,     2.6 },
+};
+
+static const wchar_t* RADIO_DESC[RADIO_N] = {
+    L"Crackly two-way radio. \"Kssht\" when you stop talking.",
+    L"Like you're on a phone call (8 kHz phone line).",
+    L"Loud, distorted horn with an echo off the street.",
+    L"1940s valve radio: warm, crackle and hum.",
+    L"Mission control, with Apollo \"Quindar\" beeps.",
+    L"Tinny, buzzy drive-thru speaker. Clicks on and off.",
+    L"Crunchy 8-bit game console voice.",
+    L"Muffled, like you're talking from the next room.",
+};
+
+static inline float SatSoft(float x)   { return tanhf(x); }
+static void BqPeak(Biquad& q, double fc, double db, double Q)   // peaking EQ
+{
+    double A = pow(10.0, db / 40.0), w = 2.0 * 3.141592653589793 * fc / RATE, c = cos(w), al = sin(w) / (2.0 * Q);
+    double a0 = 1 + al / A;
+    q.b0 = (float)((1 + al * A) / a0); q.b1 = (float)(-2 * c / a0); q.b2 = (float)((1 - al * A) / a0);
+    q.a1 = (float)(-2 * c / a0);        q.a2 = (float)((1 - al / A) / a0);
+    q.z1 = q.z2 = 0;
+}
+
+#define RADIO_SLAP 8192
+static struct RadioState {
+    int    preset;                             // preset the filters are set up for (-1 = none)
+    Biquad hp[2], lp[2], lpPost[2], peak, noiseBp[2], quindar;
+    float  compEnv, keyEnv, keyed, holdLeft;   // talk detection: keyed = 0..1 "transmitting"
+    bool   talking;
+    int    quietFor;
+    float  srHold; int srCount;                // sample-and-hold for the codec / 8-bit
+    float  slap[RADIO_SLAP]; int slapW;
+    // start/stop sounds
+    int    sqLeft, sqLen, sqKind;              // samples left, length, which sound (1 = start, 2 = stop)
+    double sqPhase;
+    float  crackleEnv;
+    double humPhase;
+    unsigned seed;
+} gRadio;
+
+static struct RadioParams { const RadioPreset* p; float drive, statik, squelch; } gRp;
+
+static void RadioReset()
+{
+    memset(&gRadio, 0, sizeof(gRadio));
+    gRadio.preset = -1;
+    gRadio.seed = 0x1234567u;
+}
+
+static void RadioSetup(int idx)                // filters for a preset (audio thread)
+{
+    const RadioPreset& p = RADIO_PRESETS[idx];
+    for (int i = 0; i < 2; i++) {
+        BqSet(gRadio.hp[i], 2, p.hp, i ? 1.3066 : 0.5412);
+        BqSet(gRadio.lp[i], 0, p.lp, i ? 1.3066 : 0.5412);
+        BqSet(gRadio.lpPost[i], 0, p.lp, i ? 1.3066 : 0.5412);
+        BqSet(gRadio.noiseBp[i], 1, 2500.0, 0.8);
+    }
+    if (p.peakDb != 0) BqPeak(gRadio.peak, p.peakHz, p.peakDb, p.peakQ);
+    BqSet(gRadio.quindar, 1, 2500.0, 4.0);
+    gRadio.preset = idx;
+}
+
+static void RadioBlock()
+{
+    int idx = Iclamp(gRadioPreset, 0, RADIO_N - 1);
+    gRp.p       = &RADIO_PRESETS[idx];
+    gRp.drive   = gRadioDrive / 50.0f;         // 50% = the preset as designed
+    gRp.statik  = gRadioStatic / 50.0f;
+    gRp.squelch = gRadioSquelch / 100.0f;
+}
+
+static inline float RadioNoise()                // white noise, -1..1
+{
+    gRadio.seed = gRadio.seed * 1664525u + 1013904223u;
+    return (float)((int)(gRadio.seed >> 8) & 0xFFFF) / 32768.0f - 1.0f;
+}
+
+static float Radio(float x)
+{
+    RadioState& r = gRadio;
+    const RadioPreset& p = *gRp.p;
+    int idx = (int)(gRp.p - RADIO_PRESETS);
+    if (r.preset != idx) RadioSetup(idx);
+
+    // --- are you talking? (decides when the radio is "keyed", and when to play start/stop sounds) ---
+    float a = x < 0 ? -x : x;
+    r.keyEnv = a > r.keyEnv ? a : r.keyEnv * 0.998f;                // ~10 ms decay
+    if (!r.talking && r.keyEnv > 0.008f) {                          // about -42 dBFS: you started
+        r.talking = true;
+        if (r.quietFor > RATE / 4 && p.squelch != SQ_NONE && gRp.squelch > 0) {   // only after a real pause
+            r.sqKind = 1; r.sqLen = p.squelch == SQ_QUINDAR ? RATE / 4 : p.squelch == SQ_WALKIE ? RATE / 25 : RATE / 100;
+            r.sqLeft = r.sqLen; r.sqPhase = 0;
+        }
+        r.quietFor = 0;
+    }
+    if (r.talking) {
+        if (r.keyEnv < 0.003f) {                                    // -50 dBFS for 0.3 s: you stopped
+            if (++r.quietFor > RATE * 3 / 10) {
+                r.talking = false;
+                if (p.squelch != SQ_NONE && gRp.squelch > 0) {
+                    r.sqKind = 2; r.sqLen = p.squelch == SQ_QUINDAR ? RATE / 4 : p.squelch == SQ_WALKIE ? RATE * 18 / 100 : RATE / 100;
+                    r.sqLeft = r.sqLen; r.sqPhase = 0;
+                }
+            }
+        } else r.quietFor = 0;
+    } else r.quietFor++;
+    r.keyed += ((r.talking ? 1.0f : 0.0f) - r.keyed) * 0.0005f;     // noise fades in/out over ~40 ms
+
+    // --- background noise, added before the filters so it sounds like it came through the device ---
+    float n = 0;
+    if (gRp.statik > 0 && r.keyed > 0.001f) {
+        n += RadioNoise() * p.hiss;
+        if (p.crackle > 0) {                                        // vinyl-like pops and crackle
+            if ((r.seed & 0x3FFF) < (unsigned)(p.crackle * 6)) r.crackleEnv = RadioNoise() * 0.3f;
+            n += r.crackleEnv; r.crackleEnv *= 0.9f;
+        }
+        n *= gRp.statik * r.keyed;
+    }
+    float s = x + n;
+
+    // --- device: compression, band, resonance, distortion ---
+    float pw = s * s;
+    r.compEnv += (pw - r.compEnv) * (pw > r.compEnv ? 0.01f : 0.0003f);
+    if (p.comp > 0) {
+        float lvl = 10.0f * log10f(r.compEnv + 1e-12f);
+        float gdb = lvl > -32.0f ? (-32.0f - lvl) * p.comp * 0.75f : 0.0f;   // up to 4:1 above -32 dBFS
+        s *= powf(10.0f, (gdb + p.comp * 10.0f) / 20.0f);                    // + make-up
+    }
+    s = BqRun(r.hp[0], s);
+    if (p.peakDb != 0) s = BqRun(r.peak, s);
+
+    float g = powf(10.0f, p.driveDb * gRp.drive / 20.0f);
+    if (p.driveDb > 0 && g > 1.0f) {
+        float v = s * g;
+        if (p.clip == CLIP_HARD)        v = v > 0.5f ? 0.5f : v < -0.5f ? -0.5f : v;
+        else if (p.clip == CLIP_RATTLE) v = SatSoft(v + 0.3f * v * v);  // lopsided: buzzy cheap speaker
+        else                            v = SatSoft(v);
+        s = v / (p.clip == CLIP_HARD ? 0.5f : 1.0f) * 0.5f;
+    }
+    s = BqRun(r.hp[1], s);                     // second half of the low cut, after distortion: removes rumble and DC it adds
+
+    s = BqRun(r.lp[1], BqRun(r.lp[0], s));     // top cut, before the crunch (stops harsh aliasing)
+    if (p.srDiv > 1 || p.bits > 0 || p.mulaw) {                     // digital crunch
+        if (++r.srCount >= (p.srDiv > 1 ? p.srDiv : 1)) {
+            r.srCount = 0;
+            float v = s;
+            if (p.mulaw) {                                          // G.711-style: 8-bit with the telephone curve
+                float m = logf(1.0f + 255.0f * fminf(fabsf(v), 1.0f)) / logf(256.0f);
+                m = floorf(m * 127.0f + 0.5f) / 127.0f;
+                v = (v < 0 ? -1.0f : 1.0f) * (powf(256.0f, m) - 1.0f) / 255.0f;
+            }
+            if (p.bits > 0) { float q = (float)(1 << (p.bits - 1)); v = floorf(v * q + 0.5f) / q; }
+            r.srHold = v;
+        }
+        s = BqRun(r.lpPost[1], BqRun(r.lpPost[0], r.srHold));   // and again after: smooths the steps
+    }
+
+    if (p.hum > 0 && r.keyed > 0.001f) {                            // mains hum (old valve radios)
+        r.humPhase += 120.0 / RATE; if (r.humPhase >= 1) r.humPhase -= 1;
+        s += (float)(sin(6.283185307179586 * r.humPhase) + 0.5 * sin(12.566370614359172 * r.humPhase)) * p.hum * gRp.statik * r.keyed;
+    }
+    if (p.slapGain > 0) {                                           // echo off walls
+        int d = Iclamp((int)(p.slapMs * RATE / 1000), 1, RADIO_SLAP - 1);
+        float e = r.slap[(r.slapW - d) & (RADIO_SLAP - 1)];
+        r.slap[r.slapW] = s + e * 0.35f;
+        r.slapW = (r.slapW + 1) & (RADIO_SLAP - 1);
+        s += e * p.slapGain;
+    }
+
+    // --- start / stop sounds ---
+    if (r.sqLeft > 0) {
+        float t = 1.0f - (float)r.sqLeft / r.sqLen, v = 0;
+        if (p.squelch == SQ_QUINDAR) {                              // NASA Apollo "Quindar" beeps: 2525 Hz in, 2475 Hz out
+            r.sqPhase += (r.sqKind == 1 ? 2525.0 : 2475.0) / RATE;
+            float env = fminf(1.0f, fminf(t, 1.0f - t) * 40.0f);
+            v = (float)sin(6.283185307179586 * r.sqPhase) * 0.25f * env;
+        } else if (p.squelch == SQ_WALKIE) {                        // "kssht": a burst of band-limited static
+            float env = r.sqKind == 1 ? (1.0f - t) : (t < 0.05f ? t * 20.0f : (1.0f - t) * (1.0f - t) * 1.1f);
+            v = BqRun(r.noiseBp[1], BqRun(r.noiseBp[0], RadioNoise())) * 0.9f * env;
+        } else {                                                    // a short click
+            v = (t < 0.15f ? 1.0f - t / 0.15f : 0.0f) * (r.sqKind == 1 ? 0.35f : 0.25f) * (RadioNoise() * 0.5f + 0.5f);
+        }
+        s += v * gRp.squelch;
+        r.sqLeft--;
+    }
+    return s * powf(10.0f, p.outDb / 20.0f);
+}
+
 static void FxReset()                          // audio thread only
 {
-    PsReset(gPsFx); PsReset(gPsTune); VocReset();
+    PsReset(gPsFx); PsReset(gPsTune); VocReset(); RadioReset();
     memset(combBuf, 0, sizeof(combBuf)); memset(combStore, 0, sizeof(combStore));
     memset(apBuf, 0, sizeof(apBuf)); memset(preBuf, 0, sizeof(preBuf)); preW = 0;
     for (int i = 0; i < 8; i++) { combLen[i] = Imin(COMB_TUNE[i] * RATE / 44100, COMB_MAX); combIdx[i] = 0; }
@@ -694,6 +916,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const bool   fxRev   = gFxOn && gFxRevOn;
     const bool   fxVoc   = gFxOn && gFxVocOn;
     if (fxVoc) VocBlock();
+    const bool   fxRadio = gFxOn && gFxRadioOn;
+    if (fxRadio) RadioBlock();
     const double psRatio = pow(2.0, (gFxSemi + gFxCents / 100.0) / 12.0);
     const int    psGrain = Iclamp(gFxGrainMs * RATE / 1000, 64, PS_SIZE - PS_SEARCH - PS_CORR - 8);
     const float  psMix   = gFxPitchMix / 100.0f;
@@ -754,6 +978,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (fxPitch) s = PitchShift(gPsFx, s, psRatio, psGrain, psMix);
         if (fxVoc)   s = Vocoder(s);
         if (fxRev)   s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
+        if (fxRadio) s = Radio(s);                  // last: you're heard *through* the device
 
         float effect = 0.0f, everything;
         if (looping) {
@@ -832,7 +1057,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -874,6 +1099,7 @@ static FxGroup gFxGroups[] = {
     { L"Pitch",  &gFxPitchOn, L"fx_pitch_on",  true, L"fx_pitch_hotkey"  },
     { L"Reverb", &gFxRevOn,   L"fx_reverb_on", true, L"fx_reverb_hotkey" },
     { L"Vocoder", &gFxVocOn,  L"fx_vocoder_on", true, L"fx_vocoder_hotkey" },
+    { L"Radio",   &gFxRadioOn, L"fx_radio_on",  true, L"fx_radio_hotkey" },
 };
 #define FX_GROUPS ((int)(sizeof(gFxGroups) / sizeof(gFxGroups[0])))
 
@@ -884,7 +1110,7 @@ static int  gFxKeys[FX_KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[FX_KEY_SLOTS];
 
 // Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
-enum { KG_PITCH = 0, KG_REVERB = 1, KG_VOCODER = 2, KG_NS = 3, KG_GATE = 4, KG_TONE = 5 };
+enum { KG_PITCH = 0, KG_REVERB = 1, KG_VOCODER = 2, KG_RADIO = 3, KG_NS = 4, KG_GATE = 5, KG_TONE = 6 };
 struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar;
               const wchar_t* offText; };          // shown (and the knob dimmed) when the value is at its minimum
 static Knob gKnobs[] = {
@@ -899,6 +1125,9 @@ static Knob gKnobs[] = {
     { L"Retune",    L" ms", 0,   200, 15,  &gVocRetuneMs,   L"voc_retune_ms",     KG_VOCODER, false, nullptr },
     { L"Synth",     L"%",   0,   100, 60,  &gVocSynth,      L"voc_synth",         KG_VOCODER, false, nullptr },
     { L"Mix",       L"%",   0,   100, 100, &gVocMix,        L"voc_mix",           KG_VOCODER, false, nullptr },
+    { L"Drive",     L"%",   0,   100, 50,  &gRadioDrive,    L"radio_drive",       KG_RADIO, false, nullptr },
+    { L"Static",    L"%",   0,   100, 50,  &gRadioStatic,   L"radio_static",      KG_RADIO, false, L"Off" },
+    { L"Squelch",   L"%",   0,   100, 70,  &gRadioSquelch,  L"radio_squelch",     KG_RADIO, false, L"Off" },
     { L"Strength",  L"%",   0,   100, 100, &gNsStrength,    L"ns_strength",       KG_NS,   false, nullptr },
     { L"Threshold", L" dB", -90, -10, -50, &gGateThrDb,     L"gate_threshold_db", KG_GATE, false, nullptr },
     { L"Voice",     L"%",   10,  99,  60,  &gGateVoicePct,  L"gate_voice_pct",    KG_GATE, false, nullptr },
@@ -1226,6 +1455,7 @@ static void LoadSettings()
     gVocStyle     = Iclamp(INI_INT(L"voc_style", VOC_HARMONY), 0, VOC_STYLES - 1);
     gVocKey       = Iclamp(INI_INT(L"voc_key", 0), 0, 11);
     gVocScale     = Iclamp(INI_INT(L"voc_scale", 1), 0, VOC_SCALES - 1);
+    gRadioPreset  = Iclamp(INI_INT(L"radio_preset", 0), 0, RADIO_N - 1);
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
     {
@@ -1284,6 +1514,7 @@ static void SaveSettings()
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale);
+    SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
@@ -1499,6 +1730,12 @@ static bool KnobActive(int i)
     case KG_TONE: return true;
     }
     if (k.var == &gVocSynth && gVocStyle == VOC_TUNE) return false;   // Tune style has no synth
+    if (k.group == KG_RADIO) {                  // dim what the chosen preset doesn't have
+        const RadioPreset& rp = RADIO_PRESETS[Iclamp(gRadioPreset, 0, RADIO_N - 1)];
+        if (k.var == &gRadioSquelch && rp.squelch == SQ_NONE) return false;
+        if (k.var == &gRadioStatic && rp.hiss == 0 && rp.crackle == 0 && rp.hum == 0) return false;
+        if (k.var == &gRadioDrive && rp.driveDb == 0) return false;
+    }
     return gFxOn && *gFxGroups[k.group].on;
 }
 static int  KnobStep(int i)   { return Imax(1, (gKnobs[i].hi - gKnobs[i].lo) / 50); }
@@ -1547,7 +1784,7 @@ static void PaintKnob(HWND h, HDC dc)
     FillRect(dc, &rc, BgBrush());
 
     const bool on = KnobActive(i), focus = GetFocus() == h;
-    const int  cx = rc.right / 2, cy = 52, r = 26;
+    const int  cx = rc.right / 2, cy = 47, r = 26;     // fits knobs 96 px tall (Voice FX) and taller
     double frac = (double)(*k.var - k.lo) / (double)(k.hi - k.lo);
     double ang  = 225.0 - 270.0 * frac;         // 225 = minimum (bottom left), -45 = maximum (bottom right)
 
@@ -1589,7 +1826,7 @@ static void PaintKnob(HWND h, HDC dc)
     else wsprintfW(txt, k.bipolar && *k.var > 0 ? L"+%d%s" : L"%d%s", *k.var, k.unit);
     SelectObject(dc, gFontBold);
     SetTextColor(dc, on ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(130, 130, 130)));
-    RECT vr = { 0, cy + 30, rc.right, rc.bottom };
+    RECT vr = { 0, cy + 29, rc.right, rc.bottom };
     DrawTextW(dc, txt, -1, &vr, DT_SINGLELINE | DT_CENTER | DT_TOP);
     SelectObject(dc, of);
 }
@@ -1708,6 +1945,10 @@ static const TipText gKnobTips[] = {
                              L"20-60 ms = natural pitch correction; higher = gentle." },
     { L"voc_synth",          L"Tune + harmony: how loud the harmony voices are. Robot and Choir: how much of your voice is replaced by the synth." },
     { L"voc_mix",            L"How much of the vocoder you hear. 100% = only the effect; lower blends your original voice back in." },
+    { L"radio_drive",        L"How hard the device distorts. 50% = how the preset is designed; higher = more broken-up and crunchy." },
+    { L"radio_static",       L"Background noise while you talk: radio hiss, crackle, hum. 50% = the preset's normal amount." },
+    { L"radio_squelch",      L"Volume of the sounds when you start and stop talking: the walkie-talkie \"kssht\", "
+                             L"the space beeps, the drive-thru click." },
     { L"ns_strength",        L"How much background noise is removed. 100% = full cleanup; lower blends some of the original back in for a more natural sound." },
     { L"gate_threshold_db",  L"How loud you must be for the gate to open. Set it just above the meter's level when you're quiet. Used when the gate opens on Volume." },
     { L"gate_voice_pct",     L"How sure the AI must be that you're speaking before the gate opens. Higher = stricter. Used when the gate opens on Voice." },
@@ -1732,6 +1973,8 @@ static const TipText gLabelTips[] = {
     { L"Voice level:", L"How loud your live voice is while the loop plays (with \"Keep talking\" ticked)." },
     { L"Style",        L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
                        L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you." },
+    { L"Preset",       L"Which device you sound like: walkie-talkie, phone call, megaphone, old radio, space radio, "
+                       L"drive-thru, 8-bit or the next room." },
     { L"Key / scale",  L"The key of the song you're singing to. Your voice snaps to notes of this scale, and harmonies are built from it." },
     { L"Opens on:",    L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech. Volume + voice: both." },
     { L"Buffer:",      L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling." },
@@ -1765,7 +2008,7 @@ static void AddTips()
     // Tabs
     TipId(IDC_TAB0 + PAGE_MAIN,     L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
     TipId(IDC_TAB0 + PAGE_MIC,      L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
-    TipId(IDC_TAB0 + PAGE_FX,       L"Pitch, reverb and the vocoder (auto-tune and harmonies) on your live voice.");
+    TipId(IDC_TAB0 + PAGE_FX,       L"Pitch, reverb, the vocoder (auto-tune and harmonies) and radio/phone/megaphone effects on your live voice.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
 
     // Main
@@ -1799,6 +2042,7 @@ static void AddTips()
                         L"Voice: how sure the AI is that you're talking (shown when noise suppression or the Voice gate is on); "
                         L"the blue line is the Voice setting.");
     TipId(IDC_NSON,     L"Turn AI noise suppression (RNNoise) on or off. It removes fans, keyboards, hum and room noise. Adds about 20 ms of delay.");
+    TipId(IDC_RADIOPRESET, L"Which device you sound like. The knobs adjust the chosen preset; knobs it doesn't use are dimmed.");
     TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
                         L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you.");
     TipId(IDC_VOCKEY,   L"The key of the song (its home note). Not sure? Try C with Major, or A with Minor.");
@@ -1808,7 +2052,10 @@ static void AddTips()
                         L"(ignores loud non-voice noise). Volume + voice: both.");
 
     // Voice FX
-    TipId(IDC_FXON,         L"Turn all voice effects on or off.");
+    TipId(IDC_FXON,         L"Turn all voice effects on or off. Order: Pitch, Vocoder, Reverb, then Radio last, "
+                            L"so you're heard through the device.\n"
+                            L"Knobs: drag up/down or scroll (Shift = fine), double-click to reset. Hotkeys work from anywhere; "
+                            L"right-click one (or press Backspace while setting it) to clear it.");
     TipId(IDC_FXKEY_MASTER, L"Set a hotkey that turns all voice effects on/off from anywhere. Right-click to clear it.");
     for (int g = 0; g < FX_GROUPS; g++) {
         static wchar_t on[FX_GROUPS][96], key[FX_GROUPS][128], rst[FX_GROUPS][96];
@@ -2556,8 +2803,8 @@ static void ShowHelp()
         L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
         L"PAGES\n"
-        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch, reverb "
-        L"and the vocoder (auto-tune + harmonies) to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch, reverb, "
+        L"the vocoder (auto-tune + harmonies) and radio effects to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -2571,7 +2818,9 @@ static void ShowHelp()
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
         L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n"
         L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices. Pick the key of the song; "
-        L"Retune 0 ms gives the hard auto-tune sound.\n\n"
+        L"Retune 0 ms gives the hard auto-tune sound.\n"
+        L"Radio: sound like a walkie-talkie, phone call, megaphone, old radio, space radio, drive-thru, 8-bit or the next room. "
+        L"Drive = distortion, Static = background noise, Squelch = start/stop sounds.\n\n"
         L"HOTKEY\n"
         L"Click the hotkey button, hold one key or up to 3 together (like Shift + F or Ctrl + Shift + 1), "
         L"then let go. Esc cancels. Mouse side buttons work too.\n\n"
@@ -2897,50 +3146,53 @@ static void CreateUI()
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
     // Sections stack downward (FX_SEC_STEP apart); there's room below for more effects.
     gBuildPage = PAGE_FX;
-    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 56, 410, 48, IDC_FXON);
+    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 52, 410, 44, IDC_FXON);
     {
         wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 66, 114, 30, IDC_FXKEY_MASTER);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 59, 114, 30, IDC_FXKEY_MASTER);
     }
-    const int FX_SEC_Y0 = 126, FX_SEC_STEP = 138, FX_SEC_H = 126;
+    const int FX_SEC_Y0 = 110, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
     for (int g = 0; g < FX_GROUPS; g++) {
         int y = FX_SEC_Y0 + FX_SEC_STEP * g;
         AddSection(14, y, 532, FX_SEC_H, gFxGroups[g].title);
         int kx = 26, kstep = 98, kw = KNOB_W;
         if (g == KG_VOCODER) {                  // dropdowns on the left, narrower knobs after them
-            Ctl(L"STATIC", L"Style", 0, 28, y + 14, 150, 16, IDC_HDR);
-            HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 31, 152, 300, IDC_VOCSTYLE);
+            Ctl(L"STATIC", L"Style", 0, 28, y + 10, 150, 16, IDC_HDR);
+            HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 27, 152, 300, IDC_VOCSTYLE);
             const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir" };
             for (const wchar_t* n : styleNames) SendMessageW(st, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(st, CB_SETCURSEL, gVocStyle, 0);
-            Ctl(L"STATIC", L"Key / scale", 0, 28, y + 62, 150, 16, IDC_HDR);
-            HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 79, 56, 300, IDC_VOCKEY);
+            Ctl(L"STATIC", L"Key / scale", 0, 28, y + 56, 150, 16, IDC_HDR);
+            HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 73, 56, 300, IDC_VOCKEY);
             const wchar_t* keyNames[12] = { L"C", L"C#", L"D", L"D#", L"E", L"F", L"F#", L"G", L"G#", L"A", L"A#", L"B" };
             for (const wchar_t* n : keyNames) SendMessageW(ky, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(ky, CB_SETCURSEL, gVocKey, 0);
-            HWND sc = Ctl(L"COMBOBOX", L"", COMBO, 86, y + 79, 92, 300, IDC_VOCSCALE);
+            HWND sc = Ctl(L"COMBOBOX", L"", COMBO, 86, y + 73, 92, 300, IDC_VOCSCALE);
             const wchar_t* scaleNames[VOC_SCALES] = { L"Chromatic", L"Major", L"Minor", L"Major pentatonic", L"Minor pentatonic", L"Blues" };
             for (const wchar_t* n : scaleNames) SendMessageW(sc, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(sc, CB_SETCURSEL, gVocScale, 0);
             SendMessageW(sc, CB_SETDROPPEDWIDTH, 140, 0);
             kx = 186; kstep = 80; kw = 80;
+        } else if (g == KG_RADIO) {             // preset dropdown + a line about it
+            Ctl(L"STATIC", L"Preset", 0, 28, y + 10, 150, 16, IDC_HDR);
+            HWND rp = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 27, 152, 300, IDC_RADIOPRESET);
+            for (int i = 0; i < RADIO_N; i++) SendMessageW(rp, CB_ADDSTRING, 0, (LPARAM)RADIO_PRESETS[i].name);
+            SendMessageW(rp, CB_SETCURSEL, gRadioPreset, 0);
+            Ctl(L"STATIC", RADIO_DESC[Iclamp(gRadioPreset, 0, RADIO_N - 1)], 0, 28, y + 56, 152, 48, IDC_RADIODESC);
+            kx = 186; kstep = 80; kw = 80;
         }
         int col = 0;
         for (int i = 0; i < KNOB_N; i++) {
             if (gKnobs[i].group != g) continue;
-            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), kx + col * kstep, y + 14, kw, KNOB_H, IDC_KNOB + i);
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), kx + col * kstep, y + 8, kw, FX_KNOB_H, IDC_KNOB + i);
             col++;
         }
-        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_FXGRP_ON + g);
+        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 12, 100, 20, IDC_FXGRP_ON + g);
         CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
         wchar_t kn[120]; FxKeyButtonText(1 + g, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 44, 104, 28, IDC_FXGRP_KEY + g);
-        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 80, 104, 28, IDC_FXGRP_RESET + g);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 38, 104, 26, IDC_FXGRP_KEY + g);
+        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
     }
-    Ctl(L"STATIC", L"Drag a knob up/down or scroll it  -  Shift = fine steps  -  double-click resets.", 0,
-        30, FX_SEC_Y0 + FX_SEC_STEP * FX_GROUPS - 4, 500, 18, IDC_HDR);
-    Ctl(L"STATIC", L"Hotkeys switch an effect on/off from anywhere. Right-click one (or press Backspace) to clear it.", 0,
-        30, FX_SEC_Y0 + FX_SEC_STEP * FX_GROUPS + 16, 516, 18, IDC_HDR);
 
     // ---------------- Settings page ----------------
     gBuildPage = PAGE_SETTINGS;
@@ -3163,6 +3415,13 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
         break;
     case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_RADIOPRESET:
+        if (code == CBN_SELCHANGE) {
+            gRadioPreset = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, RADIO_N - 1);
+            SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[gRadioPreset]);
+            RedrawKnobs();                      // dims knobs the preset doesn't use
+        }
+        break;
     case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE:
         if (code == CBN_SELCHANGE) {
             int v = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
@@ -3308,7 +3567,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: {
         HDC dc = (HDC)w;
-        bool header = GetDlgCtrlID((HWND)l) == IDC_HDR;
+        int  cid    = GetDlgCtrlID((HWND)l);
+        bool header = cid == IDC_HDR || cid == IDC_RADIODESC;   // dim helper text
         bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
         if (!gDark) {
             if (!header) break;
