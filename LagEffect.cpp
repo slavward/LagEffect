@@ -15,7 +15,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.4.1"
+#define APP_VERSION L"1.5.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -262,7 +262,7 @@ enum {
     IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_FADE, IDC_GATE, IDC_TALKVOL,
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
-    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR,
+    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_VERSION,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
 };
@@ -740,19 +740,27 @@ static void StopAudio()
 // ======================= layout helpers =======================
 // Everything below the output list moves down as outputs are added, so controls created after
 // the list are recorded with their starting position.
+// Controls also belong to a page (tab): 0 = Main, 1 = Settings. Only the current page is shown.
 #define CLIENT_W  560
-#define BASE_H    690                          // window height with one output
-#define ROW_Y0    88
+#define BASE_H    592                          // window height with one output
+#define ROW_Y0    134
 #define ROW_H     30
+#define TAB_COUNT 2
 
 struct Shifted { HWND h; int x, y; };
-struct Section { int x, y, w, h; const wchar_t* title; bool shifts; };
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; };
 struct Framed  { HWND edit, ud; };
+struct Paged   { HWND h; int page; };
 static Shifted gShift[96];   static int gShiftN = 0;
-static Section gSections[8]; static int gSectionN = 0;
+static Section gSections[12]; static int gSectionN = 0;
 static Framed  gFramed[24];  static int gFramedN = 0;
+static Paged   gPaged[160];  static int gPagedN = 0;
 static bool    gRecordShift = false;
 static int     gDevSectionIdx = 0;
+static int     gBuildPage = -1;                // page new controls go on (-1 = always shown, e.g. the tabs)
+static int     gPage = 0;                      // page being shown
+
+static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < 160) gPaged[gPagedN++] = { h, gBuildPage }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 
@@ -762,6 +770,7 @@ static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int
                              gWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE);
     if (gRecordShift && gShiftN < 96) gShift[gShiftN++] = { c, x, y };
+    RecordPage(c);
     return c;
 }
 
@@ -780,12 +789,13 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
         gShift[gShiftN++] = { u, r.left, r.top };
     }
     if (gFramedN < 24) gFramed[gFramedN++] = { e, u };
+    RecordPage(u);
     return u;
 }
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < 8) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift };
+    if (gSectionN < 12) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage };
 }
 
 // ======================= device lists =======================
@@ -859,14 +869,24 @@ static void RestartIfRunning()
     if (gWantRunning) { StopAudio(); StartAudio(false); UpdateUi(); }
 }
 
+// Which output row a control belongs to (-1 if none). Sets *isDel for the row's remove button.
+static int RowOfId(int id, bool* isDel)
+{
+    *isDel = false;
+    const int bases[] = { IDC_ROWLBL, IDC_ROWDEV, IDC_ROWMODE, IDC_ROWVOL, SPIN_UD(IDC_ROWVOL), IDC_ROWDEL };
+    for (int b : bases)
+        if (id >= b && id < b + MAX_OUT) { *isDel = b == IDC_ROWDEL; return id - b; }
+    return -1;
+}
+
 static void Layout()
 {
-    const int show[] = { IDC_ROWLBL, IDC_ROWDEV, IDC_ROWMODE, IDC_ROWVOL, SPIN_UD(IDC_ROWVOL), IDC_ROWDEL };
-    for (int k = 0; k < MAX_OUT; k++)
-        for (int id : show) {
-            HWND c = GetDlgItem(gWnd, id + k);
-            if (c) ShowWindow(c, k < gRows && !(id == IDC_ROWDEL && k == 0) ? SW_SHOW : SW_HIDE);
-        }
+    for (int i = 0; i < gPagedN; i++) {
+        bool del;
+        int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
+        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)));
+        ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
+    }
 
     int by = ROW_Y0 + ROW_H * gRows + 6;
     SetWindowPos(GetDlgItem(gWnd, IDC_ADDOUT),  nullptr, 30,  by, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -879,10 +899,19 @@ static void Layout()
         SetWindowPos(gShift[i].h, nullptr, gShift[i].x, gShift[i].y + d, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
-    RECT r = { 0, 0, CLIENT_W, BASE_H + d };
+    RECT r = { 0, 0, CLIENT_W, BASE_H + d };   // both pages share the window size, so switching never jumps
     AdjustWindowRect(&r, style, FALSE);
     SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+static void SetPage(int page)
+{
+    if (page < 0 || page >= TAB_COUNT || page == gPage) return;
+    HWND focus = GetFocus();
+    gPage = page;
+    Layout();
+    if (!focus || !IsWindowVisible(focus)) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + page));
 }
 
 static void SetRowMode(int k, int mode)
@@ -1269,6 +1298,9 @@ static void ShowHelp()
         L"Hold (or toggle) your hotkey to repeat the last bit of your mic.\n"
         L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
+        L"PAGES\n"
+        L"Main has the outputs, effect and hotkey. Settings has latency, theme and updates. "
+        L"Ctrl+Tab switches between them.\n\n"
         L"HOTKEY\n"
         L"Click the hotkey button, hold one key or up to 3 together (like Shift + F or Ctrl + Shift + 1), "
         L"then let go. Esc cancels. Mouse side buttons work too.\n\n"
@@ -1426,18 +1458,25 @@ static void CreateUI()
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
     const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything" };
 
-    // Layout grid: sections run from x 14 to 546, contents from x 30 to 530.
-    // Effect section uses two columns: label / number box / unit at 30 / 136 / 218 and 290 / 392 / 474.
+    // Tabs (always visible). Drawn by DrawTab().
+    gBuildPage = -1;
+    Ctl(L"BUTTON", L"Main",     BS_OWNERDRAW | WS_TABSTOP, 14,  10, 100, 32, IDC_TAB0);
+    Ctl(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, 118, 10, 100, 32, IDC_TAB1);
+
+    // ---------------- Main page ----------------
+    // Grid: sections run from x 14 to 546, contents from x 30 to 530.
+    // Effect section columns: label / number box / unit at 30 / 136 / 218 and 290 / 392 / 474.
+    gBuildPage = 0;
 
     // Audio: microphone + output list
     gDevSectionIdx = gSectionN;
-    AddSection(14, 14, 532, 152, L"Audio");
-    Ctl(L"STATIC", L"Microphone:", 0, 30, 39, 90, 20, -1);
-    HWND mic = Ctl(L"COMBOBOX", L"", COMBO, 124, 36, 406, 300, IDC_MIC);
+    AddSection(14, 60, 532, 152, L"Audio");
+    Ctl(L"STATIC", L"Microphone:", 0, 30, 85, 90, 20, -1);
+    HWND mic = Ctl(L"COMBOBOX", L"", COMBO, 124, 82, 406, 300, IDC_MIC);
     SendMessageW(mic, CB_SETDROPPEDWIDTH, 420, 0);
-    Ctl(L"STATIC", L"Output", 0, 80, 70, 200, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Plays", 0, 320, 70, 100, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Volume %", 0, 432, 70, 70, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Output", 0, 80, 116, 200, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Plays", 0, 320, 116, 100, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 432, 116, 70, 16, IDC_HDR);
     for (int k = 0; k < MAX_OUT; k++) {
         int y = ROW_Y0 + ROW_H * k;
         wchar_t lbl[16]; wsprintfW(lbl, L"Out %d", k + 1);
@@ -1450,83 +1489,119 @@ static void CreateUI()
         Spin(IDC_ROWVOL + k, 432, y, 68, 0, 200, gRowVol[k]);
         Ctl(L"BUTTON", L"×", WS_TABSTOP, 506, y, 24, 23, IDC_ROWDEL + k);
     }
-    Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 124, 124, 28, IDC_ADDOUT);
-    Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 124, 124, 28, IDC_VBCABLE);
+    Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 170, 124, 28, IDC_ADDOUT);
+    Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 170, 124, 28, IDC_VBCABLE);
     FillDevices();
 
-    gRecordShift = true;                        // everything below moves with the output list
+    gRecordShift = true;                        // everything below on this page moves with the output list
 
     // Effect
-    AddSection(14, 186, 532, 165, L"Effect");
-    Ctl(L"STATIC", L"Loop length:", 0, 30, 213, 104, 20, -1);
-    Spin(IDC_LOOP, 136, 210, 76, 10, 2000, gLoopMs);
-    Ctl(L"STATIC", L"ms", 0, 218, 213, 40, 20, -1);
-    Ctl(L"STATIC", L"Speed:", 0, 290, 213, 100, 20, -1);
-    Spin(IDC_SPEED, 392, 210, 76, 10, 400, gSpeedPct);
-    Ctl(L"STATIC", L"%", 0, 474, 213, 40, 20, -1);
+    AddSection(14, 232, 532, 165, L"Effect");
+    Ctl(L"STATIC", L"Loop length:", 0, 30, 259, 104, 20, -1);
+    Spin(IDC_LOOP, 136, 256, 76, 10, 2000, gLoopMs);
+    Ctl(L"STATIC", L"ms", 0, 218, 259, 40, 20, -1);
+    Ctl(L"STATIC", L"Speed:", 0, 290, 259, 100, 20, -1);
+    Spin(IDC_SPEED, 392, 256, 76, 10, 400, gSpeedPct);
+    Ctl(L"STATIC", L"%", 0, 474, 259, 40, 20, -1);
 
-    Ctl(L"STATIC", L"Pitch:", 0, 30, 247, 104, 20, -1);
-    Spin(IDC_PITCH, 136, 244, 76, 25, 400, gPitchPct);
-    Ctl(L"STATIC", L"%", 0, 218, 247, 40, 20, -1);
-    Ctl(L"STATIC", L"Smoothing:", 0, 290, 247, 100, 20, -1);
-    Spin(IDC_FADE, 392, 244, 76, 0, 50, gFadeMs);
-    Ctl(L"STATIC", L"ms", 0, 474, 247, 40, 20, -1);
+    Ctl(L"STATIC", L"Pitch:", 0, 30, 293, 104, 20, -1);
+    Spin(IDC_PITCH, 136, 290, 76, 25, 400, gPitchPct);
+    Ctl(L"STATIC", L"%", 0, 218, 293, 40, 20, -1);
+    Ctl(L"STATIC", L"Smoothing:", 0, 290, 293, 100, 20, -1);
+    Spin(IDC_FADE, 392, 290, 76, 0, 50, gFadeMs);
+    Ctl(L"STATIC", L"ms", 0, 474, 293, 40, 20, -1);
 
-    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 281, 104, 20, IDC_GATEON);
+    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 327, 104, 20, IDC_GATEON);
     CheckDlgButton(gWnd, IDC_GATEON, gGateOn ? BST_CHECKED : BST_UNCHECKED);
-    Spin(IDC_GATE, 136, 278, 76, 20, 90, gGateDb);
-    Ctl(L"STATIC", L"-dB", 0, 218, 281, 40, 20, -1);
+    Spin(IDC_GATE, 136, 324, 76, 20, 90, gGateDb);
+    Ctl(L"STATIC", L"-dB", 0, 218, 327, 40, 20, -1);
 
-    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 315, 250, 20, IDC_TALKON);
+    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 361, 250, 20, IDC_TALKON);
     CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Voice level:", 0, 290, 315, 100, 20, -1);
-    Spin(IDC_TALKVOL, 392, 312, 76, 0, 200, gTalkVolPct);
-    Ctl(L"STATIC", L"%", 0, 474, 315, 40, 20, -1);
+    Ctl(L"STATIC", L"Voice level:", 0, 290, 361, 100, 20, -1);
+    Spin(IDC_TALKVOL, 392, 358, 76, 0, 200, gTalkVolPct);
+    Ctl(L"STATIC", L"%", 0, 474, 361, 40, 20, -1);
 
-    // Hotkey + latency
+    // Hotkey
     wchar_t key[120]; HotkeyName(key, 120);
-    AddSection(14, 371, 259, 97, L"Hotkey");
-    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 394, 227, 30, IDC_HOTKEY);
-    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 30, 434, 80, 20, IDC_HOLD);
-    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 120, 434, 100, 20, IDC_TOGGLE);
+    AddSection(14, 417, 532, 69, L"Hotkey");
+    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 440, 260, 30, IDC_HOTKEY);
+    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 310, 445, 80, 20, IDC_HOLD);
+    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 400, 445, 100, 20, IDC_TOGGLE);
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
 
-    AddSection(287, 371, 259, 97, L"Latency");
-    Ctl(L"STATIC", L"Buffer:", WS_GROUP, 303, 399, 56, 20, -1);
-    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 362, 395, 168, 200, IDC_BUFFER);
+    // Status + buttons
+    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
+    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 544, 172, 34, IDC_START);
+    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 544, 172, 34, IDC_TRAY);
+    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 544, 172, 34, IDC_HELPBTN);
+
+    gRecordShift = false;
+
+    // ---------------- Settings page ----------------
+    gBuildPage = 1;
+
+    AddSection(14, 60, 532, 87, L"Latency");
+    Ctl(L"STATIC", L"Buffer:", 0, 30, 85, 90, 20, -1);
+    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 124, 81, 168, 200, IDC_BUFFER);
     const wchar_t* bufNames[] = { L"32 (fastest)", L"64", L"128 (default)", L"256", L"512 (safest)" };
     for (const wchar_t* n : bufNames) SendMessageW(buf, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(buf, CB_SETCURSEL, gBufIdx, 0);
-    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 303, 434, 200, 20, IDC_EXCL);
+    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 84, 220, 20, IDC_EXCL);
     CheckDlgButton(gWnd, IDC_EXCL, gExclusive ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Smaller buffer = less delay. Pick a bigger one if you hear crackling.", 0, 30, 116, 500, 18, IDC_HDR);
 
-    // Status + buttons
-    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW, 14, 486, 532, 30, IDC_STATUS);
-    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 526, 172, 34, IDC_START);
-    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 526, 172, 34, IDC_TRAY);
-    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 526, 172, 34, IDC_HELPBTN);
-
-    // App options
-    AddSection(14, 580, 532, 96, L"App");
-    Ctl(L"STATIC", L"Theme:", 0, 30, 605, 60, 20, -1);
-    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 601, 110, 200, IDC_THEME);
+    AddSection(14, 167, 532, 100, L"App");
+    Ctl(L"STATIC", L"Theme:", 0, 30, 196, 60, 20, -1);
+    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 192, 110, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
     for (const wchar_t* n : themeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, gThemeMode, 0);
-    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 603, 300, 20, IDC_AUTO);
+    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 194, 300, 20, IDC_AUTO);
     CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Updates:", 0, 30, 639, 60, 20, -1);
-    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 636, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
+    Ctl(L"STATIC", L"Updates:", 0, 30, 230, 60, 20, -1);
+    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 227, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
     SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
     if (gFramedN < 24) gFramed[gFramedN++] = { repo, nullptr };
-    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 635, 100, 26, IDC_CHECKUPD);
-    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 638, 118, 20, IDC_UPDSTART);
+    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 226, 100, 26, IDC_CHECKUPD);
+    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 229, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
 
-    gRecordShift = false;
+    Ctl(L"STATIC", L"Lag Effect " APP_VERSION, 0, 30, 283, 300, 18, IDC_HDR);
+
+    gBuildPage = -1;
     gUiReady = true;
     Layout();
+}
+
+// Tab button: label, with an accent bar under the selected one.
+static void DrawTab(DRAWITEMSTRUCT* d)
+{
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    int idx = (int)d->CtlID - IDC_TAB0;
+    bool active = idx == gPage;
+
+    FillRect(dc, &rc, BgBrush());
+    wchar_t text[32]; GetWindowTextW(d->hwndItem, text, 32);
+    HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, active ? (gDark ? DK_TEXT : RGB(20, 20, 20)) : (gDark ? DK_DIM : RGB(105, 105, 105)));
+    RECT tr = rc; tr.bottom -= 3;
+    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, of);
+    if (active) {
+        HBRUSH ab = CreateSolidBrush(ACCENT);
+        RECT bar = { rc.left + 14, rc.bottom - 3, rc.right - 14, rc.bottom };
+        FillRect(dc, &bar, ab);
+        DeleteObject(ab);
+    }
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+        RECT fr = rc; InflateRect(&fr, -4, -4);
+        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        DrawFocusRect(dc, &fr);
+    }
 }
 
 static void PaintWindow(HDC dc)
@@ -1537,8 +1612,17 @@ static void PaintWindow(HDC dc)
     HPEN border = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
     HGDIOBJ oldPen = SelectObject(dc, border), oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
 
+    {                                           // line under the tabs
+        HPEN sep = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+        HGDIOBJ op = SelectObject(dc, sep);
+        MoveToEx(dc, 14, 42, nullptr); LineTo(dc, CLIENT_W - 14, 42);
+        SelectObject(dc, op);
+        DeleteObject(sep);
+    }
+
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
+        if (s.page >= 0 && s.page != gPage) continue;
         int y = s.y + (s.shifts ? d : 0);
         RoundRect(dc, s.x, y, s.x + s.w, y + s.h, 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
@@ -1645,6 +1729,9 @@ static void OnCommand(int id, int code)
         if (code == EN_CHANGE && gUiReady) GetDlgItemTextW(gWnd, IDC_REPO, gUpdateRepo, 200);
         break;
     case IDC_ADDOUT:   if (code == BN_CLICKED) AddOutput(); break;
+    case IDC_TAB0: case IDC_TAB1:
+        if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
+        break;
     case IDC_GATEON:   gGateOn = Checked(IDC_GATEON); break;
     case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
     case IDC_UPDSTART: gUpdateOnStart = Checked(IDC_UPDSTART); break;
@@ -1730,6 +1817,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_DRAWITEM:
         if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_TAB0 || w == IDC_TAB1) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MINIMIZE) { ToTray(); return 0; }   // minimize goes to the tray
@@ -1827,6 +1915,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
+            (msg.hwnd == h || IsChild(h, msg.hwnd))) {
+            SetPage((gPage + 1) % TAB_COUNT);   // Ctrl+Tab: next page
+            continue;
+        }
         if (!IsDialogMessageW(h, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
