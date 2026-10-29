@@ -1,21 +1,26 @@
 // LagEffect.cpp - hold (or toggle) a hotkey to loop the last chunk of your mic.
 // Windows app with a settings window and tray icon. Settings save to LagEffect.ini.
 // Built for Discord / OBS: several outputs each playing Off / Effect only / Everything,
-// built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater.
+// built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater,
+// and a Voice FX page (pitch shift + reverb on your live voice, set with knobs).
 //
-// Build:
-//   1. Put miniaudio.h (https://github.com/mackron/miniaudio) next to this file.
+// Build (GitHub Actions does this automatically, see .github/workflows/build.yml):
+//   1. Put miniaudio.h (https://github.com/mackron/miniaudio, 0.11.25) next to this file.
+//      RNNoise (noise suppression) is included in the rnnoise folder.
 //   2. Visual Studio (Developer Command Prompt):
 //        rc LagEffect.rc
-//        cl /O2 LagEffect.cpp LagEffect.res /link /SUBSYSTEM:WINDOWS
+//        cl /O2 /MT /utf-8 /D_USE_MATH_DEFINES /I rnnoise\\include LagEffect.cpp rnnoise\src\denoise.c rnnoise\src\rnn.c
+//           rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
+//           LagEffect.res /link /SUBSYSTEM:WINDOWS
 //      MinGW / MSYS2:
 //        windres LagEffect.rc -O coff -o LagEffect_res.o
-//        g++ -O2 LagEffect.cpp LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
+//        gcc -O2 -Irnnoise/include -c rnnoise/src/{denoise,rnn,rnn_data,pitch,kiss_fft,celt_lpc}.c
+//        g++ -O2 LagEffect.cpp *.o LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
 //
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.4.1"
+#define APP_VERSION L"1.7.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -23,13 +28,19 @@
 #define NOMINMAX
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
+#include "rnnoise/include/rnnoise.h"           // AI noise suppression (BSD licence, see rnnoise/COPYING)
 
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <winhttp.h>
 #include <string.h>
+#include <stdlib.h>
 #include <math.h>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <xmmintrin.h>
+#define HAVE_SSE_FLAGS 1
+#endif
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
@@ -57,12 +68,11 @@ enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2 };
 
 // Settings shared with the audio threads (plain ints/floats are safe to read on x86/x64).
 static volatile int   gLoopMs = 500, gSpeedPct = 100, gPitchPct = 100, gFadeMs = 3;
-static volatile int   gGateDb = 50, gTalkVolPct = 100;
+static volatile int   gTalkVolPct = 100;
 #define MAX_KEYS 3                             // hotkey can be a combination of up to 3 keys
 static volatile int   gHotkeys[MAX_KEYS] = { VK_F8, 0, 0 };
-static volatile bool  gToggleMode = false, gGateOn = false, gTalkOver = false;
+static volatile bool  gToggleMode = false, gTalkOver = false;
 static volatile bool  gCapturingKey = false, gLooping = false;
-static volatile float gGateLin = 0.00316f;     // -50 dB
 static volatile int   gRowMode[MAX_OUT] = { MODE_ALL, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT };
 static volatile int   gRowVol[MAX_OUT]  = { 100, 100, 100, 100, 100 };
 
@@ -74,18 +84,102 @@ static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static int    gateHold = 0;
 
+// Mic cleanup (Mic tab). Order: boost -> low cut -> AI noise suppression -> gate -> leveler.
+enum { GATE_OFF = 0, GATE_VOLUME = 1, GATE_VOICE = 2, GATE_BOTH = 3 };
+static volatile int   gMicBoostDb = 0, gLowCutHz = 80, gLevelerPct = 0;
+static volatile bool  gNsOn = false;
+static volatile int   gNsStrength = 100;
+static volatile int   gGateMode = GATE_OFF, gGateLastMode = GATE_VOLUME;
+static volatile int   gGateThrDb = -50, gGateVoicePct = 60, gGateHoldMs = 150, gGateReleaseMs = 80, gGateRangeDb = 80;
+static volatile float gMeterPeak = 0, gMeterVad = 0;  // for the Mic tab meter (UI reads, then clears the peak)
+static volatile bool  gMeterGateOpen = true;
+
+// RNNoise works on 10 ms frames (480 samples at 48 kHz) and delays its output by one more frame,
+// so the dry signal is delayed by the same 20 ms to stay lined up when blending.
+#define NS_FRAME 480
+#define NS_DELAY (NS_FRAME * 2)
+#define DRY_RING 1024
+static DenoiseState* gNs = nullptr;
+static float nsIn[NS_FRAME], nsOut[NS_FRAME], dryRing[DRY_RING];
+static int   nsIdx = 0, dryW = 0;
+static float nsVad = 0;
+static float hpX1, hpX2, hpY1, hpY2, hpB0 = 1, hpB1, hpB2, hpA1, hpA2;
+static int   hpFc = -1;
+static float lvEnv = 0;
+static float limGain[MAX_OUT] = { 1, 1, 1, 1, 1 };
+
+// 2nd-order Butterworth high-pass ("Low cut"), coefficients recomputed when the knob moves.
+static void LowCutSetup(int fc)
+{
+    hpFc = fc;
+    if (fc <= 0) return;
+    double w = 2.0 * 3.141592653589793 * fc / RATE, c = cos(w), al = sin(w) / (2.0 * 0.7071067811865476);
+    double a0 = 1.0 + al;
+    hpB0 = (float)((1.0 + c) / 2.0 / a0); hpB1 = (float)(-(1.0 + c) / a0); hpB2 = hpB0;
+    hpA1 = (float)(-2.0 * c / a0);         hpA2 = (float)((1.0 - al) / a0);
+}
+
+static inline float LowCut(float x)
+{
+    float y = hpB0 * x + hpB1 * hpX1 + hpB2 * hpX2 - hpA1 * hpY1 - hpA2 * hpY2;
+    hpX2 = hpX1; hpX1 = x; hpY2 = hpY1; hpY1 = y;
+    return y;
+}
+
+// Runs RNNoise one frame behind. Returns the denoised sample and, through *dry, the input from
+// the same moment (20 ms ago). Updates nsVad (0..1 chance that the last frame was speech).
+static inline float NoiseStage(float x, float* dry)
+{
+    dryRing[dryW] = x;
+    *dry = dryRing[(dryW - NS_DELAY) & (DRY_RING - 1)];
+    dryW = (dryW + 1) & (DRY_RING - 1);
+    float den = nsOut[nsIdx];
+    nsIn[nsIdx] = x * 32768.0f;                  // RNNoise expects 16-bit sample values
+    if (++nsIdx == NS_FRAME) {
+        nsIdx = 0;
+        float frame[NS_FRAME];
+        nsVad = gNs ? rnnoise_process_frame(gNs, frame, nsIn) : 1.0f;
+        for (int i = 0; i < NS_FRAME; i++) nsOut[i] = gNs ? frame[i] * (1.0f / 32768.0f) : nsIn[i] * (1.0f / 32768.0f);
+    }
+    return den;
+}
+
+static void MicReset()                          // audio thread / before start
+{
+    gateEnv = 0; gateGain = 1; gateHold = 0;
+    memset(nsIn, 0, sizeof(nsIn)); memset(nsOut, 0, sizeof(nsOut)); memset(dryRing, 0, sizeof(dryRing));
+    nsIdx = 0; dryW = 0; nsVad = 0;
+    hpX1 = hpX2 = hpY1 = hpY2 = 0; hpFc = -1;
+    lvEnv = 0;
+    for (int k = 0; k < MAX_OUT; k++) limGain[k] = 1;
+}
+
+// Output limiter: leaves everything under -1 dBFS untouched; louder peaks are turned down
+// smoothly instead of being distorted (replaces the old soft clipper, which coloured loud voices).
+static inline float Limit(int k, float x)
+{
+    const float ceil = 0.891f;                   // -1 dBFS
+    float a = x < 0 ? -x : x;
+    if (a * limGain[k] > ceil) limGain[k] = ceil / a;
+    float y = x * limGain[k];
+    limGain[k] += (1.0f - limGain[k]) * 0.00014f;   // ~150 ms recovery
+    return y;
+}
+
+// 4-point Hermite interpolation: noticeably cleaner than straight lines when pitch/speed resample.
+static inline float Hermite(float xm1, float x0, float x1, float x2, float t)
+{
+    float c1 = 0.5f * (x1 - xm1);
+    float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+    float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+    return ((c3 * t + c2) * t + c1) * t + x0;
+}
+
 // Output 1 plays straight from the main audio callback. Outputs 2-5 are separate devices
 // fed through ring buffers.
 static float             ring[MAX_OUT][RING_SIZE];
 static volatile unsigned ringW[MAX_OUT], ringR[MAX_OUT];
 static volatile bool     ringOn[MAX_OUT];
-
-static void UpdateGateLin()
-{
-    float v = 1.0f;
-    for (int i = 0; i < gGateDb; i++) v *= 0.891250938f;   // -1 dB per step
-    gGateLin = v;
-}
 
 static inline double WrapPos(double p, double len)
 {
@@ -94,26 +188,17 @@ static inline double WrapPos(double p, double len)
     return p;
 }
 
-// Leaves normal levels untouched and gently rounds off peaks above 0.7 (voice + loop can add up).
-static inline float SoftLimit(float x)
-{
-    float a = x < 0 ? -x : x;
-    if (a <= 0.7f) return x;
-    float y = 0.7f + 0.3f * tanhf((a - 0.7f) / 0.3f);
-    return x < 0 ? -y : y;
-}
-
 static inline float RowSignal(int mode, float effect, float everything)
 {
     return mode == MODE_EFFECT ? effect : mode == MODE_ALL ? everything : 0.0f;
 }
 
-// True while every key in the hotkey combination is held down.
-static bool ComboDown()
+// True while every key in a hotkey combination is held down (false if the combination is empty).
+static bool KeysDown(const volatile int* keys)
 {
     bool any = false;
     for (int i = 0; i < MAX_KEYS; i++) {
-        int vk = gHotkeys[i];
+        int vk = keys[i];
         if (!vk) continue;
         any = true;
         if (!(GetAsyncKeyState(vk) & 0x8000)) return false;
@@ -121,8 +206,138 @@ static bool ComboDown()
     return any;
 }
 
+static bool ComboDown() { return KeysDown(gHotkeys); }
+
+// ======================= voice effects (Voice FX page) =======================
+// Run on the live mic right after the noise gate, so they're on everything you send, and the
+// stutter loop records them too. Each effect has its own on/off switch and knobs; to add one,
+// write its Process function, call it in AudioCallback, and add a group + knobs to gFxGroups/gKnobs.
+static volatile bool gFxOn = false;            // master switch at the top of the page
+static volatile bool gFxPitchOn = true, gFxRevOn = true;
+static volatile int  gFxSemi = 0, gFxCents = 0, gFxGrainMs = 50, gFxPitchMix = 100;
+static volatile int  gFxRevMix = 30, gFxRevSize = 60, gFxRevDamp = 50, gFxPreMs = 20;
+static volatile bool gFxResetReq = true;       // UI asks the audio thread to clear effect buffers
+
+// Pitch shifter: two read taps glide through a short delay line at the new speed and crossfade
+// (Hann windows, half a grain apart). Each new grain starts where the waveform best lines up with
+// the one fading out, so the crossfade stays in phase: no warble, no level dips.
+#define PS_SIZE   8192                         // > 100 ms grain span + search at 48 kHz
+#define PS_SEARCH 720                          // 15 ms: covers voice pitch periods down to ~67 Hz
+#define PS_CORR   192                          // samples compared when lining up a grain
+static float  psBuf[PS_SIZE];
+static int    psW = 0;
+static double psDelay[2], psFrac[2];
+static bool   psPrimed = false;
+
+static inline float PsRead(double d)
+{
+    double rp = (double)psW - d;
+    if (rp < 0) rp += PS_SIZE;
+    int   i0 = (int)rp;
+    float t  = (float)(rp - i0);
+    return Hermite(psBuf[(i0 - 1) & (PS_SIZE - 1)], psBuf[i0 & (PS_SIZE - 1)],
+                   psBuf[(i0 + 1) & (PS_SIZE - 1)], psBuf[(i0 + 2) & (PS_SIZE - 1)], t);
+}
+
+static double PsGrainStart(int k, double ratio, int span)
+{
+    // Going up, the read point catches up with the input, so a grain starts a full span back.
+    int base  = ratio > 1.0 ? 2 + span : 2;
+    int other = (int)(psDelay[1 - k] + 0.5);
+    float best = -1e30f; int bestD = 0;
+    for (int d = 0; d < PS_SEARCH; d += 2) {
+        int cand = base + d;
+        float dot = 0, e = 0;
+        for (int j = 0; j < PS_CORR; j += 2) {
+            float x = psBuf[(psW - other - j) & (PS_SIZE - 1)];
+            float y = psBuf[(psW - cand - j) & (PS_SIZE - 1)];
+            dot += x * y; e += y * y;
+        }
+        float score = dot / sqrtf(e + 1e-9f);
+        if (score > best) { best = score; bestD = d; }
+    }
+    return (double)(base + bestD);
+}
+
+static float PitchShift(float x, double ratio, int span, float mix)
+{
+    psBuf[psW] = x;
+    float out = x;
+    if (ratio != 1.0) {
+        double grain = span / fabs(1.0 - ratio);           // one grain sweeps the whole span
+        if (grain > RATE) grain = RATE;
+        if (grain < 256)  grain = 256;
+        if (!psPrimed) {
+            psDelay[0] = psDelay[1] = ratio > 1.0 ? 2 + span : 2;
+            psFrac[0] = 0.0; psFrac[1] = 0.5;
+            psPrimed = true;
+        }
+        const double maxD = PS_SIZE - PS_CORR - 4;
+        float wet = 0.0f;
+        for (int k = 0; k < 2; k++) {
+            if (psFrac[k] >= 1.0) { psFrac[k] -= 1.0; psDelay[k] = PsGrainStart(k, ratio, span); }
+            if (psDelay[k] < 2.0)  psDelay[k] = 2.0;
+            if (psDelay[k] > maxD) psDelay[k] = maxD;
+            float s = (float)sin(3.141592653589793 * psFrac[k]);
+            wet += PsRead(psDelay[k]) * s * s;
+            psDelay[k] += 1.0 - ratio;
+            psFrac[k]  += 1.0 / grain;
+        }
+        out = x + (wet - x) * mix;
+    } else {
+        psPrimed = false;
+    }
+    psW = (psW + 1) & (PS_SIZE - 1);
+    return out;
+}
+
+// Reverb: Freeverb-style (8 damped comb filters into 4 allpasses), with a pre-delay in front.
+static const int COMB_TUNE[8] = { 1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617 };   // at 44.1 kHz
+static const int AP_TUNE[4]   = { 556, 441, 341, 225 };
+#define COMB_MAX 1800
+#define AP_MAX   640
+#define PRE_SIZE 16384                         // > 200 ms at 48 kHz
+static float combBuf[8][COMB_MAX], combStore[8], apBuf[4][AP_MAX], preBuf[PRE_SIZE];
+static int   combLen[8], combIdx[8], apLen[4], apIdx[4], preW = 0;
+
+static float Reverb(float x, float size, float damp, float mix, int pre)
+{
+    preBuf[preW] = x;
+    float in = preBuf[(preW - pre) & (PRE_SIZE - 1)] * 0.015f;
+    preW = (preW + 1) & (PRE_SIZE - 1);
+
+    const float fb = 0.7f + 0.28f * size, d1 = damp * 0.4f, d2 = 1.0f - d1;
+    float acc = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        float y = combBuf[i][combIdx[i]];
+        combStore[i] = y * d2 + combStore[i] * d1;
+        combBuf[i][combIdx[i]] = in + combStore[i] * fb;
+        if (++combIdx[i] >= combLen[i]) combIdx[i] = 0;
+        acc += y;
+    }
+    for (int i = 0; i < 4; i++) {
+        float b = apBuf[i][apIdx[i]];
+        apBuf[i][apIdx[i]] = acc + b * 0.5f;
+        acc = b - acc;
+        if (++apIdx[i] >= apLen[i]) apIdx[i] = 0;
+    }
+    return x + (acc * 3.0f - x) * mix;
+}
+
+static void FxReset()                          // audio thread only
+{
+    memset(psBuf, 0, sizeof(psBuf)); psW = 0; psPrimed = false;
+    memset(combBuf, 0, sizeof(combBuf)); memset(combStore, 0, sizeof(combStore));
+    memset(apBuf, 0, sizeof(apBuf)); memset(preBuf, 0, sizeof(preBuf)); preW = 0;
+    for (int i = 0; i < 8; i++) { combLen[i] = Imin(COMB_TUNE[i] * RATE / 44100, COMB_MAX); combIdx[i] = 0; }
+    for (int i = 0; i < 4; i++) { apLen[i] = Imin(AP_TUNE[i] * RATE / 44100, AP_MAX); apIdx[i] = 0; }
+}
+
 static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32 frames)
 {
+#ifdef HAVE_SSE_FLAGS
+    _mm_setcsr(_mm_getcsr() | 0x8040);         // flush denormals to zero: reverb tails stay cheap
+#endif
     float* out = (float*)output;                // stereo
     const float* in = (const float*)input;      // mono
 
@@ -167,8 +382,6 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         r[k]    = ringR[k];
     }
 
-    const bool   gateOn  = gGateOn;
-    const float  thr     = gGateLin;
     const bool   talk    = gTalkOver;
     const float  talkVol = gTalkVolPct / 100.0f;
     const double speed   = gSpeedPct / 100.0;
@@ -177,27 +390,78 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     double fade = (double)gFadeMs * RATE / 1000.0;
     if (fade * 2 > len) fade = len / 2.0;
 
-    for (ma_uint32 f = 0; f < frames; f++) {
-        float s = in ? in[f] : 0.0f;
+    if (gFxResetReq) { FxReset(); gFxResetReq = false; }
+    const bool   fxPitch = gFxOn && gFxPitchOn;
+    const bool   fxRev   = gFxOn && gFxRevOn;
+    const double psRatio = pow(2.0, (gFxSemi + gFxCents / 100.0) / 12.0);
+    const int    psGrain = Iclamp(gFxGrainMs * RATE / 1000, 64, PS_SIZE - PS_SEARCH - PS_CORR - 8);
+    const float  psMix   = gFxPitchMix / 100.0f;
+    const float  rvMix = gFxRevMix / 100.0f, rvSize = gFxRevSize / 100.0f, rvDamp = gFxRevDamp / 100.0f;
+    const int    rvPre = Iclamp(gFxPreMs * RATE / 1000, 0, PRE_SIZE - 1);
 
-        if (gateOn) {                           // noise gate: 1 ms open, 150 ms hold, 80 ms close
-            float a = s < 0 ? -s : s;
-            gateEnv = a > gateEnv ? a : gateEnv * 0.99948f;
-            if (gateEnv > thr) gateHold = RATE * 150 / 1000;
-            else if (gateHold > 0) gateHold--;
-            float target = gateHold > 0 ? 1.0f : 0.0f;
-            gateGain += (target - gateGain) * (target > gateGain ? 0.0206f : 0.00026f);
-            s *= gateGain;
+    // Mic cleanup settings for this block
+    const float boost    = powf(10.0f, gMicBoostDb / 20.0f);
+    if (gLowCutHz != hpFc) LowCutSetup(gLowCutHz);
+    const bool  lowCut   = hpFc > 0;
+    const int   gateMode = gGateMode;
+    const bool  nsOn     = gNsOn;
+    const bool  nsStage  = nsOn || gateMode == GATE_VOICE || gateMode == GATE_BOTH;   // voice detection needs RNNoise too
+    const float nsMix    = gNsStrength / 100.0f;
+    const float thrOpen  = powf(10.0f, gGateThrDb / 20.0f), thrClose = thrOpen * 0.63f;   // 4 dB hysteresis
+    const float voiceMin = gGateVoicePct / 100.0f;
+    const int   holdN    = gGateHoldMs * RATE / 1000;
+    const float relCoef  = 1.0f - expf(-1.0f / (gGateReleaseMs * 0.001f * RATE));
+    const float atkCoef  = 1.0f - expf(-1.0f / (0.001f * RATE));                      // opens in ~1 ms
+    const float floorLin = powf(10.0f, -gGateRangeDb / 20.0f);
+    const float lvAmt    = gLevelerPct / 100.0f;
+    const float lvRatio  = 1.0f + 3.0f * lvAmt, lvMakeupDb = 6.0f * lvAmt;
+    float blockPeak = 0;
+
+    for (ma_uint32 f = 0; f < frames; f++) {
+        float s = in ? in[f] * boost : 0.0f;
+        if (lowCut) s = LowCut(s);
+
+        if (nsStage) {
+            float dry, den = NoiseStage(s, &dry);
+            s = nsOn ? dry + (den - dry) * nsMix : dry;
         }
+        { float a = s < 0 ? -s : s; if (a > blockPeak) blockPeak = a; }
+
+        if (gateMode != GATE_OFF) {             // noise gate: opens in 1 ms, then hold, then release
+            float a = s < 0 ? -s : s;
+            gateEnv = a > gateEnv ? a : gateEnv * 0.99792f;          // 10 ms peak follower
+            bool loud  = gateEnv > (gateHold > 0 ? thrClose : thrOpen);
+            bool voice = nsVad >= voiceMin;
+            bool open  = gateMode == GATE_VOLUME ? loud : gateMode == GATE_VOICE ? voice : (loud && voice);
+            if (open) gateHold = holdN + 1;
+            else if (gateHold > 0) gateHold--;
+            float target = gateHold > 0 ? 1.0f : floorLin;
+            gateGain += (target - gateGain) * (target > gateGain ? atkCoef : relCoef);
+            s *= gateGain;
+        } else {
+            gateGain = 1.0f; gateHold = 1;
+        }
+
+        if (lvAmt > 0) {                        // leveler: gentle compressor above -30 dBFS + make-up gain
+            float pw = s * s;
+            lvEnv += (pw - lvEnv) * (pw > lvEnv ? 0.0042f : 0.0001f);   // ~5 ms attack, ~200 ms release
+            float lvl = 10.0f * log10f(lvEnv + 1e-12f);
+            float gdb = (lvl > -30.0f ? (-30.0f - lvl) * (1.0f - 1.0f / lvRatio) : 0.0f) + lvMakeupDb;
+            s *= powf(10.0f, gdb / 20.0f);
+        }
+
+        if (fxPitch) s = PitchShift(s, psRatio, psGrain, psMix);
+        if (fxRev)   s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
 
         float effect = 0.0f, everything;
         if (looping) {
             float v = 0.0f;
             for (int k = 0; k < 2; k++) {
                 double rp = WrapPos(grainStart[k] + grainAge[k] * pitch, len);
-                size_t i0 = (size_t)rp, i1 = (i0 + 1) % frozenLen;
+                size_t i0 = (size_t)rp;
                 float t = (float)(rp - (double)i0);
-                float smp = frozen[i0] * (1 - t) + frozen[i1] * t;
+                size_t im = (i0 + frozenLen - 1) % frozenLen, i1 = (i0 + 1) % frozenLen, i2 = (i0 + 2) % frozenLen;
+                float smp = Hermite(frozen[im], frozen[i0], frozen[i1], frozen[i2], t);
                 if (fade >= 1) {                // soften the click at the loop seam
                     double d = len - rp;
                     if (rp < d) d = rp;
@@ -220,18 +484,21 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             everything = s;
         }
 
-        float o = SoftLimit(RowSignal(mode[0], effect, everything) * vol[0]);
+        float o = Limit(0, RowSignal(mode[0], effect, everything) * vol[0]);
         out[f * 2] = o;
         out[f * 2 + 1] = o;
 
         for (int k = 1; k < MAX_OUT; k++) {
             if (!on[k] || (w[k] - r[k]) >= RING_SIZE) continue;
-            ring[k][w[k] & (RING_SIZE - 1)] = SoftLimit(RowSignal(mode[k], effect, everything) * vol[k]);
+            ring[k][w[k] & (RING_SIZE - 1)] = Limit(k, RowSignal(mode[k], effect, everything) * vol[k]);
             w[k]++;
         }
     }
     MemoryBarrier();
     for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
+    if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
+    gMeterVad = nsStage ? nsVad : -1.0f;
+    gMeterGateOpen = gateHold > 0;
 }
 
 static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_uint32 frames)
@@ -262,8 +529,10 @@ enum {
     IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_FADE, IDC_GATE, IDC_TALKVOL,
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
-    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR,
+    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
+    IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
 };
 #define SPIN_UD(id)        ((id) + 100)      // up-down control paired with a number box
@@ -275,6 +544,7 @@ enum {
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
 #define TIMER_CLEANUP   4
+#define TIMER_FXKEYS    5
 
 static HINSTANCE gInst; static HWND gWnd, gStatus; static HFONT gFont, gFontBold; static HICON gIcon;
 static ma_context gCtx; static ma_device gDev, gExtraDev[MAX_OUT];
@@ -293,9 +563,47 @@ static Range gRanges[] = {
     { IDC_SPEED,   10, 400,  &gSpeedPct,   L"speed"           },
     { IDC_PITCH,   25, 400,  &gPitchPct,   L"pitch"           },
     { IDC_FADE,    0,  50,   &gFadeMs,     L"smoothing_ms"    },
-    { IDC_GATE,    20, 90,   &gGateDb,     L"gate_db"         },
     { IDC_TALKVOL, 0,  200,  &gTalkVolPct, L"talkover_volume" },
 };
+
+// Voice FX page: one group (section) per effect, each with an on/off box and a row of knobs.
+struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bool def; const wchar_t* hotkeyKey; };
+static FxGroup gFxGroups[] = {
+    { L"Pitch",  &gFxPitchOn, L"fx_pitch_on",  true, L"fx_pitch_hotkey"  },
+    { L"Reverb", &gFxRevOn,   L"fx_reverb_on", true, L"fx_reverb_hotkey" },
+};
+#define FX_GROUPS ((int)(sizeof(gFxGroups) / sizeof(gFxGroups[0])))
+
+// Optional hotkeys that switch Voice FX on/off: slot 0 = the whole page, slot 1+g = effect group g.
+// Each is a combination of up to MAX_KEYS keys (0 = unused). Polled by the window (TIMER_FXKEYS).
+#define FX_KEY_SLOTS (1 + FX_GROUPS)
+static int  gFxKeys[FX_KEY_SLOTS][MAX_KEYS];
+static bool gFxKeyWasDown[FX_KEY_SLOTS];
+
+// Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
+enum { KG_PITCH = 0, KG_REVERB = 1, KG_NS = 2, KG_GATE = 3, KG_TONE = 4 };
+struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar;
+              const wchar_t* offText; };          // shown (and the knob dimmed) when the value is at its minimum
+static Knob gKnobs[] = {
+    { L"Pitch",     L" st", -12, 12,  0,   &gFxSemi,     L"fx_pitch_semitones", 0, true, nullptr  },
+    { L"Fine",      L" ct", -100, 100, 0,  &gFxCents,    L"fx_pitch_cents",     0, true, nullptr  },
+    { L"Grain",     L" ms", 20,  100, 50,  &gFxGrainMs,  L"fx_pitch_grain_ms",  0, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 100, &gFxPitchMix, L"fx_pitch_mix",       0, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 30,  &gFxRevMix,   L"fx_reverb_mix",      1, false, nullptr },
+    { L"Size",      L"%",   0,   100, 60,  &gFxRevSize,  L"fx_reverb_size",     1, false, nullptr },
+    { L"Damping",   L"%",   0,   100, 50,  &gFxRevDamp,  L"fx_reverb_damping",  1, false, nullptr },
+    { L"Pre-delay", L" ms", 0,   200, 20,  &gFxPreMs,    L"fx_reverb_predelay", 1, false, nullptr },
+    { L"Strength",  L"%",   0,   100, 100, &gNsStrength,    L"ns_strength",       KG_NS,   false, nullptr },
+    { L"Threshold", L" dB", -90, -10, -50, &gGateThrDb,     L"gate_threshold_db", KG_GATE, false, nullptr },
+    { L"Voice",     L"%",   10,  99,  60,  &gGateVoicePct,  L"gate_voice_pct",    KG_GATE, false, nullptr },
+    { L"Hold",      L" ms", 0,   1000, 150, &gGateHoldMs,   L"gate_hold_ms",      KG_GATE, false, nullptr },
+    { L"Release",   L" ms", 10,  1000, 80, &gGateReleaseMs, L"gate_release_ms",   KG_GATE, false, nullptr },
+    { L"Range",     L" dB", 0,   80,  80,  &gGateRangeDb,   L"gate_range_db",     KG_GATE, false, nullptr },
+    { L"Mic boost", L" dB", -12, 24,  0,   &gMicBoostDb,    L"mic_boost_db",      KG_TONE, true, nullptr  },
+    { L"Low cut",   L" Hz", 0,   300, 80,  &gLowCutHz,      L"low_cut_hz",        KG_TONE, false, L"Off" },
+    { L"Leveler",   L"%",   0,   100, 0,   &gLevelerPct,    L"leveler",           KG_TONE, false, L"Off" },
+};
+#define KNOB_N ((int)(sizeof(gKnobs) / sizeof(gKnobs[0])))
 
 static void Widen(const char* s, wchar_t* out, int cap)
 {
@@ -544,15 +852,35 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 }
 
 // ======================= settings =======================
+static const wchar_t* FxKeyIniName(int slot) { return slot == 0 ? L"fx_hotkey" : gFxGroups[slot - 1].hotkeyKey; }
+
 static wchar_t gUpdateRepo[200];
 static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
 {
-    GetModuleFileNameW(nullptr, gIni, MAX_PATH);
-    wchar_t* slash = wcsrchr(gIni, L'\\');
-    if (slash) slash[1] = 0; else gIni[0] = 0;
-    lstrcatW(gIni, L"LagEffect.ini");
+    // Settings live in %APPDATA%\LagEffect\LagEffect.ini, so every copy of the app (any folder,
+    // any version, after updates) shares them. The first time, settings saved next to the exe by
+    // older versions are copied over.
+    wchar_t local[MAX_PATH];
+    GetModuleFileNameW(nullptr, local, MAX_PATH);
+    wchar_t* slash = wcsrchr(local, L'\\');
+    if (slash) slash[1] = 0; else local[0] = 0;
+    lstrcatW(local, L"LagEffect.ini");
+
+    wchar_t dir[MAX_PATH];
+    DWORD n = GetEnvironmentVariableW(L"APPDATA", dir, MAX_PATH);
+    if (n > 0 && n < MAX_PATH - 32) {
+        lstrcatW(dir, L"\\LagEffect");
+        CreateDirectoryW(dir, nullptr);         // fine if it already exists
+        lstrcpynW(gIni, dir, MAX_PATH);
+        lstrcatW(gIni, L"\\LagEffect.ini");
+        if (GetFileAttributesW(gIni) == INVALID_FILE_ATTRIBUTES && GetFileAttributesW(local) != INVALID_FILE_ATTRIBUTES)
+            CopyFileW(local, gIni, TRUE);
+        if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) lstrcpynW(gIni, local, MAX_PATH);   // no AppData: old place
+    } else {
+        lstrcpynW(gIni, local, MAX_PATH);
+    }
 
     #define INI_INT(k, d) (int)GetPrivateProfileIntW(L"settings", k, d, gIni)
     for (Range& r : gRanges) *r.var = Iclamp(INI_INT(r.key, *r.var), r.lo, r.hi);
@@ -561,14 +889,39 @@ static void LoadSettings()
     gHotkeys[2]    = Iclamp(INI_INT(L"hotkey3", 0), 0, 255);
     if (!gHotkeys[0]) gHotkeys[0] = VK_F8;
     gToggleMode    = INI_INT(L"toggle", 0) != 0;
-    gGateOn        = INI_INT(L"gate", 0) != 0;
     gTalkOver      = INI_INT(L"talkover", 0) != 0;
     gBufIdx        = Iclamp(INI_INT(L"buffer", 2), 0, 4);
     gExclusive     = INI_INT(L"exclusive", 0) != 0;
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
     gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
-    UpdateGateLin();
+
+    gFxOn = INI_INT(L"fx_on", 0) != 0;
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+        wchar_t b[64];
+        GetPrivateProfileStringW(L"settings", FxKeyIniName(slot), L"", b, 64, gIni);
+        const wchar_t* q = b;
+        for (int i = 0; i < MAX_KEYS; i++) {
+            gFxKeys[slot][i] = *q ? Iclamp(_wtoi(q), 0, 255) : 0;
+            while (*q && *q != L',') q++;
+            if (*q == L',') q++;
+        }
+    }
+    for (FxGroup& g : gFxGroups) *g.on = INI_INT(g.key, g.def) != 0;
+    for (Knob& k : gKnobs) {                    // read as text: knob values can be negative
+        wchar_t b[32];
+        GetPrivateProfileStringW(L"settings", k.key, L"", b, 32, gIni);
+        *k.var = Iclamp(b[0] ? _wtoi(b) : k.def, k.lo, k.hi);
+    }
+    // Mic tab. Settings from 1.5 and older: gate=1/0 and gate_db=50 (meaning -50 dB).
+    gNsOn         = INI_INT(L"ns_on", 0) != 0;
+    gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
+    gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
+    {
+        wchar_t b[32];
+        GetPrivateProfileStringW(L"settings", L"gate_threshold_db", L"", b, 32, gIni);
+        if (!b[0]) gGateThrDb = Iclamp(-INI_INT(L"gate_db", 50), -90, -10);
+    }
 
     GetPrivateProfileStringW(L"settings", L"mic",         L"", gMicName, 512, gIni);
     GetPrivateProfileStringW(L"settings", L"update_repo", DEFAULT_UPDATE_REPO, gUpdateRepo, 200, gIni);
@@ -617,9 +970,18 @@ static void SaveSettings()
     for (Range& r : gRanges) SaveInt(r.key, *r.var);
     SaveInt(L"hotkey", gHotkeys[0]); SaveInt(L"hotkey2", gHotkeys[1]); SaveInt(L"hotkey3", gHotkeys[2]);
     SaveInt(L"toggle", gToggleMode);
-    SaveInt(L"gate", gGateOn); SaveInt(L"talkover", gTalkOver);
+    SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
+    SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
+    SaveInt(L"fx_on", gFxOn);
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+        wchar_t b[64];
+        wsprintfW(b, L"%d,%d,%d", gFxKeys[slot][0], gFxKeys[slot][1], gFxKeys[slot][2]);
+        WritePrivateProfileStringW(L"settings", FxKeyIniName(slot), b, gIni);
+    }
+    for (FxGroup& g : gFxGroups) SaveInt(g.key, *g.on);
+    for (Knob& k : gKnobs) SaveInt(k.key, *k.var);
     WritePrivateProfileStringW(L"settings", L"update_repo", gUpdateRepo, gIni);
     wchar_t name[512], key[32];
     SelectedName(IDC_MIC, gCapDevs, gCapCount, name, 512);
@@ -652,6 +1014,7 @@ static bool StartExtraOutput(int k)
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.dataCallback       = ExtraOutputCallback;
+    cfg.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;
     cfg.notificationCallback = NotifyCallback;
     cfg.pUserData          = (void*)(INT_PTR)k;
     int i = ComboIndex(IDC_ROWDEV + k);
@@ -688,6 +1051,7 @@ static bool StartAudio(bool quiet)
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.dataCallback       = AudioCallback;
+    cfg.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;   // cleanest resampling if a device isn't at 48 kHz
     cfg.notificationCallback = NotifyCallback;
     if (gExclusive) {
         cfg.capture.shareMode  = ma_share_mode_exclusive;
@@ -699,7 +1063,8 @@ static bool StartAudio(bool quiet)
 
     memset(hist, 0, sizeof(hist));
     wpos = 0; frozenLen = 1; looping = false; toggled = false; prevDown = false;
-    gateEnv = 0; gateGain = 1; gateHold = 0;
+    MicReset();
+    gFxResetReq = true;
 
     gStopping = false;
     gWantRunning = true;
@@ -740,19 +1105,28 @@ static void StopAudio()
 // ======================= layout helpers =======================
 // Everything below the output list moves down as outputs are added, so controls created after
 // the list are recorded with their starting position.
+// Controls also belong to a page (tab): Main, Mic, Voice FX, Settings. Only the current page is shown.
 #define CLIENT_W  560
-#define BASE_H    690                          // window height with one output
-#define ROW_Y0    88
+#define BASE_H    592                          // window height with one output
+#define ROW_Y0    134
 #define ROW_H     30
+#define TAB_COUNT 4
+enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SETTINGS = 3 };
 
 struct Shifted { HWND h; int x, y; };
-struct Section { int x, y, w, h; const wchar_t* title; bool shifts; };
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; };
 struct Framed  { HWND edit, ud; };
+struct Paged   { HWND h; int page; };
 static Shifted gShift[96];   static int gShiftN = 0;
-static Section gSections[8]; static int gSectionN = 0;
+static Section gSections[12]; static int gSectionN = 0;
 static Framed  gFramed[24];  static int gFramedN = 0;
+static Paged   gPaged[160];  static int gPagedN = 0;
 static bool    gRecordShift = false;
 static int     gDevSectionIdx = 0;
+static int     gBuildPage = -1;                // page new controls go on (-1 = always shown, e.g. the tabs)
+static int     gPage = 0;                      // page being shown
+
+static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < 160) gPaged[gPagedN++] = { h, gBuildPage }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 
@@ -762,6 +1136,7 @@ static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int
                              gWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE);
     if (gRecordShift && gShiftN < 96) gShift[gShiftN++] = { c, x, y };
+    RecordPage(c);
     return c;
 }
 
@@ -780,12 +1155,417 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
         gShift[gShiftN++] = { u, r.left, r.top };
     }
     if (gFramedN < 24) gFramed[gFramedN++] = { e, u };
+    RecordPage(u);
     return u;
 }
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < 8) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift };
+    if (gSectionN < 12) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage };
+}
+
+// ======================= knob control (Voice FX page) =======================
+// Drag up/down (Shift = fine), scroll the wheel, or use the arrow keys / Page Up/Down / Home / End.
+// Double-click or Delete resets to the default. Writes straight into the knob's setting.
+#define KNOB_W 96
+#define KNOB_H 106
+static int    gKnobLastY = 0;
+static double gKnobAccum = 0;
+static int    gWheelAccum = 0;
+
+static bool KnobActive(int i)
+{
+    const Knob& k = gKnobs[i];
+    if (k.offText && *k.var == k.lo) return false;
+    switch (k.group) {
+    case KG_NS:   return gNsOn;
+    case KG_GATE:
+        if (gGateMode == GATE_OFF) return false;
+        if (k.var == &gGateThrDb)    return gGateMode == GATE_VOLUME || gGateMode == GATE_BOTH;
+        if (k.var == &gGateVoicePct) return gGateMode == GATE_VOICE  || gGateMode == GATE_BOTH;
+        return true;
+    case KG_TONE: return true;
+    }
+    return gFxOn && *gFxGroups[k.group].on;
+}
+static int  KnobStep(int i)   { return Imax(1, (gKnobs[i].hi - gKnobs[i].lo) / 50); }
+
+static void SetKnobValue(HWND h, int i, int v)
+{
+    Knob& k = gKnobs[i];
+    v = Iclamp(v, k.lo, k.hi);
+    if (v != *k.var) { *k.var = v; InvalidateRect(h, nullptr, FALSE); }
+}
+
+static void RedrawKnobs()
+{
+    for (int i = 0; i < KNOB_N; i++) InvalidateRect(GetDlgItem(gWnd, IDC_KNOB + i), nullptr, FALSE);
+}
+
+static void KnobPoint(int cx, int cy, int r, double deg, int* x, int* y)
+{
+    double a = deg * 3.14159265358979 / 180.0;
+    *x = cx + (int)floor(r * cos(a) + 0.5);
+    *y = cy - (int)floor(r * sin(a) + 0.5);
+}
+
+// Clockwise arc from angle 'from' down to angle 'to' (degrees, 0 = right, 90 = up).
+static void KnobArc(HDC dc, int cx, int cy, int r, double from, double to, COLORREF c, int width)
+{
+    if (from - to < 1.0) return;
+    LOGBRUSH lb = { BS_SOLID, c, 0 };
+    HPEN p = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND, width, &lb, 0, nullptr);
+    HGDIOBJ op = SelectObject(dc, p);
+    int x1, y1, x2, y2;
+    KnobPoint(cx, cy, r, from, &x1, &y1);
+    KnobPoint(cx, cy, r, to, &x2, &y2);
+    SetArcDirection(dc, AD_CLOCKWISE);
+    Arc(dc, cx - r, cy - r, cx + r, cy + r, x1, y1, x2, y2);
+    SelectObject(dc, op);
+    DeleteObject(p);
+}
+
+static void PaintKnob(HWND h, HDC dc)
+{
+    int i = GetDlgCtrlID(h) - IDC_KNOB;
+    if (i < 0 || i >= KNOB_N) return;
+    Knob& k = gKnobs[i];
+    RECT rc; GetClientRect(h, &rc);
+    FillRect(dc, &rc, BgBrush());
+
+    const bool on = KnobActive(i), focus = GetFocus() == h;
+    const int  cx = rc.right / 2, cy = 52, r = 26;
+    double frac = (double)(*k.var - k.lo) / (double)(k.hi - k.lo);
+    double ang  = 225.0 - 270.0 * frac;         // 225 = minimum (bottom left), -45 = maximum (bottom right)
+
+    COLORREF track = gDark ? RGB(66, 66, 66) : RGB(212, 212, 212);
+    COLORREF value = on ? ACCENT : (gDark ? RGB(112, 112, 112) : RGB(158, 158, 158));
+    KnobArc(dc, cx, cy, r, 225.0, -45.0, track, 5);
+    if (k.bipolar) {                            // fills from the middle (12 o'clock) toward the value
+        if (ang < 90.0) KnobArc(dc, cx, cy, r, 90.0, ang, value, 5);
+        else            KnobArc(dc, cx, cy, r, ang, 90.0, value, 5);
+    } else {
+        KnobArc(dc, cx, cy, r, 225.0, ang, value, 5);
+    }
+
+    HBRUSH body = CreateSolidBrush(gDark ? RGB(54, 54, 54) : RGB(252, 252, 252));
+    HPEN   edge = CreatePen(PS_SOLID, 1, focus ? ACCENT : gDark ? RGB(88, 88, 88) : RGB(186, 186, 186));
+    HGDIOBJ ob = SelectObject(dc, body), op = SelectObject(dc, edge);
+    Ellipse(dc, cx - 18, cy - 18, cx + 19, cy + 19);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(body); DeleteObject(edge);
+
+    int x1, y1, x2, y2;                         // pointer
+    KnobPoint(cx, cy, 6, ang, &x1, &y1);
+    KnobPoint(cx, cy, 15, ang, &x2, &y2);
+    LOGBRUSH lb = { BS_SOLID, on ? (gDark ? DK_TEXT : RGB(40, 40, 40)) : (gDark ? DK_DIM : RGB(130, 130, 130)), 0 };
+    HPEN ptr = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND, 3, &lb, 0, nullptr);
+    op = SelectObject(dc, ptr);
+    MoveToEx(dc, x1, y1, nullptr); LineTo(dc, x2, y2);
+    SelectObject(dc, op);
+    DeleteObject(ptr);
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, gFont);
+    SetTextColor(dc, focus ? ACCENT : gDark ? DK_DIM : RGB(95, 95, 95));
+    RECT lr = { 0, 0, rc.right, 18 };
+    DrawTextW(dc, k.label, -1, &lr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+    wchar_t txt[32];
+    if (k.offText && *k.var == k.lo) lstrcpynW(txt, k.offText, 32);
+    else wsprintfW(txt, k.bipolar && *k.var > 0 ? L"+%d%s" : L"%d%s", *k.var, k.unit);
+    SelectObject(dc, gFontBold);
+    SetTextColor(dc, on ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(130, 130, 130)));
+    RECT vr = { 0, cy + 30, rc.right, rc.bottom };
+    DrawTextW(dc, txt, -1, &vr, DT_SINGLELINE | DT_CENTER | DT_TOP);
+    SelectObject(dc, of);
+}
+
+static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    int i = GetDlgCtrlID(h) - IDC_KNOB;
+    if (i < 0 || i >= KNOB_N) return DefWindowProcW(h, m, w, l);
+    Knob& k = gKnobs[i];
+    switch (m) {
+    case WM_GETDLGCODE:
+        return DLGC_WANTARROWS;
+    case WM_LBUTTONDOWN:
+        SetFocus(h);
+        SetCapture(h);
+        gKnobLastY = (short)HIWORD(l);
+        gKnobAccum = *k.var;
+        return 0;
+    case WM_MOUSEMOVE:
+        if (GetCapture() == h) {
+            int y = (short)HIWORD(l);
+            double perPixel = (k.hi - k.lo) / ((w & MK_SHIFT) ? 600.0 : 150.0);
+            gKnobAccum += (gKnobLastY - y) * perPixel;
+            gKnobAccum = gKnobAccum < k.lo ? k.lo : gKnobAccum > k.hi ? k.hi : gKnobAccum;
+            gKnobLastY = y;
+            SetKnobValue(h, i, (int)floor(gKnobAccum + 0.5));
+        }
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == h) ReleaseCapture();
+        return 0;
+    case WM_LBUTTONDBLCLK:
+        SetFocus(h);
+        SetKnobValue(h, i, k.def);
+        return 0;
+    case WM_MOUSEWHEEL: {
+        gWheelAccum += GET_WHEEL_DELTA_WPARAM(w);
+        int notches = gWheelAccum / WHEEL_DELTA;
+        gWheelAccum -= notches * WHEEL_DELTA;
+        int step = (GET_KEYSTATE_WPARAM(w) & MK_SHIFT) ? 1 : KnobStep(i);
+        SetKnobValue(h, i, *k.var + notches * step);
+        return 0;
+    }
+    case WM_KEYDOWN: {
+        bool fine = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+        int step = fine ? 1 : KnobStep(i);
+        switch (w) {
+        case VK_UP:    case VK_RIGHT: SetKnobValue(h, i, *k.var + step);     return 0;
+        case VK_DOWN:  case VK_LEFT:  SetKnobValue(h, i, *k.var - step);     return 0;
+        case VK_PRIOR: SetKnobValue(h, i, *k.var + step * 5);                return 0;
+        case VK_NEXT:  SetKnobValue(h, i, *k.var - step * 5);                return 0;
+        case VK_HOME:  SetKnobValue(h, i, k.lo);                             return 0;
+        case VK_END:   SetKnobValue(h, i, k.hi);                             return 0;
+        case VK_DELETE: case VK_BACK: SetKnobValue(h, i, k.def);             return 0;
+        }
+        break;
+    }
+    case WM_SETFOCUS: case WM_KILLFOCUS:
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT: {                            // double-buffered so dragging never flickers
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ old = SelectObject(mem, bmp);
+        PaintKnob(h, mem);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// Master switch at the top of the Voice FX page: a card with an on/off pill.
+static void DrawFxSwitch(DRAWITEMSTRUCT* d)
+{
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    const bool on = gFxOn;
+
+    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : RGB(252, 252, 252));
+    HPEN   cpen = CreatePen(PS_SOLID, 1, on ? ACCENT : gDark ? DK_SECTION : RGB(206, 206, 206));
+    HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, cpen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(card); DeleteObject(cpen);
+
+    const int pw = 44, ph = 22, px = rc.left + 16, py = (rc.top + rc.bottom - ph) / 2;
+    COLORREF pill = on ? ACCENT : gDark ? RGB(90, 90, 90) : RGB(170, 170, 170);
+    HBRUSH pb = CreateSolidBrush(pill);
+    HPEN   pp = CreatePen(PS_SOLID, 1, pill);
+    ob = SelectObject(dc, pb); op = SelectObject(dc, pp);
+    RoundRect(dc, px, py, px + pw, py + ph, ph, ph);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(pb); DeleteObject(pp);
+
+    int kx = on ? px + pw - ph + 3 : px + 3;
+    HBRUSH kb = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN   kp = CreatePen(PS_SOLID, 1, RGB(255, 255, 255));
+    ob = SelectObject(dc, kb); op = SelectObject(dc, kp);
+    Ellipse(dc, kx, py + 3, kx + ph - 6, py + ph - 3);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(kb); DeleteObject(kp);
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, gFontBold);
+    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    RECT tr = { px + pw + 14, rc.top + 5, rc.right - 70, rc.top + 24 };
+    DrawTextW(dc, L"Voice effects", -1, &tr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+    SelectObject(dc, gFont);
+    SetTextColor(dc, gDark ? DK_DIM : RGB(105, 105, 105));
+    RECT sr = { px + pw + 14, rc.top + 23, rc.right - 70, rc.bottom - 4 };
+    DrawTextW(dc, L"Changes your live voice (and the loop).", -1, &sr,
+              DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(dc, gFontBold);
+    SetTextColor(dc, on ? ACCENT : gDark ? DK_DIM : RGB(120, 120, 120));
+    RECT st = { rc.right - 64, rc.top, rc.right - 16, rc.bottom };
+    DrawTextW(dc, on ? L"ON" : L"OFF", -1, &st, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+    SelectObject(dc, of);
+
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+        RECT fr = rc; InflateRect(&fr, -4, -4);
+        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        DrawFocusRect(dc, &fr);
+    }
+}
+
+static void SetFxOn(bool on)
+{
+    if (on && !gFxOn) gFxResetReq = true;      // start clean, no stale reverb tail
+    gFxOn = on;
+    InvalidateRect(GetDlgItem(gWnd, IDC_FXON), nullptr, FALSE);
+    RedrawKnobs();
+}
+
+static void UpdateStatus(bool force);
+
+static void SetFxGroupOn(int g, bool on)
+{
+    if (on && !*gFxGroups[g].on) gFxResetReq = true;
+    *gFxGroups[g].on = on;
+    CheckDlgButton(gWnd, IDC_FXGRP_ON + g, on ? BST_CHECKED : BST_UNCHECKED);
+    RedrawKnobs();
+}
+
+// Voice FX hotkeys: the page key flips the master switch; an effect's key flips that effect
+// (and turns the master switch on with it, so the key always does something you can hear).
+static void PollFxKeys()
+{
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+        bool down = !gCapturingKey && KeysDown(gFxKeys[slot]);
+        bool pressed = down && !gFxKeyWasDown[slot];
+        gFxKeyWasDown[slot] = down;
+        if (!pressed) continue;
+        if (slot == 0) {
+            SetFxOn(!gFxOn);
+        } else {
+            int g = slot - 1;
+            bool on = !(*gFxGroups[g].on && gFxOn);
+            SetFxGroupOn(g, on);
+            if (on && !gFxOn) SetFxOn(true);
+        }
+        UpdateStatus(true);
+    }
+}
+
+// ---------- Mic tab ----------
+static float gMeterShowDb = -90.0f, gMeterVadShow = 0.0f;
+
+static void UpdateMeter()                       // every 50 ms: fast rise, smooth fall
+{
+    float peak = gMeterPeak; gMeterPeak = 0;
+    float db = peak > 0.0000316f ? 20.0f * log10f(peak) : -90.0f;
+    gMeterShowDb = db > gMeterShowDb ? db : (gMeterShowDb - 2.5f > db ? gMeterShowDb - 2.5f : db);
+    float v = gMeterVad;
+    gMeterVadShow = v < 0 ? -1.0f : (v > gMeterVadShow ? v : gMeterVadShow * 0.8f + v * 0.2f);
+    if (gPage == PAGE_MIC) InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+}
+
+static void DrawMeterTo(HDC dc, RECT rc)
+{
+    FillRect(dc, &rc, BgBrush());
+    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : RGB(252, 252, 252));
+    HPEN   cpen = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+    HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, cpen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(card); DeleteObject(cpen);
+
+    const float lo = -72.0f;
+    const int x0 = rc.left + 96, x1 = rc.right - 120, bh = 12;
+    const int by = rc.top + 14;
+    auto X = [&](float db) { float t = (db - lo) / -lo; t = t < 0 ? 0 : t > 1 ? 1 : t; return x0 + (int)((x1 - x0) * t); };
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, gFontBold);
+    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    RECT lr = { rc.left + 14, rc.top, x0 - 8, rc.top + 40 };
+    DrawTextW(dc, L"Mic level", -1, &lr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+
+    RECT track = { x0, by, x1, by + bh };
+    HBRUSH tb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222));
+    FillRect(dc, &track, tb); DeleteObject(tb);
+
+    bool gateOn = gGateMode != GATE_OFF, open = !gateOn || gMeterGateOpen;
+    COLORREF fillc = !gRunning ? (gDark ? RGB(90, 90, 90) : RGB(180, 180, 180))
+                   : open ? RGB(40, 190, 90) : (gDark ? RGB(110, 110, 110) : RGB(165, 165, 165));
+    RECT lvl = { x0, by, X(gMeterShowDb), by + bh };
+    HBRUSH fb = CreateSolidBrush(fillc); FillRect(dc, &lvl, fb); DeleteObject(fb);
+    if (gMeterShowDb > -6.0f) {                 // hot zone
+        RECT hot = { X(-6.0f), by, X(gMeterShowDb), by + bh };
+        HBRUSH hb = CreateSolidBrush(RGB(235, 150, 40)); FillRect(dc, &hot, hb); DeleteObject(hb);
+    }
+    if (gateOn && (gGateMode == GATE_VOLUME || gGateMode == GATE_BOTH)) {   // threshold marker
+        int tx = X((float)gGateThrDb);
+        RECT m = { tx - 1, by - 4, tx + 1, by + bh + 4 };
+        HBRUSH mb = CreateSolidBrush(ACCENT); FillRect(dc, &m, mb); DeleteObject(mb);
+    }
+
+    SelectObject(dc, gFont);
+    SetTextColor(dc, gDark ? DK_DIM : RGB(105, 105, 105));
+    if (gMeterVadShow >= 0) {                   // voice detection bar (when RNNoise is running)
+        int vy = by + bh + 8;
+        RECT vt = { x0, vy, x1, vy + 5 };
+        HBRUSH vb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222)); FillRect(dc, &vt, vb); DeleteObject(vb);
+        RECT vf = { x0, vy, x0 + (int)((x1 - x0) * (gMeterVadShow > 1 ? 1 : gMeterVadShow)), vy + 5 };
+        HBRUSH vfb = CreateSolidBrush(RGB(160, 120, 240)); FillRect(dc, &vf, vfb); DeleteObject(vfb);
+        if (gGateMode == GATE_VOICE || gGateMode == GATE_BOTH) {
+            int tx = x0 + (int)((x1 - x0) * (gGateVoicePct / 100.0f));
+            RECT m = { tx - 1, vy - 3, tx + 1, vy + 8 };
+            HBRUSH mb = CreateSolidBrush(ACCENT); FillRect(dc, &m, mb); DeleteObject(mb);
+        }
+        RECT vl = { x0, vy + 6, x1, rc.bottom - 2 };
+        DrawTextW(dc, L"voice detected", -1, &vl, DT_SINGLELINE | DT_LEFT | DT_TOP);
+    }
+
+    wchar_t t1[32], t2[32];
+    if (!gRunning) { lstrcpynW(t1, L"--", 32); lstrcpynW(t2, L"Audio stopped", 32); }
+    else {
+        if (gMeterShowDb <= -89.0f) lstrcpynW(t1, L"silent", 32);
+        else wsprintfW(t1, L"%d dB", (int)floorf(gMeterShowDb + 0.5f));
+        lstrcpynW(t2, !gateOn ? L"Gate off" : open ? L"Gate open" : L"Gate closed", 32);
+    }
+    SelectObject(dc, gFontBold);
+    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    RECT r1 = { x1 + 10, rc.top + 8, rc.right - 14, rc.top + 26 };
+    DrawTextW(dc, t1, -1, &r1, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+    SelectObject(dc, gFont);
+    SetTextColor(dc, open && gateOn && gRunning ? RGB(40, 170, 80) : gDark ? DK_DIM : RGB(105, 105, 105));
+    RECT r2 = { x1 + 10, rc.top + 27, rc.right - 14, rc.top + 45 };
+    DrawTextW(dc, t2, -1, &r2, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+    SelectObject(dc, of);
+}
+
+static void DrawMeter(DRAWITEMSTRUCT* d)        // double-buffered, it redraws 20 times a second
+{
+    RECT rc = d->rcItem;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    HDC mem = CreateCompatibleDC(d->hDC);
+    HBITMAP bmp = CreateCompatibleBitmap(d->hDC, w, h);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    RECT local = { 0, 0, w, h };
+    DrawMeterTo(mem, local);
+    BitBlt(d->hDC, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+}
+
+static void SetGateMode(int m)
+{
+    if (m != GATE_OFF) gGateLastMode = m;
+    gGateMode = m;
+    CheckDlgButton(gWnd, IDC_GATEON, m != GATE_OFF ? BST_CHECKED : BST_UNCHECKED);
+    SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_SETCURSEL, m, 0);
+    RedrawKnobs();
+}
+
+static void ResetFxGroup(int g)
+{
+    for (int i = 0; i < KNOB_N; i++)
+        if (gKnobs[i].group == g) SetKnobValue(GetDlgItem(gWnd, IDC_KNOB + i), i, gKnobs[i].def);
 }
 
 // ======================= device lists =======================
@@ -841,6 +1621,7 @@ static void UpdateStatus(bool force = false)
         HotkeyName(key, 120);
         wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
     }
+    if (gRunning && gFxOn) lstrcatW(s, L"   (Voice FX on)");
     if (force || lstrcmpW(s, last) != 0 || lastLoop != gLooping) {
         lstrcpynW(last, s, 200); lastLoop = gLooping;
         SetWindowTextW(gStatus, s);
@@ -859,14 +1640,24 @@ static void RestartIfRunning()
     if (gWantRunning) { StopAudio(); StartAudio(false); UpdateUi(); }
 }
 
+// Which output row a control belongs to (-1 if none). Sets *isDel for the row's remove button.
+static int RowOfId(int id, bool* isDel)
+{
+    *isDel = false;
+    const int bases[] = { IDC_ROWLBL, IDC_ROWDEV, IDC_ROWMODE, IDC_ROWVOL, SPIN_UD(IDC_ROWVOL), IDC_ROWDEL };
+    for (int b : bases)
+        if (id >= b && id < b + MAX_OUT) { *isDel = b == IDC_ROWDEL; return id - b; }
+    return -1;
+}
+
 static void Layout()
 {
-    const int show[] = { IDC_ROWLBL, IDC_ROWDEV, IDC_ROWMODE, IDC_ROWVOL, SPIN_UD(IDC_ROWVOL), IDC_ROWDEL };
-    for (int k = 0; k < MAX_OUT; k++)
-        for (int id : show) {
-            HWND c = GetDlgItem(gWnd, id + k);
-            if (c) ShowWindow(c, k < gRows && !(id == IDC_ROWDEL && k == 0) ? SW_SHOW : SW_HIDE);
-        }
+    for (int i = 0; i < gPagedN; i++) {
+        bool del;
+        int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
+        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)));
+        ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
+    }
 
     int by = ROW_Y0 + ROW_H * gRows + 6;
     SetWindowPos(GetDlgItem(gWnd, IDC_ADDOUT),  nullptr, 30,  by, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -879,10 +1670,19 @@ static void Layout()
         SetWindowPos(gShift[i].h, nullptr, gShift[i].x, gShift[i].y + d, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 
     DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
-    RECT r = { 0, 0, CLIENT_W, BASE_H + d };
+    RECT r = { 0, 0, CLIENT_W, BASE_H + d };   // both pages share the window size, so switching never jumps
     AdjustWindowRect(&r, style, FALSE);
     SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+static void SetPage(int page)
+{
+    if (page < 0 || page >= TAB_COUNT || page == gPage) return;
+    HWND focus = GetFocus();
+    gPage = page;
+    Layout();
+    if (!focus || !IsWindowVisible(focus)) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + page));
 }
 
 static void SetRowMode(int k, int mode)
@@ -1129,6 +1929,7 @@ static DWORD WINAPI DownloadThread(LPVOID arg)
 }
 
 static bool gUpdateBusy = false;
+static bool gResumeAudio = false;               // set when relaunched by the updater while audio was running
 
 static void StartUpdateCheck(bool manual)
 {
@@ -1202,13 +2003,14 @@ static void OnUpdateDownloaded(UpdateJob* job)
         MessageBoxW(gWnd, L"Couldn't install the update. Your current version is unchanged.", L"Lag Effect - Updates", MB_ICONWARNING);
         return;
     }
+    bool wasRunning = gWantRunning;            // the new version picks up where this one left off
     SaveSettings();
     StopAudio();
     RemoveTray();
     lstrcpynW(dir, exe, MAX_PATH);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = 0;
-    ShellExecuteW(nullptr, L"open", exe, L"--updated", dir, SW_SHOWNORMAL);
+    ShellExecuteW(nullptr, L"open", exe, wasRunning ? L"--updated --resume" : L"--updated", dir, SW_SHOWNORMAL);
     DestroyWindow(gWnd);
 }
 
@@ -1269,6 +2071,21 @@ static void ShowHelp()
         L"Hold (or toggle) your hotkey to repeat the last bit of your mic.\n"
         L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
+        L"PAGES\n"
+        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch and "
+        L"reverb to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"MIC\n"
+        L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
+        L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
+        L"the meter's level when you're quiet), on Voice (AI speech detection) or both. Low cut removes rumble, "
+        L"Leveler evens out your volume.\n\n"
+        L"VOICE FX\n"
+        L"Flip the switch at the top, then tick the effects you want. Drag a knob up or down, scroll it, "
+        L"or use the arrow keys (hold Shift for fine steps). Double-click a knob to reset it.\n"
+        L"Hotkeys: click \"Set hotkey\" next to the switch, Pitch or Reverb and press a key or combo. "
+        L"They work from anywhere, even in a game. Right-click a hotkey button (or press Backspace while setting it) to clear it.\n"
+        L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
+        L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n\n"
         L"HOTKEY\n"
         L"Click the hotkey button, hold one key or up to 3 together (like Shift + F or Ctrl + Shift + 1), "
         L"then let go. Esc cancels. Mouse side buttons work too.\n\n"
@@ -1282,7 +2099,7 @@ static void ShowHelp()
         L"2. In Discord, set Input Device to \"CABLE Output\".\n"
         L"3. Set Noise Suppression to None or Standard (Krisp erases the effect), and turn off Echo "
         L"Cancellation and Automatic Gain Control.\n"
-        L"4. Turn on Lag Effect's noise gate to keep background noise out.\n\n"
+        L"4. On the Mic tab, turn on Noise suppression (AI) and/or the noise gate to keep background noise out.\n\n"
         L"OBS\n"
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
@@ -1293,12 +2110,40 @@ static void ShowHelp()
 }
 
 // ======================= hotkey picker =======================
-static void BeginKeyCapture()
+// One picker for every hotkey: the stutter hotkey (IDC_HOTKEY) and the Voice FX on/off keys.
+static volatile int* gCapTarget = gHotkeys;    // where the captured combination is stored
+static int           gCapButton = IDC_HOTKEY;  // button that shows it
+
+static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 {
+    ComboName(gFxKeys[slot], MAX_KEYS, buf, cap);
+    if (!buf[0]) lstrcpynW(buf, L"Set hotkey", cap);
+}
+
+static int FxKeyButtonId(int slot) { return slot == 0 ? IDC_FXKEY_MASTER : IDC_FXGRP_KEY + slot - 1; }
+
+static void ShowCaptureTarget()
+{
+    wchar_t name[120];
+    if (gCapButton == IDC_HOTKEY) HotkeyName(name, 120);
+    else {
+        int slot = gCapButton == IDC_FXKEY_MASTER ? 0 : gCapButton - IDC_FXGRP_KEY + 1;
+        FxKeyButtonText(slot, name, 120);
+    }
+    SetDlgItemTextW(gWnd, gCapButton, name);
+}
+
+static void EndKeyCapture();
+
+static void BeginKeyCapture(volatile int* target, int button)
+{
+    if (gCapturingKey) EndKeyCapture();         // only one picker at a time
+    gCapTarget = target;
+    gCapButton = button;
     gCapturingKey = true;
     gCapKeyCount = 0;
     for (int vk = 0; vk < 256; vk++) gKeyWasDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-    SetDlgItemTextW(gWnd, IDC_HOTKEY, L"Hold your key(s), then let go");
+    SetDlgItemTextW(gWnd, button, button == IDC_HOTKEY ? L"Hold your key(s), then let go" : L"Press keys...");
     SetTimer(gWnd, TIMER_KEY, 15, nullptr);
 }
 
@@ -1306,9 +2151,17 @@ static void EndKeyCapture()
 {
     gCapturingKey = false;
     KillTimer(gWnd, TIMER_KEY);
-    wchar_t name[120]; HotkeyName(name, 120);
-    SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+    ShowCaptureTarget();
+    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) gFxKeyWasDown[slot] = KeysDown(gFxKeys[slot]);   // no instant toggle
     UpdateStatus(true);
+}
+
+static void ClearFxKey(int slot)
+{
+    if (gCapturingKey) EndKeyCapture();
+    for (int i = 0; i < MAX_KEYS; i++) gFxKeys[slot][i] = 0;
+    wchar_t name[120]; FxKeyButtonText(slot, name, 120);
+    SetDlgItemTextW(gWnd, FxKeyButtonId(slot), name);
 }
 
 // Left/right Shift, Ctrl and Alt are stored as plain Shift/Ctrl/Alt so either side works.
@@ -1344,6 +2197,11 @@ static void PollKeyCapture()
         gKeyWasDown[vk] = d;
         if (!pressed) continue;
         if (vk == VK_ESCAPE) { EndKeyCapture(); return; }    // cancel, keep the old hotkey
+        if (vk == VK_BACK && gCapKeyCount == 0 && gCapButton != IDC_HOTKEY) {   // Backspace clears an FX hotkey
+            for (int i = 0; i < MAX_KEYS; i++) gCapTarget[i] = 0;
+            EndKeyCapture();
+            return;
+        }
         int key = NormalizeKey(vk);
         bool have = false;
         for (int i = 0; i < gCapKeyCount; i++) if (gCapKeys[i] == key) have = true;
@@ -1362,13 +2220,13 @@ static void PollKeyCapture()
         wchar_t name[140];
         ComboName(gCapKeys, gCapKeyCount, name, 120);
         lstrcatW(name, L" ...");
-        SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+        SetDlgItemTextW(gWnd, gCapButton, name);
     }
 
     for (int i = 0; i < gCapKeyCount; i++)
         if (GetAsyncKeyState(gCapKeys[i]) & 0x8000) return;   // still holding: wait
 
-    for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = i < gCapKeyCount ? gCapKeys[i] : 0;
+    for (int i = 0; i < MAX_KEYS; i++) gCapTarget[i] = i < gCapKeyCount ? gCapKeys[i] : 0;
     EndKeyCapture();
 }
 
@@ -1426,18 +2284,27 @@ static void CreateUI()
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
     const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything" };
 
-    // Layout grid: sections run from x 14 to 546, contents from x 30 to 530.
-    // Effect section uses two columns: label / number box / unit at 30 / 136 / 218 and 290 / 392 / 474.
+    // Tabs (always visible). Drawn by DrawTab().
+    gBuildPage = -1;
+    Ctl(L"BUTTON", L"Main",     BS_OWNERDRAW | WS_TABSTOP, 14,  10, 100, 32, IDC_TAB0 + PAGE_MAIN);
+    Ctl(L"BUTTON", L"Mic",      BS_OWNERDRAW | WS_TABSTOP, 118, 10, 100, 32, IDC_TAB0 + PAGE_MIC);
+    Ctl(L"BUTTON", L"Voice FX", BS_OWNERDRAW | WS_TABSTOP, 222, 10, 100, 32, IDC_TAB0 + PAGE_FX);
+    Ctl(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, 326, 10, 100, 32, IDC_TAB0 + PAGE_SETTINGS);
+
+    // ---------------- Main page ----------------
+    // Grid: sections run from x 14 to 546, contents from x 30 to 530.
+    // Effect section columns: label / number box / unit at 30 / 136 / 218 and 290 / 392 / 474.
+    gBuildPage = PAGE_MAIN;
 
     // Audio: microphone + output list
     gDevSectionIdx = gSectionN;
-    AddSection(14, 14, 532, 152, L"Audio");
-    Ctl(L"STATIC", L"Microphone:", 0, 30, 39, 90, 20, -1);
-    HWND mic = Ctl(L"COMBOBOX", L"", COMBO, 124, 36, 406, 300, IDC_MIC);
+    AddSection(14, 60, 532, 152, L"Audio");
+    Ctl(L"STATIC", L"Microphone:", 0, 30, 85, 90, 20, -1);
+    HWND mic = Ctl(L"COMBOBOX", L"", COMBO, 124, 82, 406, 300, IDC_MIC);
     SendMessageW(mic, CB_SETDROPPEDWIDTH, 420, 0);
-    Ctl(L"STATIC", L"Output", 0, 80, 70, 200, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Plays", 0, 320, 70, 100, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Volume %", 0, 432, 70, 70, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Output", 0, 80, 116, 200, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Plays", 0, 320, 116, 100, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 432, 116, 70, 16, IDC_HDR);
     for (int k = 0; k < MAX_OUT; k++) {
         int y = ROW_Y0 + ROW_H * k;
         wchar_t lbl[16]; wsprintfW(lbl, L"Out %d", k + 1);
@@ -1450,83 +2317,193 @@ static void CreateUI()
         Spin(IDC_ROWVOL + k, 432, y, 68, 0, 200, gRowVol[k]);
         Ctl(L"BUTTON", L"×", WS_TABSTOP, 506, y, 24, 23, IDC_ROWDEL + k);
     }
-    Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 124, 124, 28, IDC_ADDOUT);
-    Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 124, 124, 28, IDC_VBCABLE);
+    Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 170, 124, 28, IDC_ADDOUT);
+    Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 170, 124, 28, IDC_VBCABLE);
     FillDevices();
 
-    gRecordShift = true;                        // everything below moves with the output list
+    gRecordShift = true;                        // everything below on this page moves with the output list
 
     // Effect
-    AddSection(14, 186, 532, 165, L"Effect");
-    Ctl(L"STATIC", L"Loop length:", 0, 30, 213, 104, 20, -1);
-    Spin(IDC_LOOP, 136, 210, 76, 10, 2000, gLoopMs);
-    Ctl(L"STATIC", L"ms", 0, 218, 213, 40, 20, -1);
-    Ctl(L"STATIC", L"Speed:", 0, 290, 213, 100, 20, -1);
-    Spin(IDC_SPEED, 392, 210, 76, 10, 400, gSpeedPct);
-    Ctl(L"STATIC", L"%", 0, 474, 213, 40, 20, -1);
+    AddSection(14, 232, 532, 165, L"Effect");
+    Ctl(L"STATIC", L"Loop length:", 0, 30, 259, 104, 20, -1);
+    Spin(IDC_LOOP, 136, 256, 76, 10, 2000, gLoopMs);
+    Ctl(L"STATIC", L"ms", 0, 218, 259, 40, 20, -1);
+    Ctl(L"STATIC", L"Speed:", 0, 290, 259, 100, 20, -1);
+    Spin(IDC_SPEED, 392, 256, 76, 10, 400, gSpeedPct);
+    Ctl(L"STATIC", L"%", 0, 474, 259, 40, 20, -1);
 
-    Ctl(L"STATIC", L"Pitch:", 0, 30, 247, 104, 20, -1);
-    Spin(IDC_PITCH, 136, 244, 76, 25, 400, gPitchPct);
-    Ctl(L"STATIC", L"%", 0, 218, 247, 40, 20, -1);
-    Ctl(L"STATIC", L"Smoothing:", 0, 290, 247, 100, 20, -1);
-    Spin(IDC_FADE, 392, 244, 76, 0, 50, gFadeMs);
-    Ctl(L"STATIC", L"ms", 0, 474, 247, 40, 20, -1);
+    Ctl(L"STATIC", L"Pitch:", 0, 30, 293, 104, 20, -1);
+    Spin(IDC_PITCH, 136, 290, 76, 25, 400, gPitchPct);
+    Ctl(L"STATIC", L"%", 0, 218, 293, 40, 20, -1);
+    Ctl(L"STATIC", L"Smoothing:", 0, 290, 293, 100, 20, -1);
+    Spin(IDC_FADE, 392, 290, 76, 0, 50, gFadeMs);
+    Ctl(L"STATIC", L"ms", 0, 474, 293, 40, 20, -1);
 
-    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 281, 104, 20, IDC_GATEON);
-    CheckDlgButton(gWnd, IDC_GATEON, gGateOn ? BST_CHECKED : BST_UNCHECKED);
-    Spin(IDC_GATE, 136, 278, 76, 20, 90, gGateDb);
-    Ctl(L"STATIC", L"-dB", 0, 218, 281, 40, 20, -1);
+    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 327, 104, 20, IDC_GATEON);
+    CheckDlgButton(gWnd, IDC_GATEON, gGateMode != GATE_OFF ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Threshold, AI noise suppression and more are on the Mic tab.", 0, 136, 328, 390, 18, IDC_HDR);
 
-    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 315, 250, 20, IDC_TALKON);
+    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 361, 250, 20, IDC_TALKON);
     CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Voice level:", 0, 290, 315, 100, 20, -1);
-    Spin(IDC_TALKVOL, 392, 312, 76, 0, 200, gTalkVolPct);
-    Ctl(L"STATIC", L"%", 0, 474, 315, 40, 20, -1);
+    Ctl(L"STATIC", L"Voice level:", 0, 290, 361, 100, 20, -1);
+    Spin(IDC_TALKVOL, 392, 358, 76, 0, 200, gTalkVolPct);
+    Ctl(L"STATIC", L"%", 0, 474, 361, 40, 20, -1);
 
-    // Hotkey + latency
+    // Hotkey
     wchar_t key[120]; HotkeyName(key, 120);
-    AddSection(14, 371, 259, 97, L"Hotkey");
-    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 394, 227, 30, IDC_HOTKEY);
-    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 30, 434, 80, 20, IDC_HOLD);
-    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 120, 434, 100, 20, IDC_TOGGLE);
+    AddSection(14, 417, 532, 69, L"Hotkey");
+    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 440, 260, 30, IDC_HOTKEY);
+    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 310, 445, 80, 20, IDC_HOLD);
+    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 400, 445, 100, 20, IDC_TOGGLE);
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
 
-    AddSection(287, 371, 259, 97, L"Latency");
-    Ctl(L"STATIC", L"Buffer:", WS_GROUP, 303, 399, 56, 20, -1);
-    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 362, 395, 168, 200, IDC_BUFFER);
+    // Status + buttons
+    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
+    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 544, 172, 34, IDC_START);
+    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 544, 172, 34, IDC_TRAY);
+    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 544, 172, 34, IDC_HELPBTN);
+
+    gRecordShift = false;
+
+    // ---------------- Mic page ----------------
+    // Live meter, then AI noise suppression, noise gate and voice quality sections.
+    gBuildPage = PAGE_MIC;
+    Ctl(L"STATIC", L"", SS_OWNERDRAW, 14, 56, 532, 52, IDC_METER);
+    {
+        const int MIC_Y0 = 130, MIC_STEP = 146, MIC_H = 126;
+        int y = MIC_Y0;                         // noise suppression
+        AddSection(14, y, 532, MIC_H, L"Noise suppression (AI)");
+        for (int i = 0; i < KNOB_N; i++)
+            if (gKnobs[i].group == KG_NS) Ctl(L"LagKnob", L"", WS_TABSTOP | WS_GROUP, 26, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+        Ctl(L"STATIC", L"Removes background noise like fans, keyboards, hum and room echo, "
+                       L"and keeps your voice. Uses RNNoise. Adds about 20 ms of delay.", 0, 134, y + 24, 284, 74, IDC_HDR);
+        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_NSON);
+        CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+
+        y += MIC_STEP;                          // noise gate
+        AddSection(14, y, 532, MIC_H, L"Noise gate");
+        int col = 0;
+        for (int i = 0; i < KNOB_N; i++) {
+            if (gKnobs[i].group != KG_GATE) continue;
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 22 + col * 80, y + 14, 80, KNOB_H, IDC_KNOB + i);
+            col++;
+        }
+        Ctl(L"STATIC", L"Opens on:", 0, 430, y + 16, 100, 18, IDC_HDR);
+        HWND gm = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 428, y + 36, 104, 200, IDC_GATEMODE);
+        const wchar_t* gateNames[] = { L"Off", L"Volume", L"Voice", L"Volume + voice" };
+        for (const wchar_t* n : gateNames) SendMessageW(gm, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(gm, CB_SETCURSEL, gGateMode, 0);
+        SendMessageW(gm, CB_SETDROPPEDWIDTH, 130, 0);
+        Ctl(L"STATIC", L"Voice = AI speech detection. Range = how much quieter when closed.", 0, 430, y + 66, 108, 56, IDC_HDR);
+
+        y += MIC_STEP;                          // voice quality
+        AddSection(14, y, 532, MIC_H, L"Voice quality");
+        col = 0;
+        for (int i = 0; i < KNOB_N; i++) {
+            if (gKnobs[i].group != KG_TONE) continue;
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 98, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+            col++;
+        }
+        Ctl(L"STATIC", L"Low cut removes rumble and desk thumps. Leveler evens out loud and quiet speech. "
+                       L"A limiter on every output stops clipping and distortion.", 0, 330, y + 22, 200, 90, IDC_HDR);
+    }
+
+    // ---------------- Voice FX page ----------------
+    // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
+    // Sections stack downward (FX_SEC_STEP apart); there's room below for more effects.
+    gBuildPage = PAGE_FX;
+    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 56, 410, 48, IDC_FXON);
+    {
+        wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 66, 114, 30, IDC_FXKEY_MASTER);
+    }
+    const int FX_SEC_Y0 = 126, FX_SEC_STEP = 146, FX_SEC_H = 126;
+    for (int g = 0; g < FX_GROUPS; g++) {
+        int y = FX_SEC_Y0 + FX_SEC_STEP * g;
+        AddSection(14, y, 532, FX_SEC_H, gFxGroups[g].title);
+        int col = 0;
+        for (int i = 0; i < KNOB_N; i++) {
+            if (gKnobs[i].group != g) continue;
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 98, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+            col++;
+        }
+        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_FXGRP_ON + g);
+        CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
+        wchar_t kn[120]; FxKeyButtonText(1 + g, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 44, 104, 28, IDC_FXGRP_KEY + g);
+        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 80, 104, 28, IDC_FXGRP_RESET + g);
+    }
+    Ctl(L"STATIC", L"Drag a knob up/down or scroll it  -  Shift = fine steps  -  double-click resets.", 0,
+        30, FX_SEC_Y0 + FX_SEC_STEP * FX_GROUPS - 4, 500, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Hotkeys switch an effect on/off from anywhere. Right-click one (or press Backspace) to clear it.", 0,
+        30, FX_SEC_Y0 + FX_SEC_STEP * FX_GROUPS + 16, 516, 18, IDC_HDR);
+
+    // ---------------- Settings page ----------------
+    gBuildPage = PAGE_SETTINGS;
+
+    AddSection(14, 60, 532, 87, L"Latency");
+    Ctl(L"STATIC", L"Buffer:", 0, 30, 85, 90, 20, -1);
+    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 124, 81, 168, 200, IDC_BUFFER);
     const wchar_t* bufNames[] = { L"32 (fastest)", L"64", L"128 (default)", L"256", L"512 (safest)" };
     for (const wchar_t* n : bufNames) SendMessageW(buf, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(buf, CB_SETCURSEL, gBufIdx, 0);
-    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 303, 434, 200, 20, IDC_EXCL);
+    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 84, 220, 20, IDC_EXCL);
     CheckDlgButton(gWnd, IDC_EXCL, gExclusive ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Smaller buffer = less delay. Pick a bigger one if you hear crackling.", 0, 30, 116, 500, 18, IDC_HDR);
 
-    // Status + buttons
-    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW, 14, 486, 532, 30, IDC_STATUS);
-    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 526, 172, 34, IDC_START);
-    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 526, 172, 34, IDC_TRAY);
-    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 526, 172, 34, IDC_HELPBTN);
-
-    // App options
-    AddSection(14, 580, 532, 96, L"App");
-    Ctl(L"STATIC", L"Theme:", 0, 30, 605, 60, 20, -1);
-    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 601, 110, 200, IDC_THEME);
+    AddSection(14, 167, 532, 100, L"App");
+    Ctl(L"STATIC", L"Theme:", 0, 30, 196, 60, 20, -1);
+    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 192, 110, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
     for (const wchar_t* n : themeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, gThemeMode, 0);
-    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 603, 300, 20, IDC_AUTO);
+    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 194, 300, 20, IDC_AUTO);
     CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Updates:", 0, 30, 639, 60, 20, -1);
-    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 636, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
+    Ctl(L"STATIC", L"Updates:", 0, 30, 230, 60, 20, -1);
+    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 227, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
     SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
     if (gFramedN < 24) gFramed[gFramedN++] = { repo, nullptr };
-    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 635, 100, 26, IDC_CHECKUPD);
-    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 638, 118, 20, IDC_UPDSTART);
+    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 226, 100, 26, IDC_CHECKUPD);
+    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 229, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
 
-    gRecordShift = false;
+    Ctl(L"STATIC", L"Lag Effect " APP_VERSION, 0, 30, 283, 300, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 303, 420, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 298, 84, 26, IDC_OPENSET);
+
+    gBuildPage = -1;
     gUiReady = true;
     Layout();
+}
+
+// Tab button: label, with an accent bar under the selected one.
+static void DrawTab(DRAWITEMSTRUCT* d)
+{
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    int idx = (int)d->CtlID - IDC_TAB0;
+    bool active = idx == gPage;
+
+    FillRect(dc, &rc, BgBrush());
+    wchar_t text[32]; GetWindowTextW(d->hwndItem, text, 32);
+    HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, active ? (gDark ? DK_TEXT : RGB(20, 20, 20)) : (gDark ? DK_DIM : RGB(105, 105, 105)));
+    RECT tr = rc; tr.bottom -= 3;
+    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, of);
+    if (active) {
+        HBRUSH ab = CreateSolidBrush(ACCENT);
+        RECT bar = { rc.left + 14, rc.bottom - 3, rc.right - 14, rc.bottom };
+        FillRect(dc, &bar, ab);
+        DeleteObject(ab);
+    }
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+        RECT fr = rc; InflateRect(&fr, -4, -4);
+        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        DrawFocusRect(dc, &fr);
+    }
 }
 
 static void PaintWindow(HDC dc)
@@ -1537,8 +2514,17 @@ static void PaintWindow(HDC dc)
     HPEN border = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
     HGDIOBJ oldPen = SelectObject(dc, border), oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
 
+    {                                           // line under the tabs
+        HPEN sep = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+        HGDIOBJ op = SelectObject(dc, sep);
+        MoveToEx(dc, 14, 42, nullptr); LineTo(dc, CLIENT_W - 14, 42);
+        SelectObject(dc, op);
+        DeleteObject(sep);
+    }
+
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
+        if (s.page >= 0 && s.page != gPage) continue;
         int y = s.y + (s.shifts ? d : 0);
         RoundRect(dc, s.x, y, s.x + s.w, y + s.h, 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
@@ -1628,9 +2614,21 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) RemoveOutput(id - IDC_ROWDEL);
         return;
     }
+    if (id >= IDC_FXGRP_ON && id < IDC_FXGRP_ON + FX_GROUPS) {
+        SetFxGroupOn(id - IDC_FXGRP_ON, Checked(id));
+        return;
+    }
+    if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) {
+        if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[1 + id - IDC_FXGRP_KEY], id);
+        return;
+    }
+    if (id >= IDC_FXGRP_RESET && id < IDC_FXGRP_RESET + FX_GROUPS) {
+        if (code == BN_CLICKED) ResetFxGroup(id - IDC_FXGRP_RESET);
+        return;
+    }
 
     switch (id) {
-    case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_FADE: case IDC_GATE: case IDC_TALKVOL:
+    case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_FADE: case IDC_TALKVOL:
         if (!gUiReady) break;
         for (Range& r : gRanges) {
             if (r.id != id) continue;
@@ -1639,19 +2637,42 @@ static void OnCommand(int id, int code)
             if (code == EN_CHANGE && ok) *r.var = Iclamp(v, r.lo, r.hi);
             else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)*r.var, FALSE);
         }
-        if (id == IDC_GATE) UpdateGateLin();
         break;
     case IDC_REPO:
         if (code == EN_CHANGE && gUiReady) GetDlgItemTextW(gWnd, IDC_REPO, gUpdateRepo, 200);
         break;
     case IDC_ADDOUT:   if (code == BN_CLICKED) AddOutput(); break;
-    case IDC_GATEON:   gGateOn = Checked(IDC_GATEON); break;
+    case IDC_TAB0: case IDC_TAB1: case IDC_TAB2:
+        if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
+        break;
+    case IDC_FXON:
+        if (code == BN_CLICKED) { SetFxOn(!gFxOn); UpdateStatus(true); }
+        break;
+    case IDC_GATEON:   SetGateMode(Checked(IDC_GATEON) ? gGateLastMode : GATE_OFF); break;
+    case IDC_GATEMODE:
+        if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
+        break;
+    case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_OPENSET:
+        if (code == BN_CLICKED) {
+            SaveSettings();                     // so the file is there and up to date
+            wchar_t args[MAX_PATH + 16];
+            wsprintfW(args, L"/select,\"%s\"", gIni);
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", args, nullptr, SW_SHOWNORMAL);
+        }
+        break;
+    case IDC_TAB3:
+        if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
+        break;
     case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
     case IDC_UPDSTART: gUpdateOnStart = Checked(IDC_UPDSTART); break;
     case IDC_CHECKUPD: if (code == BN_CLICKED) StartUpdateCheck(true); break;
     case IDC_HOLD:
     case IDC_TOGGLE:   gToggleMode = Checked(IDC_TOGGLE); UpdateStatus(true); break;
-    case IDC_HOTKEY:   if (code == BN_CLICKED) BeginKeyCapture(); break;
+    case IDC_HOTKEY:   if (code == BN_CLICKED) BeginKeyCapture(gHotkeys, IDC_HOTKEY); break;
+    case IDC_FXKEY_MASTER:
+        if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[0], IDC_FXKEY_MASTER);
+        break;
     case IDC_THEME:
         if (code == CBN_SELCHANGE) {
             gThemeMode = (int)SendDlgItemMessageW(gWnd, IDC_THEME, CB_GETCURSEL, 0, 0);
@@ -1689,15 +2710,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         gWnd = h;
         CreateUI();
         ApplyTheme();
-        if (gAutoStart && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 2000, nullptr);
+        // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
+        if ((gAutoStart || gResumeAudio) && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
         UpdateUi();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
+        SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
-        if (w == TIMER_STATUS) UpdateStatus();
+        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) CleanupOldExe();
+        else if (w == TIMER_FXKEYS) PollFxKeys();
         else if (w == TIMER_RECONNECT) {
             if (!gWantRunning || gRunning || StartAudio(true)) KillTimer(h, TIMER_RECONNECT);
             UpdateUi();
@@ -1730,7 +2754,19 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_DRAWITEM:
         if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_METER) { DrawMeter((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
+    case WM_LBUTTONDOWN:                        // click on empty space: leave the text/number box you were in
+        SetFocus(h);
+        return 0;
+    case WM_CONTEXTMENU: {                      // right-click a Voice FX hotkey button to clear it
+        int id = GetDlgCtrlID((HWND)w);
+        if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
+        if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
+        break;
+    }
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MINIMIZE) { ToTray(); return 0; }   // minimize goes to the tray
         break;
@@ -1789,9 +2825,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     InitCommonControlsEx(&icc);
 
     bool justUpdated = wcsstr(GetCommandLineW(), L"--updated") != nullptr;
+    gResumeAudio = justUpdated && wcsstr(GetCommandLineW(), L"--resume") != nullptr;
 
     LoadSettings();
     LoadThemeApis();
+    gNs = rnnoise_create(nullptr);              // built-in model; created once, used by the audio thread
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
     if (gCtxOk) ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
 
@@ -1808,6 +2846,14 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     wc.hbrBackground = nullptr;                          // painted in WM_ERASEBKGND (light or dark)
     wc.lpszClassName = L"LagEffectWnd";
     RegisterClassW(&wc);
+
+    WNDCLASSW kc = {};                                   // knobs on the Voice FX page
+    kc.style         = CS_DBLCLKS;
+    kc.lpfnWndProc   = KnobProc;
+    kc.hInstance     = hi;
+    kc.hCursor       = LoadCursorW(nullptr, IDC_SIZENS);
+    kc.lpszClassName = L"LagKnob";
+    RegisterClassW(&kc);
 
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT r = { 0, 0, CLIENT_W, BASE_H };
@@ -1827,6 +2873,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
+            (msg.hwnd == h || IsChild(h, msg.hwnd))) {
+            SetPage((gPage + 1) % TAB_COUNT);   // Ctrl+Tab: next page
+            continue;
+        }
         if (!IsDialogMessageW(h, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
