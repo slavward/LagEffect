@@ -30,7 +30,10 @@ jobs:
         shell: cmd
         run: |
           rc /nologo LagEffect.rc || exit /b 1
-          cl /nologo /O2 /MT /utf-8 /EHsc /W3 LagEffect.cpp LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe || exit /b 1
+          cl /nologo /O2 /MT /utf-8 /EHsc /W3 /D_USE_MATH_DEFINES LagEffect.cpp ^
+            rnnoise\src\denoise.c rnnoise\src\rnn.c rnnoise\src\rnn_data.c rnnoise\src\pitch.c ^
+            rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c ^
+            LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe || exit /b 1
 
       - name: Check the exe
         shell: pwsh

@@ -4,19 +4,23 @@
 // built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater,
 // and a Voice FX page (pitch shift + reverb on your live voice, set with knobs).
 //
-// Build:
-//   1. Put miniaudio.h (https://github.com/mackron/miniaudio) next to this file.
+// Build (GitHub Actions does this automatically, see .github/workflows/build.yml):
+//   1. Put miniaudio.h (https://github.com/mackron/miniaudio, 0.11.25) next to this file.
+//      RNNoise (noise suppression) is included in the rnnoise folder.
 //   2. Visual Studio (Developer Command Prompt):
 //        rc LagEffect.rc
-//        cl /O2 LagEffect.cpp LagEffect.res /link /SUBSYSTEM:WINDOWS
+//        cl /O2 /MT /utf-8 /D_USE_MATH_DEFINES LagEffect.cpp rnnoise\src\denoise.c rnnoise\src\rnn.c
+//           rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
+//           LagEffect.res /link /SUBSYSTEM:WINDOWS
 //      MinGW / MSYS2:
 //        windres LagEffect.rc -O coff -o LagEffect_res.o
-//        g++ -O2 LagEffect.cpp LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
+//        gcc -O2 -c rnnoise/src/{denoise,rnn,rnn_data,pitch,kiss_fft,celt_lpc}.c
+//        g++ -O2 LagEffect.cpp *.o LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
 //
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.6.0"
+#define APP_VERSION L"1.7.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -24,6 +28,7 @@
 #define NOMINMAX
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
+#include "rnnoise/include/rnnoise.h"           // AI noise suppression (BSD licence, see rnnoise/COPYING)
 
 #include <windows.h>
 #include <commctrl.h>
@@ -63,12 +68,11 @@ enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2 };
 
 // Settings shared with the audio threads (plain ints/floats are safe to read on x86/x64).
 static volatile int   gLoopMs = 500, gSpeedPct = 100, gPitchPct = 100, gFadeMs = 3;
-static volatile int   gGateDb = 50, gTalkVolPct = 100;
+static volatile int   gTalkVolPct = 100;
 #define MAX_KEYS 3                             // hotkey can be a combination of up to 3 keys
 static volatile int   gHotkeys[MAX_KEYS] = { VK_F8, 0, 0 };
-static volatile bool  gToggleMode = false, gGateOn = false, gTalkOver = false;
+static volatile bool  gToggleMode = false, gTalkOver = false;
 static volatile bool  gCapturingKey = false, gLooping = false;
-static volatile float gGateLin = 0.00316f;     // -50 dB
 static volatile int   gRowMode[MAX_OUT] = { MODE_ALL, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT };
 static volatile int   gRowVol[MAX_OUT]  = { 100, 100, 100, 100, 100 };
 
@@ -80,33 +84,108 @@ static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static int    gateHold = 0;
 
+// Mic cleanup (Mic tab). Order: boost -> low cut -> AI noise suppression -> gate -> leveler.
+enum { GATE_OFF = 0, GATE_VOLUME = 1, GATE_VOICE = 2, GATE_BOTH = 3 };
+static volatile int   gMicBoostDb = 0, gLowCutHz = 80, gLevelerPct = 0;
+static volatile bool  gNsOn = false;
+static volatile int   gNsStrength = 100;
+static volatile int   gGateMode = GATE_OFF, gGateLastMode = GATE_VOLUME;
+static volatile int   gGateThrDb = -50, gGateVoicePct = 60, gGateHoldMs = 150, gGateReleaseMs = 80, gGateRangeDb = 80;
+static volatile float gMeterPeak = 0, gMeterVad = 0;  // for the Mic tab meter (UI reads, then clears the peak)
+static volatile bool  gMeterGateOpen = true;
+
+// RNNoise works on 10 ms frames (480 samples at 48 kHz) and delays its output by one more frame,
+// so the dry signal is delayed by the same 20 ms to stay lined up when blending.
+#define NS_FRAME 480
+#define NS_DELAY (NS_FRAME * 2)
+#define DRY_RING 1024
+static DenoiseState* gNs = nullptr;
+static float nsIn[NS_FRAME], nsOut[NS_FRAME], dryRing[DRY_RING];
+static int   nsIdx = 0, dryW = 0;
+static float nsVad = 0;
+static float hpX1, hpX2, hpY1, hpY2, hpB0 = 1, hpB1, hpB2, hpA1, hpA2;
+static int   hpFc = -1;
+static float lvEnv = 0;
+static float limGain[MAX_OUT] = { 1, 1, 1, 1, 1 };
+
+// 2nd-order Butterworth high-pass ("Low cut"), coefficients recomputed when the knob moves.
+static void LowCutSetup(int fc)
+{
+    hpFc = fc;
+    if (fc <= 0) return;
+    double w = 2.0 * 3.141592653589793 * fc / RATE, c = cos(w), al = sin(w) / (2.0 * 0.7071067811865476);
+    double a0 = 1.0 + al;
+    hpB0 = (float)((1.0 + c) / 2.0 / a0); hpB1 = (float)(-(1.0 + c) / a0); hpB2 = hpB0;
+    hpA1 = (float)(-2.0 * c / a0);         hpA2 = (float)((1.0 - al) / a0);
+}
+
+static inline float LowCut(float x)
+{
+    float y = hpB0 * x + hpB1 * hpX1 + hpB2 * hpX2 - hpA1 * hpY1 - hpA2 * hpY2;
+    hpX2 = hpX1; hpX1 = x; hpY2 = hpY1; hpY1 = y;
+    return y;
+}
+
+// Runs RNNoise one frame behind. Returns the denoised sample and, through *dry, the input from
+// the same moment (20 ms ago). Updates nsVad (0..1 chance that the last frame was speech).
+static inline float NoiseStage(float x, float* dry)
+{
+    dryRing[dryW] = x;
+    *dry = dryRing[(dryW - NS_DELAY) & (DRY_RING - 1)];
+    dryW = (dryW + 1) & (DRY_RING - 1);
+    float den = nsOut[nsIdx];
+    nsIn[nsIdx] = x * 32768.0f;                  // RNNoise expects 16-bit sample values
+    if (++nsIdx == NS_FRAME) {
+        nsIdx = 0;
+        float frame[NS_FRAME];
+        nsVad = gNs ? rnnoise_process_frame(gNs, frame, nsIn) : 1.0f;
+        for (int i = 0; i < NS_FRAME; i++) nsOut[i] = gNs ? frame[i] * (1.0f / 32768.0f) : nsIn[i] * (1.0f / 32768.0f);
+    }
+    return den;
+}
+
+static void MicReset()                          // audio thread / before start
+{
+    gateEnv = 0; gateGain = 1; gateHold = 0;
+    memset(nsIn, 0, sizeof(nsIn)); memset(nsOut, 0, sizeof(nsOut)); memset(dryRing, 0, sizeof(dryRing));
+    nsIdx = 0; dryW = 0; nsVad = 0;
+    hpX1 = hpX2 = hpY1 = hpY2 = 0; hpFc = -1;
+    lvEnv = 0;
+    for (int k = 0; k < MAX_OUT; k++) limGain[k] = 1;
+}
+
+// Output limiter: leaves everything under -1 dBFS untouched; louder peaks are turned down
+// smoothly instead of being distorted (replaces the old soft clipper, which coloured loud voices).
+static inline float Limit(int k, float x)
+{
+    const float ceil = 0.891f;                   // -1 dBFS
+    float a = x < 0 ? -x : x;
+    if (a * limGain[k] > ceil) limGain[k] = ceil / a;
+    float y = x * limGain[k];
+    limGain[k] += (1.0f - limGain[k]) * 0.00014f;   // ~150 ms recovery
+    return y;
+}
+
+// 4-point Hermite interpolation: noticeably cleaner than straight lines when pitch/speed resample.
+static inline float Hermite(float xm1, float x0, float x1, float x2, float t)
+{
+    float c1 = 0.5f * (x1 - xm1);
+    float c2 = xm1 - 2.5f * x0 + 2.0f * x1 - 0.5f * x2;
+    float c3 = 0.5f * (x2 - xm1) + 1.5f * (x0 - x1);
+    return ((c3 * t + c2) * t + c1) * t + x0;
+}
+
 // Output 1 plays straight from the main audio callback. Outputs 2-5 are separate devices
 // fed through ring buffers.
 static float             ring[MAX_OUT][RING_SIZE];
 static volatile unsigned ringW[MAX_OUT], ringR[MAX_OUT];
 static volatile bool     ringOn[MAX_OUT];
 
-static void UpdateGateLin()
-{
-    float v = 1.0f;
-    for (int i = 0; i < gGateDb; i++) v *= 0.891250938f;   // -1 dB per step
-    gGateLin = v;
-}
-
 static inline double WrapPos(double p, double len)
 {
     while (p >= len) p -= len;
     while (p < 0) p += len;
     return p;
-}
-
-// Leaves normal levels untouched and gently rounds off peaks above 0.7 (voice + loop can add up).
-static inline float SoftLimit(float x)
-{
-    float a = x < 0 ? -x : x;
-    if (a <= 0.7f) return x;
-    float y = 0.7f + 0.3f * tanhf((a - 0.7f) / 0.3f);
-    return x < 0 ? -y : y;
 }
 
 static inline float RowSignal(int mode, float effect, float everything)
@@ -156,14 +235,14 @@ static inline float PsRead(double d)
     if (rp < 0) rp += PS_SIZE;
     int   i0 = (int)rp;
     float t  = (float)(rp - i0);
-    float a = psBuf[i0 & (PS_SIZE - 1)], b = psBuf[(i0 + 1) & (PS_SIZE - 1)];
-    return a + (b - a) * t;
+    return Hermite(psBuf[(i0 - 1) & (PS_SIZE - 1)], psBuf[i0 & (PS_SIZE - 1)],
+                   psBuf[(i0 + 1) & (PS_SIZE - 1)], psBuf[(i0 + 2) & (PS_SIZE - 1)], t);
 }
 
 static double PsGrainStart(int k, double ratio, int span)
 {
     // Going up, the read point catches up with the input, so a grain starts a full span back.
-    int base  = ratio > 1.0 ? 1 + span : 1;
+    int base  = ratio > 1.0 ? 2 + span : 2;
     int other = (int)(psDelay[1 - k] + 0.5);
     float best = -1e30f; int bestD = 0;
     for (int d = 0; d < PS_SEARCH; d += 2) {
@@ -189,7 +268,7 @@ static float PitchShift(float x, double ratio, int span, float mix)
         if (grain > RATE) grain = RATE;
         if (grain < 256)  grain = 256;
         if (!psPrimed) {
-            psDelay[0] = psDelay[1] = ratio > 1.0 ? 1 + span : 1;
+            psDelay[0] = psDelay[1] = ratio > 1.0 ? 2 + span : 2;
             psFrac[0] = 0.0; psFrac[1] = 0.5;
             psPrimed = true;
         }
@@ -197,7 +276,7 @@ static float PitchShift(float x, double ratio, int span, float mix)
         float wet = 0.0f;
         for (int k = 0; k < 2; k++) {
             if (psFrac[k] >= 1.0) { psFrac[k] -= 1.0; psDelay[k] = PsGrainStart(k, ratio, span); }
-            if (psDelay[k] < 1.0)  psDelay[k] = 1.0;
+            if (psDelay[k] < 2.0)  psDelay[k] = 2.0;
             if (psDelay[k] > maxD) psDelay[k] = maxD;
             float s = (float)sin(3.141592653589793 * psFrac[k]);
             wet += PsRead(psDelay[k]) * s * s;
@@ -303,8 +382,6 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         r[k]    = ringR[k];
     }
 
-    const bool   gateOn  = gGateOn;
-    const float  thr     = gGateLin;
     const bool   talk    = gTalkOver;
     const float  talkVol = gTalkVolPct / 100.0f;
     const double speed   = gSpeedPct / 100.0;
@@ -322,18 +399,57 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const float  rvMix = gFxRevMix / 100.0f, rvSize = gFxRevSize / 100.0f, rvDamp = gFxRevDamp / 100.0f;
     const int    rvPre = Iclamp(gFxPreMs * RATE / 1000, 0, PRE_SIZE - 1);
 
-    for (ma_uint32 f = 0; f < frames; f++) {
-        float s = in ? in[f] : 0.0f;
+    // Mic cleanup settings for this block
+    const float boost    = powf(10.0f, gMicBoostDb / 20.0f);
+    if (gLowCutHz != hpFc) LowCutSetup(gLowCutHz);
+    const bool  lowCut   = hpFc > 0;
+    const int   gateMode = gGateMode;
+    const bool  nsOn     = gNsOn;
+    const bool  nsStage  = nsOn || gateMode == GATE_VOICE || gateMode == GATE_BOTH;   // voice detection needs RNNoise too
+    const float nsMix    = gNsStrength / 100.0f;
+    const float thrOpen  = powf(10.0f, gGateThrDb / 20.0f), thrClose = thrOpen * 0.63f;   // 4 dB hysteresis
+    const float voiceMin = gGateVoicePct / 100.0f;
+    const int   holdN    = gGateHoldMs * RATE / 1000;
+    const float relCoef  = 1.0f - expf(-1.0f / (gGateReleaseMs * 0.001f * RATE));
+    const float atkCoef  = 1.0f - expf(-1.0f / (0.001f * RATE));                      // opens in ~1 ms
+    const float floorLin = powf(10.0f, -gGateRangeDb / 20.0f);
+    const float lvAmt    = gLevelerPct / 100.0f;
+    const float lvRatio  = 1.0f + 3.0f * lvAmt, lvMakeupDb = 6.0f * lvAmt;
+    float blockPeak = 0;
 
-        if (gateOn) {                           // noise gate: 1 ms open, 150 ms hold, 80 ms close
-            float a = s < 0 ? -s : s;
-            gateEnv = a > gateEnv ? a : gateEnv * 0.99948f;
-            if (gateEnv > thr) gateHold = RATE * 150 / 1000;
-            else if (gateHold > 0) gateHold--;
-            float target = gateHold > 0 ? 1.0f : 0.0f;
-            gateGain += (target - gateGain) * (target > gateGain ? 0.0206f : 0.00026f);
-            s *= gateGain;
+    for (ma_uint32 f = 0; f < frames; f++) {
+        float s = in ? in[f] * boost : 0.0f;
+        if (lowCut) s = LowCut(s);
+
+        if (nsStage) {
+            float dry, den = NoiseStage(s, &dry);
+            s = nsOn ? dry + (den - dry) * nsMix : dry;
         }
+        { float a = s < 0 ? -s : s; if (a > blockPeak) blockPeak = a; }
+
+        if (gateMode != GATE_OFF) {             // noise gate: opens in 1 ms, then hold, then release
+            float a = s < 0 ? -s : s;
+            gateEnv = a > gateEnv ? a : gateEnv * 0.99792f;          // 10 ms peak follower
+            bool loud  = gateEnv > (gateHold > 0 ? thrClose : thrOpen);
+            bool voice = nsVad >= voiceMin;
+            bool open  = gateMode == GATE_VOLUME ? loud : gateMode == GATE_VOICE ? voice : (loud && voice);
+            if (open) gateHold = holdN + 1;
+            else if (gateHold > 0) gateHold--;
+            float target = gateHold > 0 ? 1.0f : floorLin;
+            gateGain += (target - gateGain) * (target > gateGain ? atkCoef : relCoef);
+            s *= gateGain;
+        } else {
+            gateGain = 1.0f; gateHold = 1;
+        }
+
+        if (lvAmt > 0) {                        // leveler: gentle compressor above -30 dBFS + make-up gain
+            float pw = s * s;
+            lvEnv += (pw - lvEnv) * (pw > lvEnv ? 0.0042f : 0.0001f);   // ~5 ms attack, ~200 ms release
+            float lvl = 10.0f * log10f(lvEnv + 1e-12f);
+            float gdb = (lvl > -30.0f ? (-30.0f - lvl) * (1.0f - 1.0f / lvRatio) : 0.0f) + lvMakeupDb;
+            s *= powf(10.0f, gdb / 20.0f);
+        }
+
         if (fxPitch) s = PitchShift(s, psRatio, psGrain, psMix);
         if (fxRev)   s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
 
@@ -342,9 +458,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             float v = 0.0f;
             for (int k = 0; k < 2; k++) {
                 double rp = WrapPos(grainStart[k] + grainAge[k] * pitch, len);
-                size_t i0 = (size_t)rp, i1 = (i0 + 1) % frozenLen;
+                size_t i0 = (size_t)rp;
                 float t = (float)(rp - (double)i0);
-                float smp = frozen[i0] * (1 - t) + frozen[i1] * t;
+                size_t im = (i0 + frozenLen - 1) % frozenLen, i1 = (i0 + 1) % frozenLen, i2 = (i0 + 2) % frozenLen;
+                float smp = Hermite(frozen[im], frozen[i0], frozen[i1], frozen[i2], t);
                 if (fade >= 1) {                // soften the click at the loop seam
                     double d = len - rp;
                     if (rp < d) d = rp;
@@ -367,18 +484,21 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             everything = s;
         }
 
-        float o = SoftLimit(RowSignal(mode[0], effect, everything) * vol[0]);
+        float o = Limit(0, RowSignal(mode[0], effect, everything) * vol[0]);
         out[f * 2] = o;
         out[f * 2 + 1] = o;
 
         for (int k = 1; k < MAX_OUT; k++) {
             if (!on[k] || (w[k] - r[k]) >= RING_SIZE) continue;
-            ring[k][w[k] & (RING_SIZE - 1)] = SoftLimit(RowSignal(mode[k], effect, everything) * vol[k]);
+            ring[k][w[k] & (RING_SIZE - 1)] = Limit(k, RowSignal(mode[k], effect, everything) * vol[k]);
             w[k]++;
         }
     }
     MemoryBarrier();
     for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
+    if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
+    gMeterVad = nsStage ? nsVad : -1.0f;
+    gMeterGateOpen = gateHold > 0;
 }
 
 static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_uint32 frames)
@@ -409,8 +529,8 @@ enum {
     IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_FADE, IDC_GATE, IDC_TALKVOL,
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
-    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_VERSION,
-    IDC_FXON, IDC_FXKEY_MASTER,
+    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -443,7 +563,6 @@ static Range gRanges[] = {
     { IDC_SPEED,   10, 400,  &gSpeedPct,   L"speed"           },
     { IDC_PITCH,   25, 400,  &gPitchPct,   L"pitch"           },
     { IDC_FADE,    0,  50,   &gFadeMs,     L"smoothing_ms"    },
-    { IDC_GATE,    20, 90,   &gGateDb,     L"gate_db"         },
     { IDC_TALKVOL, 0,  200,  &gTalkVolPct, L"talkover_volume" },
 };
 
@@ -461,16 +580,28 @@ static FxGroup gFxGroups[] = {
 static int  gFxKeys[FX_KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[FX_KEY_SLOTS];
 
-struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar; };
+// Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
+enum { KG_PITCH = 0, KG_REVERB = 1, KG_NS = 2, KG_GATE = 3, KG_TONE = 4 };
+struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar;
+              const wchar_t* offText; };          // shown (and the knob dimmed) when the value is at its minimum
 static Knob gKnobs[] = {
-    { L"Pitch",     L" st", -12, 12,  0,   &gFxSemi,     L"fx_pitch_semitones", 0, true  },
-    { L"Fine",      L" ct", -100, 100, 0,  &gFxCents,    L"fx_pitch_cents",     0, true  },
-    { L"Grain",     L" ms", 20,  100, 50,  &gFxGrainMs,  L"fx_pitch_grain_ms",  0, false },
-    { L"Mix",       L"%",   0,   100, 100, &gFxPitchMix, L"fx_pitch_mix",       0, false },
-    { L"Mix",       L"%",   0,   100, 30,  &gFxRevMix,   L"fx_reverb_mix",      1, false },
-    { L"Size",      L"%",   0,   100, 60,  &gFxRevSize,  L"fx_reverb_size",     1, false },
-    { L"Damping",   L"%",   0,   100, 50,  &gFxRevDamp,  L"fx_reverb_damping",  1, false },
-    { L"Pre-delay", L" ms", 0,   200, 20,  &gFxPreMs,    L"fx_reverb_predelay", 1, false },
+    { L"Pitch",     L" st", -12, 12,  0,   &gFxSemi,     L"fx_pitch_semitones", 0, true, nullptr  },
+    { L"Fine",      L" ct", -100, 100, 0,  &gFxCents,    L"fx_pitch_cents",     0, true, nullptr  },
+    { L"Grain",     L" ms", 20,  100, 50,  &gFxGrainMs,  L"fx_pitch_grain_ms",  0, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 100, &gFxPitchMix, L"fx_pitch_mix",       0, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 30,  &gFxRevMix,   L"fx_reverb_mix",      1, false, nullptr },
+    { L"Size",      L"%",   0,   100, 60,  &gFxRevSize,  L"fx_reverb_size",     1, false, nullptr },
+    { L"Damping",   L"%",   0,   100, 50,  &gFxRevDamp,  L"fx_reverb_damping",  1, false, nullptr },
+    { L"Pre-delay", L" ms", 0,   200, 20,  &gFxPreMs,    L"fx_reverb_predelay", 1, false, nullptr },
+    { L"Strength",  L"%",   0,   100, 100, &gNsStrength,    L"ns_strength",       KG_NS,   false, nullptr },
+    { L"Threshold", L" dB", -90, -10, -50, &gGateThrDb,     L"gate_threshold_db", KG_GATE, false, nullptr },
+    { L"Voice",     L"%",   10,  99,  60,  &gGateVoicePct,  L"gate_voice_pct",    KG_GATE, false, nullptr },
+    { L"Hold",      L" ms", 0,   1000, 150, &gGateHoldMs,   L"gate_hold_ms",      KG_GATE, false, nullptr },
+    { L"Release",   L" ms", 10,  1000, 80, &gGateReleaseMs, L"gate_release_ms",   KG_GATE, false, nullptr },
+    { L"Range",     L" dB", 0,   80,  80,  &gGateRangeDb,   L"gate_range_db",     KG_GATE, false, nullptr },
+    { L"Mic boost", L" dB", -12, 24,  0,   &gMicBoostDb,    L"mic_boost_db",      KG_TONE, true, nullptr  },
+    { L"Low cut",   L" Hz", 0,   300, 80,  &gLowCutHz,      L"low_cut_hz",        KG_TONE, false, L"Off" },
+    { L"Leveler",   L"%",   0,   100, 0,   &gLevelerPct,    L"leveler",           KG_TONE, false, L"Off" },
 };
 #define KNOB_N ((int)(sizeof(gKnobs) / sizeof(gKnobs[0])))
 
@@ -740,14 +871,12 @@ static void LoadSettings()
     gHotkeys[2]    = Iclamp(INI_INT(L"hotkey3", 0), 0, 255);
     if (!gHotkeys[0]) gHotkeys[0] = VK_F8;
     gToggleMode    = INI_INT(L"toggle", 0) != 0;
-    gGateOn        = INI_INT(L"gate", 0) != 0;
     gTalkOver      = INI_INT(L"talkover", 0) != 0;
     gBufIdx        = Iclamp(INI_INT(L"buffer", 2), 0, 4);
     gExclusive     = INI_INT(L"exclusive", 0) != 0;
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
     gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
-    UpdateGateLin();
 
     gFxOn = INI_INT(L"fx_on", 0) != 0;
     for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
@@ -765,6 +894,15 @@ static void LoadSettings()
         wchar_t b[32];
         GetPrivateProfileStringW(L"settings", k.key, L"", b, 32, gIni);
         *k.var = Iclamp(b[0] ? _wtoi(b) : k.def, k.lo, k.hi);
+    }
+    // Mic tab. Settings from 1.5 and older: gate=1/0 and gate_db=50 (meaning -50 dB).
+    gNsOn         = INI_INT(L"ns_on", 0) != 0;
+    gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
+    gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
+    {
+        wchar_t b[32];
+        GetPrivateProfileStringW(L"settings", L"gate_threshold_db", L"", b, 32, gIni);
+        if (!b[0]) gGateThrDb = Iclamp(-INI_INT(L"gate_db", 50), -90, -10);
     }
 
     GetPrivateProfileStringW(L"settings", L"mic",         L"", gMicName, 512, gIni);
@@ -814,7 +952,8 @@ static void SaveSettings()
     for (Range& r : gRanges) SaveInt(r.key, *r.var);
     SaveInt(L"hotkey", gHotkeys[0]); SaveInt(L"hotkey2", gHotkeys[1]); SaveInt(L"hotkey3", gHotkeys[2]);
     SaveInt(L"toggle", gToggleMode);
-    SaveInt(L"gate", gGateOn); SaveInt(L"talkover", gTalkOver);
+    SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
+    SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
@@ -857,6 +996,7 @@ static bool StartExtraOutput(int k)
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.dataCallback       = ExtraOutputCallback;
+    cfg.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;
     cfg.notificationCallback = NotifyCallback;
     cfg.pUserData          = (void*)(INT_PTR)k;
     int i = ComboIndex(IDC_ROWDEV + k);
@@ -893,6 +1033,7 @@ static bool StartAudio(bool quiet)
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.dataCallback       = AudioCallback;
+    cfg.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;   // cleanest resampling if a device isn't at 48 kHz
     cfg.notificationCallback = NotifyCallback;
     if (gExclusive) {
         cfg.capture.shareMode  = ma_share_mode_exclusive;
@@ -904,7 +1045,7 @@ static bool StartAudio(bool quiet)
 
     memset(hist, 0, sizeof(hist));
     wpos = 0; frozenLen = 1; looping = false; toggled = false; prevDown = false;
-    gateEnv = 0; gateGain = 1; gateHold = 0;
+    MicReset();
     gFxResetReq = true;
 
     gStopping = false;
@@ -946,13 +1087,13 @@ static void StopAudio()
 // ======================= layout helpers =======================
 // Everything below the output list moves down as outputs are added, so controls created after
 // the list are recorded with their starting position.
-// Controls also belong to a page (tab): 0 = Main, 1 = Voice FX, 2 = Settings. Only the current page is shown.
+// Controls also belong to a page (tab): Main, Mic, Voice FX, Settings. Only the current page is shown.
 #define CLIENT_W  560
 #define BASE_H    592                          // window height with one output
 #define ROW_Y0    134
 #define ROW_H     30
-#define TAB_COUNT 3
-enum { PAGE_MAIN = 0, PAGE_FX = 1, PAGE_SETTINGS = 2 };
+#define TAB_COUNT 4
+enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SETTINGS = 3 };
 
 struct Shifted { HWND h; int x, y; };
 struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; };
@@ -1014,7 +1155,21 @@ static int    gKnobLastY = 0;
 static double gKnobAccum = 0;
 static int    gWheelAccum = 0;
 
-static bool KnobActive(int i) { return gFxOn && *gFxGroups[gKnobs[i].group].on; }
+static bool KnobActive(int i)
+{
+    const Knob& k = gKnobs[i];
+    if (k.offText && *k.var == k.lo) return false;
+    switch (k.group) {
+    case KG_NS:   return gNsOn;
+    case KG_GATE:
+        if (gGateMode == GATE_OFF) return false;
+        if (k.var == &gGateThrDb)    return gGateMode == GATE_VOLUME || gGateMode == GATE_BOTH;
+        if (k.var == &gGateVoicePct) return gGateMode == GATE_VOICE  || gGateMode == GATE_BOTH;
+        return true;
+    case KG_TONE: return true;
+    }
+    return gFxOn && *gFxGroups[k.group].on;
+}
 static int  KnobStep(int i)   { return Imax(1, (gKnobs[i].hi - gKnobs[i].lo) / 50); }
 
 static void SetKnobValue(HWND h, int i, int v)
@@ -1099,7 +1254,8 @@ static void PaintKnob(HWND h, HDC dc)
     DrawTextW(dc, k.label, -1, &lr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
 
     wchar_t txt[32];
-    wsprintfW(txt, k.bipolar && *k.var > 0 ? L"+%d%s" : L"%d%s", *k.var, k.unit);
+    if (k.offText && *k.var == k.lo) lstrcpynW(txt, k.offText, 32);
+    else wsprintfW(txt, k.bipolar && *k.var > 0 ? L"+%d%s" : L"%d%s", *k.var, k.unit);
     SelectObject(dc, gFontBold);
     SetTextColor(dc, on ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(130, 130, 130)));
     RECT vr = { 0, cy + 30, rc.right, rc.bottom };
@@ -1276,6 +1432,116 @@ static void PollFxKeys()
         }
         UpdateStatus(true);
     }
+}
+
+// ---------- Mic tab ----------
+static float gMeterShowDb = -90.0f, gMeterVadShow = 0.0f;
+
+static void UpdateMeter()                       // every 50 ms: fast rise, smooth fall
+{
+    float peak = gMeterPeak; gMeterPeak = 0;
+    float db = peak > 0.0000316f ? 20.0f * log10f(peak) : -90.0f;
+    gMeterShowDb = db > gMeterShowDb ? db : (gMeterShowDb - 2.5f > db ? gMeterShowDb - 2.5f : db);
+    float v = gMeterVad;
+    gMeterVadShow = v < 0 ? -1.0f : (v > gMeterVadShow ? v : gMeterVadShow * 0.8f + v * 0.2f);
+    if (gPage == PAGE_MIC) InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+}
+
+static void DrawMeterTo(HDC dc, RECT rc)
+{
+    FillRect(dc, &rc, BgBrush());
+    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : RGB(252, 252, 252));
+    HPEN   cpen = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+    HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, cpen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(dc, ob); SelectObject(dc, op);
+    DeleteObject(card); DeleteObject(cpen);
+
+    const float lo = -72.0f;
+    const int x0 = rc.left + 96, x1 = rc.right - 120, bh = 12;
+    const int by = rc.top + 14;
+    auto X = [&](float db) { float t = (db - lo) / -lo; t = t < 0 ? 0 : t > 1 ? 1 : t; return x0 + (int)((x1 - x0) * t); };
+
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, gFontBold);
+    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    RECT lr = { rc.left + 14, rc.top, x0 - 8, rc.top + 40 };
+    DrawTextW(dc, L"Mic level", -1, &lr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+
+    RECT track = { x0, by, x1, by + bh };
+    HBRUSH tb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222));
+    FillRect(dc, &track, tb); DeleteObject(tb);
+
+    bool gateOn = gGateMode != GATE_OFF, open = !gateOn || gMeterGateOpen;
+    COLORREF fillc = !gRunning ? (gDark ? RGB(90, 90, 90) : RGB(180, 180, 180))
+                   : open ? RGB(40, 190, 90) : (gDark ? RGB(110, 110, 110) : RGB(165, 165, 165));
+    RECT lvl = { x0, by, X(gMeterShowDb), by + bh };
+    HBRUSH fb = CreateSolidBrush(fillc); FillRect(dc, &lvl, fb); DeleteObject(fb);
+    if (gMeterShowDb > -6.0f) {                 // hot zone
+        RECT hot = { X(-6.0f), by, X(gMeterShowDb), by + bh };
+        HBRUSH hb = CreateSolidBrush(RGB(235, 150, 40)); FillRect(dc, &hot, hb); DeleteObject(hb);
+    }
+    if (gateOn && (gGateMode == GATE_VOLUME || gGateMode == GATE_BOTH)) {   // threshold marker
+        int tx = X((float)gGateThrDb);
+        RECT m = { tx - 1, by - 4, tx + 1, by + bh + 4 };
+        HBRUSH mb = CreateSolidBrush(ACCENT); FillRect(dc, &m, mb); DeleteObject(mb);
+    }
+
+    SelectObject(dc, gFont);
+    SetTextColor(dc, gDark ? DK_DIM : RGB(105, 105, 105));
+    if (gMeterVadShow >= 0) {                   // voice detection bar (when RNNoise is running)
+        int vy = by + bh + 8;
+        RECT vt = { x0, vy, x1, vy + 5 };
+        HBRUSH vb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222)); FillRect(dc, &vt, vb); DeleteObject(vb);
+        RECT vf = { x0, vy, x0 + (int)((x1 - x0) * (gMeterVadShow > 1 ? 1 : gMeterVadShow)), vy + 5 };
+        HBRUSH vfb = CreateSolidBrush(RGB(160, 120, 240)); FillRect(dc, &vf, vfb); DeleteObject(vfb);
+        if (gGateMode == GATE_VOICE || gGateMode == GATE_BOTH) {
+            int tx = x0 + (int)((x1 - x0) * (gGateVoicePct / 100.0f));
+            RECT m = { tx - 1, vy - 3, tx + 1, vy + 8 };
+            HBRUSH mb = CreateSolidBrush(ACCENT); FillRect(dc, &m, mb); DeleteObject(mb);
+        }
+        RECT vl = { x0, vy + 6, x1, rc.bottom - 2 };
+        DrawTextW(dc, L"voice detected", -1, &vl, DT_SINGLELINE | DT_LEFT | DT_TOP);
+    }
+
+    wchar_t t1[32], t2[32];
+    if (!gRunning) { lstrcpynW(t1, L"--", 32); lstrcpynW(t2, L"Audio stopped", 32); }
+    else {
+        if (gMeterShowDb <= -89.0f) lstrcpynW(t1, L"silent", 32);
+        else wsprintfW(t1, L"%d dB", (int)floorf(gMeterShowDb + 0.5f));
+        lstrcpynW(t2, !gateOn ? L"Gate off" : open ? L"Gate open" : L"Gate closed", 32);
+    }
+    SelectObject(dc, gFontBold);
+    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    RECT r1 = { x1 + 10, rc.top + 8, rc.right - 14, rc.top + 26 };
+    DrawTextW(dc, t1, -1, &r1, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+    SelectObject(dc, gFont);
+    SetTextColor(dc, open && gateOn && gRunning ? RGB(40, 170, 80) : gDark ? DK_DIM : RGB(105, 105, 105));
+    RECT r2 = { x1 + 10, rc.top + 27, rc.right - 14, rc.top + 45 };
+    DrawTextW(dc, t2, -1, &r2, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+    SelectObject(dc, of);
+}
+
+static void DrawMeter(DRAWITEMSTRUCT* d)        // double-buffered, it redraws 20 times a second
+{
+    RECT rc = d->rcItem;
+    int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    HDC mem = CreateCompatibleDC(d->hDC);
+    HBITMAP bmp = CreateCompatibleBitmap(d->hDC, w, h);
+    HGDIOBJ old = SelectObject(mem, bmp);
+    RECT local = { 0, 0, w, h };
+    DrawMeterTo(mem, local);
+    BitBlt(d->hDC, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY);
+    SelectObject(mem, old); DeleteObject(bmp); DeleteDC(mem);
+}
+
+static void SetGateMode(int m)
+{
+    if (m != GATE_OFF) gGateLastMode = m;
+    gGateMode = m;
+    CheckDlgButton(gWnd, IDC_GATEON, m != GATE_OFF ? BST_CHECKED : BST_UNCHECKED);
+    SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_SETCURSEL, m, 0);
+    RedrawKnobs();
 }
 
 static void ResetFxGroup(int g)
@@ -1788,8 +2054,13 @@ static void ShowHelp()
         L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
         L"PAGES\n"
-        L"Main has the outputs, effect and hotkey. Voice FX adds pitch and reverb to your live voice. "
-        L"Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch and "
+        L"reverb to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"MIC\n"
+        L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
+        L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
+        L"the meter's level when you're quiet), on Voice (AI speech detection) or both. Low cut removes rumble, "
+        L"Leveler evens out your volume.\n\n"
         L"VOICE FX\n"
         L"Flip the switch at the top, then tick the effects you want. Drag a knob up or down, scroll it, "
         L"or use the arrow keys (hold Shift for fine steps). Double-click a knob to reset it.\n"
@@ -1810,7 +2081,7 @@ static void ShowHelp()
         L"2. In Discord, set Input Device to \"CABLE Output\".\n"
         L"3. Set Noise Suppression to None or Standard (Krisp erases the effect), and turn off Echo "
         L"Cancellation and Automatic Gain Control.\n"
-        L"4. Turn on Lag Effect's noise gate to keep background noise out.\n\n"
+        L"4. On the Mic tab, turn on Noise suppression (AI) and/or the noise gate to keep background noise out.\n\n"
         L"OBS\n"
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
@@ -1998,8 +2269,9 @@ static void CreateUI()
     // Tabs (always visible). Drawn by DrawTab().
     gBuildPage = -1;
     Ctl(L"BUTTON", L"Main",     BS_OWNERDRAW | WS_TABSTOP, 14,  10, 100, 32, IDC_TAB0 + PAGE_MAIN);
-    Ctl(L"BUTTON", L"Voice FX", BS_OWNERDRAW | WS_TABSTOP, 118, 10, 100, 32, IDC_TAB0 + PAGE_FX);
-    Ctl(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, 222, 10, 100, 32, IDC_TAB0 + PAGE_SETTINGS);
+    Ctl(L"BUTTON", L"Mic",      BS_OWNERDRAW | WS_TABSTOP, 118, 10, 100, 32, IDC_TAB0 + PAGE_MIC);
+    Ctl(L"BUTTON", L"Voice FX", BS_OWNERDRAW | WS_TABSTOP, 222, 10, 100, 32, IDC_TAB0 + PAGE_FX);
+    Ctl(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, 326, 10, 100, 32, IDC_TAB0 + PAGE_SETTINGS);
 
     // ---------------- Main page ----------------
     // Grid: sections run from x 14 to 546, contents from x 30 to 530.
@@ -2050,9 +2322,8 @@ static void CreateUI()
     Ctl(L"STATIC", L"ms", 0, 474, 293, 40, 20, -1);
 
     Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 327, 104, 20, IDC_GATEON);
-    CheckDlgButton(gWnd, IDC_GATEON, gGateOn ? BST_CHECKED : BST_UNCHECKED);
-    Spin(IDC_GATE, 136, 324, 76, 20, 90, gGateDb);
-    Ctl(L"STATIC", L"-dB", 0, 218, 327, 40, 20, -1);
+    CheckDlgButton(gWnd, IDC_GATEON, gGateMode != GATE_OFF ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Threshold, AI noise suppression and more are on the Mic tab.", 0, 136, 328, 390, 18, IDC_HDR);
 
     Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 361, 250, 20, IDC_TALKON);
     CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
@@ -2075,6 +2346,49 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 544, 172, 34, IDC_HELPBTN);
 
     gRecordShift = false;
+
+    // ---------------- Mic page ----------------
+    // Live meter, then AI noise suppression, noise gate and voice quality sections.
+    gBuildPage = PAGE_MIC;
+    Ctl(L"STATIC", L"", SS_OWNERDRAW, 14, 56, 532, 52, IDC_METER);
+    {
+        const int MIC_Y0 = 130, MIC_STEP = 146, MIC_H = 126;
+        int y = MIC_Y0;                         // noise suppression
+        AddSection(14, y, 532, MIC_H, L"Noise suppression (AI)");
+        for (int i = 0; i < KNOB_N; i++)
+            if (gKnobs[i].group == KG_NS) Ctl(L"LagKnob", L"", WS_TABSTOP | WS_GROUP, 26, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+        Ctl(L"STATIC", L"Removes background noise like fans, keyboards, hum and room echo, "
+                       L"and keeps your voice. Uses RNNoise. Adds about 20 ms of delay.", 0, 134, y + 24, 284, 74, IDC_HDR);
+        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_NSON);
+        CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+
+        y += MIC_STEP;                          // noise gate
+        AddSection(14, y, 532, MIC_H, L"Noise gate");
+        int col = 0;
+        for (int i = 0; i < KNOB_N; i++) {
+            if (gKnobs[i].group != KG_GATE) continue;
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 22 + col * 80, y + 14, 80, KNOB_H, IDC_KNOB + i);
+            col++;
+        }
+        Ctl(L"STATIC", L"Opens on:", 0, 430, y + 16, 100, 18, IDC_HDR);
+        HWND gm = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 428, y + 36, 104, 200, IDC_GATEMODE);
+        const wchar_t* gateNames[] = { L"Off", L"Volume", L"Voice", L"Volume + voice" };
+        for (const wchar_t* n : gateNames) SendMessageW(gm, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(gm, CB_SETCURSEL, gGateMode, 0);
+        SendMessageW(gm, CB_SETDROPPEDWIDTH, 130, 0);
+        Ctl(L"STATIC", L"Voice = AI speech detection. Range = how much quieter when closed.", 0, 430, y + 66, 108, 56, IDC_HDR);
+
+        y += MIC_STEP;                          // voice quality
+        AddSection(14, y, 532, MIC_H, L"Voice quality");
+        col = 0;
+        for (int i = 0; i < KNOB_N; i++) {
+            if (gKnobs[i].group != KG_TONE) continue;
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 98, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+            col++;
+        }
+        Ctl(L"STATIC", L"Low cut removes rumble and desk thumps. Leveler evens out loud and quiet speech. "
+                       L"A limiter on every output stops clipping and distortion.", 0, 330, y + 22, 200, 90, IDC_HDR);
+    }
 
     // ---------------- Voice FX page ----------------
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
@@ -2294,7 +2608,7 @@ static void OnCommand(int id, int code)
     }
 
     switch (id) {
-    case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_FADE: case IDC_GATE: case IDC_TALKVOL:
+    case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_FADE: case IDC_TALKVOL:
         if (!gUiReady) break;
         for (Range& r : gRanges) {
             if (r.id != id) continue;
@@ -2303,7 +2617,6 @@ static void OnCommand(int id, int code)
             if (code == EN_CHANGE && ok) *r.var = Iclamp(v, r.lo, r.hi);
             else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)*r.var, FALSE);
         }
-        if (id == IDC_GATE) UpdateGateLin();
         break;
     case IDC_REPO:
         if (code == EN_CHANGE && gUiReady) GetDlgItemTextW(gWnd, IDC_REPO, gUpdateRepo, 200);
@@ -2315,7 +2628,14 @@ static void OnCommand(int id, int code)
     case IDC_FXON:
         if (code == BN_CLICKED) { SetFxOn(!gFxOn); UpdateStatus(true); }
         break;
-    case IDC_GATEON:   gGateOn = Checked(IDC_GATEON); break;
+    case IDC_GATEON:   SetGateMode(Checked(IDC_GATEON) ? gGateLastMode : GATE_OFF); break;
+    case IDC_GATEMODE:
+        if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
+        break;
+    case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_TAB3:
+        if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
+        break;
     case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
     case IDC_UPDSTART: gUpdateOnStart = Checked(IDC_UPDSTART); break;
     case IDC_CHECKUPD: if (code == BN_CLICKED) StartUpdateCheck(true); break;
@@ -2370,7 +2690,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
-        if (w == TIMER_STATUS) UpdateStatus();
+        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) CleanupOldExe();
         else if (w == TIMER_FXKEYS) PollFxKeys();
@@ -2408,7 +2728,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_METER) { DrawMeter((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
+    case WM_LBUTTONDOWN:                        // click on empty space: leave the text/number box you were in
+        SetFocus(h);
+        return 0;
     case WM_CONTEXTMENU: {                      // right-click a Voice FX hotkey button to clear it
         int id = GetDlgCtrlID((HWND)w);
         if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
@@ -2477,6 +2801,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
 
     LoadSettings();
     LoadThemeApis();
+    gNs = rnnoise_create(nullptr);              // built-in model; created once, used by the audio thread
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
     if (gCtxOk) ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
 
