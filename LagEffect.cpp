@@ -1477,8 +1477,9 @@ static void AddTips()
     TipId(IDC_HELPBTN, L"How everything works, plus setup steps for Discord and OBS.");
 
     // Mic
-    TipId(IDC_METER,    L"Your mic level after noise suppression. Green = the gate lets you through; the blue line is the gate threshold; "
-                        L"the purple bar shows how sure the AI is that you're talking.");
+    TipId(IDC_METER,    L"Mic level: your level after noise suppression. Green = the gate lets you through; the blue line is the gate threshold.\n"
+                        L"Voice: how sure the AI is that you're talking (shown when noise suppression or the Voice gate is on); "
+                        L"the blue line is the Voice setting.");
     TipId(IDC_NSON,     L"Turn AI noise suppression (RNNoise) on or off. It removes fans, keyboards, hum and room noise. Adds about 20 ms of delay.");
     TipId(IDC_GATEMODE, L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech "
                         L"(ignores loud non-voice noise). Volume + voice: both.");
@@ -1637,13 +1638,13 @@ static void DrawMeterTo(HDC dc, RECT rc)
 
     const float lo = -72.0f;
     const int x0 = rc.left + 96, x1 = rc.right - 120, bh = 12;
-    const int by = rc.top + 14;
+    const int by = rc.top + 11;                 // level bar row; the voice bar row sits under it
     auto X = [&](float db) { float t = (db - lo) / -lo; t = t < 0 ? 0 : t > 1 ? 1 : t; return x0 + (int)((x1 - x0) * t); };
 
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, gFontBold);
     SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
-    RECT lr = { rc.left + 14, rc.top, x0 - 8, rc.top + 40 };
+    RECT lr = { rc.left + 14, by - 6, x0 - 8, by + bh + 6 };
     DrawTextW(dc, L"Mic level", -1, &lr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
 
     RECT track = { x0, by, x1, by + bh };
@@ -1668,7 +1669,9 @@ static void DrawMeterTo(HDC dc, RECT rc)
     SelectObject(dc, gFont);
     SetTextColor(dc, gDark ? DK_DIM : RGB(105, 105, 105));
     if (gMeterVadShow >= 0) {                   // voice detection bar (when RNNoise is running)
-        int vy = by + bh + 8;
+        int vy = by + bh + 11;
+        RECT vlab = { rc.left + 14, vy - 6, x0 - 8, vy + 11 };   // label to the left, like "Mic level"
+        DrawTextW(dc, L"Voice", -1, &vlab, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
         RECT vt = { x0, vy, x1, vy + 5 };
         HBRUSH vb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222)); FillRect(dc, &vt, vb); DeleteObject(vb);
         RECT vf = { x0, vy, x0 + (int)((x1 - x0) * (gMeterVadShow > 1 ? 1 : gMeterVadShow)), vy + 5 };
@@ -1678,8 +1681,6 @@ static void DrawMeterTo(HDC dc, RECT rc)
             RECT m = { tx - 1, vy - 3, tx + 1, vy + 8 };
             HBRUSH mb = CreateSolidBrush(ACCENT); FillRect(dc, &m, mb); DeleteObject(mb);
         }
-        RECT vl = { x0, vy + 6, x1, rc.bottom - 2 };
-        DrawTextW(dc, L"voice detected", -1, &vl, DT_SINGLELINE | DT_LEFT | DT_TOP);
     }
 
     wchar_t t1[32], t2[32];
