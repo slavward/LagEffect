@@ -31,7 +31,7 @@ jobs:
         run: |
           set RN=rnnoise\src\denoise.c rnnoise\src\rnn.c rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
           rc /nologo LagEffect.rc > build.log 2>&1 || (type build.log & exit /b 1)
-          cl /nologo /O2 /MT /utf-8 /EHsc /W3 /D_USE_MATH_DEFINES LagEffect.cpp %RN% LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe >> build.log 2>&1 || (type build.log & exit /b 1)
+          cl /nologo /O2 /MT /utf-8 /EHsc /W3 /D_USE_MATH_DEFINES /I rnnoise\include LagEffect.cpp %RN% LagEffect.res /link /SUBSYSTEM:WINDOWS /OUT:LagEffect.exe >> build.log 2>&1 || (type build.log & exit /b 1)
           type build.log
 
       - name: Check the exe

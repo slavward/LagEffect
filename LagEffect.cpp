@@ -9,12 +9,12 @@
 //      RNNoise (noise suppression) is included in the rnnoise folder.
 //   2. Visual Studio (Developer Command Prompt):
 //        rc LagEffect.rc
-//        cl /O2 /MT /utf-8 /D_USE_MATH_DEFINES LagEffect.cpp rnnoise\src\denoise.c rnnoise\src\rnn.c
+//        cl /O2 /MT /utf-8 /D_USE_MATH_DEFINES /I rnnoise\\include LagEffect.cpp rnnoise\src\denoise.c rnnoise\src\rnn.c
 //           rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
 //           LagEffect.res /link /SUBSYSTEM:WINDOWS
 //      MinGW / MSYS2:
 //        windres LagEffect.rc -O coff -o LagEffect_res.o
-//        gcc -O2 -c rnnoise/src/{denoise,rnn,rnn_data,pitch,kiss_fft,celt_lpc}.c
+//        gcc -O2 -Irnnoise/include -c rnnoise/src/{denoise,rnn,rnn_data,pitch,kiss_fft,celt_lpc}.c
 //        g++ -O2 LagEffect.cpp *.o LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
 //
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
