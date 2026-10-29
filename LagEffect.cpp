@@ -20,7 +20,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.7.0"
+#define APP_VERSION L"1.7.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -658,6 +658,7 @@ enum { THEME_SYSTEM = 0, THEME_LIGHT = 1, THEME_DARK = 2 };
 static int    gThemeMode = THEME_SYSTEM;
 static bool   gDark = false;
 static HBRUSH gBrDarkBg, gBrDarkCtl;
+static HWND   gTip;                             // hover-help tooltip window (see AddTips)
 
 #define DK_BG      RGB(32, 32, 32)
 #define DK_CTL     RGB(45, 45, 45)
@@ -749,6 +750,7 @@ static void ApplyTheme()
         if (pFlushMenuThemes) pFlushMenuThemes();
     }
     EnumChildWindows(gWnd, ThemeChild, 0);
+    if (gTip) SetTheme(gTip, gDark ? L"DarkMode_Explorer" : nullptr, nullptr);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
@@ -1356,6 +1358,164 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     }
     return DefWindowProcW(h, m, w, l);
+}
+
+// ======================= tooltips =======================
+// Hover help for every setting. Labels get SS_NOTIFY so they can be hovered too
+// (clicking one still takes focus out of text boxes, see OnCommand). gTip is declared with the theme code.
+
+static void Tip(HWND c, const wchar_t* text)
+{
+    if (!gTip || !c || !text) return;
+    TTTOOLINFOW ti = {};
+    ti.cbSize   = sizeof(ti);
+    ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd     = gWnd;
+    ti.uId      = (UINT_PTR)c;
+    ti.lpszText = (LPWSTR)text;
+    SendMessageW(gTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
+static void TipId(int id, const wchar_t* text)    // a control, plus its spin arrows if it's a number box
+{
+    Tip(GetDlgItem(gWnd, id), text);
+    Tip(GetDlgItem(gWnd, SPIN_UD(id)), text);
+}
+
+struct TipText { const wchar_t* key; const wchar_t* text; };
+
+static const TipText gKnobTips[] = {
+    { L"fx_pitch_semitones", L"How much higher or lower your voice sounds, in semitones. +12 = one octave up, -12 = one octave down." },
+    { L"fx_pitch_cents",     L"Fine-tunes the pitch in cents (100 cents = 1 semitone)." },
+    { L"fx_pitch_grain_ms",  L"Size of the slices used to shift pitch. Longer sounds smoother; shorter adds less delay." },
+    { L"fx_pitch_mix",       L"How much of the pitched voice you hear. 100% = only the pitched voice; lower blends in your normal voice." },
+    { L"fx_reverb_mix",      L"How much room echo is added. 0% = none, 100% = only the echo." },
+    { L"fx_reverb_size",     L"How big the room sounds. Higher = a longer echo tail." },
+    { L"fx_reverb_damping",  L"Softens the echo's high end. Higher = a darker, warmer tail." },
+    { L"fx_reverb_predelay", L"Gap before the echo starts. 10-30 ms keeps your words clear." },
+    { L"ns_strength",        L"How much background noise is removed. 100% = full cleanup; lower blends some of the original back in for a more natural sound." },
+    { L"gate_threshold_db",  L"How loud you must be for the gate to open. Set it just above the meter's level when you're quiet. Used when the gate opens on Volume." },
+    { L"gate_voice_pct",     L"How sure the AI must be that you're speaking before the gate opens. Higher = stricter. Used when the gate opens on Voice." },
+    { L"gate_hold_ms",       L"How long the gate stays open after you stop talking, so the ends of words aren't cut off." },
+    { L"gate_release_ms",    L"How quickly the sound fades out when the gate closes. Longer = smoother." },
+    { L"gate_range_db",      L"How much quieter it gets while the gate is closed. 80 dB = silent; 10-20 dB just turns noise down, which sounds more natural." },
+    { L"mic_boost_db",       L"Turns your microphone up or down before everything else." },
+    { L"low_cut_hz",         L"Removes deep rumble below this pitch: desk bumps, AC hum, wind. 80 Hz suits most voices. All the way down = Off." },
+    { L"leveler",            L"Evens out your volume: loud parts get quieter, quiet parts louder. All the way down = Off." },
+};
+
+// Labels (static text) matched by their text.
+static const TipText gLabelTips[] = {
+    { L"Microphone:",  L"The microphone Lag Effect listens to." },
+    { L"Output",       L"Where each output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers." },
+    { L"Plays",        L"What each output plays: Off, Effect only (just the stutter) or Everything (your voice plus the stutter)." },
+    { L"Volume %",     L"Volume of each output. 100% = unchanged." },
+    { L"Loop length:", L"How much of your last words gets repeated when you press the hotkey, in milliseconds." },
+    { L"Speed:",       L"How fast the loop plays through. 100% = normal; lower = slower and longer." },
+    { L"Pitch:",       L"How high or low the loop sounds. 100% = normal; 200% = one octave up, 50% = one octave down." },
+    { L"Smoothing:",   L"Fades the loop's edges to stop clicks where it repeats. 0 = sharp and choppy." },
+    { L"Voice level:", L"How loud your live voice is while the loop plays (with \"Keep talking\" ticked)." },
+    { L"Opens on:",    L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech. Volume + voice: both." },
+    { L"Buffer:",      L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling." },
+    { L"Theme:",       L"Light, dark, or follow Windows." },
+    { L"Updates:",     L"The GitHub repo Lag Effect checks for new versions." },
+};
+
+static BOOL CALLBACK TipLabel(HWND h, LPARAM)
+{
+    wchar_t cls[16], text[64];
+    GetClassNameW(h, cls, 16);
+    if (lstrcmpiW(cls, L"Static")) return TRUE;
+    GetWindowTextW(h, text, 64);
+    for (const TipText& t : gLabelTips) {
+        if (lstrcmpW(text, t.key)) continue;
+        SetWindowLongW(h, GWL_STYLE, GetWindowLongW(h, GWL_STYLE) | SS_NOTIFY);   // hoverable
+        Tip(h, t.text);
+    }
+    return TRUE;
+}
+
+static void AddTips()
+{
+    gTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr, WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                           CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, gWnd, nullptr, gInst, nullptr);
+    if (!gTip) return;
+    SendMessageW(gTip, TTM_SETMAXTIPWIDTH, 0, 320);
+    SendMessageW(gTip, TTM_SETDELAYTIME, TTDT_INITIAL, 450);
+    SendMessageW(gTip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
+
+    // Tabs
+    TipId(IDC_TAB0 + PAGE_MAIN,     L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
+    TipId(IDC_TAB0 + PAGE_MIC,      L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
+    TipId(IDC_TAB0 + PAGE_FX,       L"Pitch and reverb on your live voice.");
+    TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
+
+    // Main
+    TipId(IDC_MIC, L"The microphone Lag Effect listens to.");
+    for (int k = 0; k < MAX_OUT; k++) {
+        TipId(IDC_ROWLBL + k,  L"An output: a device Lag Effect plays to.");
+        TipId(IDC_ROWDEV + k,  L"Where this output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers.");
+        TipId(IDC_ROWMODE + k, L"Off = nothing. Effect only = just the stutter. Everything = your voice plus the stutter (what others should hear).");
+        TipId(IDC_ROWVOL + k,  L"Volume of this output. 100% = unchanged, up to 200%.");
+        TipId(IDC_ROWDEL + k,  L"Remove this output.");
+    }
+    TipId(IDC_ADDOUT,  L"Add another output (up to 5), e.g. VB-Cable for Discord plus your headphones to hear yourself.");
+    TipId(IDC_VBCABLE, L"Set up VB-Cable automatically: output 1 goes to VB-Cable, output 2 to your headphones.");
+    TipId(IDC_LOOP,    L"How much of your last words gets repeated when you press the hotkey, in milliseconds.");
+    TipId(IDC_SPEED,   L"How fast the loop plays through. 100% = normal; lower = slower and longer.");
+    TipId(IDC_PITCH,   L"How high or low the loop sounds. 100% = normal; 200% = one octave up, 50% = one octave down.");
+    TipId(IDC_FADE,    L"Fades the loop's edges to stop clicks where it repeats. 0 = sharp and choppy.");
+    TipId(IDC_GATEON,  L"Mutes your mic between words so background noise doesn't get through. Fine-tune it on the Mic tab.");
+    TipId(IDC_TALKON,  L"Keep your live voice going while the loop plays, so you can talk over the stutter.");
+    TipId(IDC_TALKVOL, L"How loud your live voice is while the loop plays.");
+    TipId(IDC_HOTKEY,  L"Click, then hold the key(s) you want (up to 3, e.g. Ctrl + F). Works in any app or game. Esc cancels.");
+    TipId(IDC_HOLD,    L"The stutter plays while you hold the hotkey.");
+    TipId(IDC_TOGGLE,  L"Press the hotkey once to start the stutter, again to stop it.");
+    TipId(IDC_STATUS,  L"What Lag Effect is doing right now.");
+    TipId(IDC_START,   L"Start or stop audio processing.");
+    TipId(IDC_TRAY,    L"Hide the window. Lag Effect keeps running in the system tray; click the tray icon to bring it back.");
+    TipId(IDC_HELPBTN, L"How everything works, plus setup steps for Discord and OBS.");
+
+    // Mic
+    TipId(IDC_METER,    L"Your mic level after noise suppression. Green = the gate lets you through; the blue line is the gate threshold; "
+                        L"the purple bar shows how sure the AI is that you're talking.");
+    TipId(IDC_NSON,     L"Turn AI noise suppression (RNNoise) on or off. It removes fans, keyboards, hum and room noise. Adds about 20 ms of delay.");
+    TipId(IDC_GATEMODE, L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech "
+                        L"(ignores loud non-voice noise). Volume + voice: both.");
+
+    // Voice FX
+    TipId(IDC_FXON,         L"Turn all voice effects on or off.");
+    TipId(IDC_FXKEY_MASTER, L"Set a hotkey that turns all voice effects on/off from anywhere. Right-click to clear it.");
+    for (int g = 0; g < FX_GROUPS; g++) {
+        static wchar_t on[FX_GROUPS][96], key[FX_GROUPS][128], rst[FX_GROUPS][96];
+        wsprintfW(on[g],  L"Turn %s on or off.", gFxGroups[g].title);
+        wsprintfW(key[g], L"Set a hotkey that turns %s on/off from anywhere (also turns Voice effects on). Right-click to clear it.", gFxGroups[g].title);
+        wsprintfW(rst[g], L"Put all %s knobs back to their defaults.", gFxGroups[g].title);
+        TipId(IDC_FXGRP_ON + g, on[g]);
+        TipId(IDC_FXGRP_KEY + g, key[g]);
+        TipId(IDC_FXGRP_RESET + g, rst[g]);
+    }
+
+    // Settings
+    TipId(IDC_BUFFER,   L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling.");
+    TipId(IDC_EXCL,     L"Takes over the mic and output 1 for the lowest delay. Other apps can't use them while it's on.");
+    TipId(IDC_THEME,    L"Light, dark, or follow Windows.");
+    TipId(IDC_AUTO,     L"When Lag Effect opens, start audio straight away and hide in the tray.");
+    TipId(IDC_REPO,     L"The GitHub repo Lag Effect checks for new versions.");
+    TipId(IDC_CHECKUPD, L"Check GitHub for a newer version now.");
+    TipId(IDC_UPDSTART, L"Check for updates each time Lag Effect starts.");
+    TipId(IDC_OPENSET,  L"Open the folder with your settings file (LagEffect.ini).");
+
+    // Knobs
+    for (int i = 0; i < KNOB_N; i++)
+        for (const TipText& t : gKnobTips)
+            if (!lstrcmpW(t.key, gKnobs[i].key)) {
+                static wchar_t buf[KNOB_N][400];
+                wsprintfW(buf[i], L"%s\nDrag up/down or scroll. Shift = fine steps. Double-click = reset.", t.text);
+                Tip(GetDlgItem(gWnd, IDC_KNOB + i), buf[i]);
+            }
+
+    EnumChildWindows(gWnd, TipLabel, 0);
 }
 
 // Master switch at the top of the Voice FX page: a card with an on/off pill.
@@ -2358,7 +2518,7 @@ static void CreateUI()
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
 
     // Status + buttons
-    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
+    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
     Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 544, 172, 34, IDC_START);
     Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 544, 172, 34, IDC_TRAY);
     Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 544, 172, 34, IDC_HELPBTN);
@@ -2368,7 +2528,7 @@ static void CreateUI()
     // ---------------- Mic page ----------------
     // Live meter, then AI noise suppression, noise gate and voice quality sections.
     gBuildPage = PAGE_MIC;
-    Ctl(L"STATIC", L"", SS_OWNERDRAW, 14, 56, 532, 52, IDC_METER);
+    Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 56, 532, 52, IDC_METER);
     {
         const int MIC_Y0 = 130, MIC_STEP = 146, MIC_H = 126;
         int y = MIC_Y0;                         // noise suppression
@@ -2394,7 +2554,7 @@ static void CreateUI()
         for (const wchar_t* n : gateNames) SendMessageW(gm, CB_ADDSTRING, 0, (LPARAM)n);
         SendMessageW(gm, CB_SETCURSEL, gGateMode, 0);
         SendMessageW(gm, CB_SETDROPPEDWIDTH, 130, 0);
-        Ctl(L"STATIC", L"Voice = AI speech detection. Range = how much quieter when closed.", 0, 430, y + 66, 108, 56, IDC_HDR);
+        Ctl(L"STATIC", L"Hover any knob for help.", 0, 430, y + 70, 104, 36, IDC_HDR);
 
         y += MIC_STEP;                          // voice quality
         AddSection(14, y, 532, MIC_H, L"Voice quality");
@@ -2404,8 +2564,7 @@ static void CreateUI()
             Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 98, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
             col++;
         }
-        Ctl(L"STATIC", L"Low cut removes rumble and desk thumps. Leveler evens out loud and quiet speech. "
-                       L"A limiter on every output stops clipping and distortion.", 0, 330, y + 22, 200, 90, IDC_HDR);
+        Ctl(L"STATIC", L"Every output also has a limiter, so loud moments never clip or distort.", 0, 330, y + 30, 196, 54, IDC_HDR);
     }
 
     // ---------------- Voice FX page ----------------
@@ -2474,6 +2633,7 @@ static void CreateUI()
 
     gBuildPage = -1;
     gUiReady = true;
+    AddTips();
     Layout();
 }
 
@@ -2593,6 +2753,11 @@ static bool Checked(int id) { return IsDlgButtonChecked(gWnd, id) == BST_CHECKED
 
 static void OnCommand(int id, int code)
 {
+    if (code == STN_CLICKED && (id == 0xFFFF || id == IDC_HDR || id == IDC_METER || id == IDC_STATUS ||
+                                (id >= IDC_ROWLBL && id < IDC_ROWLBL + MAX_OUT))) {
+        SetFocus(gWnd);                         // clicking text = clicking empty space
+        return;
+    }
     if (id >= IDC_ROWDEV && id < IDC_ROWDEV + MAX_OUT) {
         if (code == CBN_SELCHANGE) RestartIfRunning();
         return;
@@ -2821,7 +2986,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     gInst = hi;
     INITCOMMONCONTROLSEX icc = {};
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_STANDARD_CLASSES | ICC_UPDOWN_CLASS;
+    icc.dwICC = ICC_STANDARD_CLASSES | ICC_UPDOWN_CLASS | ICC_BAR_CLASSES;   // BAR = tooltips
     InitCommonControlsEx(&icc);
 
     bool justUpdated = wcsstr(GetCommandLineW(), L"--updated") != nullptr;
