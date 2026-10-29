@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.9.0"
+#define APP_VERSION L"1.9.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -691,6 +691,8 @@ static struct RadioState {
     // start/stop sounds
     int    sqLeft, sqLen, sqKind;              // samples left, length, which sound (1 = start, 2 = stop)
     double sqPhase;
+    float  sqFlutter, sqFlutterTarget, sqTilt;  // walkie tail: slow level wobble, brighter "hiss" tilt
+    Biquad sqThump[2];                          // drive-thru relay click: two short resonances
     float  crackleEnv;
     double humPhase;
     unsigned seed;
@@ -747,18 +749,26 @@ static float Radio(float x)
     if (!r.talking && r.keyEnv > 0.008f) {                          // about -42 dBFS: you started
         r.talking = true;
         if (r.quietFor > RATE / 4 && p.squelch != SQ_NONE && gRp.squelch > 0) {   // only after a real pause
-            r.sqKind = 1; r.sqLen = p.squelch == SQ_QUINDAR ? RATE / 4 : p.squelch == SQ_WALKIE ? RATE / 25 : RATE / 100;
+            r.sqKind = 1;
+            r.sqLen = p.squelch == SQ_QUINDAR ? RATE / 4 : p.squelch == SQ_WALKIE ? RATE * 3 / 100 : RATE * 3 / 100;
             r.sqLeft = r.sqLen; r.sqPhase = 0;
+            if (p.squelch == SQ_CLICK) { BqSet(r.sqThump[0], 1, 1300.0, 6.0); BqSet(r.sqThump[1], 1, 320.0, 3.0); }
         }
         r.quietFor = 0;
     }
     if (r.talking) {
-        if (r.keyEnv < 0.003f) {                                    // -50 dBFS for 0.3 s: you stopped
-            if (++r.quietFor > RATE * 3 / 10) {
+        if (r.keyEnv < 0.003f) {                                    // -50 dBFS for ~0.22 s: you let go of the button
+            if (++r.quietFor > RATE * 22 / 100) {
                 r.talking = false;
                 if (p.squelch != SQ_NONE && gRp.squelch > 0) {
-                    r.sqKind = 2; r.sqLen = p.squelch == SQ_QUINDAR ? RATE / 4 : p.squelch == SQ_WALKIE ? RATE * 18 / 100 : RATE / 100;
+                    r.sqKind = 2;
+                    // a real squelch tail is 150-250 ms and never quite the same twice
+                    r.sqLen = p.squelch == SQ_QUINDAR ? RATE / 4
+                            : p.squelch == SQ_WALKIE  ? RATE * (16 + (int)((r.seed >> 10) % 9)) / 100
+                            :                           RATE * 3 / 100;
                     r.sqLeft = r.sqLen; r.sqPhase = 0;
+                    r.sqFlutter = 1.0f; r.sqFlutterTarget = 1.0f;
+                    if (p.squelch == SQ_CLICK) { BqSet(r.sqThump[0], 1, 1100.0, 6.0); BqSet(r.sqThump[1], 1, 280.0, 3.0); }
                 }
             }
         } else r.quietFor = 0;
@@ -775,6 +785,39 @@ static float Radio(float x)
         }
         n *= gRp.statik * r.keyed;
     }
+    // --- start/stop sounds made *by the device*: they go through its speaker like your voice does ---
+    float sqIn = 0, sqOut = 0;
+    if (r.sqLeft > 0) {
+        float t = 1.0f - (float)r.sqLeft / r.sqLen;
+        int   done = r.sqLen - r.sqLeft, left = r.sqLeft;
+        if (p.squelch == SQ_WALKIE) {
+            float wn = RadioNoise();
+            float hiss = wn - 0.55f * r.sqTilt; r.sqTilt = wn;       // FM receiver noise leans bright
+            if (r.sqKind == 2) {                                    // "KSSHHT": full blast, a little wobble, hard cut
+                if ((done & 511) == 0) r.sqFlutterTarget = 0.8f + 0.4f * (RadioNoise() * 0.5f + 0.5f);
+                r.sqFlutter += (r.sqFlutterTarget - r.sqFlutter) * 0.004f;
+                float env = fminf(1.0f, done / (0.002f * RATE))         // 2 ms snap on
+                          * fminf(1.0f, left / (0.004f * RATE))         // 4 ms cut off
+                          * (done < RATE / 50 ? 1.25f : 1.0f);          // the first instant is a touch louder
+                sqIn = hiss * 0.55f * env * r.sqFlutter;
+            } else {                                                // keying up: a click, then a 30 ms blip of static
+                float click = done < 24 ? (done < 6 ? 0.9f : -0.5f) : 0.0f;
+                float env = expf(-t * 5.0f) * fminf(1.0f, left / (0.003f * RATE));
+                sqIn = click + hiss * 0.35f * env;
+            }
+        } else if (p.squelch == SQ_CLICK) {                         // relay / speaker thump
+            float kick = done < 3 ? (r.sqKind == 1 ? 1.0f : 0.7f) : 0.0f;
+            sqIn = (BqRun(r.sqThump[0], kick) * 2.5f + BqRun(r.sqThump[1], kick) * 2.0f)
+                 + RadioNoise() * 0.05f * expf(-t * 12.0f);
+        } else if (p.squelch == SQ_QUINDAR) {                       // NASA Apollo "Quindar" beeps: 2525 Hz in, 2475 Hz out
+            r.sqPhase += (r.sqKind == 1 ? 2525.0 : 2475.0) / RATE;
+            float env = fminf(1.0f, fminf((float)done, (float)left) / (0.004f * RATE));
+            sqOut = (float)sin(6.283185307179586 * r.sqPhase) * 0.22f * env;   // a clean tone, added after the speaker
+        }
+        sqIn *= gRp.squelch; sqOut *= gRp.squelch;
+        r.sqLeft--;
+    }
+
     float s = x + n;
 
     // --- device: compression, band, resonance, distortion ---
@@ -785,6 +828,7 @@ static float Radio(float x)
         float gdb = lvl > -32.0f ? (-32.0f - lvl) * p.comp * 0.75f : 0.0f;   // up to 4:1 above -32 dBFS
         s *= powf(10.0f, (gdb + p.comp * 10.0f) / 20.0f);                    // + make-up
     }
+    s += sqIn;                                  // squelch joins after the compressor, before the speaker
     s = BqRun(r.hp[0], s);
     if (p.peakDb != 0) s = BqRun(r.peak, s);
 
@@ -826,22 +870,7 @@ static float Radio(float x)
         s += e * p.slapGain;
     }
 
-    // --- start / stop sounds ---
-    if (r.sqLeft > 0) {
-        float t = 1.0f - (float)r.sqLeft / r.sqLen, v = 0;
-        if (p.squelch == SQ_QUINDAR) {                              // NASA Apollo "Quindar" beeps: 2525 Hz in, 2475 Hz out
-            r.sqPhase += (r.sqKind == 1 ? 2525.0 : 2475.0) / RATE;
-            float env = fminf(1.0f, fminf(t, 1.0f - t) * 40.0f);
-            v = (float)sin(6.283185307179586 * r.sqPhase) * 0.25f * env;
-        } else if (p.squelch == SQ_WALKIE) {                        // "kssht": a burst of band-limited static
-            float env = r.sqKind == 1 ? (1.0f - t) : (t < 0.05f ? t * 20.0f : (1.0f - t) * (1.0f - t) * 1.1f);
-            v = BqRun(r.noiseBp[1], BqRun(r.noiseBp[0], RadioNoise())) * 0.9f * env;
-        } else {                                                    // a short click
-            v = (t < 0.15f ? 1.0f - t / 0.15f : 0.0f) * (r.sqKind == 1 ? 0.35f : 0.25f) * (RadioNoise() * 0.5f + 0.5f);
-        }
-        s += v * gRp.squelch;
-        r.sqLeft--;
-    }
+    s += sqOut;
     return s * powf(10.0f, p.outDb / 20.0f);
 }
 
