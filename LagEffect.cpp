@@ -2,7 +2,8 @@
 // Windows app with a settings window and tray icon. Settings save to LagEffect.ini.
 // Built for Discord / OBS: several outputs each playing Off / Effect only / Everything,
 // built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater,
-// and a Voice FX page (pitch shift + reverb on your live voice, set with knobs).
+// a Voice FX page (pitch shift, reverb and a Voloco-style vocoder on your live voice, set with knobs),
+// and a Mic page (AI noise suppression, noise gate, voice quality).
 //
 // Build (GitHub Actions does this automatically, see .github/workflows/build.yml):
 //   1. Put miniaudio.h (https://github.com/mackron/miniaudio, 0.11.25) next to this file.
@@ -20,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.7.2"
+#define APP_VERSION L"1.8.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -217,6 +218,11 @@ static volatile bool gFxPitchOn = true, gFxRevOn = true;
 static volatile int  gFxSemi = 0, gFxCents = 0, gFxGrainMs = 50, gFxPitchMix = 100;
 static volatile int  gFxRevMix = 30, gFxRevSize = 60, gFxRevDamp = 50, gFxPreMs = 20;
 static volatile bool gFxResetReq = true;       // UI asks the audio thread to clear effect buffers
+static volatile bool gFxVocOn = false;
+// Vocoder (Voloco-style): style, key (0 = C .. 11 = B), scale, and knobs.
+enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_STYLES };
+static volatile int  gVocStyle = VOC_HARMONY, gVocKey = 0, gVocScale = 1;
+static volatile int  gVocRetuneMs = 15, gVocSynth = 60, gVocMix = 100;
 
 // Pitch shifter: two read taps glide through a short delay line at the new speed and crossfade
 // (Hann windows, half a grain apart). Each new grain starts where the waveform best lines up with
@@ -224,33 +230,37 @@ static volatile bool gFxResetReq = true;       // UI asks the audio thread to cl
 #define PS_SIZE   8192                         // > 100 ms grain span + search at 48 kHz
 #define PS_SEARCH 720                          // 15 ms: covers voice pitch periods down to ~67 Hz
 #define PS_CORR   192                          // samples compared when lining up a grain
-static float  psBuf[PS_SIZE];
-static int    psW = 0;
-static double psDelay[2], psFrac[2];
-static bool   psPrimed = false;
+// Each shifter keeps its own state, so several can run at once (Voice FX pitch, vocoder tuning).
+struct PShift {
+    float  buf[PS_SIZE];
+    int    w;
+    double delay[2], frac[2];
+    bool   primed;
+};
+static PShift gPsFx, gPsTune;
 
-static inline float PsRead(double d)
+static void PsReset(PShift& p) { memset(&p, 0, sizeof(p)); }
+
+static inline float PsRead(const PShift& p, double d)
 {
-    double rp = (double)psW - d;
+    double rp = (double)p.w - d;
     if (rp < 0) rp += PS_SIZE;
     int   i0 = (int)rp;
     float t  = (float)(rp - i0);
-    return Hermite(psBuf[(i0 - 1) & (PS_SIZE - 1)], psBuf[i0 & (PS_SIZE - 1)],
-                   psBuf[(i0 + 1) & (PS_SIZE - 1)], psBuf[(i0 + 2) & (PS_SIZE - 1)], t);
+    return Hermite(p.buf[(i0 - 1) & (PS_SIZE - 1)], p.buf[i0 & (PS_SIZE - 1)],
+                   p.buf[(i0 + 1) & (PS_SIZE - 1)], p.buf[(i0 + 2) & (PS_SIZE - 1)], t);
 }
 
-static double PsGrainStart(int k, double ratio, int span)
+static double PsGrainStart(const PShift& p, int k, int base)
 {
-    // Going up, the read point catches up with the input, so a grain starts a full span back.
-    int base  = ratio > 1.0 ? 2 + span : 2;
-    int other = (int)(psDelay[1 - k] + 0.5);
+    int other = (int)(p.delay[1 - k] + 0.5);
     float best = -1e30f; int bestD = 0;
     for (int d = 0; d < PS_SEARCH; d += 2) {
         int cand = base + d;
         float dot = 0, e = 0;
         for (int j = 0; j < PS_CORR; j += 2) {
-            float x = psBuf[(psW - other - j) & (PS_SIZE - 1)];
-            float y = psBuf[(psW - cand - j) & (PS_SIZE - 1)];
+            float x = p.buf[(p.w - other - j) & (PS_SIZE - 1)];
+            float y = p.buf[(p.w - cand - j) & (PS_SIZE - 1)];
             dot += x * y; e += y * y;
         }
         float score = dot / sqrtf(e + 1e-9f);
@@ -259,35 +269,46 @@ static double PsGrainStart(int k, double ratio, int span)
     return (double)(base + bestD);
 }
 
-static float PitchShift(float x, double ratio, int span, float mix)
+// centered = false: lowest delay; each grain sweeps the whole span in one direction (big shifts).
+// centered = true: grains start mid-span and may drift either way, so the ratio can swing above
+// and below 1 smoothly (used for auto-tune, where small corrections flip direction all the time).
+static float PitchShift(PShift& p, float x, double ratio, int span, float mix, bool centered = false)
 {
-    psBuf[psW] = x;
+    p.buf[p.w] = x;
     float out = x;
     if (ratio != 1.0) {
-        double grain = span / fabs(1.0 - ratio);           // one grain sweeps the whole span
+        double grain = (centered ? span / 2 : span) / fabs(1.0 - ratio);   // one grain sweeps the (half) span
         if (grain > RATE) grain = RATE;
         if (grain < 256)  grain = 256;
-        if (!psPrimed) {
-            psDelay[0] = psDelay[1] = ratio > 1.0 ? 2 + span : 2;
-            psFrac[0] = 0.0; psFrac[1] = 0.5;
-            psPrimed = true;
+        // Going up, the read point catches up with the input, so a grain starts a full span back.
+        const int base = centered ? 2 + span / 2 : ratio > 1.0 ? 2 + span : 2;
+        if (!p.primed) {
+            p.delay[0] = p.delay[1] = base;
+            p.frac[0] = 0.0; p.frac[1] = 0.5;
+            p.primed = true;
         }
         const double maxD = PS_SIZE - PS_CORR - 4;
         float wet = 0.0f;
         for (int k = 0; k < 2; k++) {
-            if (psFrac[k] >= 1.0) { psFrac[k] -= 1.0; psDelay[k] = PsGrainStart(k, ratio, span); }
-            if (psDelay[k] < 2.0)  psDelay[k] = 2.0;
-            if (psDelay[k] > maxD) psDelay[k] = maxD;
-            float s = (float)sin(3.141592653589793 * psFrac[k]);
-            wet += PsRead(psDelay[k]) * s * s;
-            psDelay[k] += 1.0 - ratio;
-            psFrac[k]  += 1.0 / grain;
+            if (p.frac[k] >= 1.0) { p.frac[k] -= 1.0; p.delay[k] = PsGrainStart(p, k, base); }
+            if (p.delay[k] < 2.0)  p.delay[k] = 2.0;
+            if (p.delay[k] > maxD) p.delay[k] = maxD;
+            float sn = (float)sin(3.141592653589793 * p.frac[k]);
+            wet += PsRead(p, p.delay[k]) * sn * sn;
+            p.delay[k] += 1.0 - ratio;
+            p.frac[k]  += 1.0 / grain;
         }
         out = x + (wet - x) * mix;
-    } else {
-        psPrimed = false;
+    } else if (!centered) {
+        p.primed = false;
+    } else if (p.primed) {                      // centered: keep the same delay at ratio 1, no jump
+        float sn0 = (float)sin(3.141592653589793 * p.frac[0]), sn1 = (float)sin(3.141592653589793 * p.frac[1]);
+        out = (PsRead(p, p.delay[0]) * sn0 * sn0 + PsRead(p, p.delay[1]) * sn1 * sn1);
+        out = x + (out - x) * mix;
+        p.frac[0] += 1.0 / RATE; p.frac[1] += 1.0 / RATE;
+        for (int k = 0; k < 2; k++) if (p.frac[k] >= 1.0) { p.frac[k] -= 1.0; p.delay[k] = PsGrainStart(p, k, 2 + span / 2); }
     }
-    psW = (psW + 1) & (PS_SIZE - 1);
+    p.w = (p.w + 1) & (PS_SIZE - 1);
     return out;
 }
 
@@ -324,9 +345,287 @@ static float Reverb(float x, float size, float damp, float mix, int pre)
     return x + (acc * 3.0f - x) * mix;
 }
 
+// ======================= vocoder (Voloco-style tune + harmony) =======================
+// 1. Pitch detection: YIN on a 12 kHz copy of the voice, every 5 ms.
+// 2. Tune: the detected note is snapped to the nearest note of the chosen key/scale; Retune sets
+//    how fast it gets there (0 = instant, the hard "robot" auto-tune). The voice is shifted with
+//    its own phase-aligned pitch shifter, which keeps its natural tone.
+// 3. Synth: band-limited sawtooth voices (two slightly detuned oscillators each) play the tuned
+//    note and/or a chord built from the scale, following your pitch.
+// 4. Channel vocoder: 28 bands (4th-order filters, 110 Hz - 7.6 kHz) shape the synth with your
+//    voice's tone, with the synth's own tilt flattened out so words stay clear; consonants
+//    ("s", "t") above 5 kHz pass through directly.
+// Room to grow: more styles (VOC_STYLES), scales (VOC_SCALES), and per-style voice lists (VocVoices).
+#define VOC_SCALES 6
+static const char VOC_SCALE_STEPS[VOC_SCALES][12] = {
+    { 1,1,1,1,1,1,1,1,1,1,1,1 },               // Chromatic
+    { 1,0,1,0,1,1,0,1,0,1,0,1 },               // Major
+    { 1,0,1,1,0,1,0,1,1,0,1,0 },               // Minor (natural)
+    { 1,0,1,0,1,0,0,1,0,1,0,0 },               // Major pentatonic
+    { 1,0,0,1,0,1,0,1,0,0,1,0 },               // Minor pentatonic
+    { 1,0,0,1,0,1,1,1,0,0,1,0 },               // Blues
+};
+
+#define PD_DS     4                            // detector runs at 48 kHz / 4 = 12 kHz
+#define PD_RATE   (RATE / PD_DS)
+#define PD_MAXLAG 200                          // lowest pitch: 12000 / 200 = 60 Hz
+#define PD_MINLAG 12                           // highest: 1000 Hz
+#define PD_WIN    320                          // ~27 ms analysis window
+#define PD_BUF    1024
+#define PD_HOP    64                           // analyse every ~5 ms
+#define VOC_BANDS 28
+#define VOC_OSC   8                            // synth voices (each = 2 detuned saws)
+
+struct Biquad { float b0, b1, b2, a1, a2, z1, z2; };
+static inline float BqRun(Biquad& q, float x)
+{
+    float y = q.b0 * x + q.z1;
+    q.z1 = q.b1 * x - q.a1 * y + q.z2;
+    q.z2 = q.b2 * x - q.a2 * y;
+    return y;
+}
+static void BqSet(Biquad& q, int type, double fc, double Q)   // 0 = low-pass, 1 = band-pass (0 dB peak), 2 = high-pass
+{
+    double w = 2.0 * 3.141592653589793 * fc / RATE, c = cos(w), al = sin(w) / (2.0 * Q), a0 = 1.0 + al;
+    double b0, b1, b2;
+    if (type == 0)      { b0 = (1 - c) / 2; b1 = 1 - c;    b2 = (1 - c) / 2; }
+    else if (type == 1) { b0 = al;          b1 = 0;        b2 = -al; }
+    else                { b0 = (1 + c) / 2; b1 = -(1 + c); b2 = (1 + c) / 2; }
+    q.b0 = (float)(b0 / a0); q.b1 = (float)(b1 / a0); q.b2 = (float)(b2 / a0);
+    q.a1 = (float)(-2 * c / a0); q.a2 = (float)((1 - al) / a0);
+    q.z1 = q.z2 = 0;
+}
+
+static struct VocState {
+    // pitch detection
+    Biquad dsLp[2];
+    float  pdBuf[PD_BUF];
+    int    pdW, pdPhase, pdHop;
+    float  pdD[PD_MAXLAG + 2];
+    float  f0;                                 // detected pitch in Hz (0 = no clear pitch)
+    float  level;                              // recent voice level, for the voicing decision
+    int    unvoicedHops;
+    // tuning
+    int    targetNote;                         // MIDI note being tuned to (-1 = none yet)
+    float  shift, wantShift;                   // correction in semitones (current, goal)
+    float  outNote;                            // the note being sung after correction (MIDI, fractional)
+    // synth
+    double phase[VOC_OSC][2];
+    float  oscFreq[VOC_OSC], oscGain[VOC_OSC];
+    float  voiced;                             // 0..1, fades the synth in and out
+    // vocoder
+    Biquad modBp[VOC_BANDS][2], carBp[VOC_BANDS][2];
+    float  modEnv[VOC_BANDS], carEnv[VOC_BANDS];
+    Biquad sibHp[2];
+    bool   ready;
+} gVoc;
+
+static void VocReset()                         // audio thread / before start
+{
+    memset(&gVoc, 0, sizeof(gVoc));
+    for (int i = 0; i < 2; i++) BqSet(gVoc.dsLp[i], 0, 2600.0, i ? 1.3066 : 0.5412);   // 4th-order Butterworth
+    const double lo = 110.0, hi = 7600.0, r = pow(hi / lo, 1.0 / (VOC_BANDS - 1));
+    const double Q = 1.0 / (sqrt(r) - 1.0 / sqrt(r));
+    for (int b = 0; b < VOC_BANDS; b++) {
+        double fc = lo * pow(r, b);
+        for (int i = 0; i < 2; i++) { BqSet(gVoc.modBp[b][i], 1, fc, Q); BqSet(gVoc.carBp[b][i], 1, fc, Q); }
+    }
+    for (int i = 0; i < 2; i++) BqSet(gVoc.sibHp[i], 2, 5000.0, i ? 1.3066 : 0.5412);
+    gVoc.targetNote = -1;
+    gVoc.ready = true;
+}
+
+static inline float MidiToHz(float n) { return 440.0f * powf(2.0f, (n - 69.0f) / 12.0f); }
+
+static bool VocInScale(int note, int key, int scale)
+{
+    int d = ((note - key) % 12 + 12) % 12;
+    return VOC_SCALE_STEPS[scale][d] != 0;
+}
+
+static int VocNearest(float note, int key, int scale)   // nearest allowed note
+{
+    int best = -1; float bd = 99;
+    for (int n = (int)floorf(note) - 3; n <= (int)ceilf(note) + 3; n++)
+        if (VocInScale(n, key, scale) && fabsf(n - note) < bd) { bd = fabsf(n - note); best = n; }
+    return best;
+}
+
+// Harmonies use the scale's parent: Chromatic and Major pentatonic -> Major; Minor pentatonic and Blues -> Minor.
+static int VocHarmonyScale(int scale) { return scale == 0 || scale == 3 ? 1 : scale == 4 || scale == 5 ? 2 : scale; }
+
+static int VocScaleStep(int note, int steps, int key, int scale)   // move up/down by scale notes
+{
+    scale = VocHarmonyScale(scale);
+    int n = note, dir = steps > 0 ? 1 : -1;
+    for (int k = 0; k != steps; k += dir) {
+        do n += dir; while (!VocInScale(n, key, scale));
+    }
+    return n;
+}
+
+// YIN pitch detection on the last PD_WIN + PD_MAXLAG samples of the 12 kHz buffer.
+static float VocDetect()
+{
+    float* d = gVoc.pdD;
+    const int base = gVoc.pdW - PD_WIN - PD_MAXLAG;
+    float energy = 0;
+    for (int j = 0; j < PD_WIN; j++) { float x = gVoc.pdBuf[(base + PD_MAXLAG + j) & (PD_BUF - 1)]; energy += x * x; }
+    gVoc.level = sqrtf(energy / PD_WIN);
+    if (gVoc.level < 0.002f) return 0;         // too quiet to have a pitch (about -54 dBFS)
+
+    d[0] = 1; float run = 0;
+    for (int tau = 1; tau <= PD_MAXLAG; tau++) {
+        float sum = 0;
+        for (int j = 0; j < PD_WIN; j++) {
+            float a = gVoc.pdBuf[(base + PD_MAXLAG + j) & (PD_BUF - 1)];
+            float b = gVoc.pdBuf[(base + PD_MAXLAG + j - tau) & (PD_BUF - 1)];
+            sum += (a - b) * (a - b);
+        }
+        run += sum;
+        d[tau] = run > 0 ? sum * tau / run : 1;   // cumulative mean normalised difference
+    }
+    int tau = -1;
+    for (int t = PD_MINLAG; t < PD_MAXLAG; t++)
+        if (d[t] < 0.15f) { while (t + 1 < PD_MAXLAG && d[t + 1] < d[t]) t++; tau = t; break; }
+    if (tau < 0) return 0;                      // no clear pitch: breath, "s", noise
+    float a = d[tau - 1], b = d[tau], c = d[tau + 1], den = a - 2 * b + c;
+    float t = tau + (fabsf(den) > 1e-9f ? 0.5f * (a - c) / den : 0.0f);   // parabolic refinement
+    return (float)PD_RATE / t;
+}
+
+// Which notes the synth plays, as offsets in scale steps from the tuned note (99 = unused).
+static void VocVoices(int style, int* steps, float* gains, int* octaves)
+{
+    for (int i = 0; i < VOC_OSC; i++) { steps[i] = 99; gains[i] = 0; octaves[i] = 0; }
+    switch (style) {
+    case VOC_HARMONY:                           // third + fifth above, root an octave below
+        steps[0] = 2; gains[0] = 0.8f;
+        steps[1] = 4; gains[1] = 0.7f;
+        steps[2] = 0; gains[2] = 0.6f; octaves[2] = -1;
+        break;
+    case VOC_ROBOT:                             // the tuned note, doubled an octave below
+        steps[0] = 0; gains[0] = 1.0f;
+        steps[1] = 0; gains[1] = 0.5f; octaves[1] = -1;
+        break;
+    case VOC_CHOIR:                             // full chord across two octaves
+        steps[0] = 0; gains[0] = 1.0f;
+        steps[1] = 2; gains[1] = 0.8f;
+        steps[2] = 4; gains[2] = 0.8f;
+        steps[3] = 0; gains[3] = 0.6f; octaves[3] = -1;
+        steps[4] = 4; gains[4] = 0.4f; octaves[4] = -1;
+        steps[5] = 0; gains[5] = 0.35f; octaves[5] = 1;
+        break;
+    }
+}
+
+static inline float PolyBlep(double t, double dt)   // removes the aliasing a plain sawtooth would have
+{
+    if (t < dt)       { t /= dt;             return (float)(t + t - t * t - 1.0); }
+    if (t > 1.0 - dt) { t = (t - 1.0) / dt;  return (float)(t * t + t + t + 1.0); }
+    return 0.0f;
+}
+
+// Per-block settings, read once per audio callback.
+static struct VocParams { int style, key, scale; float retuneCoef, synth, mix; } gVp;
+
+static void VocBlock()
+{
+    gVp.style = Iclamp(gVocStyle, 0, VOC_STYLES - 1);
+    gVp.key   = Iclamp(gVocKey, 0, 11);
+    gVp.scale = Iclamp(gVocScale, 0, VOC_SCALES - 1);
+    float ms  = (float)gVocRetuneMs;
+    gVp.retuneCoef = ms <= 0 ? 1.0f : 1.0f - expf(-1.0f / (ms * 0.001f * RATE));
+    gVp.synth = gVocSynth / 100.0f;
+    gVp.mix   = gVocMix / 100.0f;
+}
+
+static float Vocoder(float x)
+{
+    VocState& v = gVoc;
+    if (!v.ready) VocReset();
+
+    // --- pitch detection (12 kHz) ---
+    float lp = BqRun(v.dsLp[1], BqRun(v.dsLp[0], x));
+    if (++v.pdPhase >= PD_DS) {
+        v.pdPhase = 0;
+        v.pdBuf[v.pdW & (PD_BUF - 1)] = lp;
+        v.pdW++;
+        if (++v.pdHop >= PD_HOP) {
+            v.pdHop = 0;
+            float f = VocDetect();
+            if (f > 0) {
+                v.f0 = f; v.unvoicedHops = 0;
+                float note = 69.0f + 12.0f * log2f(f / 440.0f);
+                int cand = VocNearest(note, gVp.key, gVp.scale);
+                // stay on the current note unless the new one is clearly closer (no flutter between two notes)
+                if (v.targetNote < 0 || !VocInScale(v.targetNote, gVp.key, gVp.scale) ||
+                    fabsf(note - v.targetNote) > fabsf(note - cand) + 0.25f)
+                    v.targetNote = cand;
+                v.wantShift = (float)v.targetNote - note;
+            } else if (++v.unvoicedHops > 4) {  // ~20 ms of no pitch
+                v.f0 = 0;
+                v.wantShift = 0;
+            }
+        }
+    }
+
+    // --- tune ---
+    v.shift += (v.wantShift - v.shift) * (v.f0 > 0 ? gVp.retuneCoef : 0.002f);
+    float tuned = PitchShift(gPsTune, x, pow(2.0, v.shift / 12.0), 960, 1.0f, true);   // 20 ms span, centered
+    if (v.f0 > 0) v.outNote = 69.0f + 12.0f * log2f(v.f0 / 440.0f) + v.shift;
+    if (gVp.style == VOC_TUNE) return x + (tuned - x) * gVp.mix;
+
+    // --- synth carrier ---
+    v.voiced += ((v.f0 > 0 ? 1.0f : 0.0f) - v.voiced) * 0.002f;   // ~10 ms fade
+    int steps[VOC_OSC], octs[VOC_OSC]; float gains[VOC_OSC];
+    VocVoices(gVp.style, steps, gains, octs);
+    float car = 0;
+    if (v.targetNote >= 0) {
+        float bend = v.outNote - (float)v.targetNote;              // follow vibrato and slides
+        for (int i = 0; i < VOC_OSC; i++) {
+            if (steps[i] == 99) continue;
+            int n = VocScaleStep(v.targetNote, steps[i], gVp.key, gVp.scale) + 12 * octs[i];
+            float fq = MidiToHz((float)n + bend);
+            if (fq > 6000.0f) continue;
+            v.oscFreq[i] += (fq - v.oscFreq[i]) * (v.oscFreq[i] > 0 ? 0.01f : 1.0f);
+            for (int k = 0; k < 2; k++) {                          // two saws, +/- 7 cents
+                double dt = v.oscFreq[i] * (k ? 1.00405 : 0.99597) / RATE;
+                double& ph = v.phase[i][k];
+                ph += dt; if (ph >= 1.0) ph -= 1.0;
+                car += ((float)(2.0 * ph - 1.0) - PolyBlep(ph, dt)) * gains[i] * 0.5f;
+            }
+        }
+    }
+    static unsigned seed = 12345;                                  // a little noise fills gaps between harmonics
+    seed = seed * 1664525u + 1013904223u;
+    car = car * v.voiced + ((int)(seed >> 9) % 2000 - 1000) * 0.00002f;
+
+    // --- channel vocoder ---
+    float voc = 0;
+    for (int b = 0; b < VOC_BANDS; b++) {
+        float m = BqRun(v.modBp[b][1], BqRun(v.modBp[b][0], tuned));
+        float c = BqRun(v.carBp[b][1], BqRun(v.carBp[b][0], car));
+        float am = m < 0 ? -m : m, ac = c < 0 ? -c : c;
+        v.modEnv[b] += (am - v.modEnv[b]) * (am > v.modEnv[b] ? 0.007f : 0.0014f);   // ~3 ms attack, ~15 ms release
+        v.carEnv[b] += (ac - v.carEnv[b]) * 0.0014f;
+        voc += c * v.modEnv[b] / (v.carEnv[b] + 0.0005f);         // carrier flattened, voice's shape applied
+    }
+    voc *= 1.5f;                                // calibrated: pure synth voice about as loud as your voice
+    voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], tuned)) * 0.7f;    // keep "s" and "t" sounds clear
+
+    float out;
+    if (gVp.style == VOC_HARMONY) out = tuned + voc * gVp.synth;   // your tuned voice + harmonies
+    else {                                                         // blend toward pure synth voice, equal loudness
+        float a = gVp.synth * 1.5707963f;
+        out = tuned * cosf(a) + voc * sinf(a);
+    }
+    return x + (out - x) * gVp.mix;
+}
+
 static void FxReset()                          // audio thread only
 {
-    memset(psBuf, 0, sizeof(psBuf)); psW = 0; psPrimed = false;
+    PsReset(gPsFx); PsReset(gPsTune); VocReset();
     memset(combBuf, 0, sizeof(combBuf)); memset(combStore, 0, sizeof(combStore));
     memset(apBuf, 0, sizeof(apBuf)); memset(preBuf, 0, sizeof(preBuf)); preW = 0;
     for (int i = 0; i < 8; i++) { combLen[i] = Imin(COMB_TUNE[i] * RATE / 44100, COMB_MAX); combIdx[i] = 0; }
@@ -393,6 +692,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (gFxResetReq) { FxReset(); gFxResetReq = false; }
     const bool   fxPitch = gFxOn && gFxPitchOn;
     const bool   fxRev   = gFxOn && gFxRevOn;
+    const bool   fxVoc   = gFxOn && gFxVocOn;
+    if (fxVoc) VocBlock();
     const double psRatio = pow(2.0, (gFxSemi + gFxCents / 100.0) / 12.0);
     const int    psGrain = Iclamp(gFxGrainMs * RATE / 1000, 64, PS_SIZE - PS_SEARCH - PS_CORR - 8);
     const float  psMix   = gFxPitchMix / 100.0f;
@@ -450,7 +751,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s *= powf(10.0f, gdb / 20.0f);
         }
 
-        if (fxPitch) s = PitchShift(s, psRatio, psGrain, psMix);
+        if (fxPitch) s = PitchShift(gPsFx, s, psRatio, psGrain, psMix);
+        if (fxVoc)   s = Vocoder(s);
         if (fxRev)   s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
 
         float effect = 0.0f, everything;
@@ -530,7 +832,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -571,6 +873,7 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 static FxGroup gFxGroups[] = {
     { L"Pitch",  &gFxPitchOn, L"fx_pitch_on",  true, L"fx_pitch_hotkey"  },
     { L"Reverb", &gFxRevOn,   L"fx_reverb_on", true, L"fx_reverb_hotkey" },
+    { L"Vocoder", &gFxVocOn,  L"fx_vocoder_on", true, L"fx_vocoder_hotkey" },
 };
 #define FX_GROUPS ((int)(sizeof(gFxGroups) / sizeof(gFxGroups[0])))
 
@@ -581,7 +884,7 @@ static int  gFxKeys[FX_KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[FX_KEY_SLOTS];
 
 // Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
-enum { KG_PITCH = 0, KG_REVERB = 1, KG_NS = 2, KG_GATE = 3, KG_TONE = 4 };
+enum { KG_PITCH = 0, KG_REVERB = 1, KG_VOCODER = 2, KG_NS = 3, KG_GATE = 4, KG_TONE = 5 };
 struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar;
               const wchar_t* offText; };          // shown (and the knob dimmed) when the value is at its minimum
 static Knob gKnobs[] = {
@@ -593,6 +896,9 @@ static Knob gKnobs[] = {
     { L"Size",      L"%",   0,   100, 60,  &gFxRevSize,  L"fx_reverb_size",     1, false, nullptr },
     { L"Damping",   L"%",   0,   100, 50,  &gFxRevDamp,  L"fx_reverb_damping",  1, false, nullptr },
     { L"Pre-delay", L" ms", 0,   200, 20,  &gFxPreMs,    L"fx_reverb_predelay", 1, false, nullptr },
+    { L"Retune",    L" ms", 0,   200, 15,  &gVocRetuneMs,   L"voc_retune_ms",     KG_VOCODER, false, nullptr },
+    { L"Synth",     L"%",   0,   100, 60,  &gVocSynth,      L"voc_synth",         KG_VOCODER, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 100, &gVocMix,        L"voc_mix",           KG_VOCODER, false, nullptr },
     { L"Strength",  L"%",   0,   100, 100, &gNsStrength,    L"ns_strength",       KG_NS,   false, nullptr },
     { L"Threshold", L" dB", -90, -10, -50, &gGateThrDb,     L"gate_threshold_db", KG_GATE, false, nullptr },
     { L"Voice",     L"%",   10,  99,  60,  &gGateVoicePct,  L"gate_voice_pct",    KG_GATE, false, nullptr },
@@ -917,6 +1223,9 @@ static void LoadSettings()
     }
     // Mic tab. Settings from 1.5 and older: gate=1/0 and gate_db=50 (meaning -50 dB).
     gNsOn         = INI_INT(L"ns_on", 0) != 0;
+    gVocStyle     = Iclamp(INI_INT(L"voc_style", VOC_HARMONY), 0, VOC_STYLES - 1);
+    gVocKey       = Iclamp(INI_INT(L"voc_key", 0), 0, 11);
+    gVocScale     = Iclamp(INI_INT(L"voc_scale", 1), 0, VOC_SCALES - 1);
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
     {
@@ -974,6 +1283,7 @@ static void SaveSettings()
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
+    SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
@@ -1188,6 +1498,7 @@ static bool KnobActive(int i)
         return true;
     case KG_TONE: return true;
     }
+    if (k.var == &gVocSynth && gVocStyle == VOC_TUNE) return false;   // Tune style has no synth
     return gFxOn && *gFxGroups[k.group].on;
 }
 static int  KnobStep(int i)   { return Imax(1, (gKnobs[i].hi - gKnobs[i].lo) / 50); }
@@ -1393,6 +1704,10 @@ static const TipText gKnobTips[] = {
     { L"fx_reverb_size",     L"How big the room sounds. Higher = a longer echo tail." },
     { L"fx_reverb_damping",  L"Softens the echo's high end. Higher = a darker, warmer tail." },
     { L"fx_reverb_predelay", L"Gap before the echo starts. 10-30 ms keeps your words clear." },
+    { L"voc_retune_ms",      L"How fast your voice snaps to the right note. 0 ms = instant, the hard robotic auto-tune sound; "
+                             L"20-60 ms = natural pitch correction; higher = gentle." },
+    { L"voc_synth",          L"Tune + harmony: how loud the harmony voices are. Robot and Choir: how much of your voice is replaced by the synth." },
+    { L"voc_mix",            L"How much of the vocoder you hear. 100% = only the effect; lower blends your original voice back in." },
     { L"ns_strength",        L"How much background noise is removed. 100% = full cleanup; lower blends some of the original back in for a more natural sound." },
     { L"gate_threshold_db",  L"How loud you must be for the gate to open. Set it just above the meter's level when you're quiet. Used when the gate opens on Volume." },
     { L"gate_voice_pct",     L"How sure the AI must be that you're speaking before the gate opens. Higher = stricter. Used when the gate opens on Voice." },
@@ -1415,6 +1730,9 @@ static const TipText gLabelTips[] = {
     { L"Pitch:",       L"How high or low the loop sounds. 100% = normal; 200% = one octave up, 50% = one octave down." },
     { L"Smoothing:",   L"Fades the loop's edges to stop clicks where it repeats. 0 = sharp and choppy." },
     { L"Voice level:", L"How loud your live voice is while the loop plays (with \"Keep talking\" ticked)." },
+    { L"Style",        L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
+                       L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you." },
+    { L"Key / scale",  L"The key of the song you're singing to. Your voice snaps to notes of this scale, and harmonies are built from it." },
     { L"Opens on:",    L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech. Volume + voice: both." },
     { L"Buffer:",      L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling." },
     { L"Theme:",       L"Light, dark, or follow Windows." },
@@ -1447,7 +1765,7 @@ static void AddTips()
     // Tabs
     TipId(IDC_TAB0 + PAGE_MAIN,     L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
     TipId(IDC_TAB0 + PAGE_MIC,      L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
-    TipId(IDC_TAB0 + PAGE_FX,       L"Pitch and reverb on your live voice.");
+    TipId(IDC_TAB0 + PAGE_FX,       L"Pitch, reverb and the vocoder (auto-tune and harmonies) on your live voice.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
 
     // Main
@@ -1481,6 +1799,11 @@ static void AddTips()
                         L"Voice: how sure the AI is that you're talking (shown when noise suppression or the Voice gate is on); "
                         L"the blue line is the Voice setting.");
     TipId(IDC_NSON,     L"Turn AI noise suppression (RNNoise) on or off. It removes fans, keyboards, hum and room noise. Adds about 20 ms of delay.");
+    TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
+                        L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you.");
+    TipId(IDC_VOCKEY,   L"The key of the song (its home note). Not sure? Try C with Major, or A with Minor.");
+    TipId(IDC_VOCSCALE, L"Which notes are allowed. Major = happy, Minor = darker, Pentatonic = safe for most songs, "
+                        L"Chromatic = every note (just smooths your pitch).");
     TipId(IDC_GATEMODE, L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech "
                         L"(ignores loud non-voice noise). Volume + voice: both.");
 
@@ -2233,8 +2556,8 @@ static void ShowHelp()
         L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
         L"PAGES\n"
-        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch and "
-        L"reverb to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch, reverb "
+        L"and the vocoder (auto-tune + harmonies) to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -2246,7 +2569,9 @@ static void ShowHelp()
         L"Hotkeys: click \"Set hotkey\" next to the switch, Pitch or Reverb and press a key or combo. "
         L"They work from anywhere, even in a game. Right-click a hotkey button (or press Backspace while setting it) to clear it.\n"
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
-        L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n\n"
+        L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n"
+        L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices. Pick the key of the song; "
+        L"Retune 0 ms gives the hard auto-tune sound.\n\n"
         L"HOTKEY\n"
         L"Click the hotkey button, hold one key or up to 3 together (like Shift + F or Ctrl + Shift + 1), "
         L"then let go. Esc cancels. Mouse side buttons work too.\n\n"
@@ -2577,14 +2902,33 @@ static void CreateUI()
         wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 66, 114, 30, IDC_FXKEY_MASTER);
     }
-    const int FX_SEC_Y0 = 126, FX_SEC_STEP = 146, FX_SEC_H = 126;
+    const int FX_SEC_Y0 = 126, FX_SEC_STEP = 138, FX_SEC_H = 126;
     for (int g = 0; g < FX_GROUPS; g++) {
         int y = FX_SEC_Y0 + FX_SEC_STEP * g;
         AddSection(14, y, 532, FX_SEC_H, gFxGroups[g].title);
+        int kx = 26, kstep = 98, kw = KNOB_W;
+        if (g == KG_VOCODER) {                  // dropdowns on the left, narrower knobs after them
+            Ctl(L"STATIC", L"Style", 0, 28, y + 14, 150, 16, IDC_HDR);
+            HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 31, 152, 300, IDC_VOCSTYLE);
+            const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir" };
+            for (const wchar_t* n : styleNames) SendMessageW(st, CB_ADDSTRING, 0, (LPARAM)n);
+            SendMessageW(st, CB_SETCURSEL, gVocStyle, 0);
+            Ctl(L"STATIC", L"Key / scale", 0, 28, y + 62, 150, 16, IDC_HDR);
+            HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 79, 56, 300, IDC_VOCKEY);
+            const wchar_t* keyNames[12] = { L"C", L"C#", L"D", L"D#", L"E", L"F", L"F#", L"G", L"G#", L"A", L"A#", L"B" };
+            for (const wchar_t* n : keyNames) SendMessageW(ky, CB_ADDSTRING, 0, (LPARAM)n);
+            SendMessageW(ky, CB_SETCURSEL, gVocKey, 0);
+            HWND sc = Ctl(L"COMBOBOX", L"", COMBO, 86, y + 79, 92, 300, IDC_VOCSCALE);
+            const wchar_t* scaleNames[VOC_SCALES] = { L"Chromatic", L"Major", L"Minor", L"Major pentatonic", L"Minor pentatonic", L"Blues" };
+            for (const wchar_t* n : scaleNames) SendMessageW(sc, CB_ADDSTRING, 0, (LPARAM)n);
+            SendMessageW(sc, CB_SETCURSEL, gVocScale, 0);
+            SendMessageW(sc, CB_SETDROPPEDWIDTH, 140, 0);
+            kx = 186; kstep = 80; kw = 80;
+        }
         int col = 0;
         for (int i = 0; i < KNOB_N; i++) {
             if (gKnobs[i].group != g) continue;
-            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), 26 + col * 98, y + 14, KNOB_W, KNOB_H, IDC_KNOB + i);
+            Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), kx + col * kstep, y + 14, kw, KNOB_H, IDC_KNOB + i);
             col++;
         }
         Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_FXGRP_ON + g);
@@ -2819,6 +3163,13 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
         break;
     case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE:
+        if (code == CBN_SELCHANGE) {
+            int v = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            if (id == IDC_VOCSTYLE) gVocStyle = v; else if (id == IDC_VOCKEY) gVocKey = v; else gVocScale = v;
+            RedrawKnobs();                      // Synth dims in the Tune style
+        }
+        break;
     case IDC_OPENSET:
         if (code == BN_CLICKED) {
             SaveSettings();                     // so the file is there and up to date
