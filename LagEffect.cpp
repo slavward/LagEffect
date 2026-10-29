@@ -1,7 +1,7 @@
 // LagEffect.cpp - hold (or toggle) a hotkey to loop the last chunk of your mic.
 // Windows app with a settings window and tray icon. Settings save to LagEffect.ini.
-// Built for Discord / OBS: send to a virtual cable, hear yourself on headphones,
-// built-in noise gate, auto-reconnect, separate pitch/speed, dark mode, GitHub updater.
+// Built for Discord / OBS: several outputs each playing Off / Effect only / Everything,
+// built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater.
 //
 // Build:
 //   1. Put miniaudio.h (https://github.com/mackron/miniaudio) next to this file.
@@ -13,9 +13,10 @@
 //        g++ -O2 LagEffect.cpp LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
 //
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
-// is the version (e.g. v1.2.0) and attach LagEffect.exe. The app's "Check now" button finds it.
+// is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.1.0"
+#define APP_VERSION L"1.4.1"
+#define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
 #define _UNICODE
@@ -45,21 +46,25 @@ static int Imax(int a, int b) { return a > b ? a : b; }
 static int Iclamp(int v, int lo, int hi) { return Imax(lo, Imin(hi, v)); }
 
 // ======================= audio =======================
-#define RATE     48000
-#define HIST     (RATE * 2)                    // loops up to 2 seconds long
-#define MON_SIZE 16384                         // monitor ring buffer (power of two)
-#define MAXGRAIN (RATE * 40 / 1000)            // 40 ms grains for pitch/speed
+#define RATE      48000
+#define HIST      (RATE * 2)                   // loops up to 2 seconds long
+#define RING_SIZE 16384                        // per-output ring buffer (power of two)
+#define MAXGRAIN  (RATE * 40 / 1000)           // 40 ms grains for pitch/speed
+#define MAX_OUT   5                            // output rows
 static const int BUFFERS[] = { 32, 64, 128, 256, 512 };
 
-enum { MON_OFF = 0, MON_EFFECT = 1, MON_ALL = 2 };
+enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2 };
 
 // Settings shared with the audio threads (plain ints/floats are safe to read on x86/x64).
-static volatile int   gLoopMs = 500, gSpeedPct = 100, gPitchPct = 100, gVolPct = 100, gFadeMs = 3;
-static volatile int   gGateDb = 50, gMonVolPct = 100, gMonMode = MON_OFF;
-static volatile int   gHotkey = VK_F8;
-static volatile bool  gToggleMode = false, gPassThrough = true, gGateOn = false;
+static volatile int   gLoopMs = 500, gSpeedPct = 100, gPitchPct = 100, gFadeMs = 3;
+static volatile int   gGateDb = 50, gTalkVolPct = 100;
+#define MAX_KEYS 3                             // hotkey can be a combination of up to 3 keys
+static volatile int   gHotkeys[MAX_KEYS] = { VK_F8, 0, 0 };
+static volatile bool  gToggleMode = false, gGateOn = false, gTalkOver = false;
 static volatile bool  gCapturingKey = false, gLooping = false;
 static volatile float gGateLin = 0.00316f;     // -50 dB
+static volatile int   gRowMode[MAX_OUT] = { MODE_ALL, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT };
+static volatile int   gRowVol[MAX_OUT]  = { 100, 100, 100, 100, 100 };
 
 static float  hist[HIST], frozen[HIST], hann[MAXGRAIN];
 static size_t wpos = 0, frozenLen = 1;
@@ -69,9 +74,11 @@ static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static int    gateHold = 0;
 
-static float  monRing[MON_SIZE];
-static volatile unsigned monW = 0, monR = 0;
-static volatile bool     monActive = false;
+// Output 1 plays straight from the main audio callback. Outputs 2-5 are separate devices
+// fed through ring buffers.
+static float             ring[MAX_OUT][RING_SIZE];
+static volatile unsigned ringW[MAX_OUT], ringR[MAX_OUT];
+static volatile bool     ringOn[MAX_OUT];
 
 static void UpdateGateLin()
 {
@@ -87,12 +94,39 @@ static inline double WrapPos(double p, double len)
     return p;
 }
 
+// Leaves normal levels untouched and gently rounds off peaks above 0.7 (voice + loop can add up).
+static inline float SoftLimit(float x)
+{
+    float a = x < 0 ? -x : x;
+    if (a <= 0.7f) return x;
+    float y = 0.7f + 0.3f * tanhf((a - 0.7f) / 0.3f);
+    return x < 0 ? -y : y;
+}
+
+static inline float RowSignal(int mode, float effect, float everything)
+{
+    return mode == MODE_EFFECT ? effect : mode == MODE_ALL ? everything : 0.0f;
+}
+
+// True while every key in the hotkey combination is held down.
+static bool ComboDown()
+{
+    bool any = false;
+    for (int i = 0; i < MAX_KEYS; i++) {
+        int vk = gHotkeys[i];
+        if (!vk) continue;
+        any = true;
+        if (!(GetAsyncKeyState(vk) & 0x8000)) return false;
+    }
+    return any;
+}
+
 static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32 frames)
 {
     float* out = (float*)output;                // stereo
     const float* in = (const float*)input;      // mono
 
-    bool down = !gCapturingKey && (GetAsyncKeyState(gHotkey) & 0x8000) != 0;
+    bool down = !gCapturingKey && ComboDown();
     bool active;
     if (gToggleMode) { if (down && !prevDown) toggled = !toggled; active = toggled; }
     else             { toggled = false; active = down; }
@@ -113,26 +147,35 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         grainLen = g;
         for (int i = 0; i < g; i++) hann[i] = 0.5f - 0.5f * (float)cos(6.283185307179586 * i / g);
         loopPos = 0;
-        grainStart[0] = 0;                     grainAge[0] = 0;
-        grainStart[1] = WrapPos(-(double)g / 2, (double)len); grainAge[1] = g / 2;
+        grainStart[0] = 0;                                      grainAge[0] = 0;
+        grainStart[1] = WrapPos(-(double)g / 2, (double)len);   grainAge[1] = g / 2;
         looping = true;
     } else if (!active) {
         looping = false;
     }
     gLooping = looping;
 
-    const float  vol    = gVolPct / 100.0f;
-    const float  monVol = gMonVolPct / 100.0f;
-    const int    mode   = monActive ? gMonMode : MON_OFF;
-    const bool   gateOn = gGateOn;
-    const float  thr    = gGateLin;
-    const double speed  = gSpeedPct / 100.0;
-    const double pitch  = gPitchPct / 100.0;
-    const double len    = (double)frozenLen;
+    int      mode[MAX_OUT];
+    float    vol[MAX_OUT];
+    bool     on[MAX_OUT];
+    unsigned w[MAX_OUT], r[MAX_OUT];
+    for (int k = 0; k < MAX_OUT; k++) {
+        mode[k] = gRowMode[k];
+        vol[k]  = gRowVol[k] / 100.0f;
+        on[k]   = k > 0 && ringOn[k];
+        w[k]    = ringW[k];
+        r[k]    = ringR[k];
+    }
+
+    const bool   gateOn  = gGateOn;
+    const float  thr     = gGateLin;
+    const bool   talk    = gTalkOver;
+    const float  talkVol = gTalkVolPct / 100.0f;
+    const double speed   = gSpeedPct / 100.0;
+    const double pitch   = gPitchPct / 100.0;
+    const double len     = (double)frozenLen;
     double fade = (double)gFadeMs * RATE / 1000.0;
     if (fade * 2 > len) fade = len / 2.0;
-
-    unsigned w = monW, r = monR;
 
     for (ma_uint32 f = 0; f < frames; f++) {
         float s = in ? in[f] : 0.0f;
@@ -147,7 +190,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s *= gateGain;
         }
 
-        float o;
+        float effect = 0.0f, everything;
         if (looping) {
             float v = 0.0f;
             for (int k = 0; k < 2; k++) {
@@ -164,58 +207,66 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 if (++grainAge[k] >= grainLen) { grainAge[k] = 0; grainStart[k] = WrapPos(loopPos + speed, len); }
             }
             loopPos = WrapPos(loopPos + speed, len);
-            o = v * vol;
+            effect = v;
+            everything = v;
+            if (talk) {                         // keep talking over the loop
+                everything += s * talkVol;
+                hist[wpos] = s;                 // and keep recording, so the next trigger grabs fresh audio
+                wpos = (wpos + 1) % HIST;
+            }
         } else {
             hist[wpos] = s;
             wpos = (wpos + 1) % HIST;
-            o = gPassThrough ? s * vol : 0.0f;
+            everything = s;
         }
 
-        if (o > 1.0f) o = 1.0f; else if (o < -1.0f) o = -1.0f;   // never clip harshly into Discord/OBS
+        float o = SoftLimit(RowSignal(mode[0], effect, everything) * vol[0]);
         out[f * 2] = o;
         out[f * 2 + 1] = o;
 
-        if (mode != MON_OFF && (w - r) < MON_SIZE) {
-            float m = (mode == MON_ALL || looping) ? o * monVol : 0.0f;
-            if (m > 1.0f) m = 1.0f; else if (m < -1.0f) m = -1.0f;
-            monRing[w & (MON_SIZE - 1)] = m;
-            w++;
+        for (int k = 1; k < MAX_OUT; k++) {
+            if (!on[k] || (w[k] - r[k]) >= RING_SIZE) continue;
+            ring[k][w[k] & (RING_SIZE - 1)] = SoftLimit(RowSignal(mode[k], effect, everything) * vol[k]);
+            w[k]++;
         }
     }
     MemoryBarrier();
-    monW = w;
+    for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
 }
 
-static void MonitorCallback(ma_device* dev, void* output, const void*, ma_uint32 frames)
+static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_uint32 frames)
 {
+    int k = (int)(INT_PTR)dev->pUserData;
     float* out = (float*)output;                // stereo
-    unsigned w = monW;
+    unsigned w = ringW[k];
     MemoryBarrier();
-    unsigned r = monR;
+    unsigned r = ringR[k];
     unsigned avail = w - r;
 
-    // The two devices run on separate clocks; drop old audio so delay never builds up.
+    // Each device runs on its own clock; drop old audio so delay never builds up.
     unsigned maxLag = dev->playback.internalPeriodSizeInFrames * 3 + 512;
     if (avail > maxLag) { r = w - dev->playback.internalPeriodSizeInFrames; avail = w - r; }
 
     for (ma_uint32 f = 0; f < frames; f++) {
         float m = 0.0f;
-        if (avail) { m = monRing[r & (MON_SIZE - 1)]; r++; avail--; }
+        if (avail) { m = ring[k][r & (RING_SIZE - 1)]; r++; avail--; }
         out[f * 2] = m;
         out[f * 2 + 1] = m;
     }
-    monR = r;
+    ringR[k] = r;
 }
 
 // ======================= app state =======================
 enum {
-    IDC_MIC = 101, IDC_OUT, IDC_MON, IDC_MONMODE, IDC_VBCABLE,
-    IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_VOL, IDC_FADE, IDC_GATE, IDC_MONVOL,
-    IDC_GATEON, IDC_PASS, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
+    IDC_MIC = 101, IDC_ADDOUT, IDC_VBCABLE,
+    IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_FADE, IDC_GATE, IDC_TALKVOL,
+    IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
-    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART,
+    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR,
+    IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
 };
+#define SPIN_UD(id)        ((id) + 100)      // up-down control paired with a number box
 #define WM_TRAY            (WM_APP + 1)
 #define WM_DEVICE_LOST     (WM_APP + 2)
 #define WM_UPDATE_CHECKED  (WM_APP + 3)
@@ -225,25 +276,25 @@ enum {
 #define TIMER_RECONNECT 3
 #define TIMER_CLEANUP   4
 
-static HINSTANCE gInst; static HWND gWnd, gStatus; static HFONT gFont; static HICON gIcon;
-static ma_context gCtx; static ma_device gDev, gMonDev;
-static bool gCtxOk = false, gRunning = false, gMonRunning = false, gWantRunning = false, gStopping = false;
-static ma_device_info *gOuts = nullptr, *gIns = nullptr; static ma_uint32 gOutCount = 0, gInCount = 0;
-static int  gBufIdx = 2;
+static HINSTANCE gInst; static HWND gWnd, gStatus; static HFONT gFont, gFontBold; static HICON gIcon;
+static ma_context gCtx; static ma_device gDev, gExtraDev[MAX_OUT];
+static bool gCtxOk = false, gRunning = false, gWantRunning = false, gStopping = false;
+static bool gExtraRunning[MAX_OUT];
+static ma_device_info *gPlayDevs = nullptr, *gCapDevs = nullptr; static ma_uint32 gPlayCount = 0, gCapCount = 0;
+static int  gRows = 1, gBufIdx = 2;
 static bool gExclusive = false, gAutoStart = false, gInTray = false, gUiReady = false;
-static wchar_t gMicName[512], gOutName[512], gMonName[512], gIni[MAX_PATH];
+static wchar_t gMicName[512], gRowName[MAX_OUT][512], gIni[MAX_PATH];
 static bool gKeyWasDown[256];
-static int  gWaitRelease = 0;
+static int  gCapKeys[MAX_KEYS], gCapKeyCount = 0;
 
 struct Range { int id, lo, hi; volatile int* var; const wchar_t* key; };
 static Range gRanges[] = {
-    { IDC_LOOP,   10, 2000, &gLoopMs,    L"loop_ms"        },
-    { IDC_SPEED,  10, 400,  &gSpeedPct,  L"speed"          },
-    { IDC_PITCH,  25, 400,  &gPitchPct,  L"pitch"          },
-    { IDC_VOL,    0,  200,  &gVolPct,    L"volume"         },
-    { IDC_FADE,   0,  50,   &gFadeMs,    L"smoothing_ms"   },
-    { IDC_GATE,   20, 90,   &gGateDb,    L"gate_db"        },
-    { IDC_MONVOL, 0,  200,  &gMonVolPct, L"monitor_volume" },
+    { IDC_LOOP,    10, 2000, &gLoopMs,     L"loop_ms"         },
+    { IDC_SPEED,   10, 400,  &gSpeedPct,   L"speed"           },
+    { IDC_PITCH,   25, 400,  &gPitchPct,   L"pitch"           },
+    { IDC_FADE,    0,  50,   &gFadeMs,     L"smoothing_ms"    },
+    { IDC_GATE,    20, 90,   &gGateDb,     L"gate_db"         },
+    { IDC_TALKVOL, 0,  200,  &gTalkVolPct, L"talkover_volume" },
 };
 
 static void Widen(const char* s, wchar_t* out, int cap)
@@ -275,14 +326,41 @@ static void KeyName(int vk, wchar_t* buf, int cap)
     wsprintfW(buf, L"Key %d", vk);
 }
 
+static void ComboName(const int* keys, int count, wchar_t* buf, int cap)
+{
+    buf[0] = 0;
+    for (int i = 0; i < count; i++) {
+        if (!keys[i]) continue;
+        wchar_t one[64];
+        KeyName(keys[i], one, 64);
+        if (buf[0] && lstrlenW(buf) + 3 < cap) lstrcatW(buf, L" + ");
+        if (lstrlenW(buf) + lstrlenW(one) < cap) lstrcatW(buf, one);
+    }
+}
+
+static void HotkeyName(wchar_t* buf, int cap)
+{
+    int keys[MAX_KEYS];
+    for (int i = 0; i < MAX_KEYS; i++) keys[i] = gHotkeys[i];
+    ComboName(keys, MAX_KEYS, buf, cap);
+}
+
 // ======================= theme (light / dark) =======================
 enum { THEME_SYSTEM = 0, THEME_LIGHT = 1, THEME_DARK = 2 };
 static int    gThemeMode = THEME_SYSTEM;
 static bool   gDark = false;
-static HBRUSH gBrBg, gBrCtl;
-#define DK_BG   RGB(32, 32, 32)
-#define DK_CTL  RGB(50, 50, 50)
-#define DK_TEXT RGB(232, 232, 232)
+static HBRUSH gBrDarkBg, gBrDarkCtl;
+
+#define DK_BG      RGB(32, 32, 32)
+#define DK_CTL     RGB(45, 45, 45)
+#define DK_BORDER  RGB(78, 78, 78)
+#define DK_SECTION RGB(64, 64, 64)
+#define DK_TEXT    RGB(235, 235, 235)
+#define DK_DIM     RGB(160, 160, 160)
+#define ACCENT     RGB(76, 160, 255)
+
+static COLORREF BgColor()  { return gDark ? DK_BG : GetSysColor(COLOR_BTNFACE); }
+static HBRUSH   BgBrush()  { return gDark ? gBrDarkBg : GetSysColorBrush(COLOR_BTNFACE); }
 
 typedef HRESULT (WINAPI* PFN_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
 typedef HRESULT (WINAPI* PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
@@ -313,8 +391,8 @@ static void LoadThemeApis()
     }
     HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
     if (dwm) pDwmSetWindowAttribute = (PFN_DwmSetWindowAttribute)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute");
-    gBrBg  = CreateSolidBrush(DK_BG);
-    gBrCtl = CreateSolidBrush(DK_CTL);
+    gBrDarkBg  = CreateSolidBrush(DK_BG);
+    gBrDarkCtl = CreateSolidBrush(DK_CTL);
 }
 
 static bool SystemUsesDark()
@@ -333,14 +411,20 @@ static BOOL CALLBACK ThemeChild(HWND h, LPARAM)
     GetClassNameW(h, cls, 32);
     if (!lstrcmpiW(cls, L"Button")) {
         LONG type = GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK;
+        // Push buttons use Windows' own dark style; checkboxes and radios are custom-drawn in dark mode.
         if (type == BS_PUSHBUTTON || type == BS_DEFPUSHBUTTON) SetTheme(h, gDark ? L"DarkMode_Explorer" : nullptr, nullptr);
-        else if (gDark) SetTheme(h, L"", L"");  // unthemed so checkbox / group text can be light
-        else            SetTheme(h, nullptr, nullptr);
-    } else if (!lstrcmpiW(cls, L"ComboBox") || !lstrcmpiW(cls, L"Edit")) {
+    } else if (!lstrcmpiW(cls, L"ComboBox")) {
         SetTheme(h, gDark ? L"DarkMode_CFD" : nullptr, nullptr);
-    } else if (!lstrcmpiW(cls, UPDOWN_CLASSW)) {
-        SetTheme(h, gDark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    } else if (!lstrcmpiW(cls, L"Edit")) {
+        SetTheme(h, gDark ? L"DarkMode_CFD" : nullptr, nullptr);
+        LONG ex = GetWindowLongW(h, GWL_EXSTYLE);          // flat border drawn by the window in dark mode
+        LONG want = gDark ? (ex & ~WS_EX_CLIENTEDGE) : (ex | WS_EX_CLIENTEDGE);
+        if (want != ex) {
+            SetWindowLongW(h, GWL_EXSTYLE, want);
+            SetWindowPos(h, nullptr, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
     }
+    InvalidateRect(h, nullptr, TRUE);
     return TRUE;
 }
 
@@ -360,9 +444,108 @@ static void ApplyTheme()
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
+// Dark-mode checkbox / radio button, drawn from scratch (Windows has no dark version of these).
+static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
+{
+    if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
+    HWND h = cd->hdr.hwndFrom;
+    LONG type = GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK;
+    bool radio = type == BS_AUTORADIOBUTTON || type == BS_RADIOBUTTON;
+    if (!radio && type != BS_AUTOCHECKBOX && type != BS_CHECKBOX) return CDRF_DODEFAULT;
+
+    HDC dc = cd->hdc;
+    RECT rc = cd->rc;
+    FillRect(dc, &rc, gBrDarkBg);
+    bool checked = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    bool hot = (cd->uItemState & CDIS_HOT) != 0;
+
+    const int s = 15;
+    int y = (rc.top + rc.bottom - s) / 2;
+    HPEN   pen = CreatePen(PS_SOLID, 1, checked ? ACCENT : hot ? RGB(200, 200, 200) : RGB(135, 135, 135));
+    HBRUSH br  = CreateSolidBrush(checked && !radio ? ACCENT : DK_CTL);
+    HGDIOBJ oldPen = SelectObject(dc, pen), oldBr = SelectObject(dc, br);
+    if (radio) Ellipse(dc, rc.left, y, rc.left + s, y + s);
+    else       RoundRect(dc, rc.left, y, rc.left + s, y + s, 5, 5);
+    SelectObject(dc, oldPen); SelectObject(dc, oldBr);
+    DeleteObject(pen); DeleteObject(br);
+
+    if (checked && radio) {
+        HBRUSH dot = CreateSolidBrush(ACCENT);
+        HPEN   none = CreatePen(PS_SOLID, 1, ACCENT);
+        oldPen = SelectObject(dc, none); oldBr = SelectObject(dc, dot);
+        Ellipse(dc, rc.left + 4, y + 4, rc.left + s - 4, y + s - 4);
+        SelectObject(dc, oldPen); SelectObject(dc, oldBr);
+        DeleteObject(dot); DeleteObject(none);
+    } else if (checked) {
+        HPEN tick = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+        oldPen = SelectObject(dc, tick);
+        POINT pts[3] = { { rc.left + 4, y + 7 }, { rc.left + 6, y + 10 }, { rc.left + 11, y + 4 } };
+        Polyline(dc, pts, 3);
+        SelectObject(dc, oldPen);
+        DeleteObject(tick);
+    }
+
+    wchar_t text[128];
+    GetWindowTextW(h, text, 128);
+    HGDIOBJ oldFont = SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, DK_TEXT);
+    RECT tr = rc; tr.left += s + 6;
+    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    if (cd->uItemState & CDIS_FOCUS) {
+        RECT fr = tr; DrawTextW(dc, text, -1, &fr, DT_SINGLELINE | DT_CALCRECT);
+        fr.top = tr.top + 2; fr.bottom = tr.bottom - 2; InflateRect(&fr, 2, 0);
+        SetTextColor(dc, DK_TEXT);
+        DrawFocusRect(dc, &fr);
+    }
+    SelectObject(dc, oldFont);
+    return CDRF_SKIPDEFAULT;
+}
+
+// Dark-mode up/down arrows for the number boxes.
+static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    if (gDark && m == WM_ERASEBKGND) return 1;
+    if (gDark && m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        int mid = (rc.top + rc.bottom) / 2;
+        POINT cur; GetCursorPos(&cur); ScreenToClient(h, &cur);
+        bool pressed = GetCapture() == h && (GetKeyState(VK_LBUTTON) & 0x8000);
+        RECT top = rc, bot = rc;
+        top.bottom = mid; bot.top = mid;
+        FillRect(dc, &rc, gBrDarkCtl);
+        if (pressed) {
+            HBRUSH hi = CreateSolidBrush(RGB(70, 70, 70));
+            FillRect(dc, cur.y < mid ? &top : &bot, hi);
+            DeleteObject(hi);
+        }
+        HBRUSH arrow = CreateSolidBrush(RGB(200, 200, 200));
+        HPEN   apen  = CreatePen(PS_SOLID, 1, RGB(200, 200, 200));
+        HGDIOBJ op = SelectObject(dc, apen), ob = SelectObject(dc, arrow);
+        int cx = (rc.left + rc.right) / 2;
+        int ty = (top.top + top.bottom) / 2, by = (bot.top + bot.bottom) / 2;
+        POINT up[3] = { { cx - 3, ty + 1 }, { cx + 3, ty + 1 }, { cx, ty - 2 } };
+        POINT dn[3] = { { cx - 3, by - 1 }, { cx + 3, by - 1 }, { cx, by + 2 } };
+        Polygon(dc, up, 3);
+        Polygon(dc, dn, 3);
+        SelectObject(dc, op); SelectObject(dc, ob);
+        DeleteObject(arrow); DeleteObject(apen);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (gDark && (m == WM_LBUTTONDOWN || m == WM_LBUTTONUP)) {
+        LRESULT res = DefSubclassProc(h, m, w, l);
+        InvalidateRect(h, nullptr, FALSE);
+        return res;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
 // ======================= settings =======================
 static wchar_t gUpdateRepo[200];
-static bool    gUpdateOnStart = false;
+static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
 {
@@ -373,23 +556,48 @@ static void LoadSettings()
 
     #define INI_INT(k, d) (int)GetPrivateProfileIntW(L"settings", k, d, gIni)
     for (Range& r : gRanges) *r.var = Iclamp(INI_INT(r.key, *r.var), r.lo, r.hi);
-    gHotkey        = INI_INT(L"hotkey", VK_F8);
+    gHotkeys[0]    = Iclamp(INI_INT(L"hotkey",  VK_F8), 0, 255);
+    gHotkeys[1]    = Iclamp(INI_INT(L"hotkey2", 0), 0, 255);
+    gHotkeys[2]    = Iclamp(INI_INT(L"hotkey3", 0), 0, 255);
+    if (!gHotkeys[0]) gHotkeys[0] = VK_F8;
     gToggleMode    = INI_INT(L"toggle", 0) != 0;
-    gPassThrough   = INI_INT(L"passthrough", 1) != 0;
     gGateOn        = INI_INT(L"gate", 0) != 0;
-    gMonMode       = Iclamp(INI_INT(L"monitor_mode", MON_OFF), 0, 2);
+    gTalkOver      = INI_INT(L"talkover", 0) != 0;
     gBufIdx        = Iclamp(INI_INT(L"buffer", 2), 0, 4);
     gExclusive     = INI_INT(L"exclusive", 0) != 0;
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
-    gUpdateOnStart = INI_INT(L"update_on_start", 0) != 0;
-    #undef INI_INT
+    gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
     UpdateGateLin();
 
     GetPrivateProfileStringW(L"settings", L"mic",         L"", gMicName, 512, gIni);
-    GetPrivateProfileStringW(L"settings", L"output",      L"", gOutName, 512, gIni);
-    GetPrivateProfileStringW(L"settings", L"monitor",     L"", gMonName, 512, gIni);
-    GetPrivateProfileStringW(L"settings", L"update_repo", L"", gUpdateRepo, 200, gIni);
+    GetPrivateProfileStringW(L"settings", L"update_repo", DEFAULT_UPDATE_REPO, gUpdateRepo, 200, gIni);
+
+    int rows = INI_INT(L"out_count", 0);
+    if (rows < 1) {
+        // Settings from 1.2 and older: "Send to" becomes output 1, "Hear on" becomes output 2.
+        rows = 1;
+        GetPrivateProfileStringW(L"settings", L"output", L"", gRowName[0], 512, gIni);
+        gRowMode[0] = INI_INT(L"passthrough", 1) ? MODE_ALL : MODE_EFFECT;
+        gRowVol[0]  = Iclamp(INI_INT(L"volume", 100), 0, 200);
+        int mon = INI_INT(L"monitor_mode", MODE_OFF);
+        if (mon != MODE_OFF) {
+            rows = 2;
+            GetPrivateProfileStringW(L"settings", L"monitor", L"", gRowName[1], 512, gIni);
+            gRowMode[1] = Iclamp(mon, 0, 2);
+            gRowVol[1]  = Iclamp(INI_INT(L"monitor_volume", 100), 0, 200);
+        }
+    } else {
+        rows = Iclamp(rows, 1, MAX_OUT);
+        for (int k = 0; k < rows; k++) {
+            wchar_t key[32];
+            wsprintfW(key, L"out%d_device", k + 1); GetPrivateProfileStringW(L"settings", key, L"", gRowName[k], 512, gIni);
+            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? MODE_ALL : MODE_EFFECT), 0, 2);
+            wsprintfW(key, L"out%d_volume", k + 1); gRowVol[k]  = Iclamp(INI_INT(key, 100), 0, 200);
+        }
+    }
+    gRows = rows;
+    #undef INI_INT
 }
 
 static void SelectedName(int comboId, ma_device_info* list, ma_uint32 count, wchar_t* out, int cap)
@@ -407,15 +615,22 @@ static void SaveInt(const wchar_t* k, int v)
 static void SaveSettings()
 {
     for (Range& r : gRanges) SaveInt(r.key, *r.var);
-    SaveInt(L"hotkey", gHotkey); SaveInt(L"toggle", gToggleMode); SaveInt(L"passthrough", gPassThrough);
-    SaveInt(L"gate", gGateOn); SaveInt(L"monitor_mode", gMonMode);
+    SaveInt(L"hotkey", gHotkeys[0]); SaveInt(L"hotkey2", gHotkeys[1]); SaveInt(L"hotkey3", gHotkeys[2]);
+    SaveInt(L"toggle", gToggleMode);
+    SaveInt(L"gate", gGateOn); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
     WritePrivateProfileStringW(L"settings", L"update_repo", gUpdateRepo, gIni);
-    wchar_t name[512];
-    SelectedName(IDC_MIC, gIns, gInCount, name, 512);   WritePrivateProfileStringW(L"settings", L"mic", name, gIni);
-    SelectedName(IDC_OUT, gOuts, gOutCount, name, 512); WritePrivateProfileStringW(L"settings", L"output", name, gIni);
-    SelectedName(IDC_MON, gOuts, gOutCount, name, 512); WritePrivateProfileStringW(L"settings", L"monitor", name, gIni);
+    wchar_t name[512], key[32];
+    SelectedName(IDC_MIC, gCapDevs, gCapCount, name, 512);
+    WritePrivateProfileStringW(L"settings", L"mic", name, gIni);
+    SaveInt(L"out_count", gRows);
+    for (int k = 0; k < gRows; k++) {
+        SelectedName(IDC_ROWDEV + k, gPlayDevs, gPlayCount, name, 512);
+        wsprintfW(key, L"out%d_device", k + 1); WritePrivateProfileStringW(L"settings", key, name, gIni);
+        wsprintfW(key, L"out%d_mode", k + 1);   SaveInt(key, gRowMode[k]);
+        wsprintfW(key, L"out%d_volume", k + 1); SaveInt(key, gRowVol[k]);
+    }
 }
 
 // ======================= audio start/stop =======================
@@ -428,26 +643,36 @@ static void NotifyCallback(const ma_device_notification* n)
 
 static int ComboIndex(int id) { return (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) - 1; }
 
-static bool StartMonitor()
+static bool StartExtraOutput(int k)
 {
-    if (gMonMode == MON_OFF) return true;
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format    = ma_format_f32;
     cfg.playback.channels  = 2;
     cfg.sampleRate         = RATE;
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
-    cfg.dataCallback       = MonitorCallback;
+    cfg.dataCallback       = ExtraOutputCallback;
     cfg.notificationCallback = NotifyCallback;
-    int i = ComboIndex(IDC_MON);
-    if (i >= 0 && i < (int)gOutCount) cfg.playback.pDeviceID = &gOuts[i].id;
+    cfg.pUserData          = (void*)(INT_PTR)k;
+    int i = ComboIndex(IDC_ROWDEV + k);
+    if (i >= 0 && i < (int)gPlayCount) cfg.playback.pDeviceID = &gPlayDevs[i].id;
 
-    monW = monR = 0;
-    if (ma_device_init(&gCtx, &cfg, &gMonDev) != MA_SUCCESS) return false;
-    if (ma_device_start(&gMonDev) != MA_SUCCESS) { ma_device_uninit(&gMonDev); return false; }
-    gMonRunning = true;
-    monActive = true;
+    ringW[k] = ringR[k] = 0;
+    if (ma_device_init(&gCtx, &cfg, &gExtraDev[k]) != MA_SUCCESS) return false;
+    if (ma_device_start(&gExtraDev[k]) != MA_SUCCESS) { ma_device_uninit(&gExtraDev[k]); return false; }
+    gExtraRunning[k] = true;
+    ringOn[k] = true;
     return true;
+}
+
+static void StopDevices()
+{
+    gStopping = true;
+    for (int k = 0; k < MAX_OUT; k++) ringOn[k] = false;
+    if (gRunning) { ma_device_uninit(&gDev); gRunning = false; }
+    for (int k = 0; k < MAX_OUT; k++)
+        if (gExtraRunning[k]) { ma_device_uninit(&gExtraDev[k]); gExtraRunning[k] = false; }
+    gLooping = false;
 }
 
 static bool StartAudio(bool quiet)
@@ -468,42 +693,41 @@ static bool StartAudio(bool quiet)
         cfg.capture.shareMode  = ma_share_mode_exclusive;
         cfg.playback.shareMode = ma_share_mode_exclusive;
     }
-    int mi = ComboIndex(IDC_MIC), oi = ComboIndex(IDC_OUT);
-    if (mi >= 0 && mi < (int)gInCount)  cfg.capture.pDeviceID  = &gIns[mi].id;
-    if (oi >= 0 && oi < (int)gOutCount) cfg.playback.pDeviceID = &gOuts[oi].id;
+    int mi = ComboIndex(IDC_MIC), oi = ComboIndex(IDC_ROWDEV);
+    if (mi >= 0 && mi < (int)gCapCount)  cfg.capture.pDeviceID  = &gCapDevs[mi].id;
+    if (oi >= 0 && oi < (int)gPlayCount) cfg.playback.pDeviceID = &gPlayDevs[oi].id;
 
     memset(hist, 0, sizeof(hist));
     wpos = 0; frozenLen = 1; looping = false; toggled = false; prevDown = false;
     gateEnv = 0; gateGain = 1; gateHold = 0;
-    monActive = false;
 
     gStopping = false;
     gWantRunning = true;
-    if (!StartMonitor() && !quiet)
-        MessageBoxW(gWnd, L"Couldn't open the \"Hear on\" device, so you won't hear yourself.\n\nThe effect is still being sent normally.",
-                    L"Lag Effect", MB_ICONWARNING);
+    wchar_t failed[128] = L"";
+    for (int k = 1; k < gRows; k++) {
+        if (!StartExtraOutput(k)) {
+            wchar_t n[8]; wsprintfW(n, failed[0] ? L", %d" : L"%d", k + 1);
+            lstrcatW(failed, n);
+        }
+    }
+    if (failed[0] && !quiet) {
+        wchar_t msg[256];
+        wsprintfW(msg, L"Couldn't open output %s, so nothing will play there.\n\nThe other outputs are working normally.", failed);
+        MessageBoxW(gWnd, msg, L"Lag Effect", MB_ICONWARNING);
+    }
 
     const wchar_t* err = gExclusive
-        ? L"Couldn't open the audio devices.\n\nTry turning off Exclusive mode or picking a bigger buffer."
-        : L"Couldn't open the audio devices.\n\nCheck that the mic and output are plugged in.";
+        ? L"Couldn't open the microphone or output 1.\n\nTry turning off Exclusive mode or picking a bigger buffer."
+        : L"Couldn't open the microphone or output 1.\n\nCheck that they're plugged in.";
     bool ok = ma_device_init(&gCtx, &cfg, &gDev) == MA_SUCCESS;
     if (ok && ma_device_start(&gDev) != MA_SUCCESS) { ma_device_uninit(&gDev); ok = false; }
     if (!ok) {
-        if (gMonRunning) { gStopping = true; ma_device_uninit(&gMonDev); gMonRunning = false; monActive = false; }
+        StopDevices();
         if (!quiet) { gWantRunning = false; MessageBoxW(gWnd, err, L"Lag Effect", MB_ICONWARNING); }
         return false;
     }
     gRunning = true;
     return true;
-}
-
-static void StopDevices()
-{
-    gStopping = true;
-    monActive = false;
-    if (gRunning)    { ma_device_uninit(&gDev);    gRunning = false; }
-    if (gMonRunning) { ma_device_uninit(&gMonDev); gMonRunning = false; }
-    gLooping = false;
 }
 
 static void StopAudio()
@@ -513,26 +737,58 @@ static void StopAudio()
     StopDevices();
 }
 
-// ======================= UI helpers =======================
+// ======================= layout helpers =======================
+// Everything below the output list moves down as outputs are added, so controls created after
+// the list are recorded with their starting position.
+#define CLIENT_W  560
+#define BASE_H    690                          // window height with one output
+#define ROW_Y0    88
+#define ROW_H     30
+
+struct Shifted { HWND h; int x, y; };
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; };
+struct Framed  { HWND edit, ud; };
+static Shifted gShift[96];   static int gShiftN = 0;
+static Section gSections[8]; static int gSectionN = 0;
+static Framed  gFramed[24];  static int gFramedN = 0;
+static bool    gRecordShift = false;
+static int     gDevSectionIdx = 0;
+
+static int RowsDelta() { return ROW_H * (gRows - 1); }
+
 static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0)
 {
     HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
                              gWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE);
+    if (gRecordShift && gShiftN < 96) gShift[gShiftN++] = { c, x, y };
     return c;
 }
 
-static void Spin(int id, int x, int y, int lo, int hi, int val)
+static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
 {
-    HWND e = Ctl(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL, x, y, 66, 23, id, WS_EX_CLIENTEDGE);
+    HWND e = Ctl(L"EDIT", L"", WS_TABSTOP | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL, x, y, w, 23, id, WS_EX_CLIENTEDGE);
     HWND u = CreateWindowExW(0, UPDOWN_CLASSW, nullptr,
                              WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS | UDS_HOTTRACK,
-                             0, 0, 0, 0, gWnd, (HMENU)(INT_PTR)(id + 100), gInst, nullptr);
+                             0, 0, 0, 0, gWnd, (HMENU)(INT_PTR)SPIN_UD(id), gInst, nullptr);
     SendMessageW(u, UDM_SETBUDDY, (WPARAM)e, 0);
     SendMessageW(u, UDM_SETRANGE32, lo, hi);
     SendMessageW(u, UDM_SETPOS32, 0, val);
+    SetWindowSubclass(u, UpDownProc, 1, 0);
+    if (gRecordShift && gShiftN < 96) {
+        RECT r; GetWindowRect(u, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+        gShift[gShiftN++] = { u, r.left, r.top };
+    }
+    if (gFramedN < 24) gFramed[gFramedN++] = { e, u };
+    return u;
 }
 
+static void AddSection(int x, int y, int w, int h, const wchar_t* title)
+{
+    if (gSectionN < 8) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift };
+}
+
+// ======================= device lists =======================
 static void FillCombo(int id, const wchar_t* defName, ma_device_info* list, ma_uint32 count, const wchar_t* want)
 {
     HWND c = GetDlgItem(gWnd, id);
@@ -550,38 +806,43 @@ static void FillCombo(int id, const wchar_t* defName, ma_device_info* list, ma_u
 
 static void FillDevices()
 {
-    FillCombo(IDC_MIC, L"Default microphone", gIns,  gInCount,  gMicName);
-    FillCombo(IDC_OUT, L"Default output",     gOuts, gOutCount, gOutName);
-    FillCombo(IDC_MON, L"Default output",     gOuts, gOutCount, gMonName);
+    FillCombo(IDC_MIC, L"Default microphone", gCapDevs, gCapCount, gMicName);
+    for (int k = 0; k < MAX_OUT; k++)
+        FillCombo(IDC_ROWDEV + k, L"Default output", gPlayDevs, gPlayCount, k < gRows ? gRowName[k] : L"");
+}
+
+static void RememberDeviceNames()
+{
+    SelectedName(IDC_MIC, gCapDevs, gCapCount, gMicName, 512);
+    for (int k = 0; k < MAX_OUT; k++) SelectedName(IDC_ROWDEV + k, gPlayDevs, gPlayCount, gRowName[k], 512);
 }
 
 static void RefreshDevices()                    // re-scan, e.g. after installing VB-Cable
 {
     if (!gCtxOk) return;
-    SelectedName(IDC_MIC, gIns, gInCount, gMicName, 512);
-    SelectedName(IDC_OUT, gOuts, gOutCount, gOutName, 512);
-    SelectedName(IDC_MON, gOuts, gOutCount, gMonName, 512);
+    RememberDeviceNames();
     bool was = gWantRunning;
     StopAudio();
-    ma_context_get_devices(&gCtx, &gOuts, &gOutCount, &gIns, &gInCount);
+    ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
     FillDevices();
     if (was) StartAudio(false);
 }
 
+// ======================= status + layout =======================
 static void UpdateStatus(bool force = false)
 {
-    static wchar_t last[160];
+    static wchar_t last[200];
     static bool lastLoop = false;
-    wchar_t s[160], key[64];
+    wchar_t s[200], key[120];
     if (gWantRunning && !gRunning) lstrcpynW(s, L"Audio device lost  -  reconnecting...", 160);
     else if (!gRunning)            lstrcpynW(s, L"Stopped  -  press Start", 160);
     else if (gLooping)             lstrcpynW(s, L"LOOPING", 160);
     else {
-        KeyName(gHotkey, key, 64);
+        HotkeyName(key, 120);
         wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
     }
     if (force || lstrcmpW(s, last) != 0 || lastLoop != gLooping) {
-        lstrcpynW(last, s, 160); lastLoop = gLooping;
+        lstrcpynW(last, s, 200); lastLoop = gLooping;
         SetWindowTextW(gStatus, s);
         InvalidateRect(gStatus, nullptr, TRUE);
     }
@@ -596,6 +857,70 @@ static void UpdateUi()
 static void RestartIfRunning()
 {
     if (gWantRunning) { StopAudio(); StartAudio(false); UpdateUi(); }
+}
+
+static void Layout()
+{
+    const int show[] = { IDC_ROWLBL, IDC_ROWDEV, IDC_ROWMODE, IDC_ROWVOL, SPIN_UD(IDC_ROWVOL), IDC_ROWDEL };
+    for (int k = 0; k < MAX_OUT; k++)
+        for (int id : show) {
+            HWND c = GetDlgItem(gWnd, id + k);
+            if (c) ShowWindow(c, k < gRows && !(id == IDC_ROWDEL && k == 0) ? SW_SHOW : SW_HIDE);
+        }
+
+    int by = ROW_Y0 + ROW_H * gRows + 6;
+    SetWindowPos(GetDlgItem(gWnd, IDC_ADDOUT),  nullptr, 30,  by, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(GetDlgItem(gWnd, IDC_VBCABLE), nullptr, 162, by, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    EnableWindow(GetDlgItem(gWnd, IDC_ADDOUT), gRows < MAX_OUT);
+    gSections[gDevSectionIdx].h = by + 28 + 14 - gSections[gDevSectionIdx].y;
+
+    int d = RowsDelta();
+    for (int i = 0; i < gShiftN; i++)
+        SetWindowPos(gShift[i].h, nullptr, gShift[i].x, gShift[i].y + d, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
+    RECT r = { 0, 0, CLIENT_W, BASE_H + d };
+    AdjustWindowRect(&r, style, FALSE);
+    SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+
+static void SetRowMode(int k, int mode)
+{
+    gRowMode[k] = mode;
+    SendDlgItemMessageW(gWnd, IDC_ROWMODE + k, CB_SETCURSEL, mode, 0);
+}
+
+static void SetRowVol(int k, int vol)
+{
+    gRowVol[k] = vol;
+    SendDlgItemMessageW(gWnd, SPIN_UD(IDC_ROWVOL + k), UDM_SETPOS32, 0, vol);
+}
+
+static void AddOutput()
+{
+    if (gRows >= MAX_OUT) return;
+    int k = gRows;
+    SendDlgItemMessageW(gWnd, IDC_ROWDEV + k, CB_SETCURSEL, 0, 0);
+    SetRowMode(k, MODE_EFFECT);
+    SetRowVol(k, 100);
+    gRows++;
+    Layout();
+    RestartIfRunning();
+}
+
+static void RemoveOutput(int k)
+{
+    if (k <= 0 || k >= gRows) return;
+    for (int j = k; j < gRows - 1; j++) {
+        LRESULT sel = SendDlgItemMessageW(gWnd, IDC_ROWDEV + j + 1, CB_GETCURSEL, 0, 0);
+        SendDlgItemMessageW(gWnd, IDC_ROWDEV + j, CB_SETCURSEL, sel, 0);
+        SetRowMode(j, gRowMode[j + 1]);
+        SetRowVol(j, gRowVol[j + 1]);
+    }
+    gRows--;
+    Layout();
+    RestartIfRunning();
 }
 
 // ======================= updater =======================
@@ -895,14 +1220,15 @@ static void CleanupOldExe()
     if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES || DeleteFileW(old)) KillTimer(gWnd, TIMER_CLEANUP);
 }
 
+
 // ======================= VB-Cable + help =======================
 static void SetupVbCable()
 {
     RefreshDevices();
     int cable = -1;
     wchar_t n[512];
-    for (ma_uint32 i = 0; i < gOutCount; i++) {
-        Widen(gOuts[i].name, n, 512);
+    for (ma_uint32 i = 0; i < gPlayCount; i++) {
+        Widen(gPlayDevs[i].name, n, 512);
         if (ContainsNoCase(n, L"CABLE Input")) { cable = (int)i; break; }
     }
     if (cable < 0) {
@@ -913,18 +1239,22 @@ static void SetupVbCable()
             ShellExecuteW(nullptr, L"open", L"https://vb-audio.com/Cable/", nullptr, nullptr, SW_SHOWNORMAL);
         return;
     }
-    SendDlgItemMessageW(gWnd, IDC_OUT, CB_SETCURSEL, cable + 1, 0);
-    SendDlgItemMessageW(gWnd, IDC_MON, CB_SETCURSEL, 0, 0);                 // hear on default output
-    if (gMonMode == MON_OFF) {
-        gMonMode = MON_EFFECT;
-        SendDlgItemMessageW(gWnd, IDC_MONMODE, CB_SETCURSEL, MON_EFFECT, 0);
+    StopAudio();
+    SendDlgItemMessageW(gWnd, IDC_ROWDEV, CB_SETCURSEL, cable + 1, 0);     // output 1 -> VB-Cable, everything
+    SetRowMode(0, MODE_ALL);
+    if (gRows == 1) {                                                     // output 2 -> your headphones, effect only
+        SendDlgItemMessageW(gWnd, IDC_ROWDEV + 1, CB_SETCURSEL, 0, 0);
+        SetRowMode(1, MODE_EFFECT);
+        SetRowVol(1, 100);
+        gRows = 2;
+        Layout();
     }
     if (gExclusive) { gExclusive = false; CheckDlgButton(gWnd, IDC_EXCL, BST_UNCHECKED); }
-    StopAudio();
     StartAudio(false);
     UpdateUi();
     MessageBoxW(gWnd,
-        L"Lag Effect now sends to VB-Cable, and you'll hear the effect on your normal output.\n\n"
+        L"Output 1 now goes to VB-Cable (Everything), and output 2 lets you hear the effect on your normal "
+        L"speakers or headphones.\n\n"
         L"Discord:  Settings > Voice & Video > Input Device = \"CABLE Output\".\n"
         L"Then turn Noise Suppression to None (or Standard), and turn off Echo Cancellation "
         L"and Automatic Gain Control. Use Lag Effect's noise gate instead.\n\n"
@@ -936,8 +1266,17 @@ static void ShowHelp()
 {
     MessageBoxW(gWnd,
         L"HOW IT WORKS\n"
-        L"Your mic goes to \"Send to\". Hold (or toggle) your hotkey to repeat the last bit of audio.\n"
-        L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n\n"
+        L"Hold (or toggle) your hotkey to repeat the last bit of your mic.\n"
+        L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
+        L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
+        L"HOTKEY\n"
+        L"Click the hotkey button, hold one key or up to 3 together (like Shift + F or Ctrl + Shift + 1), "
+        L"then let go. Esc cancels. Mouse side buttons work too.\n\n"
+        L"OUTPUTS\n"
+        L"Add up to 5 with \"+ Add output\". Each one plays:\n"
+        L"  Off - nothing\n"
+        L"  Effect only - just the stutter, never your normal voice\n"
+        L"  Everything - your voice plus the stutter (what others should hear)\n\n"
         L"DISCORD / GAMES\n"
         L"1. Install VB-Cable (free) and click \"Use VB-Cable\".\n"
         L"2. In Discord, set Input Device to \"CABLE Output\".\n"
@@ -946,10 +1285,7 @@ static void ShowHelp()
         L"4. Turn on Lag Effect's noise gate to keep background noise out.\n\n"
         L"OBS\n"
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
-        L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n"
-        L"Mute your normal mic source in OBS so you aren't heard twice.\n\n"
-        L"UPDATES\n"
-        L"Type the GitHub user/repo you publish releases to, then click \"Check now\".\n\n"
+        L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
         L"TIPS\n"
         L"Use headphones. If a game runs as administrator, run Lag Effect as administrator too, "
         L"or the hotkey won't work while that game is focused.",
@@ -960,35 +1296,80 @@ static void ShowHelp()
 static void BeginKeyCapture()
 {
     gCapturingKey = true;
-    gWaitRelease = 0;
+    gCapKeyCount = 0;
     for (int vk = 0; vk < 256; vk++) gKeyWasDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
-    SetDlgItemTextW(gWnd, IDC_HOTKEY, L"Press any key...  (Esc = cancel)");
+    SetDlgItemTextW(gWnd, IDC_HOTKEY, L"Hold your key(s), then let go");
     SetTimer(gWnd, TIMER_KEY, 15, nullptr);
 }
 
+static void EndKeyCapture()
+{
+    gCapturingKey = false;
+    KillTimer(gWnd, TIMER_KEY);
+    wchar_t name[120]; HotkeyName(name, 120);
+    SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+    UpdateStatus(true);
+}
+
+// Left/right Shift, Ctrl and Alt are stored as plain Shift/Ctrl/Alt so either side works.
+static int NormalizeKey(int vk)
+{
+    switch (vk) {
+        case VK_LSHIFT:   case VK_RSHIFT:   return VK_SHIFT;
+        case VK_LCONTROL: case VK_RCONTROL: return VK_CONTROL;
+        case VK_LMENU:    case VK_RMENU:    return VK_MENU;
+    }
+    return vk;
+}
+
+static int KeyRank(int vk)                      // modifiers are listed first: Ctrl + Shift + Alt + Win + key
+{
+    switch (vk) {
+        case VK_CONTROL: return 0;
+        case VK_SHIFT:   return 1;
+        case VK_MENU:    return 2;
+        case VK_LWIN: case VK_RWIN: return 3;
+    }
+    return 4;
+}
+
+// Records every key pressed while capturing (up to 3). The combination is saved once they're all let go.
 static void PollKeyCapture()
 {
-    if (gWaitRelease) {                         // don't trigger the effect until the new key is let go
-        if (!(GetAsyncKeyState(gWaitRelease) & 0x8000)) {
-            gWaitRelease = 0;
-            gCapturingKey = false;
-            KillTimer(gWnd, TIMER_KEY);
-        }
-        return;
-    }
+    bool changed = false;
     for (int vk = 2; vk < 256; vk++) {          // 1 = left mouse, skipped
-        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) continue;   // use left/right versions
+        if (vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU) continue;   // read left/right versions
         bool d = (GetAsyncKeyState(vk) & 0x8000) != 0;
         bool pressed = d && !gKeyWasDown[vk];
         gKeyWasDown[vk] = d;
         if (!pressed) continue;
-        if (vk != VK_ESCAPE) gHotkey = vk;
-        wchar_t name[64]; KeyName(gHotkey, name, 64);
-        SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
-        gWaitRelease = vk;
-        UpdateStatus(true);
-        return;
+        if (vk == VK_ESCAPE) { EndKeyCapture(); return; }    // cancel, keep the old hotkey
+        int key = NormalizeKey(vk);
+        bool have = false;
+        for (int i = 0; i < gCapKeyCount; i++) if (gCapKeys[i] == key) have = true;
+        if (!have && gCapKeyCount < MAX_KEYS) { gCapKeys[gCapKeyCount++] = key; changed = true; }
     }
+    if (gCapKeyCount == 0) return;
+
+    if (changed) {                              // show the combination as it's being pressed
+        int sorted[MAX_KEYS];
+        for (int i = 0; i < gCapKeyCount; i++) sorted[i] = gCapKeys[i];
+        for (int i = 1; i < gCapKeyCount; i++)
+            for (int j = i; j > 0 && KeyRank(sorted[j]) < KeyRank(sorted[j - 1]); j--) {
+                int t = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = t;
+            }
+        for (int i = 0; i < gCapKeyCount; i++) gCapKeys[i] = sorted[i];
+        wchar_t name[140];
+        ComboName(gCapKeys, gCapKeyCount, name, 120);
+        lstrcatW(name, L" ...");
+        SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+    }
+
+    for (int i = 0; i < gCapKeyCount; i++)
+        if (GetAsyncKeyState(gCapKeys[i]) & 0x8000) return;   // still holding: wait
+
+    for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = i < gCapKeyCount ? gCapKeys[i] : 0;
+    EndKeyCapture();
 }
 
 // ======================= tray =======================
@@ -1040,107 +1421,216 @@ static void TrayMenu()
 }
 
 // ======================= window =======================
-#define CLIENT_W 430
-#define CLIENT_H 534
-
 static void CreateUI()
 {
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
+    const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything" };
 
-    // Devices
-    Ctl(L"BUTTON", L"Audio devices", BS_GROUPBOX, 10, 6, 410, 112, -1);
-    Ctl(L"STATIC", L"Microphone:", 0, 22, 32, 80, 20, -1);
-    Ctl(L"COMBOBOX", L"", COMBO, 105, 28, 303, 300, IDC_MIC);
-    Ctl(L"STATIC", L"Send to:", 0, 22, 60, 80, 20, -1);
-    Ctl(L"COMBOBOX", L"", COMBO, 105, 56, 210, 300, IDC_OUT);
-    Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 320, 55, 88, 25, IDC_VBCABLE);
-    Ctl(L"STATIC", L"Hear on:", 0, 22, 88, 80, 20, -1);
-    Ctl(L"COMBOBOX", L"", COMBO, 105, 84, 210, 300, IDC_MON);
-    HWND mm = Ctl(L"COMBOBOX", L"", COMBO, 320, 84, 88, 200, IDC_MONMODE);
-    const wchar_t* monNames[] = { L"Off", L"Effect only", L"Everything" };
-    for (const wchar_t* n : monNames) SendMessageW(mm, CB_ADDSTRING, 0, (LPARAM)n);
-    SendMessageW(mm, CB_SETCURSEL, gMonMode, 0);
+    // Layout grid: sections run from x 14 to 546, contents from x 30 to 530.
+    // Effect section uses two columns: label / number box / unit at 30 / 136 / 218 and 290 / 392 / 474.
+
+    // Audio: microphone + output list
+    gDevSectionIdx = gSectionN;
+    AddSection(14, 14, 532, 152, L"Audio");
+    Ctl(L"STATIC", L"Microphone:", 0, 30, 39, 90, 20, -1);
+    HWND mic = Ctl(L"COMBOBOX", L"", COMBO, 124, 36, 406, 300, IDC_MIC);
+    SendMessageW(mic, CB_SETDROPPEDWIDTH, 420, 0);
+    Ctl(L"STATIC", L"Output", 0, 80, 70, 200, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Plays", 0, 320, 70, 100, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 432, 70, 70, 16, IDC_HDR);
+    for (int k = 0; k < MAX_OUT; k++) {
+        int y = ROW_Y0 + ROW_H * k;
+        wchar_t lbl[16]; wsprintfW(lbl, L"Out %d", k + 1);
+        Ctl(L"STATIC", lbl, 0, 30, y + 4, 46, 20, IDC_ROWLBL + k);
+        HWND dev = Ctl(L"COMBOBOX", L"", COMBO, 80, y, 234, 300, IDC_ROWDEV + k);
+        SendMessageW(dev, CB_SETDROPPEDWIDTH, 420, 0);       // the open list shows full device names
+        HWND mc = Ctl(L"COMBOBOX", L"", COMBO, 320, y, 106, 200, IDC_ROWMODE + k);
+        for (const wchar_t* n : modeNames) SendMessageW(mc, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(mc, CB_SETCURSEL, gRowMode[k], 0);
+        Spin(IDC_ROWVOL + k, 432, y, 68, 0, 200, gRowVol[k]);
+        Ctl(L"BUTTON", L"×", WS_TABSTOP, 506, y, 24, 23, IDC_ROWDEL + k);
+    }
+    Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 124, 124, 28, IDC_ADDOUT);
+    Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 124, 124, 28, IDC_VBCABLE);
     FillDevices();
 
+    gRecordShift = true;                        // everything below moves with the output list
+
     // Effect
-    Ctl(L"BUTTON", L"Effect", BS_GROUPBOX, 10, 124, 410, 150, -1);
-    Ctl(L"STATIC", L"Loop length:", 0, 22, 151, 80, 20, -1);
-    Spin(IDC_LOOP, 105, 148, 10, 2000, gLoopMs);
-    Ctl(L"STATIC", L"ms", 0, 175, 151, 30, 20, -1);
-    Ctl(L"STATIC", L"Speed:", 0, 222, 151, 76, 20, -1);
-    Spin(IDC_SPEED, 300, 148, 10, 400, gSpeedPct);
-    Ctl(L"STATIC", L"%", 0, 370, 151, 30, 20, -1);
+    AddSection(14, 186, 532, 165, L"Effect");
+    Ctl(L"STATIC", L"Loop length:", 0, 30, 213, 104, 20, -1);
+    Spin(IDC_LOOP, 136, 210, 76, 10, 2000, gLoopMs);
+    Ctl(L"STATIC", L"ms", 0, 218, 213, 40, 20, -1);
+    Ctl(L"STATIC", L"Speed:", 0, 290, 213, 100, 20, -1);
+    Spin(IDC_SPEED, 392, 210, 76, 10, 400, gSpeedPct);
+    Ctl(L"STATIC", L"%", 0, 474, 213, 40, 20, -1);
 
-    Ctl(L"STATIC", L"Pitch:", 0, 22, 181, 80, 20, -1);
-    Spin(IDC_PITCH, 105, 178, 25, 400, gPitchPct);
-    Ctl(L"STATIC", L"%", 0, 175, 181, 30, 20, -1);
-    Ctl(L"STATIC", L"Smoothing:", 0, 222, 181, 76, 20, -1);
-    Spin(IDC_FADE, 300, 178, 0, 50, gFadeMs);
-    Ctl(L"STATIC", L"ms", 0, 370, 181, 30, 20, -1);
+    Ctl(L"STATIC", L"Pitch:", 0, 30, 247, 104, 20, -1);
+    Spin(IDC_PITCH, 136, 244, 76, 25, 400, gPitchPct);
+    Ctl(L"STATIC", L"%", 0, 218, 247, 40, 20, -1);
+    Ctl(L"STATIC", L"Smoothing:", 0, 290, 247, 100, 20, -1);
+    Spin(IDC_FADE, 392, 244, 76, 0, 50, gFadeMs);
+    Ctl(L"STATIC", L"ms", 0, 474, 247, 40, 20, -1);
 
-    Ctl(L"STATIC", L"Send volume:", 0, 22, 211, 80, 20, -1);
-    Spin(IDC_VOL, 105, 208, 0, 200, gVolPct);
-    Ctl(L"STATIC", L"%", 0, 175, 211, 30, 20, -1);
-    Ctl(L"STATIC", L"Hear volume:", 0, 222, 211, 76, 20, -1);
-    Spin(IDC_MONVOL, 300, 208, 0, 200, gMonVolPct);
-    Ctl(L"STATIC", L"%", 0, 370, 211, 30, 20, -1);
-
-    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 22, 241, 80, 20, IDC_GATEON);
+    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 281, 104, 20, IDC_GATEON);
     CheckDlgButton(gWnd, IDC_GATEON, gGateOn ? BST_CHECKED : BST_UNCHECKED);
-    Spin(IDC_GATE, 105, 238, 20, 90, gGateDb);
-    Ctl(L"STATIC", L"-dB", 0, 175, 241, 30, 20, -1);
-    Ctl(L"BUTTON", L"Send mic when not looping", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 241, 190, 20, IDC_PASS);
-    CheckDlgButton(gWnd, IDC_PASS, gPassThrough ? BST_CHECKED : BST_UNCHECKED);
+    Spin(IDC_GATE, 136, 278, 76, 20, 90, gGateDb);
+    Ctl(L"STATIC", L"-dB", 0, 218, 281, 40, 20, -1);
+
+    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 315, 250, 20, IDC_TALKON);
+    CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Voice level:", 0, 290, 315, 100, 20, -1);
+    Spin(IDC_TALKVOL, 392, 312, 76, 0, 200, gTalkVolPct);
+    Ctl(L"STATIC", L"%", 0, 474, 315, 40, 20, -1);
 
     // Hotkey + latency
-    wchar_t key[64]; KeyName(gHotkey, key, 64);
-    Ctl(L"BUTTON", L"Hotkey", BS_GROUPBOX, 10, 280, 200, 84, -1);
-    Ctl(L"BUTTON", key, WS_TABSTOP, 22, 302, 176, 28, IDC_HOTKEY);
-    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 22, 336, 70, 20, IDC_HOLD);
-    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 100, 336, 90, 20, IDC_TOGGLE);
+    wchar_t key[120]; HotkeyName(key, 120);
+    AddSection(14, 371, 259, 97, L"Hotkey");
+    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 394, 227, 30, IDC_HOTKEY);
+    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 30, 434, 80, 20, IDC_HOLD);
+    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 120, 434, 100, 20, IDC_TOGGLE);
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
 
-    Ctl(L"BUTTON", L"Latency", BS_GROUPBOX | WS_GROUP, 220, 280, 200, 84, -1);
-    Ctl(L"STATIC", L"Buffer:", 0, 232, 307, 50, 20, -1);
-    HWND buf = Ctl(L"COMBOBOX", L"", COMBO, 285, 303, 123, 200, IDC_BUFFER);
+    AddSection(287, 371, 259, 97, L"Latency");
+    Ctl(L"STATIC", L"Buffer:", WS_GROUP, 303, 399, 56, 20, -1);
+    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 362, 395, 168, 200, IDC_BUFFER);
     const wchar_t* bufNames[] = { L"32 (fastest)", L"64", L"128 (default)", L"256", L"512 (safest)" };
     for (const wchar_t* n : bufNames) SendMessageW(buf, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(buf, CB_SETCURSEL, gBufIdx, 0);
-    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 232, 336, 170, 20, IDC_EXCL);
+    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 303, 434, 200, 20, IDC_EXCL);
     CheckDlgButton(gWnd, IDC_EXCL, gExclusive ? BST_CHECKED : BST_UNCHECKED);
 
     // Status + buttons
-    gStatus = Ctl(L"STATIC", L"", SS_CENTER | SS_CENTERIMAGE | SS_SUNKEN, 10, 372, 410, 22, IDC_STATUS);
-    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 10, 400, 134, 34, IDC_START);
-    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 148, 400, 134, 34, IDC_TRAY);
-    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 286, 400, 134, 34, IDC_HELPBTN);
+    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW, 14, 486, 532, 30, IDC_STATUS);
+    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 526, 172, 34, IDC_START);
+    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 526, 172, 34, IDC_TRAY);
+    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 526, 172, 34, IDC_HELPBTN);
 
     // App options
-    Ctl(L"BUTTON", L"App", BS_GROUPBOX, 10, 442, 410, 84, -1);
-    Ctl(L"STATIC", L"Theme:", 0, 22, 467, 50, 20, -1);
-    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 72, 463, 82, 200, IDC_THEME);
+    AddSection(14, 580, 532, 96, L"App");
+    Ctl(L"STATIC", L"Theme:", 0, 30, 605, 60, 20, -1);
+    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 601, 110, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
     for (const wchar_t* n : themeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, gThemeMode, 0);
-    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 166, 466, 246, 20, IDC_AUTO);
+    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 603, 300, 20, IDC_AUTO);
     CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Updates:", 0, 22, 497, 50, 20, -1);
-    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 72, 494, 150, 23, IDC_REPO, WS_EX_CLIENTEDGE);
+    Ctl(L"STATIC", L"Updates:", 0, 30, 639, 60, 20, -1);
+    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 636, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
     SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
-    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 228, 493, 86, 25, IDC_CHECKUPD);
-    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 322, 496, 92, 20, IDC_UPDSTART);
+    if (gFramedN < 24) gFramed[gFramedN++] = { repo, nullptr };
+    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 635, 100, 26, IDC_CHECKUPD);
+    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 638, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
 
+    gRecordShift = false;
     gUiReady = true;
+    Layout();
+}
+
+static void PaintWindow(HDC dc)
+{
+    int d = RowsDelta();
+    SetBkMode(dc, OPAQUE);
+    HGDIOBJ oldFont = SelectObject(dc, gFontBold);
+    HPEN border = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+    HGDIOBJ oldPen = SelectObject(dc, border), oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+
+    for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
+        Section& s = gSections[i];
+        int y = s.y + (s.shifts ? d : 0);
+        RoundRect(dc, s.x, y, s.x + s.w, y + s.h, 12, 12);
+        SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
+        RECT tr = { s.x + 10, y - sz.cy / 2, s.x + 18 + sz.cx, y + sz.cy / 2 + 1 };
+        FillRect(dc, &tr, BgBrush());
+        SetBkColor(dc, BgColor());
+        SetTextColor(dc, gDark ? DK_TEXT : RGB(40, 40, 40));
+        TextOutW(dc, s.x + 14, y - sz.cy / 2, s.title, lstrlenW(s.title));
+    }
+
+    if (gDark) {                                 // flat borders around number boxes and text boxes
+        HPEN eb = CreatePen(PS_SOLID, 1, DK_BORDER);
+        SelectObject(dc, eb);
+        for (int i = 0; i < gFramedN; i++) {
+            if (!IsWindowVisible(gFramed[i].edit)) continue;
+            RECT r; GetWindowRect(gFramed[i].edit, &r);
+            if (gFramed[i].ud) { RECT u; GetWindowRect(gFramed[i].ud, &u); UnionRect(&r, &r, &u); }
+            MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+            InflateRect(&r, 1, 1);
+            Rectangle(dc, r.left, r.top, r.right, r.bottom);
+        }
+        SelectObject(dc, border);
+        DeleteObject(eb);
+    }
+    SelectObject(dc, oldPen); SelectObject(dc, oldBr); SelectObject(dc, oldFont);
+    DeleteObject(border);
+}
+
+static void DrawStatus(DRAWITEMSTRUCT* d)
+{
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    bool loop = gLooping, live = gRunning;
+    COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : (gDark ? DK_CTL : RGB(228, 228, 228));
+    COLORREF text = loop ? (gDark ? RGB(255, 125, 125) : RGB(185, 20, 20)) : (gDark ? DK_TEXT : RGB(40, 40, 40));
+    COLORREF dotc = loop ? RGB(235, 60, 60) : live ? RGB(40, 190, 90) : RGB(150, 150, 150);
+
+    HBRUSH br = CreateSolidBrush(fill);
+    HPEN   pn = CreatePen(PS_SOLID, 1, fill);
+    HGDIOBJ op = SelectObject(dc, pn), ob = SelectObject(dc, br);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
+    SelectObject(dc, op); SelectObject(dc, ob);
+    DeleteObject(br); DeleteObject(pn);
+
+    wchar_t s[160]; GetWindowTextW(d->hwndItem, s, 160);
+    HGDIOBJ of = SelectObject(dc, loop ? gFontBold : gFont);
+    SIZE sz; GetTextExtentPoint32W(dc, s, lstrlenW(s), &sz);
+    int total = sz.cx + 14;
+    int x = (rc.left + rc.right - total) / 2, cy = (rc.top + rc.bottom) / 2;
+
+    HBRUSH db = CreateSolidBrush(dotc);
+    HPEN   dp = CreatePen(PS_SOLID, 1, dotc);
+    op = SelectObject(dc, dp); ob = SelectObject(dc, db);
+    Ellipse(dc, x, cy - 4, x + 8, cy + 4);
+    SelectObject(dc, op); SelectObject(dc, ob);
+    DeleteObject(db); DeleteObject(dp);
+
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, text);
+    TextOutW(dc, x + 14, cy - sz.cy / 2, s, lstrlenW(s));
+    SelectObject(dc, of);
 }
 
 static bool Checked(int id) { return IsDlgButtonChecked(gWnd, id) == BST_CHECKED; }
 
 static void OnCommand(int id, int code)
 {
+    if (id >= IDC_ROWDEV && id < IDC_ROWDEV + MAX_OUT) {
+        if (code == CBN_SELCHANGE) RestartIfRunning();
+        return;
+    }
+    if (id >= IDC_ROWMODE && id < IDC_ROWMODE + MAX_OUT) {
+        if (code == CBN_SELCHANGE) gRowMode[id - IDC_ROWMODE] = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+        return;
+    }
+    if (id >= IDC_ROWVOL && id < IDC_ROWVOL + MAX_OUT) {
+        if (!gUiReady) return;
+        int k = id - IDC_ROWVOL;
+        BOOL ok = FALSE;
+        int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) gRowVol[k] = Iclamp(v, 0, 200);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gRowVol[k], FALSE);
+        return;
+    }
+    if (id >= IDC_ROWDEL && id < IDC_ROWDEL + MAX_OUT) {
+        if (code == BN_CLICKED) RemoveOutput(id - IDC_ROWDEL);
+        return;
+    }
+
     switch (id) {
-    case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_VOL: case IDC_FADE: case IDC_GATE: case IDC_MONVOL:
+    case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_FADE: case IDC_GATE: case IDC_TALKVOL:
         if (!gUiReady) break;
         for (Range& r : gRanges) {
             if (r.id != id) continue;
@@ -1154,8 +1644,9 @@ static void OnCommand(int id, int code)
     case IDC_REPO:
         if (code == EN_CHANGE && gUiReady) GetDlgItemTextW(gWnd, IDC_REPO, gUpdateRepo, 200);
         break;
+    case IDC_ADDOUT:   if (code == BN_CLICKED) AddOutput(); break;
     case IDC_GATEON:   gGateOn = Checked(IDC_GATEON); break;
-    case IDC_PASS:     gPassThrough = Checked(IDC_PASS); break;
+    case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
     case IDC_UPDSTART: gUpdateOnStart = Checked(IDC_UPDSTART); break;
     case IDC_CHECKUPD: if (code == BN_CLICKED) StartUpdateCheck(true); break;
     case IDC_HOLD:
@@ -1167,16 +1658,8 @@ static void OnCommand(int id, int code)
             ApplyTheme();
         }
         break;
-    case IDC_MIC: case IDC_OUT: case IDC_MON:
+    case IDC_MIC:
         if (code == CBN_SELCHANGE) RestartIfRunning();
-        break;
-    case IDC_MONMODE:
-        if (code == CBN_SELCHANGE) {
-            int newMode = (int)SendDlgItemMessageW(gWnd, IDC_MONMODE, CB_GETCURSEL, 0, 0);
-            bool needDevice = (newMode == MON_OFF) != (gMonMode == MON_OFF);
-            gMonMode = newMode;
-            if (needDevice) RestartIfRunning();
-        }
         break;
     case IDC_BUFFER:
         if (code == CBN_SELCHANGE) {
@@ -1236,6 +1719,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_COMMAND:
         OnCommand(LOWORD(w), HIWORD(w));
         return 0;
+    case WM_NOTIFY: {
+        NMHDR* nh = (NMHDR*)l;
+        if (gDark && nh->code == NM_CUSTOMDRAW) {
+            wchar_t cls[16];
+            GetClassNameW(nh->hwndFrom, cls, 16);
+            if (!lstrcmpiW(cls, L"Button")) return DrawDarkCheck((NMCUSTOMDRAW*)l);
+        }
+        break;
+    }
+    case WM_DRAWITEM:
+        if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
+        break;
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MINIMIZE) { ToTray(); return 0; }   // minimize goes to the tray
         break;
@@ -1248,22 +1743,29 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_ERASEBKGND: {
         RECT rc; GetClientRect(h, &rc);
-        FillRect((HDC)w, &rc, gDark ? gBrBg : GetSysColorBrush(COLOR_BTNFACE));
+        FillRect((HDC)w, &rc, BgBrush());
         return 1;
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        PaintWindow(dc);
+        EndPaint(h, &ps);
+        return 0;
     }
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: {
         HDC dc = (HDC)w;
-        bool status = (HWND)l == gStatus;
+        bool header = GetDlgCtrlID((HWND)l) == IDC_HDR;
+        bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
         if (!gDark) {
-            if (!status) break;
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, gLooping ? RGB(200, 30, 30) : GetSysColor(COLOR_WINDOWTEXT));
+            if (!header) break;
+            SetTextColor(dc, RGB(110, 110, 110));
+            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
             return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
         }
-        bool field = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
-        SetTextColor(dc, status && gLooping ? RGB(255, 95, 95) : DK_TEXT);
+        SetTextColor(dc, header ? DK_DIM : DK_TEXT);
         SetBkColor(dc, field ? DK_CTL : DK_BG);
-        return (LRESULT)(field ? gBrCtl : gBrBg);
+        return (LRESULT)(field ? gBrDarkCtl : gBrDarkBg);
     }
     case WM_CLOSE:
         SaveSettings();
@@ -1291,9 +1793,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     LoadSettings();
     LoadThemeApis();
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
-    if (gCtxOk) ma_context_get_devices(&gCtx, &gOuts, &gOutCount, &gIns, &gInCount);
+    if (gCtxOk) ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
 
-    gFont = CreateFontW(-13, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    gFont     = CreateFontW(-13, 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    gFontBold = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     gIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));          // custom icon if built with LagEffect.rc
     if (!gIcon) gIcon = LoadIconW(nullptr, IDI_APPLICATION);
 
@@ -1306,8 +1809,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     wc.lpszClassName = L"LagEffectWnd";
     RegisterClassW(&wc);
 
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-    RECT r = { 0, 0, CLIENT_W, CLIENT_H };
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
+    RECT r = { 0, 0, CLIENT_W, BASE_H };
     AdjustWindowRect(&r, style, FALSE);
     HWND h = CreateWindowExW(0, wc.lpszClassName, L"Lag Effect " APP_VERSION, style, CW_USEDEFAULT, CW_USEDEFAULT,
                              r.right - r.left, r.bottom - r.top, nullptr, nullptr, hi, nullptr);
@@ -1331,5 +1834,6 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     }
     if (gCtxOk) ma_context_uninit(&gCtx);
     DeleteObject(gFont);
+    DeleteObject(gFontBold);
     return 0;
 }
