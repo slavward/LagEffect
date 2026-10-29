@@ -15,7 +15,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.5.0"
+#define APP_VERSION L"1.5.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1158,6 +1158,7 @@ static DWORD WINAPI DownloadThread(LPVOID arg)
 }
 
 static bool gUpdateBusy = false;
+static bool gResumeAudio = false;               // set when relaunched by the updater while audio was running
 
 static void StartUpdateCheck(bool manual)
 {
@@ -1231,13 +1232,14 @@ static void OnUpdateDownloaded(UpdateJob* job)
         MessageBoxW(gWnd, L"Couldn't install the update. Your current version is unchanged.", L"Lag Effect - Updates", MB_ICONWARNING);
         return;
     }
+    bool wasRunning = gWantRunning;            // the new version picks up where this one left off
     SaveSettings();
     StopAudio();
     RemoveTray();
     lstrcpynW(dir, exe, MAX_PATH);
     wchar_t* slash = wcsrchr(dir, L'\\');
     if (slash) *slash = 0;
-    ShellExecuteW(nullptr, L"open", exe, L"--updated", dir, SW_SHOWNORMAL);
+    ShellExecuteW(nullptr, L"open", exe, wasRunning ? L"--updated --resume" : L"--updated", dir, SW_SHOWNORMAL);
     DestroyWindow(gWnd);
 }
 
@@ -1776,7 +1778,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         gWnd = h;
         CreateUI();
         ApplyTheme();
-        if (gAutoStart && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 2000, nullptr);
+        // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
+        if ((gAutoStart || gResumeAudio) && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
         UpdateUi();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
@@ -1877,6 +1880,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     InitCommonControlsEx(&icc);
 
     bool justUpdated = wcsstr(GetCommandLineW(), L"--updated") != nullptr;
+    gResumeAudio = justUpdated && wcsstr(GetCommandLineW(), L"--resume") != nullptr;
 
     LoadSettings();
     LoadThemeApis();
