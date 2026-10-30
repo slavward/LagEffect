@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.11.1"
+#define APP_VERSION L"1.12.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -38,6 +38,7 @@
 #include <mmdeviceapi.h>                        // listing apps that play sound (Vocode to song)
 #include <audiopolicy.h>
 #include <tlhelp32.h>                           // process names without opening the process (browsers' audio helpers)
+#include <commdlg.h>                            // "Audio file..." picker
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -54,6 +55,7 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "comdlg32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
@@ -598,8 +600,25 @@ static void SongCallback(ma_device*, void*, const void* input, ma_uint32 frames)
     if (pk > gSongPeak) gSongPeak = pk;
 }
 
+// Song from an audio file: decoded once to 48 kHz mono 16-bit, played on a loop while vocoding.
+static short* volatile   gFileData = nullptr;
+static volatile unsigned gFileLen = 0;
+static volatile bool     gUseFile = false, gFileRestart = false;
+static unsigned          gFilePos = 0;
+
 static inline float SongRead()                  // audio thread
 {
+    if (gUseFile) {
+        short* d = gFileData; unsigned n = gFileLen;
+        if (!d || !n) return 0;
+        if (gFileRestart) { gFilePos = 0; gFileRestart = false; }
+        if (gFilePos >= n) gFilePos = 0;
+        float x = d[gFilePos] * (1.0f / 32768.0f);
+        if (++gFilePos >= n) gFilePos = 0;     // loops
+        float a = x < 0 ? -x : x;
+        if (a > gSongPeak) gSongPeak = a;
+        return x;
+    }
     unsigned w = songW;
     MemoryBarrier();
     unsigned r = songR, avail = w - r;
@@ -625,7 +644,9 @@ static void VocBlock()
     gVp.range = Iclamp(gVocRange, 0, 2);
 }
 
-static float VocodeBands(VocState& v, float mod, float car)   // channel vocoder: car shaped by mod
+// eps keeps silent carrier bands from blowing up; the synth styles were calibrated at 0.0005, the
+// Song style uses a smaller one so quiet music (low browser volume) still comes through at full level.
+static float VocodeBands(VocState& v, float mod, float car, float eps = 0.0005f)   // car shaped by mod
 {
     float voc = 0;
     for (int b = 0; b < VOC_BANDS; b++) {
@@ -634,7 +655,7 @@ static float VocodeBands(VocState& v, float mod, float car)   // channel vocoder
         float am = m < 0 ? -m : m, ac = c < 0 ? -c : c;
         v.modEnv[b] += (am - v.modEnv[b]) * (am > v.modEnv[b] ? 0.007f : 0.0014f);   // ~3 ms attack, ~15 ms release
         v.carEnv[b] += (ac - v.carEnv[b]) * 0.0014f;
-        voc += c * v.modEnv[b] / (v.carEnv[b] + 0.0005f);         // carrier flattened, voice's shape applied
+        voc += c * v.modEnv[b] / (v.carEnv[b] + eps);             // carrier flattened, voice's shape applied
     }
     return voc;
 }
@@ -647,8 +668,8 @@ static float Vocoder(float x)
     if (gVp.style == VOC_SONG) {                // the music says your words: no tuning needed
         float song = SongRead();
         if (v.bandsLow) VocBands(false);
-        float voc = VocodeBands(v, x, song) * SONG_GAIN;
-        voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], x)) * 0.5f;   // keep "s" and "t" sounds clear
+        float voc = VocodeBands(v, x, song, 0.00005f) * SONG_GAIN;
+        voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], x)) * 0.15f;  // a hint of "s" / "t" for clarity, not your voice
         float a = gVp.synth * 1.5707963f;                         // Synth: how much of your voice the song replaces
         float out = x * cosf(a) + voc * sinf(a);
         return x + (out - x) * gVp.mix;
@@ -1215,6 +1236,7 @@ enum {
 #define WM_DEVICE_LOST     (WM_APP + 2)
 #define WM_UPDATE_CHECKED  (WM_APP + 3)
 #define WM_UPDATE_DOWNLOAD (WM_APP + 4)
+#define WM_SONGFILE_LOADED (WM_APP + 5)
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -1609,6 +1631,9 @@ static const wchar_t* FxKeyIniName(int slot) { return slot == 0 ? L"fx_hotkey" :
 
 static wchar_t gUpdateRepo[200];
 static wchar_t gSongApp[64] = L"";               // Vocode to song: app to take music from ("" = all PC sound)
+static wchar_t gSongFile[MAX_PATH] = L"";        // ...or an audio file (used when gUseFile)
+static bool    gSongUseFile = false;
+static int     gVocSynthSaved = 100;             // Synth value of the other side: Song style keeps its own
 static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
@@ -1676,6 +1701,15 @@ static void LoadSettings()
     gVocScale     = Iclamp(INI_INT(L"voc_scale", 1), 0, VOC_SCALES - 1);
     gVocRange     = Iclamp(INI_INT(L"voc_range", VR_AUTO), 0, 2);
     GetPrivateProfileStringW(L"settings", L"voc_song_app", L"", gSongApp, 64, gIni);
+    GetPrivateProfileStringW(L"settings", L"voc_song_file", L"", gSongFile, MAX_PATH, gIni);
+    gSongUseFile = INI_INT(L"voc_song_use_file", 0) != 0 && gSongFile[0];
+    {   // Song style has its own Synth (default 100%: the song fully replaces your voice)
+        wchar_t b[32];
+        GetPrivateProfileStringW(L"settings", L"voc_synth_other", L"", b, 32, gIni);
+        if (b[0]) gVocSynthSaved = Iclamp(_wtoi(b), 0, 100);
+        else if (gVocStyle == VOC_SONG) { gVocSynthSaved = gVocSynth; gVocSynth = 100; }   // from 1.11
+        else gVocSynthSaved = 100;
+    }
     gRadioPreset  = Iclamp(INI_INT(L"radio_preset", 0), 0, RADIO_N - 1);
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
@@ -1736,6 +1770,9 @@ static void SaveSettings()
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
     WritePrivateProfileStringW(L"settings", L"voc_song_app", gSongApp, gIni);
+    WritePrivateProfileStringW(L"settings", L"voc_song_file", gSongFile, gIni);
+    SaveInt(L"voc_song_use_file", gSongUseFile);
+    SaveInt(L"voc_synth_other", gVocSynthSaved);
     SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"update_on_start", gUpdateOnStart);
@@ -2317,6 +2354,9 @@ static int     gSongState = 0;                  // 0 off, 1 one app, 2 all PC so
 static wchar_t gSongActiveApp[64] = L"";
 static bool    gSongHeard = false;
 
+#define SONGSRC_FILE   1000                      // item data in "Music from": the loaded file
+#define SONGSRC_BROWSE 999                       // "Audio file..."
+
 static void FillSongSources()
 {
     HWND c = GetDlgItem(gWnd, IDC_SONGSRC);
@@ -2349,7 +2389,101 @@ static void FillSongSources()
         sel = (int)it;
         gSongListN++;
     }
+    if (gSongFile[0]) {                          // the audio file, if one was picked
+        const wchar_t* base = wcsrchr(gSongFile, L'\\');
+        wchar_t label[MAX_PATH + 16];
+        wsprintfW(label, L"File: %s", base ? base + 1 : gSongFile);
+        LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
+        SendMessageW(c, CB_SETITEMDATA, it, SONGSRC_FILE);
+        if (gSongUseFile) sel = (int)it;
+    }
+    LRESULT ib = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Audio file...");
+    SendMessageW(c, CB_SETITEMDATA, ib, SONGSRC_BROWSE);
     SendMessageW(c, CB_SETCURSEL, sel, 0);
+}
+
+// ---- audio file ----
+struct SongFileJob { wchar_t path[MAX_PATH]; short* data; unsigned len; bool ok, quiet; };
+
+static DWORD WINAPI SongDecodeThread(LPVOID arg)  // decode to 48 kHz mono, up to 20 minutes
+{
+    SongFileJob* j = (SongFileJob*)arg;
+    ma_decoder_config dc = ma_decoder_config_init(ma_format_s16, 1, RATE);
+    ma_decoder dec;
+    if (ma_decoder_init_file_w(j->path, &dc, &dec) == MA_SUCCESS) {
+        const unsigned maxLen = RATE * 60 * 20;
+        unsigned cap = RATE * 30, len = 0;
+        short* buf = (short*)HeapAlloc(GetProcessHeap(), 0, cap * sizeof(short));
+        while (buf && len < maxLen) {
+            if (len + 8192 > cap) {
+                unsigned nc = cap * 2 > maxLen ? maxLen + 8192 : cap * 2;
+                short* nb = (short*)HeapReAlloc(GetProcessHeap(), 0, buf, nc * sizeof(short));
+                if (!nb) break;
+                buf = nb; cap = nc;
+            }
+            ma_uint64 got = 0;
+            if (ma_decoder_read_pcm_frames(&dec, buf + len, 8192, &got) != MA_SUCCESS || got == 0) break;
+            len += (unsigned)got;
+        }
+        ma_decoder_uninit(&dec);
+        j->data = buf; j->len = len; j->ok = buf && len > RATE / 10;
+        if (!j->ok && buf) { HeapFree(GetProcessHeap(), 0, buf); j->data = nullptr; }
+    }
+    PostMessageW(gWnd, WM_SONGFILE_LOADED, 0, (LPARAM)j);
+    return 0;
+}
+
+static bool gSongLoading = false;
+
+static void LoadSongFile(const wchar_t* path, bool quiet = false)
+{
+    SongFileJob* j = (SongFileJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(SongFileJob));
+    if (!j) return;
+    lstrcpynW(j->path, path, MAX_PATH);
+    j->quiet = quiet;
+    gSongLoading = true;
+    HANDLE t = CreateThread(nullptr, 0, SongDecodeThread, j, 0, nullptr);
+    if (t) CloseHandle(t); else { gSongLoading = false; HeapFree(GetProcessHeap(), 0, j); }
+}
+
+static void UpdateSongStatusText();
+static void UpdateSongCapture();
+
+static void OnSongFileLoaded(SongFileJob* j)
+{
+    const bool quiet = j->quiet;
+    gSongLoading = false;
+    if (j->ok) {
+        short* old = gFileData;
+        gUseFile = false;                       // let the audio thread stop reading the old one
+        Sleep(30);
+        gFileData = j->data; gFileLen = j->len; gFileRestart = true;
+        if (old) HeapFree(GetProcessHeap(), 0, old);
+        lstrcpynW(gSongFile, j->path, MAX_PATH);
+        gSongUseFile = true;
+    } else {
+        gSongUseFile = gFileData != nullptr && gSongUseFile;
+        if (!quiet) MessageBoxW(gWnd, L"Couldn't open that audio file.\n\nMP3, WAV and FLAC files work.",
+                                L"Lag Effect - Vocode to song", MB_ICONWARNING);
+    }
+    HeapFree(GetProcessHeap(), 0, j);
+    FillSongSources();
+    UpdateSongCapture();
+}
+
+static void BrowseSongFile()
+{
+    wchar_t path[MAX_PATH] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o);
+    o.hwndOwner   = gWnd;
+    o.lpstrFilter = L"Audio files (MP3, WAV, FLAC)\0*.mp3;*.wav;*.flac\0All files\0*.*\0";
+    o.lpstrFile   = path;
+    o.nMaxFile    = MAX_PATH;
+    o.lpstrTitle  = L"Pick a song to vocode to";
+    o.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&o)) { LoadSongFile(path); UpdateSongStatusText(); }
+    else FillSongSources();                     // cancelled: put the selection back
 }
 
 static void SongNotify(const ma_device_notification* n)
@@ -2386,8 +2520,15 @@ static void UpdateSongStatusText()
     case 3:  lstrcpynW(t, L"Using speaker sound (older Windows): turn off monitoring to avoid echo", 96); break;
     case 4:  wsprintfW(t, L"Waiting for %s to play...", disp); break;
     case 5:  lstrcpynW(t, L"Couldn't record PC sound", 96); break;
+    case 6: {
+        const wchar_t* base = wcsrchr(gSongFile, L'\\');
+        wchar_t name[64]; lstrcpynW(name, base ? base + 1 : gSongFile, 40);
+        wsprintfW(t, L"Playing %s (loops)", name);
+        break;
+    }
     default: lstrcpynW(t, gRunning ? L"Turn on to vocode music" : L"Press Start on the Main tab", 96); break;
     }
+    if (gSongLoading) lstrcpynW(t, L"Loading the song...", 96);
     wchar_t cur[96];
     GetDlgItemTextW(gWnd, IDC_SONGSTATUS, cur, 96);
     if (lstrcmpW(cur, t)) SetDlgItemTextW(gWnd, IDC_SONGSTATUS, t);
@@ -2397,11 +2538,13 @@ static void UpdateSongStatusText()
 static void UpdateSongCapture()
 {
     bool want = gRunning && SongModeOn();
-    if (gSongRunning && (!want || gSongLost || lstrcmpiW(gSongActiveApp, gSongApp))) {
+    gUseFile = gSongUseFile && gFileData != nullptr;    // file: no capture needed
+    if (gSongRunning && (!want || gSongLost || gSongUseFile || lstrcmpiW(gSongActiveApp, gSongApp))) {
         ma_device_uninit(&gSongDev);
         gSongRunning = false;
     }
     if (!want) { gSongState = 0; UpdateSongStatusText(); return; }
+    if (gSongUseFile) { gSongState = 6; UpdateSongStatusText(); return; }
     if (gSongRunning) { UpdateSongStatusText(); return; }
 
     lstrcpynW(gSongActiveApp, gSongApp, 64);
@@ -2430,15 +2573,24 @@ static void SongStyleChanged()                  // style / on-off changed somewh
     UpdateSongCapture();
 }
 
+// Changing between Song and the other styles swaps the Synth knob's value, so each keeps its own.
+static void VocSetStyle(int ns)
+{
+    if ((gVocStyle == VOC_SONG) != (ns == VOC_SONG)) {
+        int t = gVocSynth; gVocSynth = gVocSynthSaved; gVocSynthSaved = t;
+    }
+    gVocStyle = ns;
+}
+
 static void SetSongMode(bool on)
 {
     if (on) {
         if (gVocStyle != VOC_SONG) gPrevVocStyle = gVocStyle;
-        gVocStyle = VOC_SONG;
+        VocSetStyle(VOC_SONG);
         if (!gFxVocOn) SetFxGroupOn(KG_VOCODER, true);
         if (!gFxOn) SetFxOn(true);
     } else if (gVocStyle == VOC_SONG) {
-        gVocStyle = gPrevVocStyle;
+        VocSetStyle(gPrevVocStyle);
     }
     SendDlgItemMessageW(gWnd, IDC_VOCSTYLE, CB_SETCURSEL, gVocStyle, 0);
     SongStyleChanged();
@@ -2453,7 +2605,7 @@ static void SongTick()                          // every 50 ms
     if (on != lastOn) { lastOn = on; InvalidateRect(GetDlgItem(gWnd, IDC_SONGBTN), nullptr, FALSE); }
     DWORD now = GetTickCount();
     if (want != lastWant || (!want && gSongRunning) ||
-        (want && (!gSongRunning || gSongLost) && (gSongRetryNow || now - lastTry > 1500))) {
+        (want && !gSongUseFile && (!gSongRunning || gSongLost) && (gSongRetryNow || now - lastTry > 1500))) {
         lastWant = want; lastTry = now; gSongRetryNow = false;
         UpdateSongCapture();
     }
@@ -2636,8 +2788,9 @@ static void AddTips()
     TipId(IDC_SONGBTN,  L"Vocode to song: the music playing on your PC says your words. Talk or sing and you hear the song "
                         L"shaped by your voice; stay quiet and it's silent. Turns on Voice effects and the Vocoder's Song style. "
                         L"Click again to go back to the style you had.");
-    TipId(IDC_SONGSRC,  L"Where the music comes from: one app (Spotify, a browser...) or all PC sound except Lag Effect "
-                        L"(so it never hears itself). Recording one app needs Windows 11. Open the list to refresh it.");
+    TipId(IDC_SONGSRC,  L"Where the music comes from: one app (Spotify, a browser...), all PC sound except Lag Effect "
+                        L"(so it never hears itself), or an audio file on your PC (MP3, WAV, FLAC; it loops). "
+                        L"Recording one app needs Windows 11. Open the list to refresh it.");
     TipId(IDC_SONGSTATUS, L"Whether the song is reaching the vocoder.");
     TipId(IDC_VOCRANGE, L"How high your voice is. Auto works it out as you sing. "
                         L"Low / deep: for bass and baritone voices; hears notes down to 50 Hz, uses longer, smoother slices "
@@ -3424,7 +3577,7 @@ static void ShowHelp()
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
         L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n"
         L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices. Pick the key of the song; "
-        L"Vocode to song: click it and the music playing on your PC (one app or all PC sound) says your words. "
+        L"Vocode to song: click it and the music playing on your PC (one app, all PC sound, or an audio file) says your words. "
         L"Retune 0 ms gives the hard auto-tune sound. Deep voice? Set Voice to Low / deep (Auto usually picks it for you).\n"
         L"Radio: sound like a walkie-talkie, phone call, megaphone, old radio, space radio, drive-thru, 8-bit or the next room. "
         L"Drive = distortion, Static = background noise, Squelch = start/stop sounds.\n\n"
@@ -3788,6 +3941,7 @@ static void CreateUI()
             SendMessageW(ss, CB_SETDROPPEDWIDTH, 220, 0);
             FillSongSources();
             Ctl(L"STATIC", L"", 0, 28, y + 68, 150, 34, IDC_SONGSTATUS);
+            if (gSongUseFile && gSongFile[0]) LoadSongFile(gSongFile, true);   // reload last time's song, quietly
             kx = 186; kstep = 80; kw = 80;
         } else if (g == KG_RADIO) {             // preset dropdown + a line about it
             Ctl(L"STATIC", L"Preset", 0, 28, y + 10, 150, 16, IDC_HDR);
@@ -4084,14 +4238,20 @@ static void OnCommand(int id, int code)
         else if (code == CBN_SELCHANGE) {
             int sel = (int)SendDlgItemMessageW(gWnd, IDC_SONGSRC, CB_GETCURSEL, 0, 0);
             int idx = (int)SendDlgItemMessageW(gWnd, IDC_SONGSRC, CB_GETITEMDATA, sel, 0);
-            lstrcpynW(gSongApp, idx > 0 && idx <= gSongListN ? gSongList[idx - 1] : L"", 64);
+            if (idx == SONGSRC_BROWSE) { BrowseSongFile(); break; }
+            if (idx == SONGSRC_FILE) {
+                if (gFileData) gSongUseFile = true; else LoadSongFile(gSongFile);
+            } else {
+                gSongUseFile = false;
+                lstrcpynW(gSongApp, idx > 0 && idx <= gSongListN ? gSongList[idx - 1] : L"", 64);
+            }
             UpdateSongCapture();
         }
         break;
     case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE: case IDC_VOCRANGE:
         if (code == CBN_SELCHANGE) {
             int v = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
-            if (id == IDC_VOCSTYLE) { if (gVocStyle != VOC_SONG && v == VOC_SONG) gPrevVocStyle = gVocStyle; gVocStyle = v; SongStyleChanged(); }
+            if (id == IDC_VOCSTYLE) { if (gVocStyle != VOC_SONG && v == VOC_SONG) gPrevVocStyle = gVocStyle; VocSetStyle(v); SongStyleChanged(); }
             else if (id == IDC_VOCKEY) gVocKey = v;
             else if (id == IDC_VOCSCALE) gVocScale = v; else gVocRange = Iclamp(v, 0, 2);
             RedrawKnobs();                      // Synth dims in the Tune style
@@ -4187,6 +4347,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_UPDATE_CHECKED:
         OnUpdateChecked((UpdateJob*)l);
+        return 0;
+    case WM_SONGFILE_LOADED:
+        OnSongFileLoaded((SongFileJob*)l);
         return 0;
     case WM_UPDATE_DOWNLOAD:
         OnUpdateDownloaded((UpdateJob*)l);
