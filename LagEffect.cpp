@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.11.0"
+#define APP_VERSION L"1.11.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -37,6 +37,7 @@
 #include <winhttp.h>
 #include <mmdeviceapi.h>                        // listing apps that play sound (Vocode to song)
 #include <audiopolicy.h>
+#include <tlhelp32.h>                           // process names without opening the process (browsers' audio helpers)
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -2191,11 +2192,68 @@ static const GUID kIID_IAudioSessionControl2 = { 0xBFB7FF88, 0x7239, 0x4FC9, { 0
 
 struct AudioApp { DWORD pid; wchar_t name[64]; };
 
-// Apps that currently have sound sessions on any output (Spotify, browsers, games...), minus Lag Effect.
+// ---- which apps can be picked ----
+// Windows' process list gives every process's name and parent without needing to open it, which matters
+// for browsers: Chrome, Edge, Brave etc. play sound from a separate, locked-down helper process.
+struct ProcInfo { DWORD pid, parent; wchar_t exe[64]; };
+static int SnapProcs(ProcInfo* p, int cap)
+{
+    int n = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32W e = {}; e.dwSize = sizeof(e);
+    for (BOOL ok = Process32FirstW(snap, &e); ok && n < cap; ok = Process32NextW(snap, &e)) {
+        p[n].pid = e.th32ProcessID; p[n].parent = e.th32ParentProcessID;
+        lstrcpynW(p[n].exe, e.szExeFile, 64);
+        n++;
+    }
+    CloseHandle(snap);
+    return n;
+}
+
+static int ProcIndex(const ProcInfo* p, int n, DWORD pid)
+{
+    for (int i = 0; i < n; i++) if (p[i].pid == pid) return i;
+    return -1;
+}
+
+// Top of the tree of same-named processes (the main browser process): recording it includes all its helpers.
+static DWORD ProcRoot(const ProcInfo* p, int n, DWORD pid)
+{
+    for (int guard = 0; guard < 64; guard++) {
+        int i = ProcIndex(p, n, pid);
+        if (i < 0) return pid;
+        int up = ProcIndex(p, n, p[i].parent);
+        if (up < 0 || lstrcmpiW(p[up].exe, p[i].exe)) return pid;
+        pid = p[up].pid;
+    }
+    return pid;
+}
+
+// Browsers are always offered when running, even before they've played anything.
+static const wchar_t* KNOWN_BROWSERS[] = {
+    L"chrome.exe", L"msedge.exe", L"firefox.exe", L"opera.exe", L"brave.exe", L"vivaldi.exe", L"arc.exe",
+    L"chromium.exe", L"librewolf.exe", L"waterfox.exe", L"zen.exe", L"floorp.exe", L"thorium.exe",
+};
+
+// Apps with sound sessions on any output (Spotify, browsers, games...), plus running browsers; minus Lag Effect.
+// pid = the app's main process, so recording it covers all of its helper processes.
 static int ListAudioApps(AudioApp* out, int cap)
 {
-    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    static ProcInfo procs[2048];
+    int np = SnapProcs(procs, 2048);
+    const DWORD self = GetCurrentProcessId();
     int n = 0;
+    auto add = [&](DWORD pid) {
+        int i = ProcIndex(procs, np, pid);
+        if (i < 0 || pid == self || n >= cap) return;
+        for (int k = 0; k < n; k++) if (!lstrcmpiW(out[k].name, procs[i].exe)) return;   // one entry per app
+        out[n].pid = ProcRoot(procs, np, pid);
+        lstrcpynW(out[n].name, procs[i].exe, 64);
+        n++;
+    };
+
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     IMMDeviceEnumerator* en = nullptr;
     if (SUCCEEDED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, kIID_IMMDeviceEnumerator, (void**)&en))) {
         IMMDeviceCollection* devs = nullptr;
@@ -2209,23 +2267,14 @@ static int ListAudioApps(AudioApp* out, int cap)
                     IAudioSessionEnumerator* se = nullptr;
                     if (SUCCEEDED(mgr->GetSessionEnumerator(&se))) {
                         int sc = 0; se->GetCount(&sc);
-                        for (int i = 0; i < sc && n < cap; i++) {
+                        for (int i = 0; i < sc; i++) {
                             IAudioSessionControl* c = nullptr;
                             if (FAILED(se->GetSession(i, &c))) continue;
                             IAudioSessionControl2* c2 = nullptr;
                             if (SUCCEEDED(c->QueryInterface(kIID_IAudioSessionControl2, (void**)&c2))) {
                                 DWORD pid = 0;
-                                c2->GetProcessId(&pid);
-                                if (pid && pid != GetCurrentProcessId()) {
-                                    wchar_t path[MAX_PATH] = L""; DWORD len = MAX_PATH;
-                                    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                                    if (h) { QueryFullProcessImageNameW(h, 0, path, &len); CloseHandle(h); }
-                                    const wchar_t* base = wcsrchr(path, L'\\');
-                                    base = base ? base + 1 : path;
-                                    bool dup = false;
-                                    for (int k = 0; k < n; k++) if (!lstrcmpiW(out[k].name, base)) dup = true;
-                                    if (base[0] && !dup) { out[n].pid = pid; lstrcpynW(out[n].name, base, 64); n++; }
-                                }
+                                c2->GetProcessId(&pid);  // may report "several processes": then pid stays usable or 0
+                                if (pid) add(pid);
                                 c2->Release();
                             }
                             c->Release();
@@ -2241,11 +2290,20 @@ static int ListAudioApps(AudioApp* out, int cap)
         en->Release();
     }
     if (SUCCEEDED(co)) CoUninitialize();
+
+    for (const wchar_t* b : KNOWN_BROWSERS)       // running browsers, even if silent so far
+        for (int i = 0; i < np; i++)
+            if (!lstrcmpiW(procs[i].exe, b)) { add(procs[i].pid); break; }
     return n;
 }
 
 static void AppDisplayName(const wchar_t* exe, wchar_t* out, int cap)   // "spotify.exe" -> "Spotify"
 {
+    static const wchar_t* nice[][2] = {         // friendlier names for common apps
+        { L"msedge.exe", L"Edge" }, { L"chrome.exe", L"Chrome" }, { L"firefox.exe", L"Firefox" },
+        { L"opera.exe", L"Opera" }, { L"brave.exe", L"Brave" }, { L"vivaldi.exe", L"Vivaldi" },
+    };
+    for (auto& m : nice) if (!lstrcmpiW(exe, m[0])) { lstrcpynW(out, m[1], cap); return; }
     lstrcpynW(out, exe, cap);
     int n = lstrlenW(out);
     if (n > 4 && !lstrcmpiW(out + n - 4, L".exe")) out[n - 4] = 0;
