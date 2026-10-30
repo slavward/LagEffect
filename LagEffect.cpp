@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.10.0"
+#define APP_VERSION L"1.11.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -35,6 +35,8 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <winhttp.h>
+#include <mmdeviceapi.h>                        // listing apps that play sound (Vocode to song)
+#include <audiopolicy.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -50,6 +52,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
@@ -220,7 +223,7 @@ static volatile int  gFxRevMix = 30, gFxRevSize = 60, gFxRevDamp = 50, gFxPreMs 
 static volatile bool gFxResetReq = true;       // UI asks the audio thread to clear effect buffers
 static volatile bool gFxVocOn = false;
 // Vocoder (Voloco-style): style, key (0 = C .. 11 = B), scale, and knobs.
-enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_STYLES };
+enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_SONG = 4, VOC_STYLES };
 static volatile int  gVocStyle = VOC_HARMONY, gVocKey = 0, gVocScale = 1;
 enum { VR_AUTO = 0, VR_HIGH = 1, VR_LOW = 2 };     // voice range (Vocoder): who's singing
 static volatile int  gVocRange = VR_AUTO;
@@ -379,6 +382,7 @@ static const char VOC_SCALE_STEPS[VOC_SCALES][12] = {
 #define PD_HOP    64                           // analyse every ~5 ms
 #define VOC_BANDS 28
 #define VOC_OSC   8                            // synth voices (each = 2 detuned saws)
+#define SONG_GAIN 1.17f                        // Song style level: about as loud as your voice (calibrated in testing)
 
 struct Biquad { float b0, b1, b2, a1, a2, z1, z2; };
 static inline float BqRun(Biquad& q, float x)
@@ -569,6 +573,42 @@ static inline float PolyBlep(double t, double dt)   // removes the aliasing a pl
     return 0.0f;
 }
 
+// ---- Song style: music playing on the PC becomes the vocoder's sound ----
+// A loopback capture (one app, or everything except Lag Effect) writes the music here from its own
+// thread; the vocoder reads it as its carrier. Kept 20-100 ms fresh so it never lags behind.
+#define SONG_RING 16384
+static float             songRing[SONG_RING];
+static volatile unsigned songW = 0, songR = 0;
+static volatile float    gSongPeak = 0;         // loudest music sample lately (UI shows "hearing music")
+
+static void SongCallback(ma_device*, void*, const void* input, ma_uint32 frames)
+{
+    const float* in = (const float*)input;      // stereo
+    unsigned w = songW;
+    float pk = 0;
+    for (ma_uint32 f = 0; f < frames; f++) {
+        float m = in ? (in[f * 2] + in[f * 2 + 1]) * 0.5f : 0.0f;
+        songRing[w & (SONG_RING - 1)] = m;
+        w++;
+        float a = m < 0 ? -m : m; if (a > pk) pk = a;
+    }
+    MemoryBarrier();
+    songW = w;
+    if (pk > gSongPeak) gSongPeak = pk;
+}
+
+static inline float SongRead()                  // audio thread
+{
+    unsigned w = songW;
+    MemoryBarrier();
+    unsigned r = songR, avail = w - r;
+    if (avail > RATE / 10) { r = w - RATE / 50; avail = RATE / 50; }   // fell behind: jump to 20 ms ago
+    float x = 0;
+    if (avail) { x = songRing[r & (SONG_RING - 1)]; r++; }
+    songR = r;
+    return x;
+}
+
 // Per-block settings, read once per audio callback.
 static struct VocParams { int style, key, scale, range; float retuneCoef, synth, mix; } gVp;
 
@@ -584,10 +624,35 @@ static void VocBlock()
     gVp.range = Iclamp(gVocRange, 0, 2);
 }
 
+static float VocodeBands(VocState& v, float mod, float car)   // channel vocoder: car shaped by mod
+{
+    float voc = 0;
+    for (int b = 0; b < VOC_BANDS; b++) {
+        float m = BqRun(v.modBp[b][1], BqRun(v.modBp[b][0], mod));
+        float c = BqRun(v.carBp[b][1], BqRun(v.carBp[b][0], car));
+        float am = m < 0 ? -m : m, ac = c < 0 ? -c : c;
+        v.modEnv[b] += (am - v.modEnv[b]) * (am > v.modEnv[b] ? 0.007f : 0.0014f);   // ~3 ms attack, ~15 ms release
+        v.carEnv[b] += (ac - v.carEnv[b]) * 0.0014f;
+        voc += c * v.modEnv[b] / (v.carEnv[b] + 0.0005f);         // carrier flattened, voice's shape applied
+    }
+    return voc;
+}
+
 static float Vocoder(float x)
 {
     VocState& v = gVoc;
     if (!v.ready) VocReset();
+
+    if (gVp.style == VOC_SONG) {                // the music says your words: no tuning needed
+        float song = SongRead();
+        if (v.bandsLow) VocBands(false);
+        float voc = VocodeBands(v, x, song) * SONG_GAIN;
+        voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], x)) * 0.5f;   // keep "s" and "t" sounds clear
+        float a = gVp.synth * 1.5707963f;                         // Synth: how much of your voice the song replaces
+        float out = x * cosf(a) + voc * sinf(a);
+        return x + (out - x) * gVp.mix;
+    }
+    SongRead();                                 // keep the music buffer fresh even when not used
 
     // --- pitch detection (12 kHz) ---
     float lp = BqRun(v.dsLp[1], BqRun(v.dsLp[0], x));
@@ -665,15 +730,7 @@ static float Vocoder(float x)
     car = car * v.voiced + ((int)(seed >> 9) % 2000 - 1000) * 0.00002f;
 
     // --- channel vocoder ---
-    float voc = 0;
-    for (int b = 0; b < VOC_BANDS; b++) {
-        float m = BqRun(v.modBp[b][1], BqRun(v.modBp[b][0], tuned));
-        float c = BqRun(v.carBp[b][1], BqRun(v.carBp[b][0], car));
-        float am = m < 0 ? -m : m, ac = c < 0 ? -c : c;
-        v.modEnv[b] += (am - v.modEnv[b]) * (am > v.modEnv[b] ? 0.007f : 0.0014f);   // ~3 ms attack, ~15 ms release
-        v.carEnv[b] += (ac - v.carEnv[b]) * 0.0014f;
-        voc += c * v.modEnv[b] / (v.carEnv[b] + 0.0005f);         // carrier flattened, voice's shape applied
-    }
+    float voc = VocodeBands(v, tuned, car);
     voc *= 1.5f;                                // calibrated: pure synth voice about as loud as your voice
     voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], tuned)) * 0.7f;    // keep "s" and "t" sounds clear
 
@@ -1147,7 +1204,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_SONGBTN, IDC_SONGSRC, IDC_SONGSTATUS, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -1165,6 +1222,9 @@ enum {
 
 static HINSTANCE gInst; static HWND gWnd, gStatus; static HFONT gFont, gFontBold; static HICON gIcon;
 static ma_context gCtx; static ma_device gDev, gExtraDev[MAX_OUT];
+static ma_device gSongDev;                        // loopback capture of the music (Vocode to song)
+static bool      gSongRunning = false;
+static volatile bool gSongLost = false, gSongRetryNow = false;
 static bool gCtxOk = false, gRunning = false, gWantRunning = false, gStopping = false;
 static bool gExtraRunning[MAX_OUT];
 static ma_device_info *gPlayDevs = nullptr, *gCapDevs = nullptr; static ma_uint32 gPlayCount = 0, gCapCount = 0;
@@ -1547,6 +1607,7 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 static const wchar_t* FxKeyIniName(int slot) { return slot == 0 ? L"fx_hotkey" : gFxGroups[slot - 1].hotkeyKey; }
 
 static wchar_t gUpdateRepo[200];
+static wchar_t gSongApp[64] = L"";               // Vocode to song: app to take music from ("" = all PC sound)
 static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
@@ -1613,6 +1674,7 @@ static void LoadSettings()
     gVocKey       = Iclamp(INI_INT(L"voc_key", 0), 0, 11);
     gVocScale     = Iclamp(INI_INT(L"voc_scale", 1), 0, VOC_SCALES - 1);
     gVocRange     = Iclamp(INI_INT(L"voc_range", VR_AUTO), 0, 2);
+    GetPrivateProfileStringW(L"settings", L"voc_song_app", L"", gSongApp, 64, gIni);
     gRadioPreset  = Iclamp(INI_INT(L"radio_preset", 0), 0, RADIO_N - 1);
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
@@ -1672,6 +1734,7 @@ static void SaveSettings()
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
+    WritePrivateProfileStringW(L"settings", L"voc_song_app", gSongApp, gIni);
     SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"update_on_start", gUpdateOnStart);
@@ -1759,6 +1822,8 @@ static void StopDevices()
     if (gRunning) { ma_device_uninit(&gDev); gRunning = false; }
     for (int k = 0; k < MAX_OUT; k++)
         if (gExtraRunning[k]) { ma_device_uninit(&gExtraDev[k]); gExtraRunning[k] = false; }
+    if (gSongRunning) { ma_device_uninit(&gSongDev); gSongRunning = false; }
+    gSongRetryNow = true;
     gLooping = false;
 }
 
@@ -1931,6 +1996,7 @@ static bool KnobActive(int i)
     case KG_TONE: return true;
     }
     if (k.var == &gVocSynth && gVocStyle == VOC_TUNE) return false;   // Tune style has no synth
+    if (k.var == &gVocRetuneMs && gVocStyle == VOC_SONG) return false; // Song style doesn't tune
     if (k.group == KG_RADIO) {                  // dim what the chosen preset doesn't have
         const RadioPreset& rp = RADIO_PRESETS[Iclamp(gRadioPreset, 0, RADIO_N - 1)];
         if (k.var == &gRadioSquelch && rp.squelch == SQ_NONE) return false;
@@ -2109,6 +2175,266 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
+static void Layout();
+static void SetFxGroupOn(int g, bool on);
+static void SetFxOn(bool on);
+static void UpdateStatus(bool force);
+
+// ======================= vocode to song (capture + UI) =======================
+// Windows can record one app's sound, or everything except one app (Windows 11 / build 20348+).
+// "All PC sound" leaves Lag Effect itself out, so its own output never feeds back in. On older
+// Windows we fall back to recording the speakers, which can echo if you monitor on them.
+static const GUID kCLSID_MMDeviceEnumerator  = { 0xBCDE0395, 0xE52F, 0x467C, { 0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E } };
+static const GUID kIID_IMMDeviceEnumerator   = { 0xA95664D2, 0x9614, 0x4F35, { 0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6 } };
+static const GUID kIID_IAudioSessionManager2 = { 0x77AA99A0, 0x1BD6, 0x484F, { 0x8B, 0xC7, 0x2C, 0x65, 0x4C, 0x9A, 0x9B, 0x6F } };
+static const GUID kIID_IAudioSessionControl2 = { 0xBFB7FF88, 0x7239, 0x4FC9, { 0x8F, 0xA2, 0x07, 0xC9, 0x50, 0xBE, 0x9C, 0x6D } };
+
+struct AudioApp { DWORD pid; wchar_t name[64]; };
+
+// Apps that currently have sound sessions on any output (Spotify, browsers, games...), minus Lag Effect.
+static int ListAudioApps(AudioApp* out, int cap)
+{
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int n = 0;
+    IMMDeviceEnumerator* en = nullptr;
+    if (SUCCEEDED(CoCreateInstance(kCLSID_MMDeviceEnumerator, nullptr, CLSCTX_ALL, kIID_IMMDeviceEnumerator, (void**)&en))) {
+        IMMDeviceCollection* devs = nullptr;
+        if (SUCCEEDED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, &devs))) {
+            UINT dc = 0; devs->GetCount(&dc);
+            for (UINT d = 0; d < dc; d++) {
+                IMMDevice* dev = nullptr;
+                if (FAILED(devs->Item(d, &dev))) continue;
+                IAudioSessionManager2* mgr = nullptr;
+                if (SUCCEEDED(dev->Activate(kIID_IAudioSessionManager2, CLSCTX_ALL, nullptr, (void**)&mgr))) {
+                    IAudioSessionEnumerator* se = nullptr;
+                    if (SUCCEEDED(mgr->GetSessionEnumerator(&se))) {
+                        int sc = 0; se->GetCount(&sc);
+                        for (int i = 0; i < sc && n < cap; i++) {
+                            IAudioSessionControl* c = nullptr;
+                            if (FAILED(se->GetSession(i, &c))) continue;
+                            IAudioSessionControl2* c2 = nullptr;
+                            if (SUCCEEDED(c->QueryInterface(kIID_IAudioSessionControl2, (void**)&c2))) {
+                                DWORD pid = 0;
+                                c2->GetProcessId(&pid);
+                                if (pid && pid != GetCurrentProcessId()) {
+                                    wchar_t path[MAX_PATH] = L""; DWORD len = MAX_PATH;
+                                    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                                    if (h) { QueryFullProcessImageNameW(h, 0, path, &len); CloseHandle(h); }
+                                    const wchar_t* base = wcsrchr(path, L'\\');
+                                    base = base ? base + 1 : path;
+                                    bool dup = false;
+                                    for (int k = 0; k < n; k++) if (!lstrcmpiW(out[k].name, base)) dup = true;
+                                    if (base[0] && !dup) { out[n].pid = pid; lstrcpynW(out[n].name, base, 64); n++; }
+                                }
+                                c2->Release();
+                            }
+                            c->Release();
+                        }
+                        se->Release();
+                    }
+                    mgr->Release();
+                }
+                dev->Release();
+            }
+            devs->Release();
+        }
+        en->Release();
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    return n;
+}
+
+static void AppDisplayName(const wchar_t* exe, wchar_t* out, int cap)   // "spotify.exe" -> "Spotify"
+{
+    lstrcpynW(out, exe, cap);
+    int n = lstrlenW(out);
+    if (n > 4 && !lstrcmpiW(out + n - 4, L".exe")) out[n - 4] = 0;
+    if (out[0] >= L'a' && out[0] <= L'z') out[0] = (wchar_t)(out[0] - 32);
+}
+
+static wchar_t gSongList[32][64];               // exe names behind the "Music from" entries
+static int     gSongListN = 0;
+static int     gPrevVocStyle = VOC_HARMONY;     // style to go back to when Vocode to song is switched off
+static int     gSongState = 0;                  // 0 off, 1 one app, 2 all PC sound, 3 speakers (fallback), 4 waiting, 5 failed
+static wchar_t gSongActiveApp[64] = L"";
+static bool    gSongHeard = false;
+
+static void FillSongSources()
+{
+    HWND c = GetDlgItem(gWnd, IDC_SONGSRC);
+    if (!c) return;
+    AudioApp apps[32];
+    int n = ListAudioApps(apps, 32);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    int sel = 0;
+    LRESULT i0 = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Music: all PC sound");
+    SendMessageW(c, CB_SETITEMDATA, i0, 0);
+    gSongListN = 0;
+    bool found = gSongApp[0] == 0;
+    for (int i = 0; i < n && gSongListN < 31; i++) {
+        lstrcpynW(gSongList[gSongListN], apps[i].name, 64);
+        wchar_t disp[64], label[96];
+        AppDisplayName(apps[i].name, disp, 64);
+        wsprintfW(label, L"Music: %s", disp);
+        LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
+        SendMessageW(c, CB_SETITEMDATA, it, gSongListN + 1);
+        if (!lstrcmpiW(apps[i].name, gSongApp)) { sel = (int)it; found = true; }
+        gSongListN++;
+    }
+    if (!found) {                                // the saved app isn't playing right now: keep it listed
+        lstrcpynW(gSongList[gSongListN], gSongApp, 64);
+        wchar_t disp[64], label[96];
+        AppDisplayName(gSongApp, disp, 64);
+        wsprintfW(label, L"Music: %s (not playing)", disp);
+        LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
+        SendMessageW(c, CB_SETITEMDATA, it, gSongListN + 1);
+        sel = (int)it;
+        gSongListN++;
+    }
+    SendMessageW(c, CB_SETCURSEL, sel, 0);
+}
+
+static void SongNotify(const ma_device_notification* n)
+{
+    if (n->type == ma_device_notification_type_stopped && !gStopping) gSongLost = true;   // e.g. the app closed
+}
+
+static bool SongStartDevice(DWORD pid, bool exclude)
+{
+    ma_device_config cfg = ma_device_config_init(ma_device_type_loopback);
+    cfg.capture.format   = ma_format_f32;
+    cfg.capture.channels = 2;
+    cfg.sampleRate       = RATE;
+    cfg.dataCallback     = SongCallback;
+    cfg.notificationCallback = SongNotify;
+    cfg.wasapi.loopbackProcessID      = pid;     // 0 = the whole default output
+    cfg.wasapi.loopbackProcessExclude = exclude;
+    if (ma_device_init(&gCtx, &cfg, &gSongDev) != MA_SUCCESS) return false;
+    if (ma_device_start(&gSongDev) != MA_SUCCESS) { ma_device_uninit(&gSongDev); return false; }
+    gSongRunning = true;
+    gSongLost = false;
+    return true;
+}
+
+static bool SongModeOn() { return gFxOn && gFxVocOn && gVocStyle == VOC_SONG; }
+
+static void UpdateSongStatusText()
+{
+    wchar_t t[96], disp[64];
+    AppDisplayName(gSongActiveApp, disp, 64);
+    switch (gSongState) {
+    case 1:  wsprintfW(t, gSongHeard ? L"Hearing %s" : L"%s is silent: press play", disp); break;
+    case 2:  lstrcpynW(t, gSongHeard ? L"Hearing your PC" : L"No music playing yet", 96); break;
+    case 3:  lstrcpynW(t, L"Using speaker sound (older Windows): turn off monitoring to avoid echo", 96); break;
+    case 4:  wsprintfW(t, L"Waiting for %s to play...", disp); break;
+    case 5:  lstrcpynW(t, L"Couldn't record PC sound", 96); break;
+    default: lstrcpynW(t, gRunning ? L"Turn on to vocode music" : L"Press Start on the Main tab", 96); break;
+    }
+    wchar_t cur[96];
+    GetDlgItemTextW(gWnd, IDC_SONGSTATUS, cur, 96);
+    if (lstrcmpW(cur, t)) SetDlgItemTextW(gWnd, IDC_SONGSTATUS, t);
+}
+
+// Starts / stops / re-targets the music capture to match the settings.
+static void UpdateSongCapture()
+{
+    bool want = gRunning && SongModeOn();
+    if (gSongRunning && (!want || gSongLost || lstrcmpiW(gSongActiveApp, gSongApp))) {
+        ma_device_uninit(&gSongDev);
+        gSongRunning = false;
+    }
+    if (!want) { gSongState = 0; UpdateSongStatusText(); return; }
+    if (gSongRunning) { UpdateSongStatusText(); return; }
+
+    lstrcpynW(gSongActiveApp, gSongApp, 64);
+    if (gSongApp[0]) {                           // one app
+        AudioApp apps[32];
+        int n = ListAudioApps(apps, 32);
+        DWORD pid = 0;
+        for (int i = 0; i < n; i++) if (!lstrcmpiW(apps[i].name, gSongApp)) pid = apps[i].pid;
+        if (!pid)                               gSongState = 4;   // not playing yet: the timer tries again
+        else if (SongStartDevice(pid, false))   gSongState = 1;
+        else if (SongStartDevice(0, false))     gSongState = 3;   // Windows too old for one-app capture
+        else                                    gSongState = 5;
+    } else {                                    // everything except Lag Effect
+        if (SongStartDevice(GetCurrentProcessId(), true)) gSongState = 2;
+        else if (SongStartDevice(0, false))               gSongState = 3;
+        else                                              gSongState = 5;
+    }
+    UpdateSongStatusText();
+}
+
+static void SongStyleChanged()                  // style / on-off changed somewhere
+{
+    Layout();
+    RedrawKnobs();
+    InvalidateRect(GetDlgItem(gWnd, IDC_SONGBTN), nullptr, FALSE);
+    UpdateSongCapture();
+}
+
+static void SetSongMode(bool on)
+{
+    if (on) {
+        if (gVocStyle != VOC_SONG) gPrevVocStyle = gVocStyle;
+        gVocStyle = VOC_SONG;
+        if (!gFxVocOn) SetFxGroupOn(KG_VOCODER, true);
+        if (!gFxOn) SetFxOn(true);
+    } else if (gVocStyle == VOC_SONG) {
+        gVocStyle = gPrevVocStyle;
+    }
+    SendDlgItemMessageW(gWnd, IDC_VOCSTYLE, CB_SETCURSEL, gVocStyle, 0);
+    SongStyleChanged();
+    UpdateStatus(true);
+}
+
+static void SongTick()                          // every 50 ms
+{
+    static bool lastWant = false, lastOn = false;
+    static DWORD lastTry = 0, lastHeard = 0;
+    bool on = SongModeOn(), want = on && gRunning;
+    if (on != lastOn) { lastOn = on; InvalidateRect(GetDlgItem(gWnd, IDC_SONGBTN), nullptr, FALSE); }
+    DWORD now = GetTickCount();
+    if (want != lastWant || (!want && gSongRunning) ||
+        (want && (!gSongRunning || gSongLost) && (gSongRetryNow || now - lastTry > 1500))) {
+        lastWant = want; lastTry = now; gSongRetryNow = false;
+        UpdateSongCapture();
+    }
+    if (gSongPeak > 0.003f) lastHeard = now;    // music in the last 1.5 s?
+    gSongPeak = 0;
+    bool heard = now - lastHeard < 1500;
+    if (heard != gSongHeard) { gSongHeard = heard; UpdateSongStatusText(); }
+}
+
+static void DrawSongButton(DRAWITEMSTRUCT* d)
+{
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    bool on = SongModeOn();
+    COLORREF fill = on ? ACCENT : (gDark ? DK_CTL : LT_CARD);
+    HBRUSH b = CreateSolidBrush(fill);
+    HPEN   p = CreatePen(PS_SOLID, 1, on ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
+    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, gFontBold);
+    COLORREF txt = on ? (gDark ? RGB(20, 20, 20) : RGB(255, 255, 255)) : (gDark ? DK_TEXT : RGB(30, 30, 30));
+    SetTextColor(dc, txt);
+    RECT t1 = { rc.left, rc.top + 5, rc.right, rc.top + 24 };
+    DrawTextW(dc, L"Vocode to song", -1, &t1, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, gFont);
+    SetTextColor(dc, on ? txt : (gDark ? DK_DIM : RGB(105, 105, 105)));
+    RECT t2 = { rc.left, rc.top + 23, rc.right, rc.bottom - 4 };
+    DrawTextW(dc, on ? L"\x266A ON" : L"\x266A talk over music", -1, &t2, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(dc, of);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+        RECT fr = rc; InflateRect(&fr, -4, -4);
+        SetTextColor(dc, txt);
+        DrawFocusRect(dc, &fr);
+    }
+}
+
 // ======================= tooltips =======================
 // Hover help for every setting. Labels get SS_NOTIFY so they can be hovered too
 // (clicking one still takes focus out of text boxes, see OnCommand). gTip is declared with the theme code.
@@ -2144,7 +2470,8 @@ static const TipText gKnobTips[] = {
     { L"fx_reverb_predelay", L"Gap before the echo starts. 10-30 ms keeps your words clear." },
     { L"voc_retune_ms",      L"How fast your voice snaps to the right note. 0 ms = instant, the hard robotic auto-tune sound; "
                              L"20-60 ms = natural pitch correction; higher = gentle." },
-    { L"voc_synth",          L"Tune + harmony: how loud the harmony voices are. Robot and Choir: how much of your voice is replaced by the synth." },
+    { L"voc_synth",          L"Tune + harmony: how loud the harmony voices are. Robot and Choir: how much of your voice is replaced by the synth. "
+                             L"Song: how much of your voice is replaced by the music." },
     { L"voc_mix",            L"How much of the vocoder you hear. 100% = only the effect; lower blends your original voice back in." },
     { L"radio_drive",        L"How hard the device distorts. 50% = how the preset is designed; higher = more broken-up and crunchy." },
     { L"radio_static",       L"Background noise while you talk: radio hiss, crackle, hum. 50% = the preset's normal amount." },
@@ -2248,6 +2575,12 @@ static void AddTips()
     TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
                         L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you.");
     TipId(IDC_VOCKEY,   L"The key of the song (its home note). Not sure? Try C with Major, or A with Minor.");
+    TipId(IDC_SONGBTN,  L"Vocode to song: the music playing on your PC says your words. Talk or sing and you hear the song "
+                        L"shaped by your voice; stay quiet and it's silent. Turns on Voice effects and the Vocoder's Song style. "
+                        L"Click again to go back to the style you had.");
+    TipId(IDC_SONGSRC,  L"Where the music comes from: one app (Spotify, a browser...) or all PC sound except Lag Effect "
+                        L"(so it never hears itself). Recording one app needs Windows 11. Open the list to refresh it.");
+    TipId(IDC_SONGSTATUS, L"Whether the song is reaching the vocoder.");
     TipId(IDC_VOCRANGE, L"How high your voice is. Auto works it out as you sing. "
                         L"Low / deep: for bass and baritone voices; hears notes down to 50 Hz, uses longer, smoother slices "
                         L"for tuning, and puts harmonies above you instead of below (adds ~15 ms delay). High: tenor, alto, soprano.");
@@ -2340,7 +2673,7 @@ static void DrawFxSwitch(DRAWITEMSTRUCT* d)
     SelectObject(dc, gFont);
     SetTextColor(dc, gDark ? DK_DIM : RGB(105, 105, 105));
     RECT sr = { px + pw + 14, rc.top + 23, rc.right - 70, rc.bottom - 4 };
-    DrawTextW(dc, L"Changes your live voice (and the loop).", -1, &sr,
+    DrawTextW(dc, L"On your live voice", -1, &sr,
               DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS);
     SelectObject(dc, gFontBold);
     SetTextColor(dc, on ? ACCENT : gDark ? DK_DIM : RGB(120, 120, 120));
@@ -2598,6 +2931,10 @@ static void Layout()
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
         bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)));
+        int  cid = GetDlgCtrlID(gPaged[i].h);
+        bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
+        if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
+        if (cid == IDC_SONGSRC || cid == IDC_SONGSTATUS) vis = vis && songStyle;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
     }
 
@@ -3029,6 +3366,7 @@ static void ShowHelp()
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
         L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n"
         L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices. Pick the key of the song; "
+        L"Vocode to song: click it and the music playing on your PC (one app or all PC sound) says your words. "
         L"Retune 0 ms gives the hard auto-tune sound. Deep voice? Set Voice to Low / deep (Auto usually picks it for you).\n"
         L"Radio: sound like a walkie-talkie, phone call, megaphone, old radio, space radio, drive-thru, 8-bit or the next room. "
         L"Drive = distortion, Static = background noise, Squelch = start/stop sounds.\n\n"
@@ -3358,7 +3696,8 @@ static void CreateUI()
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
     // Sections stack downward (FX_SEC_STEP apart); there's room below for more effects.
     gBuildPage = PAGE_FX;
-    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 52, 410, 44, IDC_FXON);
+    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 52, 290, 44, IDC_FXON);
+    Ctl(L"BUTTON", L"Vocode to song", BS_OWNERDRAW | WS_TABSTOP, 310, 52, 116, 44, IDC_SONGBTN);
     {
         wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 59, 114, 30, IDC_FXKEY_MASTER);
@@ -3371,7 +3710,7 @@ static void CreateUI()
         if (g == KG_VOCODER) {                  // dropdowns on the left, narrower knobs after them
             // three dropdowns stacked: style, key + scale, voice range (hover each for help)
             HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 10, 152, 300, IDC_VOCSTYLE);
-            const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir" };
+            const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir", L"Song (vocode music)" };
             for (const wchar_t* n : styleNames) SendMessageW(st, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(st, CB_SETCURSEL, gVocStyle, 0);
             HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 40, 56, 300, IDC_VOCKEY);
@@ -3387,6 +3726,10 @@ static void CreateUI()
             const wchar_t* rangeNames[3] = { L"Voice: Auto", L"Voice: High", L"Voice: Low / deep" };
             for (const wchar_t* n : rangeNames) SendMessageW(vr, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(vr, CB_SETCURSEL, gVocRange, 0);
+            HWND ss = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 40, 152, 300, IDC_SONGSRC);   // Song style only
+            SendMessageW(ss, CB_SETDROPPEDWIDTH, 220, 0);
+            FillSongSources();
+            Ctl(L"STATIC", L"", 0, 28, y + 68, 150, 34, IDC_SONGSTATUS);
             kx = 186; kstep = 80; kw = 80;
         } else if (g == KG_RADIO) {             // preset dropdown + a line about it
             Ctl(L"STATIC", L"Preset", 0, 28, y + 10, 150, 16, IDC_HDR);
@@ -3675,10 +4018,23 @@ static void OnCommand(int id, int code)
             RedrawKnobs();                      // dims knobs the preset doesn't use
         }
         break;
+    case IDC_SONGBTN:
+        if (code == BN_CLICKED) SetSongMode(!SongModeOn());
+        break;
+    case IDC_SONGSRC:
+        if (code == CBN_DROPDOWN) FillSongSources();              // refresh: which apps are playing now
+        else if (code == CBN_SELCHANGE) {
+            int sel = (int)SendDlgItemMessageW(gWnd, IDC_SONGSRC, CB_GETCURSEL, 0, 0);
+            int idx = (int)SendDlgItemMessageW(gWnd, IDC_SONGSRC, CB_GETITEMDATA, sel, 0);
+            lstrcpynW(gSongApp, idx > 0 && idx <= gSongListN ? gSongList[idx - 1] : L"", 64);
+            UpdateSongCapture();
+        }
+        break;
     case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE: case IDC_VOCRANGE:
         if (code == CBN_SELCHANGE) {
             int v = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
-            if (id == IDC_VOCSTYLE) gVocStyle = v; else if (id == IDC_VOCKEY) gVocKey = v;
+            if (id == IDC_VOCSTYLE) { if (gVocStyle != VOC_SONG && v == VOC_SONG) gPrevVocStyle = gVocStyle; gVocStyle = v; SongStyleChanged(); }
+            else if (id == IDC_VOCKEY) gVocKey = v;
             else if (id == IDC_VOCSCALE) gVocScale = v; else gVocRange = Iclamp(v, 0, 2);
             RedrawKnobs();                      // Synth dims in the Tune style
         }
@@ -3755,7 +4111,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
-        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); }
+        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); SongTick(); }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) CleanupOldExe();
         else if (w == TIMER_FXKEYS) PollFxKeys();
@@ -3793,6 +4149,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_METER) { DrawMeter((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_COLORTHEME) { DrawColorItem((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
@@ -3833,7 +4190,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: {
         HDC dc = (HDC)w;
         int  cid    = GetDlgCtrlID((HWND)l);
-        bool header = cid == IDC_HDR || cid == IDC_RADIODESC;   // dim helper text
+        bool header = cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS;   // dim helper text
         bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
         if (!gDark) {
             if (field) break;                   // text boxes and lists keep Windows' white
