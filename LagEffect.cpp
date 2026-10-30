@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.9.3"
+#define APP_VERSION L"1.10.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1147,7 +1147,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -1283,19 +1283,78 @@ static void HotkeyName(wchar_t* buf, int cap)
 enum { THEME_SYSTEM = 0, THEME_LIGHT = 1, THEME_DARK = 2 };
 static int    gThemeMode = THEME_SYSTEM;
 static bool   gDark = false;
-static HBRUSH gBrDarkBg, gBrDarkCtl;
+static HBRUSH gBrDarkBg, gBrDarkCtl, gBrLightBg;
 static HWND   gTip;                             // hover-help tooltip window (see AddTips)
 
-#define DK_BG      RGB(32, 32, 32)
-#define DK_CTL     RGB(45, 45, 45)
-#define DK_BORDER  RGB(78, 78, 78)
-#define DK_SECTION RGB(64, 64, 64)
-#define DK_TEXT    RGB(235, 235, 235)
-#define DK_DIM     RGB(160, 160, 160)
-#define ACCENT     RGB(76, 160, 255)
+// ---- color themes ----
+// Each theme has an accent (knobs, switches, tabs, checkboxes) in a bright version for dark mode and a
+// deeper one for light mode, plus how strongly it tints the backgrounds. Add a row to add a theme.
+struct ColorTheme { const wchar_t* name; COLORREF dark, light; float tint; };
+static const ColorTheme COLOR_THEMES[] = {
+    { L"Classic",  RGB(76, 160, 255),  RGB(0, 103, 192),   0.0f  },   // the original look: blue on neutral grey
+    { L"Blue",     RGB(76, 160, 255),  RGB(0, 103, 192),   1.0f  },
+    { L"Purple",   RGB(170, 128, 255), RGB(118, 70, 220),  1.0f  },
+    { L"Pink",     RGB(255, 110, 190), RGB(214, 51, 140),  1.0f  },
+    { L"Red",      RGB(255, 92, 92),   RGB(205, 38, 38),   1.0f  },
+    { L"Orange",   RGB(255, 152, 64),  RGB(190, 88, 0),    1.0f  },
+    { L"Yellow",   RGB(245, 205, 70),  RGB(146, 110, 0),   0.8f  },
+    { L"Green",    RGB(80, 205, 120),  RGB(24, 140, 64),   1.0f  },
+    { L"Teal",     RGB(56, 204, 204),  RGB(0, 132, 140),   1.0f  },
+    { L"Graphite", RGB(200, 200, 200), RGB(80, 80, 80),    0.0f  },
+};
+#define COLOR_THEME_N ((int)(sizeof(COLOR_THEMES) / sizeof(COLOR_THEMES[0])))
+static int gColorTheme = 0;
 
-static COLORREF BgColor()  { return gDark ? DK_BG : GetSysColor(COLOR_BTNFACE); }
-static HBRUSH   BgBrush()  { return gDark ? gBrDarkBg : GetSysColorBrush(COLOR_BTNFACE); }
+// The palette in use (set by ApplyPalette). The old constant names now point at these.
+static COLORREF gDkBg, gDkCtl, gDkBorder, gDkSection, gDkText = RGB(235, 235, 235), gDkDim = RGB(160, 160, 160);
+static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
+#define DK_BG      gDkBg
+#define DK_CTL     gDkCtl
+#define DK_BORDER  gDkBorder
+#define DK_SECTION gDkSection
+#define DK_TEXT    gDkText
+#define DK_DIM     gDkDim
+#define DK_TRACK   gDkTrack
+#define DK_KNOB    gDkKnob
+#define LT_CARD    gLtCard
+#define LT_BORDER  gLtBorder
+#define LT_TRACK   gLtTrack
+#define LT_STATUS  gLtStatus
+#define ACCENT     gAccentNow
+
+static COLORREF Mix(COLORREF a, COLORREF b, float t)   // a blended toward b by t (0..1)
+{
+    return RGB((int)(GetRValue(a) + (GetRValue(b) - GetRValue(a)) * t + 0.5f),
+               (int)(GetGValue(a) + (GetGValue(b) - GetGValue(a)) * t + 0.5f),
+               (int)(GetBValue(a) + (GetBValue(b) - GetBValue(a)) * t + 0.5f));
+}
+
+static void ApplyPalette()
+{
+    const ColorTheme& t = COLOR_THEMES[Iclamp(gColorTheme, 0, COLOR_THEME_N - 1)];
+    const float k = t.tint;
+    gDkBg      = Mix(RGB(32, 32, 32), t.dark, 0.06f * k);
+    gDkCtl     = Mix(RGB(45, 45, 45), t.dark, 0.08f * k);
+    gDkBorder  = Mix(RGB(78, 78, 78), t.dark, 0.14f * k);
+    gDkSection = Mix(RGB(64, 64, 64), t.dark, 0.18f * k);
+    gDkTrack   = Mix(RGB(64, 64, 64), t.dark, 0.12f * k);
+    gDkKnob    = Mix(RGB(54, 54, 54), t.dark, 0.07f * k);
+    gLtBg      = Mix(GetSysColor(COLOR_BTNFACE), t.light, 0.07f * k);
+    gLtCard    = Mix(RGB(252, 252, 252), t.light, 0.025f * k);
+    gLtBorder  = Mix(RGB(206, 206, 206), t.light, 0.22f * k);
+    gLtTrack   = Mix(RGB(218, 218, 218), t.light, 0.15f * k);
+    gLtStatus  = Mix(RGB(228, 228, 228), t.light, 0.10f * k);
+    gAccentNow = gDark ? t.dark : t.light;
+    if (gBrDarkBg)  DeleteObject(gBrDarkBg);
+    if (gBrDarkCtl) DeleteObject(gBrDarkCtl);
+    if (gBrLightBg) DeleteObject(gBrLightBg);
+    gBrDarkBg  = CreateSolidBrush(gDkBg);
+    gBrDarkCtl = CreateSolidBrush(gDkCtl);
+    gBrLightBg = CreateSolidBrush(gLtBg);
+}
+
+static COLORREF BgColor()  { return gDark ? DK_BG : gLtBg; }
+static HBRUSH   BgBrush()  { return gDark ? gBrDarkBg : gBrLightBg; }
 
 typedef HRESULT (WINAPI* PFN_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
 typedef HRESULT (WINAPI* PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
@@ -1326,8 +1385,7 @@ static void LoadThemeApis()
     }
     HMODULE dwm = LoadLibraryW(L"dwmapi.dll");
     if (dwm) pDwmSetWindowAttribute = (PFN_DwmSetWindowAttribute)(void*)GetProcAddress(dwm, "DwmSetWindowAttribute");
-    gBrDarkBg  = CreateSolidBrush(DK_BG);
-    gBrDarkCtl = CreateSolidBrush(DK_CTL);
+    ApplyPalette();
 }
 
 static bool SystemUsesDark()
@@ -1366,10 +1424,16 @@ static BOOL CALLBACK ThemeChild(HWND h, LPARAM)
 static void ApplyTheme()
 {
     gDark = gThemeMode == THEME_DARK || (gThemeMode == THEME_SYSTEM && SystemUsesDark());
+    ApplyPalette();
     if (pDwmSetWindowAttribute) {
         BOOL d = gDark;
         if (FAILED(pDwmSetWindowAttribute(gWnd, 20, &d, sizeof(d))))    // DWMWA_USE_IMMERSIVE_DARK_MODE
             pDwmSetWindowAttribute(gWnd, 19, &d, sizeof(d));            // older Windows 10 builds
+        // Windows 11: title bar matches the window, thin border in the accent (Classic keeps Windows' own)
+        bool tinted = COLOR_THEMES[Iclamp(gColorTheme, 0, COLOR_THEME_N - 1)].tint > 0;
+        COLORREF cap = tinted ? BgColor() : 0xFFFFFFFF, brd = tinted ? ACCENT : 0xFFFFFFFF;   // 0xFFFFFFFF = default
+        pDwmSetWindowAttribute(gWnd, 35, &cap, sizeof(cap));          // DWMWA_CAPTION_COLOR
+        pDwmSetWindowAttribute(gWnd, 34, &brd, sizeof(brd));          // DWMWA_BORDER_COLOR
     }
     if (pSetPreferredAppMode) {                 // dark tray menu
         pSetPreferredAppMode(gDark ? 2 : 3);
@@ -1523,6 +1587,7 @@ static void LoadSettings()
     gHideShare     = INI_INT(L"hide_from_share", 0) != 0;
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
+    gColorTheme    = Iclamp(INI_INT(L"color_theme", 0), 0, COLOR_THEME_N - 1);
     gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
 
     gFxOn = INI_INT(L"fx_on", 0) != 0;
@@ -1609,7 +1674,7 @@ static void SaveSettings()
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
     SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare); SaveInt(L"autostart", gAutoStart);
-    SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
+    SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
     for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
         wchar_t b[64];
@@ -1924,7 +1989,7 @@ static void PaintKnob(HWND h, HDC dc)
     double frac = (double)(*k.var - k.lo) / (double)(k.hi - k.lo);
     double ang  = 225.0 - 270.0 * frac;         // 225 = minimum (bottom left), -45 = maximum (bottom right)
 
-    COLORREF track = gDark ? RGB(66, 66, 66) : RGB(212, 212, 212);
+    COLORREF track = gDark ? DK_TRACK : LT_TRACK;
     COLORREF value = on ? ACCENT : (gDark ? RGB(112, 112, 112) : RGB(158, 158, 158));
     KnobArc(dc, cx, cy, r, 225.0, -45.0, track, 5);
     if (k.bipolar) {                            // fills from the middle (12 o'clock) toward the value
@@ -1934,7 +1999,7 @@ static void PaintKnob(HWND h, HDC dc)
         KnobArc(dc, cx, cy, r, 225.0, ang, value, 5);
     }
 
-    HBRUSH body = CreateSolidBrush(gDark ? RGB(54, 54, 54) : RGB(252, 252, 252));
+    HBRUSH body = CreateSolidBrush(gDark ? DK_KNOB : LT_CARD);
     HPEN   edge = CreatePen(PS_SOLID, 1, focus ? ACCENT : gDark ? RGB(88, 88, 88) : RGB(186, 186, 186));
     HGDIOBJ ob = SelectObject(dc, body), op = SelectObject(dc, edge);
     Ellipse(dc, cx - 18, cy - 18, cx + 19, cy + 19);
@@ -2115,6 +2180,7 @@ static const TipText gLabelTips[] = {
     { L"Opens on:",    L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech. Volume + voice: both." },
     { L"Buffer:",      L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling." },
     { L"Theme:",       L"Light, dark, or follow Windows." },
+    { L"Color:",       L"The app's color: knobs, switches, tabs and a matching tint on the background. Classic is the original look." },
     { L"Updates:",     L"The GitHub repo Lag Effect checks for new versions." },
 };
 
@@ -2214,6 +2280,8 @@ static void AddTips()
                          L"Outputs to real speakers or headphones aren't locked: set those to Off or Effect only while streaming.");
     TipId(IDC_EXCL,     L"Takes over the mic and output 1 for the lowest delay. Other apps can't use them while it's on.");
     TipId(IDC_THEME,    L"Light, dark, or follow Windows.");
+    TipId(IDC_COLORTHEME, L"The app's color: knobs, switches, tabs and a matching tint on the background. "
+                          L"Classic is the original look. Works with light and dark.");
     TipId(IDC_AUTO,     L"When Lag Effect opens, start audio straight away and hide in the tray.");
     TipId(IDC_REPO,     L"The GitHub repo Lag Effect checks for new versions.");
     TipId(IDC_CHECKUPD, L"Check GitHub for a newer version now.");
@@ -2240,8 +2308,8 @@ static void DrawFxSwitch(DRAWITEMSTRUCT* d)
     FillRect(dc, &rc, BgBrush());
     const bool on = gFxOn;
 
-    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : RGB(252, 252, 252));
-    HPEN   cpen = CreatePen(PS_SOLID, 1, on ? ACCENT : gDark ? DK_SECTION : RGB(206, 206, 206));
+    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : LT_CARD);
+    HPEN   cpen = CreatePen(PS_SOLID, 1, on ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, cpen);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
     SelectObject(dc, ob); SelectObject(dc, op);
@@ -2342,8 +2410,8 @@ static void UpdateMeter()                       // every 50 ms: fast rise, smoot
 static void DrawMeterTo(HDC dc, RECT rc)
 {
     FillRect(dc, &rc, BgBrush());
-    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : RGB(252, 252, 252));
-    HPEN   cpen = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : LT_CARD);
+    HPEN   cpen = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, cpen);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
     SelectObject(dc, ob); SelectObject(dc, op);
@@ -2361,7 +2429,7 @@ static void DrawMeterTo(HDC dc, RECT rc)
     DrawTextW(dc, L"Mic level", -1, &lr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
 
     RECT track = { x0, by, x1, by + bh };
-    HBRUSH tb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222));
+    HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK);
     FillRect(dc, &track, tb); DeleteObject(tb);
 
     bool gateOn = gGateMode != GATE_OFF, open = !gateOn || gMeterGateOpen;
@@ -2386,7 +2454,7 @@ static void DrawMeterTo(HDC dc, RECT rc)
         RECT vlab = { rc.left + 14, vy - 6, x0 - 8, vy + 11 };   // label to the left, like "Mic level"
         DrawTextW(dc, L"Voice", -1, &vlab, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
         RECT vt = { x0, vy, x1, vy + 5 };
-        HBRUSH vb = CreateSolidBrush(gDark ? RGB(62, 62, 62) : RGB(222, 222, 222)); FillRect(dc, &vt, vb); DeleteObject(vb);
+        HBRUSH vb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(dc, &vt, vb); DeleteObject(vb);
         RECT vf = { x0, vy, x0 + (int)((x1 - x0) * (gMeterVadShow > 1 ? 1 : gMeterVadShow)), vy + 5 };
         HBRUSH vfb = CreateSolidBrush(RGB(160, 120, 240)); FillRect(dc, &vf, vfb); DeleteObject(vfb);
         if (gGateMode == GATE_VOICE || gGateMode == GATE_BOTH) {
@@ -3354,37 +3422,69 @@ static void CreateUI()
     CheckDlgButton(gWnd, IDC_EXCL, gExclusive ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"STATIC", L"Smaller buffer = less delay. Pick a bigger one if you hear crackling.", 0, 30, 116, 500, 18, IDC_HDR);
 
-    AddSection(14, 167, 532, 100, L"App");
+    AddSection(14, 167, 532, 134, L"App");
     Ctl(L"STATIC", L"Theme:", 0, 30, 196, 60, 20, -1);
     HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 192, 110, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
     for (const wchar_t* n : themeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, gThemeMode, 0);
-    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 222, 194, 300, 20, IDC_AUTO);
+    Ctl(L"STATIC", L"Color:", 0, 222, 196, 50, 20, -1);
+    HWND ct = Ctl(L"COMBOBOX", L"", COMBO | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, 274, 192, 140, 400, IDC_COLORTHEME);
+    for (int i = 0; i < COLOR_THEME_N; i++) SendMessageW(ct, CB_ADDSTRING, 0, (LPARAM)COLOR_THEMES[i].name);
+    SendMessageW(ct, CB_SETCURSEL, gColorTheme, 0);
+
+    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 230, 300, 20, IDC_AUTO);
     CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Updates:", 0, 30, 230, 60, 20, -1);
-    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 227, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
+    Ctl(L"STATIC", L"Updates:", 0, 30, 264, 60, 20, -1);
+    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 261, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
     SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
     if (gFramedN < 24) gFramed[gFramedN++] = { repo, nullptr };
-    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 226, 100, 26, IDC_CHECKUPD);
-    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 229, 118, 20, IDC_UPDSTART);
+    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 260, 100, 26, IDC_CHECKUPD);
+    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 263, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Lag Effect " APP_VERSION, 0, 30, 283, 300, 18, IDC_HDR);
-    Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 303, 420, 18, IDC_HDR);
-    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 298, 84, 26, IDC_OPENSET);
+    Ctl(L"STATIC", L"Lag Effect " APP_VERSION, 0, 30, 317, 300, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 337, 410, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 332, 84, 26, IDC_OPENSET);
 
-    AddSection(14, 344, 532, 92, L"Screen share");
-    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 368, 300, 20, IDC_HIDESHARE);
+    AddSection(14, 378, 532, 92, L"Screen share");
+    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 402, 300, 20, IDC_HIDESHARE);
     CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"STATIC", L"Stops Discord screen shares from picking up your voice a second time. Locks the VB-Cable "
-                   L"output to Lag Effect; your mic and speakers stay free for other apps.", 0, 30, 392, 500, 36, IDC_HDR);
+                   L"output to Lag Effect; your mic and speakers stay free for other apps.", 0, 30, 426, 500, 36, IDC_HDR);
 
     gBuildPage = -1;
     gUiReady = true;
     AddTips();
     Layout();
+}
+
+// Color dropdown: a swatch of each theme's accent next to its name.
+static void DrawColorItem(DRAWITEMSTRUCT* d)
+{
+    if (d->itemID == (UINT)-1) return;
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    bool sel = (d->itemState & ODS_SELECTED) && !(d->itemState & ODS_COMBOBOXEDIT);
+    COLORREF bg = sel ? (gDark ? Mix(DK_CTL, ACCENT, 0.35f) : GetSysColor(COLOR_HIGHLIGHT)) : (gDark ? DK_CTL : GetSysColor(COLOR_WINDOW));
+    COLORREF fg = sel && !gDark ? GetSysColor(COLOR_HIGHLIGHTTEXT) : (gDark ? DK_TEXT : GetSysColor(COLOR_WINDOWTEXT));
+    HBRUSH b = CreateSolidBrush(bg); FillRect(dc, &rc, b); DeleteObject(b);
+    int i = Iclamp((int)d->itemID, 0, COLOR_THEME_N - 1);
+    COLORREF sw = gDark ? COLOR_THEMES[i].dark : COLOR_THEMES[i].light;
+    int cy = (rc.top + rc.bottom) / 2;
+    HBRUSH sb = CreateSolidBrush(sw);
+    HPEN   sp = CreatePen(PS_SOLID, 1, gDark ? Mix(sw, RGB(255, 255, 255), 0.3f) : Mix(sw, RGB(0, 0, 0), 0.2f));
+    HGDIOBJ ob = SelectObject(dc, sb), op = SelectObject(dc, sp);
+    Ellipse(dc, rc.left + 6, cy - 6, rc.left + 18, cy + 6);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(sb); DeleteObject(sp);
+    HGDIOBJ of = SelectObject(dc, gFont);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, fg);
+    RECT tr = rc; tr.left += 26;
+    DrawTextW(dc, COLOR_THEMES[i].name, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    SelectObject(dc, of);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT) && !(d->itemState & ODS_COMBOBOXEDIT)) DrawFocusRect(dc, &rc);
 }
 
 // Tab button: label, with an accent bar under the selected one.
@@ -3421,11 +3521,11 @@ static void PaintWindow(HDC dc)
     int d = RowsDelta();
     SetBkMode(dc, OPAQUE);
     HGDIOBJ oldFont = SelectObject(dc, gFontBold);
-    HPEN border = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+    HPEN border = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ oldPen = SelectObject(dc, border), oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
 
     {                                           // line under the tabs
-        HPEN sep = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : RGB(206, 206, 206));
+        HPEN sep = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
         HGDIOBJ op = SelectObject(dc, sep);
         MoveToEx(dc, 14, 42, nullptr); LineTo(dc, CLIENT_W - 14, 42);
         SelectObject(dc, op);
@@ -3469,7 +3569,7 @@ static void DrawStatus(DRAWITEMSTRUCT* d)
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
     bool loop = gLooping, live = gRunning;
-    COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : (gDark ? DK_CTL : RGB(228, 228, 228));
+    COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : (gDark ? DK_CTL : LT_STATUS);
     COLORREF text = loop ? (gDark ? RGB(255, 125, 125) : RGB(185, 20, 20)) : (gDark ? DK_TEXT : RGB(40, 40, 40));
     COLORREF dotc = loop ? RGB(235, 60, 60) : live ? RGB(40, 190, 90) : RGB(150, 150, 150);
 
@@ -3603,6 +3703,12 @@ static void OnCommand(int id, int code)
     case IDC_FXKEY_MASTER:
         if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[0], IDC_FXKEY_MASTER);
         break;
+    case IDC_COLORTHEME:
+        if (code == CBN_SELCHANGE) {
+            gColorTheme = Iclamp((int)SendDlgItemMessageW(gWnd, IDC_COLORTHEME, CB_GETCURSEL, 0, 0), 0, COLOR_THEME_N - 1);
+            ApplyTheme();                       // live preview
+        }
+        break;
     case IDC_THEME:
         if (code == CBN_SELCHANGE) {
             gThemeMode = (int)SendDlgItemMessageW(gWnd, IDC_THEME, CB_GETCURSEL, 0, 0);
@@ -3688,6 +3794,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_METER) { DrawMeter((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_COLORTHEME) { DrawColorItem((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
     case WM_LBUTTONDOWN:                        // click on empty space: leave the text/number box you were in
         SetFocus(h);
@@ -3698,6 +3805,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
         break;
     }
+    case WM_MEASUREITEM:
+        if (w == IDC_COLORTHEME) { ((MEASUREITEMSTRUCT*)l)->itemHeight = 20; return TRUE; }
+        break;
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MINIMIZE) { ToTray(); return 0; }   // minimize goes to the tray
         break;
@@ -3726,10 +3836,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         bool header = cid == IDC_HDR || cid == IDC_RADIODESC;   // dim helper text
         bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
         if (!gDark) {
-            if (!header) break;
-            SetTextColor(dc, RGB(110, 110, 110));
-            SetBkColor(dc, GetSysColor(COLOR_BTNFACE));
-            return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+            if (field) break;                   // text boxes and lists keep Windows' white
+            SetTextColor(dc, header ? RGB(110, 110, 110) : GetSysColor(COLOR_WINDOWTEXT));
+            SetBkColor(dc, gLtBg);
+            return (LRESULT)gBrLightBg;
         }
         SetTextColor(dc, header ? DK_DIM : DK_TEXT);
         SetBkColor(dc, field ? DK_CTL : DK_BG);
