@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.9.2"
+#define APP_VERSION L"1.9.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1147,7 +1147,7 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
@@ -1170,6 +1170,7 @@ static bool gExtraRunning[MAX_OUT];
 static ma_device_info *gPlayDevs = nullptr, *gCapDevs = nullptr; static ma_uint32 gPlayCount = 0, gCapCount = 0;
 static int  gRows = 1, gBufIdx = 2;
 static bool gExclusive = false, gAutoStart = false, gInTray = false, gUiReady = false;
+static bool gHideShare = false;                 // lock virtual-cable outputs so screen shares can't record them
 static wchar_t gMicName[512], gRowName[MAX_OUT][512], gIni[MAX_PATH];
 static bool gKeyWasDown[256];
 static int  gCapKeys[MAX_KEYS], gCapKeyCount = 0;
@@ -1519,6 +1520,7 @@ static void LoadSettings()
     gTalkOver      = INI_INT(L"talkover", 0) != 0;
     gBufIdx        = Iclamp(INI_INT(L"buffer", 2), 0, 4);
     gExclusive     = INI_INT(L"exclusive", 0) != 0;
+    gHideShare     = INI_INT(L"hide_from_share", 0) != 0;
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
     gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
@@ -1606,7 +1608,7 @@ static void SaveSettings()
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
     SaveInt(L"radio_preset", gRadioPreset);
-    SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"autostart", gAutoStart);
+    SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
     for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
@@ -1639,6 +1641,21 @@ static void NotifyCallback(const ma_device_notification* n)
 
 static int ComboIndex(int id) { return (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) - 1; }
 
+// "Hide from screen share": Discord (and OBS, recorders...) record what apps play through Windows' shared
+// audio mixer. A stream opened in exclusive mode skips that mixer, so it can't be recorded. We only do this
+// for virtual cables (VB-Cable, VoiceMeeter): locking real speakers would mute every other app.
+static bool RowIsCable(int k)
+{
+    int i = ComboIndex(IDC_ROWDEV + k);
+    if (i < 0 || i >= (int)gPlayCount) return false;
+    wchar_t n[512];
+    Widen(gPlayDevs[i].name, n, 512);
+    return ContainsNoCase(n, L"CABLE") || ContainsNoCase(n, L"VB-Audio") || ContainsNoCase(n, L"VoiceMeeter");
+}
+
+static bool RowHidden(int k) { return gHideShare && RowIsCable(k); }
+static unsigned gHideFailed = 0;                // outputs (bits) that couldn't be locked, so play normally
+
 static bool StartExtraOutput(int k)
 {
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
@@ -1655,7 +1672,15 @@ static bool StartExtraOutput(int k)
     if (i >= 0 && i < (int)gPlayCount) cfg.playback.pDeviceID = &gPlayDevs[i].id;
 
     ringW[k] = ringR[k] = 0;
-    if (ma_device_init(&gCtx, &cfg, &gExtraDev[k]) != MA_SUCCESS) return false;
+    bool hide = RowHidden(k);
+    if (hide) cfg.playback.shareMode = ma_share_mode_exclusive;
+    ma_result r = ma_device_init(&gCtx, &cfg, &gExtraDev[k]);
+    if (r != MA_SUCCESS && hide) {             // the cable wouldn't lock: play normally instead of going silent
+        gHideFailed |= 1u << k;
+        cfg.playback.shareMode = ma_share_mode_shared;
+        r = ma_device_init(&gCtx, &cfg, &gExtraDev[k]);
+    }
+    if (r != MA_SUCCESS) return false;
     if (ma_device_start(&gExtraDev[k]) != MA_SUCCESS) { ma_device_uninit(&gExtraDev[k]); return false; }
     gExtraRunning[k] = true;
     ringOn[k] = true;
@@ -1691,6 +1716,9 @@ static bool StartAudio(bool quiet)
         cfg.capture.shareMode  = ma_share_mode_exclusive;
         cfg.playback.shareMode = ma_share_mode_exclusive;
     }
+    gHideFailed = 0;
+    const bool hide1 = !gExclusive && RowHidden(0);
+    if (hide1) cfg.playback.shareMode = ma_share_mode_exclusive;   // output 1 locked, mic stays shared
     int mi = ComboIndex(IDC_MIC), oi = ComboIndex(IDC_ROWDEV);
     if (mi >= 0 && mi < (int)gCapCount)  cfg.capture.pDeviceID  = &gCapDevs[mi].id;
     if (oi >= 0 && oi < (int)gPlayCount) cfg.playback.pDeviceID = &gPlayDevs[oi].id;
@@ -1719,6 +1747,11 @@ static bool StartAudio(bool quiet)
         ? L"Couldn't open the microphone or output 1.\n\nTry turning off Exclusive mode or picking a bigger buffer."
         : L"Couldn't open the microphone or output 1.\n\nCheck that they're plugged in.";
     bool ok = ma_device_init(&gCtx, &cfg, &gDev) == MA_SUCCESS;
+    if (!ok && hide1) {                         // couldn't lock output 1: open it normally
+        gHideFailed |= 1u;
+        cfg.playback.shareMode = ma_share_mode_shared;
+        ok = ma_device_init(&gCtx, &cfg, &gDev) == MA_SUCCESS;
+    }
     if (ok && ma_device_start(&gDev) != MA_SUCCESS) { ma_device_uninit(&gDev); ok = false; }
     if (!ok) {
         StopDevices();
@@ -1726,6 +1759,18 @@ static bool StartAudio(bool quiet)
         return false;
     }
     gRunning = true;
+    if (gHideFailed && !quiet) {
+        wchar_t list[64] = L"";
+        for (int k = 0; k < MAX_OUT; k++)
+            if (gHideFailed & (1u << k)) { wchar_t n[8]; wsprintfW(n, list[0] ? L", %d" : L"%d", k + 1); lstrcatW(list, n); }
+        wchar_t msg[700];
+        wsprintfW(msg, L"Couldn't hide output %s from screen shares, so it's playing normally (people may hear you twice "
+                       L"when you share your whole screen).\n\n"
+                       L"Usually another app is also playing into that cable. Or, in Windows Sound settings > Playback > "
+                       L"CABLE Input > Properties > Advanced, tick \"Allow applications to take exclusive control\". "
+                       L"A bigger buffer (Settings tab) can help too.", list);
+        MessageBoxW(gWnd, msg, L"Lag Effect - Hide from screen share", MB_ICONWARNING);
+    }
     return true;
 }
 
@@ -2163,6 +2208,10 @@ static void AddTips()
 
     // Settings
     TipId(IDC_BUFFER,   L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling.");
+    TipId(IDC_HIDESHARE, L"When you share your whole screen with sound, Discord records every app's audio, including what "
+                         L"Lag Effect sends to VB-Cable, so people hear you twice. This locks Lag Effect's VB-Cable / VoiceMeeter "
+                         L"outputs so screen shares can't record them. Discord still hears you through CABLE Output. "
+                         L"Outputs to real speakers or headphones aren't locked: set those to Off or Effect only while streaming.");
     TipId(IDC_EXCL,     L"Takes over the mic and output 1 for the lowest delay. Other apps can't use them while it's on.");
     TipId(IDC_THEME,    L"Light, dark, or follow Windows.");
     TipId(IDC_AUTO,     L"When Lag Effect opens, start audio straight away and hide in the tray.");
@@ -2931,6 +2980,7 @@ static void ShowHelp()
         L"4. On the Mic tab, turn on Noise suppression (AI) and/or the noise gate to keep background noise out.\n\n"
         L"OBS\n"
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
+        L"Sharing your whole screen in Discord? Tick Settings > Hide from screen share, or people hear you twice.\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
         L"TIPS\n"
         L"Use headphones. If a game runs as administrator, run Lag Effect as administrator too, "
@@ -3325,6 +3375,12 @@ static void CreateUI()
     Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 303, 420, 18, IDC_HDR);
     Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 298, 84, 26, IDC_OPENSET);
 
+    AddSection(14, 344, 532, 92, L"Screen share");
+    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 368, 300, 20, IDC_HIDESHARE);
+    CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Stops Discord screen shares from picking up your voice a second time. Locks the VB-Cable "
+                   L"output to Lag Effect; your mic and speakers stay free for other apps.", 0, 30, 392, 500, 36, IDC_HDR);
+
     gBuildPage = -1;
     gUiReady = true;
     AddTips();
@@ -3563,6 +3619,7 @@ static void OnCommand(int id, int code)
         }
         break;
     case IDC_EXCL:    gExclusive = Checked(IDC_EXCL); RestartIfRunning(); break;
+    case IDC_HIDESHARE: gHideShare = Checked(IDC_HIDESHARE); RestartIfRunning(); break;
     case IDC_AUTO:    gAutoStart = Checked(IDC_AUTO); break;
     case IDC_VBCABLE: SetupVbCable(); break;
     case IDC_HELPBTN: ShowHelp(); break;
