@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.15.1"
+#define APP_VERSION L"1.15.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -37,6 +37,7 @@
 #include <winhttp.h>
 #include <mmdeviceapi.h>                        // listing apps that play sound (Vocode to song)
 #include <audiopolicy.h>
+#include <audioclient.h>                        // per-app sound capture (process loopback), done by hand
 #include <tlhelp32.h>                           // process names without opening the process (browsers' audio helpers)
 #include <commdlg.h>                            // "Audio file..." picker
 #include <string.h>
@@ -1336,6 +1337,151 @@ static bool      gRecRunning = false;
 static volatile bool gRecLost = false;
 static int       gRecPcState = 0;                 // 0 off, 1 everything but Lag Effect, 2 whole output, 3 failed
 static ma_device gSongDev;                        // loopback capture of the music (Vocode to song)
+
+// ---- Recording one app's sound, or everything except one app ("process loopback", Windows 10 20348+ / 11) ----
+// miniaudio's desktop build can't open this (it asks for a device that doesn't exist and silently fails), so it's
+// done directly: ActivateAudioInterfaceAsync on the virtual process-loopback device, then a small capture thread
+// that hands stereo float audio to the same callbacks the miniaudio devices use.
+static const GUID kIID_IAudioClient        = { 0x1CB9AD4C, 0xDBFA, 0x4C32, { 0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2 } };
+static const GUID kIID_IAudioCaptureClient = { 0xC8ADBD64, 0xE71E, 0x48A0, { 0xA4, 0xDE, 0x18, 0x5C, 0x39, 0x5C, 0xD3, 0x17 } };
+static const GUID kIID_ActivateHandler     = { 0x41D949AB, 0x9862, 0x444A, { 0x80, 0xF6, 0xC2, 0x61, 0x33, 0x4D, 0xA5, 0xEB } };
+static const GUID kIID_IAgileObject        = { 0x94EA2B94, 0xE9CC, 0x49E0, { 0xC0, 0xFF, 0xEE, 0x64, 0xCA, 0x8F, 0x5B, 0x90 } };
+struct PLActivationParams { int type; DWORD pid; int mode; };   // AUDIOCLIENT_ACTIVATION_PARAMS (type 1 = process loopback)
+typedef HRESULT (WINAPI* PFN_ActivateAudioInterfaceAsync)(LPCWSTR, REFIID, PROPVARIANT*, IActivateAudioInterfaceCompletionHandler*,
+                                                          IActivateAudioInterfaceAsyncOperation**);
+
+struct PLHandler : public IActivateAudioInterfaceCompletionHandler {   // signals when Windows has activated the client
+    LONG   ref = 1;
+    HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    virtual ~PLHandler() { if (done) CloseHandle(done); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
+        if (IsEqualGUID(riid, IID_IUnknown) || IsEqualGUID(riid, kIID_ActivateHandler) || IsEqualGUID(riid, kIID_IAgileObject)) {
+            *ppv = this; AddRef(); return S_OK;
+        }
+        *ppv = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override  { return (ULONG)InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { LONG r = InterlockedDecrement(&ref); if (!r) delete this; return (ULONG)r; }
+    HRESULT STDMETHODCALLTYPE ActivateCompleted(IActivateAudioInterfaceAsyncOperation*) override { SetEvent(done); return S_OK; }
+};
+
+struct ProcLoop {
+    IAudioClient*        client = nullptr;
+    IAudioCaptureClient* cap = nullptr;
+    HANDLE               ev = nullptr, thread = nullptr;
+    volatile bool        stop = false;
+    bool                 pcm16 = false;
+    ma_device_data_proc  cb = nullptr;
+    volatile bool*       lost = nullptr;
+};
+static ProcLoop gSongPL, gRecPL;
+
+static DWORD WINAPI ProcLoopThread(LPVOID arg)
+{
+    ProcLoop* pl = (ProcLoop*)arg;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    static thread_local float buf[2048 * 2];
+    LARGE_INTEGER freq, last, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&last);
+    while (!pl->stop) {
+        WaitForSingleObject(pl->ev, 20);
+        UINT32 packet = 0;
+        bool got = false;
+        for (;;) {
+            HRESULT hr = pl->cap->GetNextPacketSize(&packet);
+            if (FAILED(hr)) { if (pl->lost) *pl->lost = true; pl->stop = true; break; }
+            if (!packet) break;
+            BYTE* data; UINT32 frames; DWORD flags;
+            if (FAILED(pl->cap->GetBuffer(&data, &frames, &flags, nullptr, nullptr))) break;
+            for (UINT32 done = 0; done < frames;) {
+                UINT32 n = frames - done; if (n > 2048) n = 2048;
+                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(buf, 0, n * 2 * sizeof(float));
+                else if (pl->pcm16) { const short* s16 = (const short*)data + done * 2; for (UINT32 k = 0; k < n * 2; k++) buf[k] = s16[k] * (1.0f / 32768.0f); }
+                else memcpy(buf, (const float*)data + done * 2, n * 2 * sizeof(float));
+                pl->cb(nullptr, nullptr, buf, n);
+                done += n;
+            }
+            pl->cap->ReleaseBuffer(frames);
+            got = true;
+        }
+        // Windows sends nothing while the PC is silent: fill that time with silence so clips stay in sync.
+        QueryPerformanceCounter(&now);
+        if (got) last = now;
+        else if (now.QuadPart - last.QuadPart > freq.QuadPart * 3 / 100) {   // 30 ms with no audio
+            long long n = (now.QuadPart - last.QuadPart) * RATE / freq.QuadPart;
+            last = now;
+            memset(buf, 0, sizeof(buf));
+            while (n > 0 && !pl->stop) { UINT32 k = n > 2048 ? 2048 : (UINT32)n; pl->cb(nullptr, nullptr, buf, k); n -= k; }
+        }
+    }
+    CoUninitialize();
+    return 0;
+}
+
+static void ProcLoopStop(ProcLoop* pl)
+{
+    if (pl->thread) { pl->stop = true; SetEvent(pl->ev); WaitForSingleObject(pl->thread, 3000); CloseHandle(pl->thread); pl->thread = nullptr; }
+    if (pl->client) pl->client->Stop();
+    if (pl->cap)    { pl->cap->Release(); pl->cap = nullptr; }
+    if (pl->client) { pl->client->Release(); pl->client = nullptr; }
+    if (pl->ev)     { CloseHandle(pl->ev); pl->ev = nullptr; }
+}
+
+static bool ProcLoopTry(ProcLoop* pl, DWORD pid, bool exclude, ma_device_data_proc cb, volatile bool* lost, bool pcm16)
+{
+    static PFN_ActivateAudioInterfaceAsync activate =
+        (PFN_ActivateAudioInterfaceAsync)(void*)GetProcAddress(LoadLibraryW(L"mmdevapi.dll"), "ActivateAudioInterfaceAsync");
+    if (!activate || !pid) return false;
+    ProcLoopStop(pl);
+    PLActivationParams ap = { 1, pid, exclude ? 1 : 0 };   // mode 0 = include the process tree, 1 = exclude it
+    PROPVARIANT pv = {};
+    pv.vt = VT_BLOB;
+    pv.blob.cbSize = sizeof(ap);
+    pv.blob.pBlobData = (BYTE*)&ap;
+    PLHandler* h = new PLHandler();
+    IActivateAudioInterfaceAsyncOperation* op = nullptr;
+    HRESULT hr = activate(L"VAD\\Process_Loopback", kIID_IAudioClient, &pv, h, &op);
+    bool ok = false;
+    if (SUCCEEDED(hr) && WaitForSingleObject(h->done, 3000) == WAIT_OBJECT_0) {
+        HRESULT act = E_FAIL; IUnknown* unk = nullptr;
+        if (SUCCEEDED(op->GetActivateResult(&act, &unk)) && SUCCEEDED(act) && unk) {
+            ok = SUCCEEDED(unk->QueryInterface(kIID_IAudioClient, (void**)&pl->client));
+            unk->Release();
+        }
+    }
+    if (op) op->Release();
+    h->Release();
+    if (!ok) { ProcLoopStop(pl); return false; }
+
+    const DWORD flags = AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM;
+    WAVEFORMATEX wf = pcm16 ? WAVEFORMATEX{ WAVE_FORMAT_PCM, 2, RATE, RATE * 4, 4, 16, 0 }
+                            : WAVEFORMATEX{ WAVE_FORMAT_IEEE_FLOAT, 2, RATE, RATE * 8, 8, 32, 0 };
+    pl->pcm16 = pcm16;
+    hr = pl->client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags, 200000, 0, &wf, nullptr);   // 20 ms buffer
+    if (FAILED(hr)) { ProcLoopStop(pl); return false; }
+    pl->ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (FAILED(pl->client->SetEventHandle(pl->ev)) ||
+        FAILED(pl->client->GetService(kIID_IAudioCaptureClient, (void**)&pl->cap)) ||
+        FAILED(pl->client->Start())) { ProcLoopStop(pl); return false; }
+    pl->cb = cb; pl->lost = lost; pl->stop = false;
+    pl->thread = CreateThread(nullptr, 0, ProcLoopThread, pl, 0, nullptr);
+    if (!pl->thread) { ProcLoopStop(pl); return false; }
+    return true;
+}
+
+static bool ProcLoopStart(ProcLoop* pl, DWORD pid, bool exclude, ma_device_data_proc cb, volatile bool* lost)
+{
+    return ProcLoopTry(pl, pid, exclude, cb, lost, false)     // 32-bit float
+        || ProcLoopTry(pl, pid, exclude, cb, lost, true);     // some systems only take 16-bit here
+}
+
+static void RecPcCallback(ma_device*, void*, const void* input, ma_uint32 frames);
+static bool gSongPLOn = false, gRecPLOn = false;
+static DWORD gSongPid = 0;                        // the app being recorded (Vocode to song, one app)  // true: running on ProcLoop, false: on a miniaudio device
+static void SongDevStop() { if (gSongPLOn) ProcLoopStop(&gSongPL); else ma_device_uninit(&gSongDev); gSongPLOn = false; }
+static void RecDevStop()  { if (gRecPLOn)  ProcLoopStop(&gRecPL);  else ma_device_uninit(&gRecDev);  gRecPLOn = false; }
 static bool      gSongRunning = false;
 static volatile bool gSongLost = false, gSongRetryNow = false;
 static bool gCtxOk = false, gRunning = false, gWantRunning = false, gStopping = false;
@@ -2029,8 +2175,8 @@ static void StopDevices()
     if (gRunning) { ma_device_uninit(&gDev); gRunning = false; }
     for (int k = 0; k < MAX_OUT; k++)
         if (gExtraRunning[k]) { ma_device_uninit(&gExtraDev[k]); gExtraRunning[k] = false; }
-    if (gSongRunning) { ma_device_uninit(&gSongDev); gSongRunning = false; }
-    if (gRecRunning)  { ma_device_uninit(&gRecDev);  gRecRunning = false; }
+    if (gSongRunning) { SongDevStop(); gSongRunning = false; }
+    if (gRecRunning)  { RecDevStop();  gRecRunning = false; }
     gSongRetryNow = true;
     gLooping = false;
 }
@@ -2671,6 +2817,13 @@ static void SongNotify(const ma_device_notification* n)
 
 static bool SongStartDevice(DWORD pid, bool exclude)
 {
+    if (pid) {                                  // one app / everything but Lag Effect: Windows' process loopback
+        gSongLost = false;
+        if (!ProcLoopStart(&gSongPL, pid, exclude, SongCallback, &gSongLost)) return false;
+        gSongPLOn = true;
+        gSongRunning = true;
+        return true;
+    }
     ma_device_config cfg = ma_device_config_init(ma_device_type_loopback);
     cfg.capture.format   = ma_format_f32;
     cfg.capture.channels = 2;
@@ -2718,7 +2871,7 @@ static void UpdateSongCapture()
     bool want = gRunning && SongModeOn();
     gUseFile = gSongUseFile && gFileData != nullptr;    // file: no capture needed
     if (gSongRunning && (!want || gSongLost || gSongUseFile || lstrcmpiW(gSongActiveApp, gSongApp))) {
-        ma_device_uninit(&gSongDev);
+        SongDevStop();
         gSongRunning = false;
     }
     if (!want) { gSongState = 0; UpdateSongStatusText(); return; }
@@ -2732,7 +2885,7 @@ static void UpdateSongCapture()
         DWORD pid = 0;
         for (int i = 0; i < n; i++) if (!lstrcmpiW(apps[i].name, gSongApp)) pid = apps[i].pid;
         if (!pid)                               gSongState = 4;   // not playing yet: the timer tries again
-        else if (SongStartDevice(pid, false))   gSongState = 1;
+        else if (SongStartDevice(pid, false))   { gSongState = 1; gSongPid = pid; }
         else if (SongStartDevice(0, false))     gSongState = 3;   // Windows too old for one-app capture
         else                                    gSongState = 5;
     } else {                                    // everything except Lag Effect
@@ -2775,6 +2928,14 @@ static void SetSongMode(bool on)
     UpdateStatus(true);
 }
 
+static bool PidAlive(DWORD pid)
+{
+    static ProcInfo procs[2048];
+    int n = SnapProcs(procs, 2048);
+    for (int i = 0; i < n; i++) if (procs[i].pid == pid) return true;
+    return n == 0;                              // couldn't list processes: assume it's still there
+}
+
 static void SongTick()                          // every 50 ms
 {
     static bool lastWant = false, lastOn = false;
@@ -2786,6 +2947,11 @@ static void SongTick()                          // every 50 ms
         (want && !gSongUseFile && (!gSongRunning || gSongLost) && (gSongRetryNow || now - lastTry > 1500))) {
         lastWant = want; lastTry = now; gSongRetryNow = false;
         UpdateSongCapture();
+    }
+    static DWORD lastAlive = 0;                 // recording one app: if it closed (or restarted), find it again
+    if (gSongRunning && gSongPLOn && gSongState == 1 && now - lastAlive > 3000) {
+        lastAlive = now;
+        if (!PidAlive(gSongPid)) gSongLost = true;
     }
     if (gSongPeak > 0.003f) lastHeard = now;    // music in the last 1.5 s?
     gSongPeak = 0;
@@ -3147,6 +3313,13 @@ static void RecNotify(const ma_device_notification* n)
 
 static bool RecStartDevice(DWORD pid, bool exclude)
 {
+    if (pid) {                                  // everything but Lag Effect: Windows' process loopback
+        gRecLost = false;
+        if (!ProcLoopStart(&gRecPL, pid, exclude, RecPcCallback, &gRecLost)) return false;
+        gRecPLOn = true;
+        gRecRunning = true;
+        return true;
+    }
     ma_device_config cfg = ma_device_config_init(ma_device_type_loopback);
     cfg.capture.format   = ma_format_f32;
     cfg.capture.channels = 2;
@@ -3176,7 +3349,7 @@ static void UpdateRecCapture()                  // every 50 ms: keep the PC-soun
     gRecVoiceOn = gRunning && (gRecSource == REC_BOTH || gRecSource == REC_VOICE);
     bool want = gRunning && gCtxOk && (gRecSource == REC_BOTH || gRecSource == REC_PC);
     if (gRecRunning && (!want || gRecLost)) {
-        ma_device_uninit(&gRecDev);
+        RecDevStop();
         gRecRunning = false;
         if (gRecLost) retryAt = GetTickCount() + 1000;
     }
@@ -3185,7 +3358,7 @@ static void UpdateRecCapture()                  // every 50 ms: keep the PC-soun
     // Recording the whole output (state 2) also picks up Lag Effect itself: try leaving it out again a few times.
     if (gRecRunning && gRecPcState == 2 && fallbackRetries < 3 && (int)(GetTickCount() - retryAt) >= 0) {
         fallbackRetries++;
-        ma_device_uninit(&gRecDev);
+        RecDevStop();
         gRecRunning = false;
         if (RecStartDevice(GetCurrentProcessId(), true)) { gRecPcState = 1; return; }
         if (!RecStartDevice(0, false)) { gRecPcState = 3; retryAt = GetTickCount() + 5000; return; }
