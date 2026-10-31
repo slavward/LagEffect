@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.12.0"
+#define APP_VERSION L"1.13.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -89,6 +89,8 @@ static bool   looping = false, prevDown = false, toggled = false;
 static double loopPos = 0, grainStart[2];
 static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
+static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
+static float  muteGain = 1;                      // ramps so muting never clicks
 static int    gateHold = 0;
 
 // Mic cleanup (Mic tab). Order: boost -> low cut -> AI noise suppression -> gate -> leveler.
@@ -1113,6 +1115,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
 
     for (ma_uint32 f = 0; f < frames; f++) {
         float s = in ? in[f] * boost : 0.0f;
+        muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
+        s *= muteGain;
         if (lowCut) s = LowCut(s);
 
         if (nsStage) {
@@ -1226,10 +1230,11 @@ enum {
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
-    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_SONGBTN, IDC_SONGSRC, IDC_SONGSTATUS, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_SONGBTN, IDC_SONGSRC, IDC_SONGSTATUS,
+    IDC_MUTEBTN, IDC_MUTEKEY, IDC_OSD, IDC_TOPMOST, IDC_STARTWIN, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
-    ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT
+    ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT, ID_TRAY_FX, ID_TRAY_SONG, ID_TRAY_NS, ID_TRAY_GATE, ID_TRAY_MUTE
 };
 #define SPIN_UD(id)        ((id) + 100)      // up-down control paired with a number box
 #define WM_TRAY            (WM_APP + 1)
@@ -1237,11 +1242,13 @@ enum {
 #define WM_UPDATE_CHECKED  (WM_APP + 3)
 #define WM_UPDATE_DOWNLOAD (WM_APP + 4)
 #define WM_SONGFILE_LOADED (WM_APP + 5)
+#define WM_SHOW_ME         (WM_APP + 6)          // another copy was started: come to the front
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
 #define TIMER_CLEANUP   4
 #define TIMER_FXKEYS    5
+#define TIMER_OSD       6
 
 static HINSTANCE gInst; static HWND gWnd, gStatus; static HFONT gFont, gFontBold; static HICON gIcon;
 static ma_context gCtx; static ma_device gDev, gExtraDev[MAX_OUT];
@@ -1254,6 +1261,8 @@ static ma_device_info *gPlayDevs = nullptr, *gCapDevs = nullptr; static ma_uint3
 static int  gRows = 1, gBufIdx = 2;
 static bool gExclusive = false, gAutoStart = false, gInTray = false, gUiReady = false;
 static bool gHideShare = false;                 // lock virtual-cable outputs so screen shares can't record them
+static bool gShowOsd = true, gTopMost = false;   // pop-up when hotkeys toggle things; window always on top
+static int  gWinX = INT_MIN, gWinY = INT_MIN;    // last window position
 static wchar_t gMicName[512], gRowName[MAX_OUT][512], gIni[MAX_PATH];
 static bool gKeyWasDown[256];
 static int  gCapKeys[MAX_KEYS], gCapKeyCount = 0;
@@ -1280,8 +1289,10 @@ static FxGroup gFxGroups[] = {
 // Optional hotkeys that switch Voice FX on/off: slot 0 = the whole page, slot 1+g = effect group g.
 // Each is a combination of up to MAX_KEYS keys (0 = unused). Polled by the window (TIMER_FXKEYS).
 #define FX_KEY_SLOTS (1 + FX_GROUPS)
-static int  gFxKeys[FX_KEY_SLOTS][MAX_KEYS];
-static bool gFxKeyWasDown[FX_KEY_SLOTS];
+#define SLOT_MUTE    FX_KEY_SLOTS                // one more hotkey after the Voice FX ones: Mute mic
+#define KEY_SLOTS    (FX_KEY_SLOTS + 1)
+static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
+static bool gFxKeyWasDown[KEY_SLOTS];
 
 // Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
 enum { KG_PITCH = 0, KG_REVERB = 1, KG_VOCODER = 2, KG_RADIO = 3, KG_NS = 4, KG_GATE = 5, KG_TONE = 6 };
@@ -1627,7 +1638,10 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 }
 
 // ======================= settings =======================
-static const wchar_t* FxKeyIniName(int slot) { return slot == 0 ? L"fx_hotkey" : gFxGroups[slot - 1].hotkeyKey; }
+static const wchar_t* FxKeyIniName(int slot)
+{
+    return slot == SLOT_MUTE ? L"mute_hotkey" : slot == 0 ? L"fx_hotkey" : gFxGroups[slot - 1].hotkeyKey;
+}
 
 static wchar_t gUpdateRepo[200];
 static wchar_t gSongApp[64] = L"";               // Vocode to song: app to take music from ("" = all PC sound)
@@ -1672,13 +1686,20 @@ static void LoadSettings()
     gBufIdx        = Iclamp(INI_INT(L"buffer", 2), 0, 4);
     gExclusive     = INI_INT(L"exclusive", 0) != 0;
     gHideShare     = INI_INT(L"hide_from_share", 0) != 0;
+    gShowOsd       = INI_INT(L"hotkey_popup", 1) != 0;
+    gTopMost       = INI_INT(L"always_on_top", 0) != 0;
+    {
+        wchar_t b[32];
+        GetPrivateProfileStringW(L"settings", L"win_x", L"", b, 32, gIni); if (b[0]) gWinX = _wtoi(b);
+        GetPrivateProfileStringW(L"settings", L"win_y", L"", b, 32, gIni); if (b[0]) gWinY = _wtoi(b);
+    }
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
     gColorTheme    = Iclamp(INI_INT(L"color_theme", 0), 0, COLOR_THEME_N - 1);
     gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
 
     gFxOn = INI_INT(L"fx_on", 0) != 0;
-    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+    for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
         GetPrivateProfileStringW(L"settings", FxKeyIniName(slot), L"", b, 64, gIni);
         const wchar_t* q = b;
@@ -1774,10 +1795,11 @@ static void SaveSettings()
     SaveInt(L"voc_song_use_file", gSongUseFile);
     SaveInt(L"voc_synth_other", gVocSynthSaved);
     SaveInt(L"radio_preset", gRadioPreset);
-    SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare); SaveInt(L"autostart", gAutoStart);
+    SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare);
+    SaveInt(L"hotkey_popup", gShowOsd); SaveInt(L"always_on_top", gTopMost); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
-    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+    for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
         wsprintfW(b, L"%d,%d,%d", gFxKeys[slot][0], gFxKeys[slot][1], gFxKeys[slot][2]);
         WritePrivateProfileStringW(L"settings", FxKeyIniName(slot), b, gIni);
@@ -2717,6 +2739,7 @@ static const TipText gLabelTips[] = {
     { L"Opens on:",    L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech. Volume + voice: both." },
     { L"Buffer:",      L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling." },
     { L"Theme:",       L"Light, dark, or follow Windows." },
+    { L"Mute hotkey:", L"A hotkey that mutes / unmutes your mic from anywhere, even in a game. Right-click it to clear." },
     { L"Color:",       L"The app's color: knobs, switches, tabs and a matching tint on the background. Classic is the original look." },
     { L"Updates:",     L"The GitHub repo Lag Effect checks for new versions." },
 };
@@ -2773,8 +2796,17 @@ static void AddTips()
     TipId(IDC_TOGGLE,  L"Press the hotkey once to start the stutter, again to stop it.");
     TipId(IDC_STATUS,  L"What Lag Effect is doing right now.");
     TipId(IDC_START,   L"Start or stop audio processing.");
-    TipId(IDC_TRAY,    L"Hide the window. Lag Effect keeps running in the system tray; click the tray icon to bring it back.");
+    TipId(IDC_MUTEBTN, L"Mute or unmute your microphone instantly (outputs go silent, the effects keep their settings). "
+                       L"You can set a Mute hotkey on the Settings tab.");
+    TipId(IDC_TRAY,    L"Hide the window. Lag Effect keeps running in the system tray; click the tray icon to bring it back. "
+                       L"Right-click the tray icon for quick on/off switches.");
     TipId(IDC_HELPBTN, L"How everything works, plus setup steps for Discord and OBS.");
+    TipId(IDC_MUTEKEY, L"A hotkey that mutes / unmutes your mic from anywhere, even in a game. Right-click to clear it.");
+    TipId(IDC_OSD,     L"Shows a short pop-up at the top of the screen (e.g. \"Pitch ON\", \"Mic muted\") when a hotkey "
+                       L"switches something, so you know it worked. Doesn't show over exclusive-fullscreen games.");
+    TipId(IDC_TOPMOST, L"Keep the Lag Effect window above other windows.");
+    TipId(IDC_STARTWIN, L"Open Lag Effect when you sign in to Windows. Uses this copy's location, so tick it again if you move the app. "
+                        L"Combine with \"Start audio && hide in tray when opened\" to have it ready in the background.");
 
     // Mic
     TipId(IDC_METER,    L"Mic level: your level after noise suppression. Green = the gate lets you through; the blue line is the gate threshold.\n"
@@ -2919,21 +2951,103 @@ static void SetFxGroupOn(int g, bool on)
 
 // Voice FX hotkeys: the page key flips the master switch; an effect's key flips that effect
 // (and turns the master switch on with it, so the key always does something you can hear).
+// ---- Mute mic ----
+static void UpdateTrayTip();
+static void SetMute(bool on)
+{
+    gMicMuted = on;
+    SetDlgItemTextW(gWnd, IDC_MUTEBTN, on ? L"Unmute mic" : L"Mute mic");
+    UpdateTrayTip();
+    UpdateStatus(true);
+}
+
+// ---- on-screen pop-up when a hotkey switches something (so you know it worked mid-game) ----
+static HWND  gOsd;
+static HFONT gFontOsd;
+static wchar_t gOsdText[64];
+static bool  gOsdOn;
+static int   gOsdTicks;                         // counts 30 ms steps while showing
+
+static LRESULT CALLBACK OsdProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    if (m == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        COLORREF fill = gOsdOn ? ACCENT : (gDark ? RGB(60, 60, 60) : RGB(90, 90, 90));
+        HBRUSH b = CreateSolidBrush(fill); FillRect(dc, &rc, b); DeleteObject(b);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, gOsdOn && gDark ? RGB(20, 20, 20) : RGB(255, 255, 255));
+        HGDIOBJ of = SelectObject(dc, gFontOsd);
+        DrawTextW(dc, gOsdText, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+        SelectObject(dc, of);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_NCHITTEST) return HTTRANSPARENT;   // clicks go straight through
+    return DefWindowProcW(h, m, w, l);
+}
+
+static void ShowOsd(const wchar_t* text, bool on)
+{
+    if (!gShowOsd) return;
+    lstrcpynW(gOsdText, text, 64);
+    gOsdOn = on;
+    const int W = 280, H = 52;
+    if (!gOsd) {
+        gOsd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                               L"LagOsd", L"", WS_POPUP, 0, 0, W, H, nullptr, nullptr, gInst, nullptr);
+        if (!gOsd) return;
+        SetWindowRgn(gOsd, CreateRoundRectRgn(0, 0, W + 1, H + 1, 18, 18), FALSE);
+    }
+    // top-centre of the screen you're on (the one with the game / focused window)
+    HMONITOR mon = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO mi = {}; mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(mon, &mi);
+    int x = (mi.rcWork.left + mi.rcWork.right - W) / 2, y = mi.rcWork.top + 48;
+    SetLayeredWindowAttributes(gOsd, 0, 235, LWA_ALPHA);
+    SetWindowPos(gOsd, HWND_TOPMOST, x, y, W, H, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(gOsd, nullptr, TRUE);
+    gOsdTicks = 0;
+    SetTimer(gWnd, TIMER_OSD, 30, nullptr);
+}
+
+static void OsdTick()                           // shows ~1.1 s, then fades out over 0.3 s
+{
+    if (!gOsd) { KillTimer(gWnd, TIMER_OSD); return; }
+    gOsdTicks++;
+    if (gOsdTicks > 36) {
+        int a = 235 - (gOsdTicks - 36) * 24;
+        if (a <= 0) { ShowWindow(gOsd, SW_HIDE); KillTimer(gWnd, TIMER_OSD); return; }
+        SetLayeredWindowAttributes(gOsd, 0, (BYTE)a, LWA_ALPHA);
+    }
+}
+
 static void PollFxKeys()
 {
-    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) {
+    for (int slot = 0; slot < KEY_SLOTS; slot++) {
         bool down = !gCapturingKey && KeysDown(gFxKeys[slot]);
         bool pressed = down && !gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
         if (!pressed) continue;
-        if (slot == 0) {
-            SetFxOn(!gFxOn);
+        wchar_t msg[64];
+        bool on;
+        if (slot == SLOT_MUTE) {
+            on = !gMicMuted;
+            SetMute(on);
+            lstrcpynW(msg, on ? L"Mic muted" : L"Mic on", 64);
+        } else if (slot == 0) {
+            on = !gFxOn;
+            SetFxOn(on);
+            wsprintfW(msg, L"Voice effects %s", on ? L"ON" : L"OFF");
         } else {
             int g = slot - 1;
-            bool on = !(*gFxGroups[g].on && gFxOn);
+            on = !(*gFxGroups[g].on && gFxOn);
             SetFxGroupOn(g, on);
             if (on && !gFxOn) SetFxOn(true);
+            wsprintfW(msg, L"%s %s", gFxGroups[g].title, on ? L"ON" : L"OFF");
         }
+        ShowOsd(msg, slot == SLOT_MUTE ? !on : on);
         UpdateStatus(true);
     }
 }
@@ -3103,11 +3217,22 @@ static void UpdateStatus(bool force = false)
     if (gWantRunning && !gRunning) lstrcpynW(s, L"Audio device lost  -  reconnecting...", 160);
     else if (!gRunning)            lstrcpynW(s, L"Stopped  -  press Start", 160);
     else if (gLooping)             lstrcpynW(s, L"LOOPING", 160);
+    else if (gMicMuted) {
+        wchar_t mk[120]; ComboName(gFxKeys[SLOT_MUTE], MAX_KEYS, mk, 120);
+        if (mk[0]) wsprintfW(s, L"MUTED  -  press %s to unmute", mk); else lstrcpynW(s, L"MUTED  -  your mic is off", 160);
+    }
     else {
         HotkeyName(key, 120);
         wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
     }
-    if (gRunning && gFxOn) lstrcatW(s, L"   (Voice FX on)");
+    if (gRunning && gFxOn && !gMicMuted) {       // which voice effects are on
+        wchar_t fx[120] = L"";
+        for (int g = 0; g < FX_GROUPS; g++)
+            if (*gFxGroups[g].on) { if (fx[0]) lstrcatW(fx, L", "); lstrcatW(fx, gFxGroups[g].title); }
+        wchar_t add[160];
+        wsprintfW(add, fx[0] ? L"   (Voice FX: %s)" : L"   (Voice FX on, none ticked)", fx);
+        if (lstrlenW(s) + lstrlenW(add) < 199) lstrcatW(s, add);
+    }
     if (force || lstrcmpW(s, last) != 0 || lastLoop != gLooping) {
         lstrcpynW(last, s, 200); lastLoop = gLooping;
         SetWindowTextW(gStatus, s);
@@ -3599,6 +3724,9 @@ static void ShowHelp()
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Sharing your whole screen in Discord? Tick Settings > Hide from screen share, or people hear you twice.\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
+        L"SHORTCUTS\n"
+        L"Ctrl+1-4 jumps to a tab. Right-click the tray icon for quick switches (mute, voice effects, vocode to song, "
+        L"noise suppression, gate). Settings has a Mute hotkey, hotkey pop-ups, Always on top and Start with Windows.\n\n"
         L"TIPS\n"
         L"Use headphones. If a game runs as administrator, run Lag Effect as administrator too, "
         L"or the hotkey won't work while that game is focused.",
@@ -3616,14 +3744,17 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     if (!buf[0]) lstrcpynW(buf, L"Set hotkey", cap);
 }
 
-static int FxKeyButtonId(int slot) { return slot == 0 ? IDC_FXKEY_MASTER : IDC_FXGRP_KEY + slot - 1; }
+static int FxKeyButtonId(int slot)
+{
+    return slot == SLOT_MUTE ? IDC_MUTEKEY : slot == 0 ? IDC_FXKEY_MASTER : IDC_FXGRP_KEY + slot - 1;
+}
 
 static void ShowCaptureTarget()
 {
     wchar_t name[120];
     if (gCapButton == IDC_HOTKEY) HotkeyName(name, 120);
     else {
-        int slot = gCapButton == IDC_FXKEY_MASTER ? 0 : gCapButton - IDC_FXGRP_KEY + 1;
+        int slot = gCapButton == IDC_MUTEKEY ? SLOT_MUTE : gCapButton == IDC_FXKEY_MASTER ? 0 : gCapButton - IDC_FXGRP_KEY + 1;
         FxKeyButtonText(slot, name, 120);
     }
     SetDlgItemTextW(gWnd, gCapButton, name);
@@ -3648,7 +3779,7 @@ static void EndKeyCapture()
     gCapturingKey = false;
     KillTimer(gWnd, TIMER_KEY);
     ShowCaptureTarget();
-    for (int slot = 0; slot < FX_KEY_SLOTS; slot++) gFxKeyWasDown[slot] = KeysDown(gFxKeys[slot]);   // no instant toggle
+    for (int slot = 0; slot < KEY_SLOTS; slot++) gFxKeyWasDown[slot] = KeysDown(gFxKeys[slot]);   // no instant toggle
     UpdateStatus(true);
 }
 
@@ -3726,6 +3857,29 @@ static void PollKeyCapture()
     EndKeyCapture();
 }
 
+// ======================= start with Windows =======================
+// HKCU\...\Run\LagEffect = "this exe". Uses this copy's location (re-tick it after moving the app).
+static const wchar_t* RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static bool StartWithWindows()
+{
+    wchar_t v[MAX_PATH + 8]; DWORD sz = sizeof(v);
+    return RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, L"LagEffect", RRF_RT_REG_SZ, nullptr, v, &sz) == ERROR_SUCCESS;
+}
+static void SetStartWithWindows(bool on)
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) return;
+    if (on) {
+        wchar_t exe[MAX_PATH], v[MAX_PATH + 8];
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        wsprintfW(v, L"\"%s\"", exe);
+        RegSetValueExW(k, L"LagEffect", 0, REG_SZ, (const BYTE*)v, (lstrlenW(v) + 1) * sizeof(wchar_t));
+    } else {
+        RegDeleteValueW(k, L"LagEffect");
+    }
+    RegCloseKey(k);
+}
+
 // ======================= tray =======================
 static void ToTray()
 {
@@ -3736,7 +3890,7 @@ static void ToTray()
     nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     nid.uCallbackMessage = WM_TRAY;
     nid.hIcon = gIcon;
-    lstrcpynW(nid.szTip, L"Lag Effect", 128);
+    lstrcpynW(nid.szTip, gMicMuted ? L"Lag Effect - mic muted" : L"Lag Effect", 128);
     if (!gInTray) Shell_NotifyIconW(NIM_ADD, &nid);
     gInTray = true;
     ShowWindow(gWnd, SW_HIDE);
@@ -3761,12 +3915,31 @@ static void FromTray()
     SetForegroundWindow(gWnd);
 }
 
+static bool SongModeOn();
+static void UpdateTrayTip()                     // tray tooltip says when you're muted
+{
+    if (!gInTray) return;
+    NOTIFYICONDATAW nid = {};
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = gWnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_TIP;
+    lstrcpynW(nid.szTip, gMicMuted ? L"Lag Effect - mic muted" : L"Lag Effect", 128);
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
 static void TrayMenu()
 {
     POINT p; GetCursorPos(&p);
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"Open");
     AppendMenuW(m, MF_STRING, ID_TRAY_RUN, gWantRunning ? L"Stop audio" : L"Start audio");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (gMicMuted ? MF_CHECKED : 0), ID_TRAY_MUTE, L"Mute mic");
+    AppendMenuW(m, MF_STRING | (gFxOn ? MF_CHECKED : 0), ID_TRAY_FX, L"Voice effects");
+    AppendMenuW(m, MF_STRING | (SongModeOn() ? MF_CHECKED : 0), ID_TRAY_SONG, L"Vocode to song");
+    AppendMenuW(m, MF_STRING | (gNsOn ? MF_CHECKED : 0), ID_TRAY_NS, L"Noise suppression");
+    AppendMenuW(m, MF_STRING | (gGateMode != GATE_OFF ? MF_CHECKED : 0), ID_TRAY_GATE, L"Noise gate");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"Exit");
     SetForegroundWindow(gWnd);
@@ -3855,9 +4028,10 @@ static void CreateUI()
 
     // Status + buttons
     gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
-    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 544, 172, 34, IDC_START);
-    Ctl(L"BUTTON", L"Minimize to tray", WS_TABSTOP, 194, 544, 172, 34, IDC_TRAY);
-    Ctl(L"BUTTON", L"Help / Discord && OBS", WS_TABSTOP, 374, 544, 172, 34, IDC_HELPBTN);
+    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 544, 127, 34, IDC_START);
+    Ctl(L"BUTTON", L"Mute mic", WS_TABSTOP, 149, 544, 127, 34, IDC_MUTEBTN);
+    Ctl(L"BUTTON", L"Hide to tray", WS_TABSTOP, 284, 544, 127, 34, IDC_TRAY);
+    Ctl(L"BUTTON", L"Help && setup", WS_TABSTOP, 419, 544, 127, 34, IDC_HELPBTN);
 
     gRecordShift = false;
 
@@ -4003,6 +4177,19 @@ static void CreateUI()
     Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 337, 410, 18, IDC_HDR);
     Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 332, 84, 26, IDC_OPENSET);
 
+    AddSection(14, 488, 532, 88, L"Shortcuts & window");      // painted text: a single & shows as &
+    Ctl(L"STATIC", L"Mute hotkey:", 0, 30, 513, 90, 20, -1);
+    {
+        wchar_t kn[120]; FxKeyButtonText(SLOT_MUTE, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 122, 508, 124, 28, IDC_MUTEKEY);
+    }
+    Ctl(L"BUTTON", L"Pop-up when a hotkey switches something", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 512, 270, 20, IDC_OSD);
+    CheckDlgButton(gWnd, IDC_OSD, gShowOsd ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Always on top", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 546, 200, 20, IDC_TOPMOST);
+    CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 546, 270, 20, IDC_STARTWIN);
+    CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
+
     AddSection(14, 378, 532, 92, L"Screen share");
     Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 402, 300, 20, IDC_HIDESHARE);
     CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
@@ -4123,7 +4310,7 @@ static void DrawStatus(DRAWITEMSTRUCT* d)
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
-    bool loop = gLooping, live = gRunning;
+    bool loop = gLooping || (gRunning && gMicMuted), live = gRunning;   // red while looping or muted
     COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : (gDark ? DK_CTL : LT_STATUS);
     COLORREF text = loop ? (gDark ? RGB(255, 125, 125) : RGB(185, 20, 20)) : (gDark ? DK_TEXT : RGB(40, 40, 40));
     COLORREF dotc = loop ? RGB(235, 60, 60) : live ? RGB(40, 190, 90) : RGB(150, 150, 150);
@@ -4300,6 +4487,23 @@ static void OnCommand(int id, int code)
         break;
     case IDC_EXCL:    gExclusive = Checked(IDC_EXCL); RestartIfRunning(); break;
     case IDC_HIDESHARE: gHideShare = Checked(IDC_HIDESHARE); RestartIfRunning(); break;
+    case IDC_MUTEBTN:  if (code == BN_CLICKED) SetMute(!gMicMuted); break;
+    case ID_TRAY_MUTE: SetMute(!gMicMuted); break;
+    case IDC_MUTEKEY:  if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_MUTE], IDC_MUTEKEY); break;
+    case IDC_OSD:      gShowOsd = Checked(IDC_OSD); if (gShowOsd) ShowOsd(L"Pop-ups are on", true); break;
+    case IDC_TOPMOST:
+        gTopMost = Checked(IDC_TOPMOST);
+        SetWindowPos(gWnd, gTopMost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        break;
+    case IDC_STARTWIN: SetStartWithWindows(Checked(IDC_STARTWIN)); break;
+    case ID_TRAY_FX:   SetFxOn(!gFxOn); UpdateStatus(true); break;
+    case ID_TRAY_SONG: SetSongMode(!SongModeOn()); break;
+    case ID_TRAY_NS:
+        gNsOn = !gNsOn;
+        CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+        RedrawKnobs();
+        break;
+    case ID_TRAY_GATE: SetGateMode(gGateMode != GATE_OFF ? GATE_OFF : gGateLastMode); break;
     case IDC_AUTO:    gAutoStart = Checked(IDC_AUTO); break;
     case IDC_VBCABLE: SetupVbCable(); break;
     case IDC_HELPBTN: ShowHelp(); break;
@@ -4333,6 +4537,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) CleanupOldExe();
         else if (w == TIMER_FXKEYS) PollFxKeys();
+        else if (w == TIMER_OSD) OsdTick();
         else if (w == TIMER_RECONNECT) {
             if (!gWantRunning || gRunning || StartAudio(true)) KillTimer(h, TIMER_RECONNECT);
             UpdateUi();
@@ -4347,6 +4552,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_UPDATE_CHECKED:
         OnUpdateChecked((UpdateJob*)l);
+        return 0;
+    case WM_SHOW_ME:                            // someone opened Lag Effect again: show this one
+        FromTray();
         return 0;
     case WM_SONGFILE_LOADED:
         OnSongFileLoaded((SongFileJob*)l);
@@ -4381,6 +4589,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         int id = GetDlgCtrlID((HWND)w);
         if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
         if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
+        if (id == IDC_MUTEKEY) { ClearFxKey(SLOT_MUTE); return 0; }
         break;
     }
     case WM_MEASUREITEM:
@@ -4423,12 +4632,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetBkColor(dc, field ? DK_CTL : DK_BG);
         return (LRESULT)(field ? gBrDarkCtl : gBrDarkBg);
     }
-    case WM_CLOSE:
+    case WM_CLOSE: {
+        WINDOWPLACEMENT wp = {}; wp.length = sizeof(wp);   // remember where the window was
+        if (GetWindowPlacement(h, &wp)) {
+            SaveInt(L"win_x", wp.rcNormalPosition.left);
+            SaveInt(L"win_y", wp.rcNormalPosition.top);
+        }
         SaveSettings();
         StopAudio();
         RemoveTray();
         DestroyWindow(h);
         return 0;
+    }
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -4447,6 +4662,22 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     bool justUpdated = wcsstr(GetCommandLineW(), L"--updated") != nullptr;
     gResumeAudio = justUpdated && wcsstr(GetCommandLineW(), L"--resume") != nullptr;
 
+    // One copy at a time: a second launch brings the running one to the front instead of fighting it
+    // for the mic. After an update, wait for the old version to finish closing.
+    HANDLE single = CreateMutexW(nullptr, TRUE, L"LagEffect.SingleInstance");
+    if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (justUpdated) WaitForSingleObject(single, 5000);
+        else {
+            HWND other = FindWindowW(L"LagEffectWnd", nullptr);
+            if (other) {
+                DWORD pid = 0; GetWindowThreadProcessId(other, &pid);
+                AllowSetForegroundWindow(pid);
+                PostMessageW(other, WM_SHOW_ME, 0, 0);
+            }
+            return 0;
+        }
+    }
+
     LoadSettings();
     LoadThemeApis();
     gNs = rnnoise_create(nullptr);              // built-in model; created once, used by the audio thread
@@ -4455,6 +4686,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
 
     gFont     = CreateFontW(-13, 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     gFontBold = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    gFontOsd  = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     gIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));          // custom icon if built with LagEffect.rc
     if (!gIcon) gIcon = LoadIconW(nullptr, IDI_APPLICATION);
 
@@ -4475,12 +4707,25 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     kc.lpszClassName = L"LagKnob";
     RegisterClassW(&kc);
 
+    WNDCLASSW oc = {};                                   // hotkey pop-up
+    oc.lpfnWndProc   = OsdProc;
+    oc.hInstance     = hi;
+    oc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
+    oc.lpszClassName = L"LagOsd";
+    RegisterClassW(&oc);
+
     DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN;
     RECT r = { 0, 0, CLIENT_W, BASE_H };
     AdjustWindowRect(&r, style, FALSE);
-    HWND h = CreateWindowExW(0, wc.lpszClassName, L"Lag Effect " APP_VERSION, style, CW_USEDEFAULT, CW_USEDEFAULT,
+    int wx = CW_USEDEFAULT, wy = CW_USEDEFAULT;          // reopen where it was, if that's still on a screen
+    if (gWinX != INT_MIN && gWinY != INT_MIN) {
+        POINT probe = { gWinX + 60, gWinY + 15 };        // a point on the title bar
+        if (MonitorFromPoint(probe, MONITOR_DEFAULTTONULL)) { wx = gWinX; wy = gWinY; }
+    }
+    HWND h = CreateWindowExW(0, wc.lpszClassName, L"Lag Effect " APP_VERSION, style, wx, wy,
                              r.right - r.left, r.bottom - r.top, nullptr, nullptr, hi, nullptr);
     if (!h) return 1;
+    if (gTopMost) SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     if (!gCtxOk) MessageBoxW(h, L"Couldn't start the Windows audio system.", L"Lag Effect", MB_ICONERROR);
     if (gAutoStart && !justUpdated) ToTray();
@@ -4498,6 +4743,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             SetPage((gPage + 1) % TAB_COUNT);   // Ctrl+Tab: next page
             continue;
         }
+        if (msg.message == WM_KEYDOWN && msg.wParam >= '1' && msg.wParam < '1' + TAB_COUNT &&
+            (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
+            SetPage((int)(msg.wParam - '1'));   // Ctrl+1..4: jump to a tab
+            continue;
+        }
         if (!IsDialogMessageW(h, &msg)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
@@ -4506,5 +4756,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     if (gCtxOk) ma_context_uninit(&gCtx);
     DeleteObject(gFont);
     DeleteObject(gFontBold);
+    DeleteObject(gFontOsd);
+    if (single) CloseHandle(single);
     return 0;
 }
