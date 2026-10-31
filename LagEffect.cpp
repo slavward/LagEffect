@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.15.0"
+#define APP_VERSION L"1.15.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -3180,30 +3180,43 @@ static void UpdateRecCapture()                  // every 50 ms: keep the PC-soun
         gRecRunning = false;
         if (gRecLost) retryAt = GetTickCount() + 1000;
     }
-    if (!want) { gRecPcState = 0; return; }
+    static int fallbackRetries = 0;
+    if (!want) { gRecPcState = 0; fallbackRetries = 0; return; }
+    // Recording the whole output (state 2) also picks up Lag Effect itself: try leaving it out again a few times.
+    if (gRecRunning && gRecPcState == 2 && fallbackRetries < 3 && (int)(GetTickCount() - retryAt) >= 0) {
+        fallbackRetries++;
+        ma_device_uninit(&gRecDev);
+        gRecRunning = false;
+        if (RecStartDevice(GetCurrentProcessId(), true)) { gRecPcState = 1; return; }
+        if (!RecStartDevice(0, false)) { gRecPcState = 3; retryAt = GetTickCount() + 5000; return; }
+        retryAt = GetTickCount() + 5000;
+        return;
+    }
     if (gRecRunning || (int)(GetTickCount() - retryAt) < 0) return;
     gRecPc.fill = 0;
     if (RecStartDevice(GetCurrentProcessId(), true)) gRecPcState = 1;
-    else if (RecStartDevice(0, false))               gRecPcState = 2;   // older Windows: the whole output
+    else if (RecStartDevice(0, false))               { gRecPcState = 2; retryAt = GetTickCount() + 5000; }   // the whole output
     else { gRecPcState = 3; retryAt = GetTickCount() + 5000; }
 }
 
 static void ClipTick()                          // every 50 ms
 {
     UpdateRecCapture();
-    wchar_t t[128];
+    wchar_t t[256];
     static const wchar_t* what[] = { L"your voice + PC sound", L"your voice", L"PC sound" };
-    if (gRecSource == REC_OFF)  lstrcpynW(t, L"Recording is off: pick what to record above.", 128);
-    else if (!gRunning)         lstrcpynW(t, L"Audio is stopped: press Start on the Main tab to record clips.", 128);
+    if (gRecSource == REC_OFF)  lstrcpynW(t, L"Recording is off: pick what to record above.", 256);
+    else if (!gRunning)         lstrcpynW(t, L"Audio is stopped: press Start on the Main tab to record clips.", 256);
     else if (gRecSource != REC_VOICE && gRecPcState == 3)
         lstrcpynW(t, gRecSource == REC_BOTH ? L"Couldn't record PC sound: clips will have your voice only."
-                                            : L"Couldn't record PC sound. Retrying...", 128);
+                                            : L"Couldn't record PC sound. Retrying...", 256);
     else {
         wsprintfW(t, L"Holding the last %d s of %s in memory. Nothing is saved until you clip.", gRecSeconds, what[gRecSource]);
-        if (gRecSource != REC_VOICE && gRecPcState == 2) lstrcatW(t, L" (Older Windows: PC sound includes Lag Effect too.)");
+        if (gRecSource != REC_VOICE && gRecPcState == 2)
+            wsprintfW(t, L"Holding the last %d s of %s in memory. Note: PC sound also includes Lag Effect's own output here.",
+                      gRecSeconds, what[gRecSource]);
     }
-    wchar_t cur[128];
-    GetDlgItemTextW(gWnd, IDC_RECSTATUS, cur, 128);
+    wchar_t cur[256];
+    GetDlgItemTextW(gWnd, IDC_RECSTATUS, cur, 256);
     if (lstrcmpW(cur, t)) SetDlgItemTextW(gWnd, IDC_RECSTATUS, t);
 }
 
@@ -4239,6 +4252,9 @@ static int RowOfId(int id, bool* isDel)
 
 static void Layout()
 {
+    // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
+    const bool freeze = IsWindowVisible(gWnd) != FALSE;
+    if (freeze) SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0);
     for (int i = 0; i < gPagedN; i++) {
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
@@ -4264,7 +4280,8 @@ static void Layout()
     RECT r = { 0, 0, CLIENT_W, BASE_H + d };   // both pages share the window size, so switching never jumps
     AdjustWindowRect(&r, style, FALSE);
     SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    if (freeze) SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | (freeze ? RDW_UPDATENOW : 0));
 }
 
 static void SetPage(int page)
@@ -5744,15 +5761,20 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SETTINGCHANGE:
         if (gThemeMode == THEME_SYSTEM && l && lstrcmpW((LPCWSTR)l, L"ImmersiveColorSet") == 0) ApplyTheme();
         break;
-    case WM_ERASEBKGND: {
-        RECT rc; GetClientRect(h, &rc);
-        FillRect((HDC)w, &rc, BgBrush());
-        return 1;
-    }
+    case WM_ERASEBKGND:
+        return 1;                               // WM_PAINT fills the background (no erase-then-draw flash)
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(h, &ps);
-        PaintWindow(dc);
+        RECT rc; GetClientRect(h, &rc);
+        HDC mem = CreateCompatibleDC(dc);
+        HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+        HGDIOBJ ob = SelectObject(mem, bmp);
+        FillRect(mem, &rc, BgBrush());
+        PaintWindow(mem);
+        BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+               mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
+        SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
         EndPaint(h, &ps);
         return 0;
     }
