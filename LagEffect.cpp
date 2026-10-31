@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.13.0"
+#define APP_VERSION L"1.14.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -90,6 +90,54 @@ static double loopPos = 0, grainStart[2];
 static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
+
+// ---- Soundboard: 8 pads of short clips, mixed into every output that isn't Off ----
+// Not recorded into the stutter loop, not run through the voice effects, not silenced by Mute mic.
+// The UI swaps clips in/out (data == nullptr while swapping); the audio thread only reads.
+#define PADS 8
+struct Pad {
+    short* volatile   data;                      // 48 kHz mono 16-bit
+    volatile unsigned len;
+    volatile int      vol;                       // percent
+    volatile bool     trigger, stop;             // UI -> audio: (re)start / stop
+    volatile bool     playing;                   // audio -> UI
+    volatile unsigned pos;
+    float             fade;                      // short fade-out when stopped or restarted (no clicks)
+    unsigned          fadePos;
+};
+static Pad gPads[PADS];
+static volatile int gPadMaster = 100;
+
+static inline float PadsMix()                    // audio thread: one output sample of all playing pads
+{
+    float sum = 0;
+    const float master = gPadMaster / 100.0f;
+    for (int i = 0; i < PADS; i++) {
+        Pad& p = gPads[i];
+        short* d = p.data; unsigned n = p.len;
+        if (p.stop) { p.stop = false; if (p.playing) { p.fade = 1.0f; p.fadePos = p.pos; } p.playing = false; }
+        if (p.trigger) {                         // (re)start: fade the old play-through out, start fresh
+            p.trigger = false;
+            if (p.playing) { p.fade = 1.0f; p.fadePos = p.pos; }
+            p.pos = 0; p.playing = d && n;
+        }
+        if (!d || !n) { p.playing = false; p.fade = 0; continue; }
+        const float g = p.vol / 100.0f * master * (1.0f / 32768.0f);
+        if (p.fade > 0) {                         // the tail of a stopped / restarted play-through
+            if (p.fadePos < n) sum += d[p.fadePos++] * g * p.fade;
+            p.fade -= 1.0f / 240.0f;              // 5 ms
+        }
+        if (p.playing) {
+            unsigned pos = p.pos;
+            float env = pos < 48 ? pos / 48.0f : 1.0f;                       // 1 ms fade-in
+            if (n - pos < 240) env *= (n - pos) / 240.0f;                    // 5 ms fade-out at the end
+            sum += d[pos] * g * env;
+            if (++pos >= n) p.playing = false;
+            p.pos = pos;
+        }
+    }
+    return sum;
+}
 static float  muteGain = 1;                      // ramps so muting never clicks
 static int    gateHold = 0;
 
@@ -1184,13 +1232,14 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             everything = s;
         }
 
-        float o = Limit(0, RowSignal(mode[0], effect, everything) * vol[0]);
+        const float sb = PadsMix();             // soundboard: every output that isn't Off
+        float o = Limit(0, (RowSignal(mode[0], effect, everything) + (mode[0] != MODE_OFF ? sb : 0.0f)) * vol[0]);
         out[f * 2] = o;
         out[f * 2 + 1] = o;
 
         for (int k = 1; k < MAX_OUT; k++) {
             if (!on[k] || (w[k] - r[k]) >= RING_SIZE) continue;
-            ring[k][w[k] & (RING_SIZE - 1)] = Limit(k, RowSignal(mode[k], effect, everything) * vol[k]);
+            ring[k][w[k] & (RING_SIZE - 1)] = Limit(k, (RowSignal(mode[k], effect, everything) + (mode[k] != MODE_OFF ? sb : 0.0f)) * vol[k]);
             w[k]++;
         }
     }
@@ -1229,11 +1278,14 @@ enum {
     IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_FADE, IDC_GATE, IDC_TALKVOL,
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
-    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3,   // tabs must stay consecutive
+    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3, IDC_TAB4,   // tabs must stay consecutive
     IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_SONGBTN, IDC_SONGSRC, IDC_SONGSTATUS,
-    IDC_MUTEBTN, IDC_MUTEKEY, IDC_OSD, IDC_TOPMOST, IDC_STARTWIN, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_MUTEBTN, IDC_MUTEKEY, IDC_OSD, IDC_TOPMOST, IDC_STARTWIN,
+    IDC_PADMASTER, IDC_PADSTOP, IDC_PADHINT, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
-    IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_KNOB = 480, IDC_FXGRP_KEY = 490,   // + group / knob index
+    IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_FXGRP_KEY = 490,   // + group index
+    IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
+    IDC_PADPLAY = 700, IDC_PADVOL = 710, IDC_PADKEY = 720, IDC_PADLOAD = 730, IDC_PADCLR = 740,   // + pad index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT, ID_TRAY_FX, ID_TRAY_SONG, ID_TRAY_NS, ID_TRAY_GATE, ID_TRAY_MUTE
 };
 #define SPIN_UD(id)        ((id) + 100)      // up-down control paired with a number box
@@ -1290,7 +1342,8 @@ static FxGroup gFxGroups[] = {
 // Each is a combination of up to MAX_KEYS keys (0 = unused). Polled by the window (TIMER_FXKEYS).
 #define FX_KEY_SLOTS (1 + FX_GROUPS)
 #define SLOT_MUTE    FX_KEY_SLOTS                // one more hotkey after the Voice FX ones: Mute mic
-#define KEY_SLOTS    (FX_KEY_SLOTS + 1)
+#define SLOT_PAD0    (SLOT_MUTE + 1)             // then one per soundboard pad
+#define KEY_SLOTS    (FX_KEY_SLOTS + 1 + PADS)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 
@@ -1324,6 +1377,7 @@ static Knob gKnobs[] = {
     { L"Leveler",   L"%",   0,   100, 0,   &gLevelerPct,    L"leveler",           KG_TONE, false, L"Off" },
 };
 #define KNOB_N ((int)(sizeof(gKnobs) / sizeof(gKnobs[0])))
+static_assert(IDC_KNOB + KNOB_N <= IDC_PADPLAY, "knob IDs would run into the soundboard IDs");
 
 static void Widen(const char* s, wchar_t* out, int cap)
 {
@@ -1640,6 +1694,9 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 // ======================= settings =======================
 static const wchar_t* FxKeyIniName(int slot)
 {
+    static const wchar_t* padKeys[PADS] = { L"pad1_hotkey", L"pad2_hotkey", L"pad3_hotkey", L"pad4_hotkey",
+                                            L"pad5_hotkey", L"pad6_hotkey", L"pad7_hotkey", L"pad8_hotkey" };
+    if (slot >= SLOT_PAD0) return padKeys[slot - SLOT_PAD0];
     return slot == SLOT_MUTE ? L"mute_hotkey" : slot == 0 ? L"fx_hotkey" : gFxGroups[slot - 1].hotkeyKey;
 }
 
@@ -1648,6 +1705,7 @@ static wchar_t gSongApp[64] = L"";               // Vocode to song: app to take 
 static wchar_t gSongFile[MAX_PATH] = L"";        // ...or an audio file (used when gUseFile)
 static bool    gSongUseFile = false;
 static int     gVocSynthSaved = 100;             // Synth value of the other side: Song style keeps its own
+static wchar_t gPadFile[PADS][MAX_PATH];         // soundboard clips
 static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
@@ -1724,6 +1782,12 @@ static void LoadSettings()
     GetPrivateProfileStringW(L"settings", L"voc_song_app", L"", gSongApp, 64, gIni);
     GetPrivateProfileStringW(L"settings", L"voc_song_file", L"", gSongFile, MAX_PATH, gIni);
     gSongUseFile = INI_INT(L"voc_song_use_file", 0) != 0 && gSongFile[0];
+    gPadMaster = Iclamp(INI_INT(L"pad_master", 100), 0, 200);
+    for (int i = 0; i < PADS; i++) {
+        wchar_t key[32];
+        wsprintfW(key, L"pad%d_file", i + 1);   GetPrivateProfileStringW(L"settings", key, L"", gPadFile[i], MAX_PATH, gIni);
+        wsprintfW(key, L"pad%d_volume", i + 1); gPads[i].vol = Iclamp(INI_INT(key, 100), 0, 200);
+    }
     {   // Song style has its own Synth (default 100%: the song fully replaces your voice)
         wchar_t b[32];
         GetPrivateProfileStringW(L"settings", L"voc_synth_other", L"", b, 32, gIni);
@@ -1794,6 +1858,12 @@ static void SaveSettings()
     WritePrivateProfileStringW(L"settings", L"voc_song_file", gSongFile, gIni);
     SaveInt(L"voc_song_use_file", gSongUseFile);
     SaveInt(L"voc_synth_other", gVocSynthSaved);
+    SaveInt(L"pad_master", gPadMaster);
+    for (int i = 0; i < PADS; i++) {
+        wchar_t key[32];
+        wsprintfW(key, L"pad%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[i], gIni);
+        wsprintfW(key, L"pad%d_volume", i + 1); SaveInt(key, gPads[i].vol);
+    }
     SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare);
     SaveInt(L"hotkey_popup", gShowOsd); SaveInt(L"always_on_top", gTopMost); SaveInt(L"autostart", gAutoStart);
@@ -1979,23 +2049,26 @@ static void StopAudio()
 #define BASE_H    592                          // window height with one output
 #define ROW_Y0    134
 #define ROW_H     30
-#define TAB_COUNT 4
-enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SETTINGS = 3 };
+#define TAB_COUNT 5
+enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_SETTINGS = 4 };
 
 struct Shifted { HWND h; int x, y; };
 struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; };
 struct Framed  { HWND edit, ud; };
 struct Paged   { HWND h; int page; };
 static Shifted gShift[96];   static int gShiftN = 0;
-static Section gSections[12]; static int gSectionN = 0;
-static Framed  gFramed[24];  static int gFramedN = 0;
-static Paged   gPaged[160];  static int gPagedN = 0;
+#define MAX_SECTIONS 32
+#define MAX_FRAMED   48
+#define MAX_PAGED    400
+static Section gSections[MAX_SECTIONS]; static int gSectionN = 0;
+static Framed  gFramed[MAX_FRAMED];     static int gFramedN = 0;
+static Paged   gPaged[MAX_PAGED];       static int gPagedN = 0;
 static bool    gRecordShift = false;
 static int     gDevSectionIdx = 0;
 static int     gBuildPage = -1;                // page new controls go on (-1 = always shown, e.g. the tabs)
 static int     gPage = 0;                      // page being shown
 
-static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < 160) gPaged[gPagedN++] = { h, gBuildPage }; }
+static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 
@@ -2023,14 +2096,14 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
         RECT r; GetWindowRect(u, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
         gShift[gShiftN++] = { u, r.left, r.top };
     }
-    if (gFramedN < 24) gFramed[gFramedN++] = { e, u };
+    if (gFramedN < MAX_FRAMED) gFramed[gFramedN++] = { e, u };
     RecordPage(u);
     return u;
 }
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < 12) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage };
+    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage };
 }
 
 // ======================= knob control (Voice FX page) =======================
@@ -2425,7 +2498,8 @@ static void FillSongSources()
 }
 
 // ---- audio file ----
-struct SongFileJob { wchar_t path[MAX_PATH]; short* data; unsigned len; bool ok, quiet; };
+struct SongFileJob { wchar_t path[MAX_PATH]; short* data; unsigned len; bool ok, quiet; int target; unsigned maxLen; };
+// target: -1 = Vocode to song, 0..PADS-1 = soundboard pad
 
 static DWORD WINAPI SongDecodeThread(LPVOID arg)  // decode to 48 kHz mono, up to 20 minutes
 {
@@ -2433,8 +2507,8 @@ static DWORD WINAPI SongDecodeThread(LPVOID arg)  // decode to 48 kHz mono, up t
     ma_decoder_config dc = ma_decoder_config_init(ma_format_s16, 1, RATE);
     ma_decoder dec;
     if (ma_decoder_init_file_w(j->path, &dc, &dec) == MA_SUCCESS) {
-        const unsigned maxLen = RATE * 60 * 20;
-        unsigned cap = RATE * 30, len = 0;
+        const unsigned maxLen = j->maxLen;
+        unsigned cap = maxLen < RATE * 30 ? maxLen + 8192 : RATE * 30, len = 0;
         short* buf = (short*)HeapAlloc(GetProcessHeap(), 0, cap * sizeof(short));
         while (buf && len < maxLen) {
             if (len + 8192 > cap) {
@@ -2448,7 +2522,7 @@ static DWORD WINAPI SongDecodeThread(LPVOID arg)  // decode to 48 kHz mono, up t
             len += (unsigned)got;
         }
         ma_decoder_uninit(&dec);
-        j->data = buf; j->len = len; j->ok = buf && len > RATE / 10;
+        j->data = buf; j->len = len; j->ok = buf && len > RATE / 50;
         if (!j->ok && buf) { HeapFree(GetProcessHeap(), 0, buf); j->data = nullptr; }
     }
     PostMessageW(gWnd, WM_SONGFILE_LOADED, 0, (LPARAM)j);
@@ -2463,6 +2537,8 @@ static void LoadSongFile(const wchar_t* path, bool quiet = false)
     if (!j) return;
     lstrcpynW(j->path, path, MAX_PATH);
     j->quiet = quiet;
+    j->target = -1;
+    j->maxLen = RATE * 60 * 20;                  // songs: up to 20 minutes
     gSongLoading = true;
     HANDLE t = CreateThread(nullptr, 0, SongDecodeThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { gSongLoading = false; HeapFree(GetProcessHeap(), 0, j); }
@@ -2471,8 +2547,10 @@ static void LoadSongFile(const wchar_t* path, bool quiet = false)
 static void UpdateSongStatusText();
 static void UpdateSongCapture();
 
+static void OnPadLoaded(SongFileJob* j);
 static void OnSongFileLoaded(SongFileJob* j)
 {
+    if (j->target >= 0) { OnPadLoaded(j); return; }
     const bool quiet = j->quiet;
     gSongLoading = false;
     if (j->ok) {
@@ -2667,6 +2745,157 @@ static void DrawSongButton(DRAWITEMSTRUCT* d)
     }
 }
 
+// ======================= soundboard (UI side) =======================
+static void SetPage(int page);
+static void PadLoad(int i, const wchar_t* path, bool quiet = false)   // decode in the background
+{
+    SongFileJob* j = (SongFileJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(SongFileJob));
+    if (!j) return;
+    lstrcpynW(j->path, path, MAX_PATH);
+    j->quiet = quiet; j->target = i; j->maxLen = RATE * 60;   // clips: up to 60 seconds
+    HANDLE t = CreateThread(nullptr, 0, SongDecodeThread, j, 0, nullptr);
+    if (t) CloseHandle(t); else HeapFree(GetProcessHeap(), 0, j);
+}
+
+static void PadSetData(int i, short* data, unsigned len)   // swap a pad's clip safely
+{
+    short* old = gPads[i].data;
+    gPads[i].stop = true;
+    gPads[i].data = nullptr; gPads[i].len = 0;
+    if (old) { Sleep(30); HeapFree(GetProcessHeap(), 0, old); }   // the audio thread has let go by now
+    gPads[i].len = len; gPads[i].data = data;
+    InvalidateRect(GetDlgItem(gWnd, IDC_PADPLAY + i), nullptr, FALSE);
+}
+
+static void OnPadLoaded(SongFileJob* j)
+{
+    int i = j->target;
+    if (j->ok) {
+        PadSetData(i, j->data, j->len);
+        lstrcpynW(gPadFile[i], j->path, MAX_PATH);
+    } else {
+        if (!j->quiet && !gPads[i].data && !lstrcmpiW(gPadFile[i], j->path)) gPadFile[i][0] = 0;   // free the pad again
+        if (!j->quiet) MessageBoxW(gWnd, L"Couldn't open that audio file.\n\nMP3, WAV and FLAC files work (the first 60 seconds are used).",
+                    L"Lag Effect - Soundboard", MB_ICONWARNING);
+    }
+    HeapFree(GetProcessHeap(), 0, j);
+    InvalidateRect(GetDlgItem(gWnd, IDC_PADPLAY + i), nullptr, FALSE);
+}
+
+static void PadClear(int i)
+{
+    PadSetData(i, nullptr, 0);
+    gPadFile[i][0] = 0;
+}
+
+static void PadBrowse(int i)
+{
+    wchar_t path[MAX_PATH] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o);
+    o.hwndOwner   = gWnd;
+    o.lpstrFilter = L"Audio files (MP3, WAV, FLAC)\0*.mp3;*.wav;*.flac\0All files\0*.*\0";
+    o.lpstrFile   = path;
+    o.nMaxFile    = MAX_PATH;
+    o.lpstrTitle  = L"Pick a sound for this pad";
+    o.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (GetOpenFileNameW(&o)) PadLoad(i, path);
+}
+
+static void PadName(int i, wchar_t* out, int cap)   // "C:\x\Air horn.mp3" -> "Air horn"
+{
+    const wchar_t* base = wcsrchr(gPadFile[i], L'\\');
+    lstrcpynW(out, base ? base + 1 : gPadFile[i], cap);
+    wchar_t* dot = wcsrchr(out, L'.');
+    if (dot && dot != out) *dot = 0;
+}
+
+static void DrawPadButton(DRAWITEMSTRUCT* d)
+{
+    int i = (int)d->CtlID - IDC_PADPLAY;
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    const Pad& p = gPads[i];
+    bool has = p.data != nullptr, playing = p.playing && p.len;
+    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : LT_CARD);
+    HPEN   pen  = CreatePen(PS_SOLID, 1, playing ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
+    HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, pen);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(card); DeleteObject(pen);
+    if (playing) {                              // progress bar along the bottom
+        int w = (int)((rc.right - rc.left - 8) * (double)p.pos / p.len);
+        RECT bar = { rc.left + 4, rc.bottom - 5, rc.left + 4 + w, rc.bottom - 3 };
+        HBRUSH ab = CreateSolidBrush(ACCENT); FillRect(dc, &bar, ab); DeleteObject(ab);
+    }
+    SetBkMode(dc, TRANSPARENT);
+    wchar_t num[8]; wsprintfW(num, L"%d", i + 1);
+    HGDIOBJ of = SelectObject(dc, gFontBold);
+    SetTextColor(dc, playing ? ACCENT : gDark ? DK_DIM : RGB(120, 120, 120));
+    RECT nr = { rc.left + 8, rc.top, rc.left + 26, rc.bottom - 2 };
+    DrawTextW(dc, playing ? L"\x25B6" : num, -1, &nr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    wchar_t name[MAX_PATH];
+    if (has) PadName(i, name, MAX_PATH); else lstrcpynW(name, L"Empty: drop a sound here", MAX_PATH);
+    SelectObject(dc, has ? gFontBold : gFont);
+    SetTextColor(dc, has ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(120, 120, 120)));
+    RECT tr = { rc.left + 28, rc.top, rc.right - 6, rc.bottom - 2 };
+    DrawTextW(dc, name, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+    SelectObject(dc, of);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
+        RECT fr = rc; InflateRect(&fr, -3, -3);
+        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        DrawFocusRect(dc, &fr);
+    }
+}
+
+static void PadTick()                           // every 50 ms: redraw pads that are playing or just stopped
+{
+    static bool was[PADS];
+    for (int i = 0; i < PADS; i++) {
+        bool now = gPads[i].playing;
+        if ((now || was[i]) && gPage == PAGE_SOUND) InvalidateRect(GetDlgItem(gWnd, IDC_PADPLAY + i), nullptr, FALSE);
+        was[i] = now;
+    }
+    static int lastRunning = -1;                // hint line: remind to press Start
+    if ((int)gRunning != lastRunning) {
+        lastRunning = (int)gRunning;
+        SetDlgItemTextW(gWnd, IDC_PADHINT, gRunning
+            ? L"Drop MP3, WAV or FLAC files onto a pad (up to 60 s each). Plays on every output that isn't Off, "
+              L"so Discord hears it. Right-click a playing pad to stop it."
+            : L"Audio is stopped: press Start on the Main tab to use the soundboard.");
+    }
+}
+
+static void OnDropFiles(HDROP drop)             // files dragged onto the window: load them into pads
+{
+    POINT pt; DragQueryPoint(drop, &pt);
+    int target = -1;
+    if (gPage == PAGE_SOUND)
+        for (int i = 0; i < PADS; i++) {        // dropped on a pad row?
+            RECT r; GetWindowRect(GetDlgItem(gWnd, IDC_PADPLAY + i), &r);
+            MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+            if (pt.y >= r.top - 5 && pt.y <= r.bottom + 5) { target = i; break; }
+        }
+    if (gPage != PAGE_SOUND) SetPage(PAGE_SOUND);
+    UINT n = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+    for (UINT f = 0; f < n; f++) {
+        wchar_t path[MAX_PATH];
+        if (!DragQueryFileW(drop, f, path, MAX_PATH)) continue;
+        int slot = target;
+        if (slot < 0 || f > 0) {                // next empty pad (from the target onward)
+            slot = -1;
+            for (int k = 0; k < PADS && slot < 0; k++) {
+                int i = ((target < 0 ? 0 : target) + k + (f > 0 && target >= 0 ? 1 : 0)) % PADS;
+                if (!gPads[i].data && !gPadFile[i][0]) slot = i;
+            }
+            if (slot < 0) break;                // all pads full
+        }
+        lstrcpynW(gPadFile[slot], path, MAX_PATH);   // mark as taken so the next file goes elsewhere
+        PadLoad(slot, path);
+    }
+    DragFinish(drop);
+}
+
 // ======================= tooltips =======================
 // Hover help for every setting. Labels get SS_NOTIFY so they can be hovered too
 // (clicking one still takes focus out of text boxes, see OnCommand). gTip is declared with the theme code.
@@ -2739,6 +2968,7 @@ static const TipText gLabelTips[] = {
     { L"Opens on:",    L"What opens the gate. Volume: when you're louder than Threshold. Voice: when the AI hears speech. Volume + voice: both." },
     { L"Buffer:",      L"Audio chunk size. Smaller = less delay; pick a bigger one if you hear crackling." },
     { L"Theme:",       L"Light, dark, or follow Windows." },
+    { L"Master volume:", L"Volume of the whole soundboard." },
     { L"Mute hotkey:", L"A hotkey that mutes / unmutes your mic from anywhere, even in a game. Right-click it to clear." },
     { L"Color:",       L"The app's color: knobs, switches, tabs and a matching tint on the background. Classic is the original look." },
     { L"Updates:",     L"The GitHub repo Lag Effect checks for new versions." },
@@ -2771,7 +3001,17 @@ static void AddTips()
     TipId(IDC_TAB0 + PAGE_MAIN,     L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
     TipId(IDC_TAB0 + PAGE_MIC,      L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
     TipId(IDC_TAB0 + PAGE_FX,       L"Pitch, reverb, the vocoder (auto-tune and harmonies) and radio/phone/megaphone effects on your live voice.");
+    TipId(IDC_TAB0 + PAGE_SOUND,    L"Soundboard: 8 pads of short sounds on hotkeys, played to Discord and your outputs.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
+    for (int i = 0; i < PADS; i++) {
+        TipId(IDC_PADPLAY + i, L"Click to play (click again to restart). Right-click to stop. Empty? Click to pick a sound, or drop a file here.");
+        TipId(IDC_PADVOL + i,  L"This pad's volume. 100% = as recorded, up to 200%.");
+        TipId(IDC_PADKEY + i,  L"A hotkey that plays this pad from anywhere, even in a game. Right-click to clear it.");
+        TipId(IDC_PADLOAD + i, L"Pick an MP3, WAV or FLAC file for this pad (up to 60 seconds are used).");
+        TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
+    }
+    TipId(IDC_PADMASTER, L"Volume of the whole soundboard.");
+    TipId(IDC_PADSTOP,   L"Stop every pad that's playing.");
 
     // Main
     TipId(IDC_MIC, L"The microphone Lag Effect listens to.");
@@ -3030,6 +3270,7 @@ static void PollFxKeys()
         bool pressed = down && !gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
         if (!pressed) continue;
+        if (slot >= SLOT_PAD0) { gPads[slot - SLOT_PAD0].trigger = true; continue; }   // soundboard pad
         wchar_t msg[64];
         bool on;
         if (slot == SLOT_MUTE) {
@@ -3724,8 +3965,11 @@ static void ShowHelp()
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Sharing your whole screen in Discord? Tick Settings > Hide from screen share, or people hear you twice.\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
+        L"SOUNDBOARD\n"
+        L"Drop sound files onto the 8 pads (or click Load), set hotkeys, and play them into Discord. "
+        L"They play on every output that isn't Off; Mute mic and voice effects don't touch them.\n\n"
         L"SHORTCUTS\n"
-        L"Ctrl+1-4 jumps to a tab. Right-click the tray icon for quick switches (mute, voice effects, vocode to song, "
+        L"Ctrl+1-5 jumps to a tab. Right-click the tray icon for quick switches (mute, voice effects, vocode to song, "
         L"noise suppression, gate). Settings has a Mute hotkey, hotkey pop-ups, Always on top and Start with Windows.\n\n"
         L"TIPS\n"
         L"Use headphones. If a game runs as administrator, run Lag Effect as administrator too, "
@@ -3746,6 +3990,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 
 static int FxKeyButtonId(int slot)
 {
+    if (slot >= SLOT_PAD0) return IDC_PADKEY + slot - SLOT_PAD0;
     return slot == SLOT_MUTE ? IDC_MUTEKEY : slot == 0 ? IDC_FXKEY_MASTER : IDC_FXGRP_KEY + slot - 1;
 }
 
@@ -3754,7 +3999,8 @@ static void ShowCaptureTarget()
     wchar_t name[120];
     if (gCapButton == IDC_HOTKEY) HotkeyName(name, 120);
     else {
-        int slot = gCapButton == IDC_MUTEKEY ? SLOT_MUTE : gCapButton == IDC_FXKEY_MASTER ? 0 : gCapButton - IDC_FXGRP_KEY + 1;
+        int slot = gCapButton >= IDC_PADKEY && gCapButton < IDC_PADKEY + PADS ? SLOT_PAD0 + gCapButton - IDC_PADKEY
+                 : gCapButton == IDC_MUTEKEY ? SLOT_MUTE : gCapButton == IDC_FXKEY_MASTER ? 0 : gCapButton - IDC_FXGRP_KEY + 1;
         FxKeyButtonText(slot, name, 120);
     }
     SetDlgItemTextW(gWnd, gCapButton, name);
@@ -3958,7 +4204,8 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Main",     BS_OWNERDRAW | WS_TABSTOP, 14,  10, 100, 32, IDC_TAB0 + PAGE_MAIN);
     Ctl(L"BUTTON", L"Mic",      BS_OWNERDRAW | WS_TABSTOP, 118, 10, 100, 32, IDC_TAB0 + PAGE_MIC);
     Ctl(L"BUTTON", L"Voice FX", BS_OWNERDRAW | WS_TABSTOP, 222, 10, 100, 32, IDC_TAB0 + PAGE_FX);
-    Ctl(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, 326, 10, 100, 32, IDC_TAB0 + PAGE_SETTINGS);
+    Ctl(L"BUTTON", L"Soundboard", BS_OWNERDRAW | WS_TABSTOP, 326, 10, 100, 32, IDC_TAB0 + PAGE_SOUND);
+    Ctl(L"BUTTON", L"Settings", BS_OWNERDRAW | WS_TABSTOP, 430, 10, 100, 32, IDC_TAB0 + PAGE_SETTINGS);
 
     // ---------------- Main page ----------------
     // Grid: sections run from x 14 to 546, contents from x 30 to 530.
@@ -4138,6 +4385,29 @@ static void CreateUI()
         Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
     }
 
+    // ---------------- Soundboard page ----------------
+    gBuildPage = PAGE_SOUND;
+    AddSection(14, 60, 532, 384, L"Pads");
+    Ctl(L"STATIC", L"Sound", 0, 30, 76, 120, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 212, 76, 70, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Hotkey", 0, 292, 76, 120, 16, IDC_HDR);
+    for (int i = 0; i < PADS; i++) {
+        int y = 96 + i * 42;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 34, IDC_PADPLAY + i);
+        Spin(IDC_PADVOL + i, 212, y + 5, 70, 0, 200, gPads[i].vol);
+        wchar_t kn[120]; FxKeyButtonText(SLOT_PAD0 + i, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 3, 128, 28, IDC_PADKEY + i);
+        Ctl(L"BUTTON", L"Load...", WS_TABSTOP, 424, y + 3, 74, 28, IDC_PADLOAD + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 3, 26, 28, IDC_PADCLR + i);
+        if (gPadFile[i][0]) PadLoad(i, gPadFile[i], true);   // reload last time's sounds, quietly
+    }
+    AddSection(14, 464, 532, 104, L"Playback");
+    Ctl(L"STATIC", L"Master volume:", 0, 30, 490, 110, 20, -1);
+    Spin(IDC_PADMASTER, 142, 487, 70, 0, 200, gPadMaster);
+    Ctl(L"STATIC", L"%", 0, 218, 490, 20, 20, -1);
+    Ctl(L"BUTTON", L"Stop all", WS_TABSTOP, 290, 484, 128, 28, IDC_PADSTOP);
+    Ctl(L"STATIC", L"", 0, 30, 522, 500, 36, IDC_PADHINT);
+
     // ---------------- Settings page ----------------
     gBuildPage = PAGE_SETTINGS;
 
@@ -4168,7 +4438,7 @@ static void CreateUI()
     Ctl(L"STATIC", L"Updates:", 0, 30, 264, 60, 20, -1);
     HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 261, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
     SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
-    if (gFramedN < 24) gFramed[gFramedN++] = { repo, nullptr };
+    if (gFramedN < MAX_FRAMED) gFramed[gFramedN++] = { repo, nullptr };
     Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 260, 100, 26, IDC_CHECKUPD);
     Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 263, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
@@ -4358,6 +4628,26 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) gRowMode[id - IDC_ROWMODE] = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
         return;
     }
+    if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) {
+        if (code == BN_CLICKED) { int i = id - IDC_PADPLAY; if (gPads[i].data) gPads[i].trigger = true; else PadBrowse(i); }
+        return;
+    }
+    if (id >= IDC_PADLOAD && id < IDC_PADLOAD + PADS) { if (code == BN_CLICKED) PadBrowse(id - IDC_PADLOAD); return; }
+    if (id >= IDC_PADCLR && id < IDC_PADCLR + PADS)   { if (code == BN_CLICKED) PadClear(id - IDC_PADCLR); return; }
+    if (id >= IDC_PADKEY && id < IDC_PADKEY + PADS) {
+        if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PAD0 + id - IDC_PADKEY], id);
+        return;
+    }
+    if ((id >= IDC_PADVOL && id < IDC_PADVOL + PADS) || id == IDC_PADMASTER) {
+        if (!gUiReady) return;
+        volatile int* var = id == IDC_PADMASTER ? &gPadMaster : &gPads[id - IDC_PADVOL].vol;
+        BOOL ok = FALSE;
+        int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) *var = Iclamp(v, 0, 200);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)*var, FALSE);
+        return;
+    }
+    if (id == IDC_PADSTOP) { if (code == BN_CLICKED) for (int i = 0; i < PADS; i++) gPads[i].stop = true; return; }
     if (id >= IDC_ROWVOL && id < IDC_ROWVOL + MAX_OUT) {
         if (!gUiReady) return;
         int k = id - IDC_ROWVOL;
@@ -4452,7 +4742,7 @@ static void OnCommand(int id, int code)
             ShellExecuteW(nullptr, L"open", L"explorer.exe", args, nullptr, SW_SHOWNORMAL);
         }
         break;
-    case IDC_TAB3:
+    case IDC_TAB3: case IDC_TAB4:
         if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
         break;
     case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
@@ -4524,6 +4814,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CREATE:
         gWnd = h;
         CreateUI();
+        DragAcceptFiles(h, TRUE);                // drop audio files onto soundboard pads
         ApplyTheme();
         // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
         if ((gAutoStart || gResumeAudio) && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
@@ -4533,7 +4824,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
-        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); SongTick(); }
+        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); SongTick(); PadTick(); }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) CleanupOldExe();
         else if (w == TIMER_FXKEYS) PollFxKeys();
@@ -4552,6 +4843,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_UPDATE_CHECKED:
         OnUpdateChecked((UpdateJob*)l);
+        return 0;
+    case WM_DROPFILES:
+        OnDropFiles((HDROP)w);
         return 0;
     case WM_SHOW_ME:                            // someone opened Lag Effect again: show this one
         FromTray();
@@ -4579,6 +4873,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) { DrawPadButton((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_METER) { DrawMeter((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_COLORTHEME) { DrawColorItem((DRAWITEMSTRUCT*)l); return TRUE; }
         break;
@@ -4590,6 +4885,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
         if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
         if (id == IDC_MUTEKEY) { ClearFxKey(SLOT_MUTE); return 0; }
+        if (id >= IDC_PADKEY && id < IDC_PADKEY + PADS) { ClearFxKey(SLOT_PAD0 + id - IDC_PADKEY); return 0; }
+        if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) { gPads[id - IDC_PADPLAY].stop = true; return 0; }   // right-click: stop
         break;
     }
     case WM_MEASUREITEM:
