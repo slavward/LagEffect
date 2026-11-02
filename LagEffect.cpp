@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.15.2"
+#define APP_VERSION L"1.16.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1335,7 +1335,7 @@ static ma_context gCtx; static ma_device gDev, gExtraDev[MAX_OUT];
 static ma_device gRecDev;                         // loopback capture of PC sound (instant replay)
 static bool      gRecRunning = false;
 static volatile bool gRecLost = false;
-static int       gRecPcState = 0;                 // 0 off, 1 everything but Lag Effect, 2 whole output, 3 failed
+static int       gRecPcState = 0;                 // 0 off, 1 recording, 2 whole output (fallback), 3 failed, 4 waiting for Discord
 static ma_device gSongDev;                        // loopback capture of the music (Vocode to song)
 
 // ---- Recording one app's sound, or everything except one app ("process loopback", Windows 10 20348+ / 11) ----
@@ -1895,8 +1895,15 @@ static bool    gSongUseFile = false;
 static int     gVocSynthSaved = 100;             // Synth value of the other side: Song style keeps its own
 static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds, then clips
 static int     gRecSeconds = 15;                 // instant replay length
-enum { REC_BOTH = 0, REC_VOICE = 1, REC_PC = 2, REC_OFF = 3 };
+// What clips keep. The numbers are saved in the settings file, so new ones go at the end.
+enum { REC_BOTH = 0, REC_VOICE = 1, REC_PC = 2, REC_OFF = 3, REC_DISCORD = 4, REC_VOICE_DISCORD = 5, REC_N };
 static int     gRecSource = REC_BOTH;
+static const int      kRecOrder[REC_N] = { REC_BOTH, REC_VOICE_DISCORD, REC_VOICE, REC_PC, REC_DISCORD, REC_OFF };   // list order
+static const wchar_t* kRecNames[REC_N] = { L"Your voice + PC sound", L"Your voice + Discord", L"Only your voice",
+                                           L"Only PC sound", L"Only Discord", L"Off" };
+static bool RecHasVoice(int s)   { return s == REC_BOTH || s == REC_VOICE || s == REC_VOICE_DISCORD; }
+static bool RecHasOther(int s)   { return s == REC_BOTH || s == REC_PC || s == REC_DISCORD || s == REC_VOICE_DISCORD; }
+static bool RecIsDiscord(int s)  { return s == REC_DISCORD || s == REC_VOICE_DISCORD; }
 struct TrimState { unsigned s, e; };
 #define TRIM_HIST 64
 struct Clip {
@@ -1990,7 +1997,7 @@ static void LoadSettings()
         wsprintfW(key, L"pad%d_volume", i + 1); gPads[i].vol = Iclamp(INI_INT(key, 100), 0, 200);
     }
     gRecSeconds = Iclamp(INI_INT(L"rec_seconds", 15), 3, REC_MAX_S);
-    gRecSource  = Iclamp(INI_INT(L"rec_source", REC_BOTH), 0, 3);
+    gRecSource  = Iclamp(INI_INT(L"rec_source", REC_BOTH), 0, REC_N - 1);
     gClipMaster = Iclamp(INI_INT(L"clip_master", 100), 0, 200);
     for (int i = 0; i < CLIPS; i++) {
         wchar_t key[32];
@@ -3249,8 +3256,8 @@ static void ClipNow()                           // save the last N seconds as a 
     if (gRecSource == REC_OFF) { ShowOsd(L"Clip recording is off", false); return; }
     if (!gRunning)             { ShowOsd(L"Press Start to record clips", false); return; }
     const unsigned N = (unsigned)gRecSeconds * RATE;
-    const bool useV = gRecSource != REC_PC && gRecVoice.buf;
-    const bool useP = gRecSource != REC_VOICE && gRecRunning && gRecPc.buf;
+    const bool useV = RecHasVoice(gRecSource) && gRecVoice.buf;
+    const bool useP = RecHasOther(gRecSource) && gRecRunning && gRecPc.buf;
     // snapshot where each ring is (the audio threads keep writing behind us)
     const unsigned wv = gRecVoice.w, fv = gRecVoice.fill, wp = gRecPc.w, fp = gRecPc.fill;
     const unsigned nv = useV ? Min(N, fv) : 0, np = useP ? Min(N, fp) : 0;
@@ -3340,51 +3347,91 @@ static void RecRestart()                        // source changed or audio (re)s
     gRecVoice.fill = 0; gRecPc.fill = 0;
 }
 
-static void UpdateRecCapture()                  // every 50 ms: keep the PC-sound capture matching the settings
+// Discord runs as several Discord.exe processes; the first one started is the parent of the rest, so
+// recording its process tree gets everyone's voices (and Discord's own sounds) and nothing else.
+static DWORD FindDiscordPid()
+{
+    static ProcInfo procs[2048];
+    int n = SnapProcs(procs, 2048);
+    auto isDiscord = [](const wchar_t* exe) {
+        return !lstrcmpiW(exe, L"Discord.exe") || !lstrcmpiW(exe, L"DiscordPTB.exe") || !lstrcmpiW(exe, L"DiscordCanary.exe");
+    };
+    for (int i = 0; i < n; i++) {
+        if (!isDiscord(procs[i].exe)) continue;
+        bool parentIsDiscord = false;
+        for (int k = 0; k < n; k++)
+            if (procs[k].pid == procs[i].parent && isDiscord(procs[k].exe)) { parentIsDiscord = true; break; }
+        if (!parentIsDiscord) return procs[i].pid;
+    }
+    return 0;
+}
+
+static void UpdateRecCapture()                  // every 50 ms: keep the PC-sound / Discord capture matching the settings
 {
     static bool wasRunning = false;
-    static DWORD retryAt = 0;
+    static DWORD retryAt = 0, lastAlive = 0, target = 0;
+    static int targetSrc = -1;                  // which kind of capture is running (0 PC sound, 1 Discord)
+    static int fallbackRetries = 0;
     if (gRunning && !wasRunning) RecRestart();
     wasRunning = gRunning;
-    gRecVoiceOn = gRunning && (gRecSource == REC_BOTH || gRecSource == REC_VOICE);
-    bool want = gRunning && gCtxOk && (gRecSource == REC_BOTH || gRecSource == REC_PC);
-    if (gRecRunning && (!want || gRecLost)) {
+    gRecVoiceOn = gRunning && RecHasVoice(gRecSource);
+    const bool want = gRunning && gCtxOk && RecHasOther(gRecSource);
+    const bool discord = RecIsDiscord(gRecSource);
+    const DWORD now = GetTickCount();
+    if (gRecRunning && discord && now - lastAlive > 3000) {   // Discord closed or restarted? find it again
+        lastAlive = now;
+        if (!PidAlive(target)) gRecLost = true;
+    }
+    if (gRecRunning && (!want || gRecLost || targetSrc != (int)discord)) {
         RecDevStop();
         gRecRunning = false;
-        if (gRecLost) retryAt = GetTickCount() + 1000;
+        if (gRecLost) retryAt = now + 1000;
+        if (targetSrc != (int)discord) { gRecPc.fill = 0; retryAt = now; fallbackRetries = 0; }
     }
-    static int fallbackRetries = 0;
-    if (!want) { gRecPcState = 0; fallbackRetries = 0; return; }
+    if (!want) { gRecPcState = 0; fallbackRetries = 0; targetSrc = -1; return; }
+    if (targetSrc != (int)discord && !gRecRunning) retryAt = Min(retryAt, now);   // switched kind: start right away
     // Recording the whole output (state 2) also picks up Lag Effect itself: try leaving it out again a few times.
-    if (gRecRunning && gRecPcState == 2 && fallbackRetries < 3 && (int)(GetTickCount() - retryAt) >= 0) {
+    if (gRecRunning && !discord && gRecPcState == 2 && fallbackRetries < 3 && (int)(now - retryAt) >= 0) {
         fallbackRetries++;
         RecDevStop();
         gRecRunning = false;
         if (RecStartDevice(GetCurrentProcessId(), true)) { gRecPcState = 1; return; }
-        if (!RecStartDevice(0, false)) { gRecPcState = 3; retryAt = GetTickCount() + 5000; return; }
-        retryAt = GetTickCount() + 5000;
+        if (!RecStartDevice(0, false)) { gRecPcState = 3; retryAt = now + 5000; return; }
+        retryAt = now + 5000;
         return;
     }
-    if (gRecRunning || (int)(GetTickCount() - retryAt) < 0) return;
+    if (gRecRunning || (int)(now - retryAt) < 0) return;
     gRecPc.fill = 0;
+    targetSrc = discord;
+    if (discord) {                              // only Discord's sound: no speaker fallback (that would be everything)
+        target = FindDiscordPid();
+        lastAlive = now;
+        if (!target)                            { gRecPcState = 4; retryAt = now + 2000; }
+        else if (RecStartDevice(target, false)) gRecPcState = 1;
+        else                                    { gRecPcState = 3; retryAt = now + 5000; }
+        return;
+    }
     if (RecStartDevice(GetCurrentProcessId(), true)) gRecPcState = 1;
-    else if (RecStartDevice(0, false))               { gRecPcState = 2; retryAt = GetTickCount() + 5000; }   // the whole output
-    else { gRecPcState = 3; retryAt = GetTickCount() + 5000; }
+    else if (RecStartDevice(0, false))               { gRecPcState = 2; retryAt = now + 5000; }   // the whole output
+    else { gRecPcState = 3; retryAt = now + 5000; }
 }
 
 static void ClipTick()                          // every 50 ms
 {
     UpdateRecCapture();
     wchar_t t[256];
-    static const wchar_t* what[] = { L"your voice + PC sound", L"your voice", L"PC sound" };
+    static const wchar_t* what[REC_N] = { L"your voice + PC sound", L"your voice", L"PC sound", L"", L"Discord", L"your voice + Discord" };
+    const wchar_t* other = RecIsDiscord(gRecSource) ? L"Discord" : L"PC sound";
     if (gRecSource == REC_OFF)  lstrcpynW(t, L"Recording is off: pick what to record above.", 256);
     else if (!gRunning)         lstrcpynW(t, L"Audio is stopped: press Start on the Main tab to record clips.", 256);
-    else if (gRecSource != REC_VOICE && gRecPcState == 3)
-        lstrcpynW(t, gRecSource == REC_BOTH ? L"Couldn't record PC sound: clips will have your voice only."
-                                            : L"Couldn't record PC sound. Retrying...", 256);
+    else if (RecHasOther(gRecSource) && gRecPcState == 4)
+        lstrcpynW(t, RecHasVoice(gRecSource) ? L"Discord isn't open: clips will have your voice only until it is."
+                                             : L"Waiting for Discord to open...", 256);
+    else if (RecHasOther(gRecSource) && gRecPcState == 3)
+        wsprintfW(t, RecHasVoice(gRecSource) ? L"Couldn't record %s: clips will have your voice only." : L"Couldn't record %s. Retrying...", other);
     else {
         wsprintfW(t, L"Holding the last %d s of %s in memory. Nothing is saved until you clip.", gRecSeconds, what[gRecSource]);
-        if (gRecSource != REC_VOICE && gRecPcState == 2)
+        if (RecHasOther(gRecSource) && !RecIsDiscord(gRecSource) && gRecPcState == 2)
             wsprintfW(t, L"Holding the last %d s of %s in memory. Note: PC sound also includes Lag Effect's own output here.",
                       gRecSeconds, what[gRecSource]);
     }
@@ -3910,7 +3957,7 @@ static void AddTips()
     TipId(IDC_CLIPNOWKEY, L"A hotkey for Clip it, so you can clip from inside a game. Right-click to clear it.");
     TipId(IDC_RECSECS,    L"How many seconds each clip saves (3 to 60).");
     TipId(IDC_RECSRC,     L"What's kept for clips: your voice as Discord hears it, the sound playing on your PC (friends, game, music), "
-                          L"or both. It's only held in memory until you clip.");
+                          L"just Discord (your friends' voices, no game or music), or a mix. It's only held in memory until you clip.");
     TipId(IDC_CLIPMASTER, L"Volume of all the clips when they're played.");
     TipId(IDC_CLIPFOLDER, L"Open the folder where clips are saved as WAV files.");
     TipId(IDC_CLIPSTOP,   L"Stop every clip that's playing.");
@@ -4894,7 +4941,7 @@ static void ShowHelp()
         L"Drop sound files onto the 8 pads (or click Load), set hotkeys, and play them into Discord. "
         L"They play on every output that isn't Off; Mute mic and voice effects don't touch them.\n\n"
         L"CLIPS (INSTANT REPLAY)\n"
-        L"Lag Effect keeps the last few seconds of your voice and/or PC sound in memory. Press Clip it (or its hotkey) "
+        L"Lag Effect keeps the last few seconds of your voice, PC sound or just Discord (pick in Record) in memory. Press Clip it (or its hotkey) "
         L"to save them as a clip. Trim lets you listen back privately, cut the start and end, and undo. "
         L"Clips are saved as WAV files in %APPDATA%\\LagEffect\\Clips.\n\n"
         L"SHORTCUTS\n"
@@ -5354,9 +5401,12 @@ static void CreateUI()
     Ctl(L"STATIC", L"Record:", 0, 30, 126, 52, 20, -1);
     {
         HWND rs = Ctl(L"COMBOBOX", L"", COMBO, 84, 122, 170, 200, IDC_RECSRC);
-        const wchar_t* recNames[] = { L"Your voice + PC sound", L"Only your voice", L"Only PC sound", L"Off" };
-        for (const wchar_t* n : recNames) SendMessageW(rs, CB_ADDSTRING, 0, (LPARAM)n);
-        SendMessageW(rs, CB_SETCURSEL, gRecSource, 0);
+        int sel = 0;
+        for (int k = 0; k < REC_N; k++) {
+            SendMessageW(rs, CB_ADDSTRING, 0, (LPARAM)kRecNames[k]);
+            if (kRecOrder[k] == gRecSource) sel = k;
+        }
+        SendMessageW(rs, CB_SETCURSEL, sel, 0);
     }
     Ctl(L"STATIC", L"Volume:", 0, 266, 126, 52, 20, -1);
     Spin(IDC_CLIPMASTER, 320, 123, 64, 0, 200, gClipMaster);
@@ -5661,7 +5711,7 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_RECSRC) {
         if (code == CBN_SELCHANGE) {
-            gRecSource = Iclamp((int)SendDlgItemMessageW(gWnd, IDC_RECSRC, CB_GETCURSEL, 0, 0), 0, 3);
+            gRecSource = kRecOrder[Iclamp((int)SendDlgItemMessageW(gWnd, IDC_RECSRC, CB_GETCURSEL, 0, 0), 0, REC_N - 1)];
             RecRestart();
             ClipTick();
         }
