@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.17.0"
+#define APP_VERSION L"1.18.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -40,6 +40,7 @@
 #include <audioclient.h>                        // per-app sound capture (process loopback), done by hand
 #include <tlhelp32.h>                           // process names without opening the process (browsers' audio helpers)
 #include <commdlg.h>                            // "Audio file..." picker
+#include <sapi.h>                               // text to speech (Windows' own voices)
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -66,7 +67,7 @@ static int Iclamp(int v, int lo, int hi) { return Imax(lo, Imin(hi, v)); }
 
 // ======================= audio =======================
 #define RATE      48000
-#define HIST      (RATE * 2)                   // loops up to 2 seconds long
+#define HIST      (RATE * 4)                   // loops up to 2 s; Rewind / Repeat word look back further
 #define RING_SIZE 16384                        // per-output ring buffer (power of two)
 #define MAXGRAIN  (RATE * 40 / 1000)           // 40 ms grains for pitch/speed
 #define MAX_OUT   5                            // output rows
@@ -91,13 +92,20 @@ static double loopPos = 0, grainStart[2];
 static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
+// Random lag: the stutter fires by itself now and then. Rewind / Repeat word: hotkey requests to the audio thread.
+static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
+static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
 
 // ---- Soundboard: 8 pads of short clips, mixed into every output that isn't Off ----
 // Not recorded into the stutter loop, not run through the voice effects, not silenced by Mute mic.
 // The UI swaps clips in/out (data == nullptr while swapping); the audio thread only reads.
-#define PADS  8                                 // soundboard pads
+#define PADS  8                                 // soundboard pads on screen (one page)
+#define PAD_BANKS 4                             // pages A-D
+#define PAD_N (PADS * PAD_BANKS)                // every pad
 #define CLIPS 8                                 // instant-replay clips (Clips tab)
-#define SB_N  (PADS + CLIPS)                    // both share one mixer: pads first, then clips
+#define CLIP0 PAD_N                             // where clips start in gPads
+#define TTS_SLOT (CLIP0 + CLIPS)                // text-to-speech plays in this slot
+#define SB_N  (TTS_SLOT + 1)                    // all share one mixer: pads, clips, then text-to-speech
 struct Pad {
     short* volatile   data;                      // 48 kHz mono 16-bit
     volatile unsigned len;
@@ -113,14 +121,20 @@ template <class T> static inline T Max(T a, T b) { return a > b ? a : b; }
 static Pad gPads[SB_N];
 static HWND gTrimWnd = nullptr;                 // clip trim editor, while open
 static volatile int gPadMaster = 100, gClipMaster = 100;
+static volatile bool gPadsFx = false, gClipsFx = false;   // play through the voice effects (as if you said it)
+static int gPadBank = 0;                        // soundboard page on screen
+static inline int PadSlot(int row) { return gPadBank * PADS + row; }
 
-static inline float PadsMix()                    // audio thread: one output sample of all playing pads
-{
+static inline float PadsMix(float& viaFx)        // audio thread: one output sample of all playing pads
+{                                               // (viaFx gets the ones that go through the voice effects)
+    viaFx = 0;
     float sum = 0;
     const float padMaster = gPadMaster / 100.0f, clipMaster = gClipMaster / 100.0f;
     for (int i = 0; i < SB_N; i++) {
         Pad& p = gPads[i];
-        const float master = i < PADS ? padMaster : clipMaster;
+        const bool  isClip = i >= CLIP0 && i < CLIP0 + CLIPS;
+        const float master = isClip ? clipMaster : padMaster;
+        float& acc = (isClip ? gClipsFx : gPadsFx) ? viaFx : sum;
         short* d = p.data; unsigned n = p.len;
         if (p.stop) { p.stop = false; if (p.playing) { p.fade = 1.0f; p.fadePos = p.pos; } p.playing = false; }
         if (p.trigger) {                         // (re)start: fade the old play-through out, start fresh
@@ -131,14 +145,14 @@ static inline float PadsMix()                    // audio thread: one output sam
         if (!d || !n) { p.playing = false; p.fade = 0; continue; }
         const float g = p.vol / 100.0f * master * (1.0f / 32768.0f);
         if (p.fade > 0) {                         // the tail of a stopped / restarted play-through
-            if (p.fadePos < n) sum += d[p.fadePos++] * g * p.fade;
+            if (p.fadePos < n) acc += d[p.fadePos++] * g * p.fade;
             p.fade -= 1.0f / 240.0f;              // 5 ms
         }
         if (p.playing) {
             unsigned pos = p.pos;
             float env = pos < 48 ? pos / 48.0f : 1.0f;                       // 1 ms fade-in
             if (n - pos < 240) env *= (n - pos) / 240.0f;                    // 5 ms fade-out at the end
-            sum += d[pos] * g * env;
+            acc += d[pos] * g * env;
             if (++pos >= n) p.playing = false;
             p.pos = pos;
         }
@@ -1522,6 +1536,73 @@ static void FxMoreReset()
     memset(&gGl, 0, sizeof(gGl));
 }
 
+// ---- Rewind (your last ~2 s backwards, speeding up like a tape) and Repeat word ("word-word-word") ----
+enum { SP_NONE = 0, SP_REWIND, SP_REPEAT };
+static int    spMode = SP_NONE, spT = 0, spIdx = 0, spRep = 0, spReps = 0, spLen = 0;
+static double spPos = 0, spTravel = 0, spTotal = 0;
+static size_t spStart = 0;
+
+static void SpStartRewind()
+{
+    spMode = SP_REWIND; spT = 0; spTravel = 0;
+    spTotal = Iclamp(gRewindMs, 300, 3000) * (double)RATE / 1000.0;
+    spPos = (double)((wpos + HIST - 1) % HIST);
+}
+
+static void SpStartRepeat()                     // find the last word: the most recent burst of sound
+{
+    const int FR = RATE / 100, NF = 150;        // 10 ms frames, last 1.5 s
+    float rms[NF], peak = 0;
+    for (int k = 0; k < NF; k++) {              // frame k ends k frames before now
+        double e = 0;
+        for (int j = 0; j < FR; j++) { float v = hist[(wpos + HIST - (size_t)(k * FR + j + 1)) % HIST]; e += v * v; }
+        rms[k] = sqrtf((float)(e / FR));
+        if (rms[k] > peak) peak = rms[k];
+    }
+    const float thr = peak * 0.12f > 0.004f ? peak * 0.12f : 0.004f;
+    int newest = -1;
+    for (int k = 0; k < NF && newest < 0; k++) if (rms[k] > thr) newest = k;
+    if (newest < 0) return;                     // nothing said lately
+    int oldest = newest, quiet = 0;
+    for (int k = newest + 1; k < NF && k - newest < 70; k++) {   // back to the gap before it (or 0.7 s)
+        if (rms[k] > thr * 0.7f) { oldest = k; quiet = 0; } else if (++quiet >= 6) break;
+    }
+    int startBack = (oldest + 2) * FR, endBack = newest > 0 ? (newest - 1) * FR : 0;   // 10 ms either side
+    spLen = startBack - endBack;
+    if (spLen < RATE / 12) return;
+    spStart = (wpos + HIST - (size_t)startBack) % HIST;
+    spReps = Iclamp(gRepeatN, 1, 6);
+    while (spReps > 1 && startBack + spLen * spReps > HIST - RATE / 4) spReps--;   // stay inside the history
+    spMode = SP_REPEAT; spIdx = 0; spRep = 0;
+}
+
+static float SpSample()
+{
+    float v = 0;
+    if (spMode == SP_REWIND) {
+        double prog = spTravel / spTotal;
+        double speed = 1.0 + 2.5 * (prog < 0.3 ? prog / 0.3 : 1.0);   // speeds up, like a tape spinning faster
+        size_t i0 = (size_t)spPos; float t = (float)(spPos - (double)i0);
+        v = hist[i0 % HIST] * (1.0f - t) + hist[(i0 + HIST - 1) % HIST] * t;
+        spPos -= speed; if (spPos < 0) spPos += HIST;
+        spTravel += speed;
+        float env = spT < 240 ? spT / 240.0f : 1.0f;
+        double left = spTotal - spTravel;
+        if (left < 1440) env *= (float)(left > 0 ? left / 1440.0 : 0.0);
+        v *= env * 0.9f;
+        spT++;
+        if (spTravel >= spTotal) spMode = SP_NONE;
+    } else if (spMode == SP_REPEAT) {
+        v = hist[(spStart + (size_t)spIdx) % HIST];
+        int edge = 144;                         // 3 ms fades at each repeat
+        if (spIdx < edge) v *= spIdx / (float)edge; else if (spLen - spIdx < edge) v *= (spLen - spIdx) / (float)edge;
+        if (++spIdx >= spLen) { spIdx = 0; if (++spRep >= spReps) spMode = SP_NONE; }
+    }
+    return v;
+}
+
+static int randLeft = 0, randWait = 0, randLoopMs = 100;   // random lag state (audio thread)
+
 static void FxReset()                          // audio thread only
 {
     FxMoreReset();
@@ -1546,8 +1627,26 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     else             { toggled = false; active = down; }
     prevDown = down;
 
+    // Random lag: now and then the stutter fires by itself (a short random loop for a random time).
+    const bool keyActive = active;
+    bool randActive = false;
+    if (gRandLagOn) {
+        if (randLeft > 0) { randLeft -= (int)frames; randActive = true; }
+        else {
+            if (randWait <= 0) {                // next one in a random time, Every on average
+                float u = FxRand(), mean = (float)Iclamp(gRandLagSec, 2, 120);
+                float sec = -logf(1.0f - u * 0.98f) * mean;
+                if (sec < 1.0f) sec = 1.0f; if (sec > mean * 4) sec = mean * 4;
+                randWait = (int)(sec * RATE);
+            }
+            randWait -= (int)frames;
+            if (randWait <= 0) { randLeft = (int)(RATE * (0.25f + 0.9f * FxRand())); randLoopMs = 50 + (int)(200 * FxRand()); randActive = true; }
+        }
+    } else { randLeft = 0; randWait = 0; }
+    active = keyActive || randActive;
+
     if (active && !looping) {                  // freeze the most recent audio
-        size_t len = (size_t)gLoopMs * RATE / 1000;
+        size_t len = (size_t)(keyActive ? gLoopMs : randLoopMs) * RATE / 1000;
         if (len < 1) len = 1;
         if (len > (size_t)HIST) len = HIST;
         size_t start = (wpos + HIST - len) % HIST;
@@ -1568,6 +1667,9 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         looping = false;
     }
     gLooping = looping;
+    if (gRewindReq) { gRewindReq = false; if (!looping) SpStartRewind(); }
+    if (gRepeatReq) { gRepeatReq = false; if (!looping) SpStartRepeat(); }
+    if (looping) spMode = SP_NONE;
 
     int      mode[MAX_OUT];
     float    vol[MAX_OUT];
@@ -1639,6 +1741,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     float blockPeak = 0;
 
     for (ma_uint32 f = 0; f < frames; f++) {
+        float sbFx;
+        const float sb = PadsMix(sbFx);         // soundboard: every output that isn't Off (sbFx: through the effects)
         float s = in ? in[f] * boost : 0.0f;
         muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
         s *= muteGain;
@@ -1673,6 +1777,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s *= powf(10.0f, gdb / 20.0f);
         }
 
+        s += sbFx;                              // pads / clips set to play through the voice effects
         if (fxPitch) s = PitchShift(gPsFx, s, psRatio, psGrain, psMix);
         if (fxForm)  s = Formant(s, fmFactor, fmMix);
         if (fxVoc)   s = Vocoder(s);
@@ -1715,9 +1820,13 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             hist[wpos] = s;
             wpos = (wpos + 1) % HIST;
             everything = s;
+            if (spMode != SP_NONE) {            // Rewind / Repeat word play instead of your live voice
+                float v = SpSample();
+                effect = v;
+                everything = talk ? v + s * talkVol : v;
+            }
         }
 
-        const float sb = PadsMix();             // soundboard: every output that isn't Off
         if (gRecVoiceOn) RecPut(gRecVoice, everything + sb);   // instant replay: what Discord hears
         float o = Limit(0, (RowSignal(mode[0], effect, everything) + (mode[0] != MODE_OFF ? sb : 0.0f)) * vol[0]);
         out[f * 2] = o;
@@ -1771,6 +1880,9 @@ enum {
     IDC_CLIPNOW, IDC_CLIPNOWKEY, IDC_RECSECS, IDC_RECSRC, IDC_CLIPMASTER, IDC_CLIPFOLDER, IDC_CLIPSTOP, IDC_RECSTATUS, IDC_RADIOPRESET, IDC_RADIODESC,
     IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3,   // Voice FX sub-tabs: must stay consecutive
     IDC_FXCHAR, IDC_ECHOSTYLE, IDC_DISTSTYLE, IDC_CHOSTYLE, IDC_MUFSTYLE, IDC_FXORDER,
+    IDC_RANDLAG, IDC_RANDSEC, IDC_REWINDKEY, IDC_REPEATKEY,
+    IDC_PADBANK0, IDC_PADBANK1, IDC_PADBANK2, IDC_PADBANK3, IDC_PADBANKKEY, IDC_PADFX,   // bank buttons: consecutive
+    IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -1785,6 +1897,7 @@ enum {
 #define WM_UPDATE_DOWNLOAD (WM_APP + 4)
 #define WM_SONGFILE_LOADED (WM_APP + 5)
 #define WM_SHOW_ME         (WM_APP + 6)          // another copy was started: come to the front
+#define WM_TTS_DONE        (WM_APP + 7)          // text-to-speech finished rendering
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -2002,7 +2115,10 @@ static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
 #define SLOT_PAD0    (SLOT_MUTE + 1)             // then one per soundboard pad
 #define SLOT_CLIPNOW (SLOT_PAD0 + PADS)            // "Clip it"
 #define SLOT_CLIP0   (SLOT_CLIPNOW + 1)          // then one per clip
-#define KEY_SLOTS    (SLOT_CLIP0 + CLIPS)
+#define SLOT_REWIND  (SLOT_CLIP0 + CLIPS)        // Main tab extras
+#define SLOT_REPEAT  (SLOT_REWIND + 1)
+#define SLOT_PADBANK (SLOT_REPEAT + 1)           // soundboard: next page
+#define KEY_SLOTS    (SLOT_PADBANK + 1)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 
@@ -2387,6 +2503,9 @@ static const wchar_t* FxKeyIniName(int slot)
                                             L"pad5_hotkey", L"pad6_hotkey", L"pad7_hotkey", L"pad8_hotkey" };
     static const wchar_t* clipKeys[CLIPS] = { L"clip1_hotkey", L"clip2_hotkey", L"clip3_hotkey", L"clip4_hotkey",
                                               L"clip5_hotkey", L"clip6_hotkey", L"clip7_hotkey", L"clip8_hotkey" };
+    if (slot == SLOT_REWIND)  return L"rewind_hotkey";
+    if (slot == SLOT_REPEAT)  return L"repeat_word_hotkey";
+    if (slot == SLOT_PADBANK) return L"pad_page_hotkey";
     if (slot >= SLOT_CLIP0)  return clipKeys[slot - SLOT_CLIP0];
     if (slot == SLOT_CLIPNOW) return L"clip_now_hotkey";
     if (slot >= SLOT_PAD0) return padKeys[slot - SLOT_PAD0];
@@ -2398,7 +2517,9 @@ static wchar_t gSongApp[64] = L"";               // Vocode to song: app to take 
 static wchar_t gSongFile[MAX_PATH] = L"";        // ...or an audio file (used when gUseFile)
 static bool    gSongUseFile = false;
 static int     gVocSynthSaved = 100;             // Synth value of the other side: Song style keeps its own
-static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds, then clips
+static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds (4 pages), then clips
+static bool    gClipAutoTrim = true;             // cut silence off the ends of new clips
+static wchar_t gTtsVoice[128];                   // text-to-speech voice (its name; empty = Windows' default)
 static int     gRecSeconds = 15;                 // instant replay length
 // What clips keep. The numbers are saved in the settings file, so new ones go at the end.
 enum { REC_BOTH = 0, REC_VOICE = 1, REC_PC = 2, REC_OFF = 3, REC_DISCORD = 4, REC_VOICE_DISCORD = 5, REC_N };
@@ -2496,12 +2617,21 @@ static void LoadSettings()
     GetPrivateProfileStringW(L"settings", L"voc_song_file", L"", gSongFile, MAX_PATH, gIni);
     gSongUseFile = INI_INT(L"voc_song_use_file", 0) != 0 && gSongFile[0];
     gPadMaster = Iclamp(INI_INT(L"pad_master", 100), 0, 200);
-    for (int i = 0; i < PADS; i++) {
+    for (int i = 0; i < PAD_N; i++) {            // pad1-8 = page A, 9-16 = B, ...
         wchar_t key[32];
         wsprintfW(key, L"pad%d_file", i + 1);   GetPrivateProfileStringW(L"settings", key, L"", gPadFile[i], MAX_PATH, gIni);
         wsprintfW(key, L"pad%d_volume", i + 1); gPads[i].vol = Iclamp(INI_INT(key, 100), 0, 200);
     }
     gRecSeconds = Iclamp(INI_INT(L"rec_seconds", 15), 3, REC_MAX_S);
+    gPadBank      = Iclamp(INI_INT(L"pad_page", 0), 0, PAD_BANKS - 1);
+    gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
+    gClipsFx      = INI_INT(L"clips_through_fx", 0) != 0;
+    gClipAutoTrim = INI_INT(L"clip_auto_trim", 1) != 0;
+    gRandLagOn    = INI_INT(L"random_lag", 0) != 0;
+    gRandLagSec   = Iclamp(INI_INT(L"random_lag_every_s", 8), 2, 120);
+    gRewindMs     = Iclamp(INI_INT(L"rewind_ms", 2000), 300, 3000);
+    gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
+    GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
     gEchoStyle = Iclamp(INI_INT(L"fx_echo_style", 0), 0, ECHO_N - 1);
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
     gChoStyle  = Iclamp(INI_INT(L"fx_chorus_style", 0), 0, CHO_N - 1);
@@ -2511,8 +2641,8 @@ static void LoadSettings()
     gClipMaster = Iclamp(INI_INT(L"clip_master", 100), 0, 200);
     for (int i = 0; i < CLIPS; i++) {
         wchar_t key[32];
-        wsprintfW(key, L"clip%d_file", i + 1);   GetPrivateProfileStringW(L"settings", key, L"", gPadFile[PADS + i], MAX_PATH, gIni);
-        wsprintfW(key, L"clip%d_volume", i + 1); gPads[PADS + i].vol = Iclamp(INI_INT(key, 100), 0, 200);
+        wsprintfW(key, L"clip%d_file", i + 1);   GetPrivateProfileStringW(L"settings", key, L"", gPadFile[CLIP0 + i], MAX_PATH, gIni);
+        wsprintfW(key, L"clip%d_volume", i + 1); gPads[CLIP0 + i].vol = Iclamp(INI_INT(key, 100), 0, 200);
         wsprintfW(key, L"clip%d_start", i + 1);  gClips[i].pendTs = (unsigned)Iclamp(INI_INT(key, 0), 0, REC_LEN);
         wsprintfW(key, L"clip%d_end", i + 1);    gClips[i].pendTe = (unsigned)Iclamp(INI_INT(key, 0), 0, REC_LEN);
     }
@@ -2587,12 +2717,21 @@ static void SaveSettings()
     SaveInt(L"voc_song_use_file", gSongUseFile);
     SaveInt(L"voc_synth_other", gVocSynthSaved);
     SaveInt(L"pad_master", gPadMaster);
-    for (int i = 0; i < PADS; i++) {
+    for (int i = 0; i < PAD_N; i++) {
         wchar_t key[32];
         wsprintfW(key, L"pad%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[i], gIni);
         wsprintfW(key, L"pad%d_volume", i + 1); SaveInt(key, gPads[i].vol);
     }
     SaveInt(L"rec_seconds", gRecSeconds);
+    SaveInt(L"pad_page", gPadBank);
+    SaveInt(L"pads_through_fx", gPadsFx);
+    SaveInt(L"clips_through_fx", gClipsFx);
+    SaveInt(L"clip_auto_trim", gClipAutoTrim);
+    SaveInt(L"random_lag", gRandLagOn);
+    SaveInt(L"random_lag_every_s", gRandLagSec);
+    SaveInt(L"rewind_ms", gRewindMs);
+    SaveInt(L"repeat_word_times", gRepeatN);
+    WritePrivateProfileStringW(L"settings", L"tts_voice", gTtsVoice, gIni);
     SaveInt(L"fx_echo_style", gEchoStyle);
     SaveInt(L"fx_dist_style", gDistStyle);
     SaveInt(L"fx_chorus_style", gChoStyle);
@@ -2604,8 +2743,8 @@ static void SaveSettings()
         wchar_t key[32];
         const Clip& c = gClips[i];
         bool loaded = c.base != nullptr;
-        wsprintfW(key, L"clip%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[PADS + i], gIni);
-        wsprintfW(key, L"clip%d_volume", i + 1); SaveInt(key, gPads[PADS + i].vol);
+        wsprintfW(key, L"clip%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[CLIP0 + i], gIni);
+        wsprintfW(key, L"clip%d_volume", i + 1); SaveInt(key, gPads[CLIP0 + i].vol);
         wsprintfW(key, L"clip%d_start", i + 1);  SaveInt(key, (int)(loaded ? c.ts : c.pendTs));
         wsprintfW(key, L"clip%d_end", i + 1);    SaveInt(key, (int)(loaded ? (c.te >= c.baseLen ? 0 : c.te) : c.pendTe));
     }
@@ -3536,14 +3675,17 @@ static void PadSetData(int i, short* data, unsigned len)   // swap a pad's clip 
     InvalidateRect(GetDlgItem(gWnd, SbButtonId(i)), nullptr, FALSE);
 }
 
-static int SbButtonId(int s) { return s < PADS ? IDC_PADPLAY + s : IDC_CLIPPLAY + s - PADS; }
+static int SbButtonId(int s)                    // the play button showing slot s (pads: the row on screen)
+{
+    return s < PAD_N ? IDC_PADPLAY + s % PADS : s < CLIP0 + CLIPS ? IDC_CLIPPLAY + s - CLIP0 : 0;
+}
 static void ClipSetBase(int c, short* data, unsigned len);
 
 static void OnPadLoaded(SongFileJob* j)
 {
     int i = j->target;
-    if (j->ok && i >= PADS) {                   // a clip (imported, or last time's)
-        ClipSetBase(i - PADS, j->data, j->len);
+    if (j->ok && i >= CLIP0) {                  // a clip (imported, or last time's)
+        ClipSetBase(i - CLIP0, j->data, j->len);
         lstrcpynW(gPadFile[i], j->path, MAX_PATH);
     } else if (j->ok) {
         PadSetData(i, j->data, j->len);
@@ -3589,7 +3731,7 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
 {
     const bool clip = (int)d->CtlID >= IDC_CLIPPLAY;
     const int  shown = (int)d->CtlID - (clip ? IDC_CLIPPLAY : IDC_PADPLAY);   // 0..7 on its own tab
-    const int  i = clip ? PADS + shown : shown;                                // slot in gPads
+    const int  i = clip ? CLIP0 + shown : PadSlot(shown);                      // slot in gPads
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
@@ -3632,9 +3774,14 @@ static void PadTick()                           // every 50 ms: redraw pads that
     static bool was[SB_N];
     for (int i = 0; i < SB_N; i++) {
         bool now = gPads[i].playing;
-        if ((now || was[i]) && gPage == (i < PADS ? PAGE_SOUND : PAGE_CLIPS))
+        if ((now || was[i]) && i < TTS_SLOT && gPage == (i < PAD_N ? PAGE_SOUND : PAGE_CLIPS) && (i >= PAD_N || i / PADS == gPadBank))
             InvalidateRect(GetDlgItem(gWnd, SbButtonId(i)), nullptr, FALSE);
         was[i] = now;
+    }
+    static DWORD lastBankDraw = 0;
+    if (gPage == PAGE_SOUND && GetTickCount() - lastBankDraw > 200) {
+        lastBankDraw = GetTickCount();
+        for (int b = 0; b < PAD_BANKS; b++) InvalidateRect(GetDlgItem(gWnd, IDC_PADBANK0 + b), nullptr, FALSE);
     }
     ClipTick();
     static int lastRunning = -1;                // hint line: remind to press Start
@@ -3651,7 +3798,7 @@ static void OnDropFiles(HDROP drop)             // files dragged onto the window
 {
     POINT pt; DragQueryPoint(drop, &pt);
     const bool clips = gPage == PAGE_CLIPS;     // on the Clips tab files become clips, otherwise pads
-    const int  first = clips ? PADS : 0, count = clips ? CLIPS : PADS;
+    const int  first = clips ? CLIP0 : gPadBank * PADS, count = clips ? CLIPS : PADS;
     int target = -1;
     if (gPage == PAGE_SOUND || clips)
         for (int i = 0; i < count; i++) {       // dropped on a row?
@@ -3715,7 +3862,7 @@ static bool WriteWav(const wchar_t* path, const short* d, unsigned n)   // 48 kH
 
 static void ClipApply(int c)                    // play the trimmed part (after a trim change)
 {
-    Pad& p = gPads[PADS + c];
+    Pad& p = gPads[CLIP0 + c];
     Clip& k = gClips[c];
     p.stop = true;
     p.len = 0; p.data = nullptr;
@@ -3726,7 +3873,7 @@ static void ClipApply(int c)                    // play the trimmed part (after 
 
 static void ClipSetBase(int c, short* data, unsigned len)   // a new recording for a slot (or none)
 {
-    Pad& p = gPads[PADS + c];
+    Pad& p = gPads[CLIP0 + c];
     Clip& k = gClips[c];
     short* old = k.base;
     p.stop = true;
@@ -3752,7 +3899,7 @@ static bool InClipFolder(const wchar_t* path)
 
 static void ClipClear(int c)                    // remove from the board; our own recordings go to the Recycle Bin
 {
-    wchar_t* path = gPadFile[PADS + c];
+    wchar_t* path = gPadFile[CLIP0 + c];
     if (path[0] && InClipFolder(path) && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
         wchar_t from[MAX_PATH + 2] = {};        // double-null terminated
         lstrcpynW(from, path, MAX_PATH);
@@ -3766,6 +3913,31 @@ static void ClipClear(int c)                    // remove from the board; our ow
     gClips[c].pendTs = gClips[c].pendTe = 0;
     ClipSetBase(c, nullptr, 0);
     path[0] = 0;
+}
+
+// Where the sound is in a recording: from just before the first sound to just after the last (non-destructive trim).
+static bool FindSoundEnds(const short* d, unsigned n, unsigned* ts, unsigned* te)
+{
+    const unsigned FR = RATE / 100;             // 10 ms frames
+    unsigned frames = n / FR;
+    if (frames < 3) return false;
+    float peak = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        double e = 0; for (unsigned j = 0; j < FR; j++) { float v = d[f * FR + j] / 32768.0f; e += v * v; }
+        float r = sqrtf((float)(e / FR)); if (r > peak) peak = r;
+    }
+    float thr = peak * 0.06f > 0.003f ? peak * 0.06f : 0.003f;   // 24 dB under the loudest part, or -50 dBFS
+    int first = -1, last = -1;
+    for (unsigned f = 0; f < frames; f++) {
+        double e = 0; for (unsigned j = 0; j < FR; j++) { float v = d[f * FR + j] / 32768.0f; e += v * v; }
+        if (sqrtf((float)(e / FR)) > thr) { if (first < 0) first = (int)f; last = (int)f; }
+    }
+    if (first < 0) return false;
+    long long a = (long long)first * FR - RATE * 12 / 100, b = (long long)(last + 1) * FR + RATE / 5;   // keep 120 ms before, 200 ms after
+    if (a < 0) a = 0; if (b > n) b = n;
+    if (b - a < RATE / 10) return false;
+    *ts = (unsigned)a; *te = (unsigned)b;
+    return true;
 }
 
 static void ClipNow()                           // save the last N seconds as a clip
@@ -3808,13 +3980,15 @@ static void ClipNow()                           // save the last N seconds as a 
     bool saved = WriteWav(path, out, len);
 
     int slot = -1;
-    for (int c = 0; c < CLIPS && slot < 0; c++) if (!gClips[c].base && !gPadFile[PADS + c][0]) slot = c;
+    for (int c = 0; c < CLIPS && slot < 0; c++) if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c;
     wchar_t msg[64];
     if (slot >= 0) {
         gClips[slot].pendTs = gClips[slot].pendTe = 0;
+        unsigned a, b;                          // Auto-trim: start where the sound starts (Reset in Trim undoes it)
+        if (gClipAutoTrim && FindSoundEnds(out, len, &a, &b)) { gClips[slot].pendTs = a; gClips[slot].pendTe = b >= len ? 0 : b; }
         ClipSetBase(slot, out, len);
-        if (saved) lstrcpynW(gPadFile[PADS + slot], path, MAX_PATH);
-        else       wsprintfW(gPadFile[PADS + slot], L"%s\\Clip %02d.%02d.%02d (not saved)", gClipDir, t.wHour, t.wMinute, t.wSecond);
+        if (saved) lstrcpynW(gPadFile[CLIP0 + slot], path, MAX_PATH);
+        else       wsprintfW(gPadFile[CLIP0 + slot], L"%s\\Clip %02d.%02d.%02d (not saved)", gClipDir, t.wHour, t.wMinute, t.wSecond);
         wsprintfW(msg, L"Clipped the last %d s", (len + RATE / 2) / RATE);
     } else {
         HeapFree(GetProcessHeap(), 0, out);
@@ -3968,11 +4142,11 @@ static void ClipBrowse(int c)                   // import a sound file into an e
     o.nMaxFile    = MAX_PATH;
     o.lpstrTitle  = L"Pick a sound for this clip slot";
     o.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
-    if (GetOpenFileNameW(&o)) { gClips[c].pendTs = gClips[c].pendTe = 0; PadLoad(PADS + c, path); }
+    if (GetOpenFileNameW(&o)) { gClips[c].pendTs = gClips[c].pendTe = 0; PadLoad(CLIP0 + c, path); }
 }
 
 // ---------------- trim editor: waveform, listen back privately, undo ----------------
-enum { IDT_WAVE = 101, IDT_PLAY, IDT_UNDO, IDT_REDO, IDT_RESET, IDT_EXPORT, IDT_DONE, IDT_INFO, IDT_NAME, IDT_HINT, IDT_NAMELBL };
+enum { IDT_WAVE = 101, IDT_PLAY, IDT_UNDO, IDT_REDO, IDT_RESET, IDT_EXPORT, IDT_DONE, IDT_INFO, IDT_NAME, IDT_HINT, IDT_NAMELBL, IDT_AUTO };
 #define TRIM_W     620
 #define TRIM_H     292
 #define WAVE_X     16
@@ -4022,7 +4196,7 @@ static void PrevStart()
     const Clip& k = gClips[gTrimClip];
     if (!gCtxOk || !k.base) return;
     gPrevData = k.base; gPrevPos = k.ts; gPrevEnd = k.te;
-    gPrevGain = gPads[PADS + gTrimClip].vol / 100.0f;
+    gPrevGain = gPads[CLIP0 + gTrimClip].vol / 100.0f;
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = 2;
@@ -4129,7 +4303,7 @@ static void TrimExport()                        // save just the trimmed part as
 
 static void TrimRename()                        // the Name box renames the clip's file
 {
-    int i = PADS + gTrimClip;
+    int i = CLIP0 + gTrimClip;
     wchar_t name[MAX_PATH];
     GetDlgItemTextW(gTrimWnd, IDT_NAME, name, MAX_PATH - 8);
     for (wchar_t* q = name; *q; q++) if (wcschr(L"\\/:*?\"<>|", *q)) *q = L'_';
@@ -4268,6 +4442,16 @@ static LRESULT CALLBACK TrimProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case IDT_UNDO:   TrimUndo(false); break;
         case IDT_REDO:   TrimUndo(true); break;
         case IDT_RESET:  TrimReset(); break;
+        case IDT_AUTO: {                        // trim the silence off both ends (undoable)
+            Clip& k = gClips[gTrimClip];
+            unsigned a, b;
+            if (FindSoundEnds(k.base, k.baseLen, &a, &b) && (a != k.ts || b != k.te)) {
+                TrimPushUndo(gTrimClip, { k.ts, k.te });
+                k.ts = a; k.te = b; gTrimLastNudge = 0;
+                TrimChanged();
+            }
+            break;
+        }
         case IDT_EXPORT: TrimExport(); break;
         case IDT_DONE: case IDCANCEL: TrimClose(); break;
         }
@@ -4338,19 +4522,20 @@ static void OpenTrim(int c)
         SendMessageW(c2, WM_SETFONT, (WPARAM)gFont, TRUE);
         return c2;
     };
-    PadName(PADS + c, gTrimOrigName, MAX_PATH);
+    PadName(CLIP0 + c, gTrimOrigName, MAX_PATH);
     mk(L"STATIC", L"Name:", 0, 16, 18, 44, 20, IDT_NAMELBL);
     HWND nm = mk(L"EDIT", gTrimOrigName, WS_TABSTOP | ES_AUTOHSCROLL, 62, 15, 300, 23, IDT_NAME, WS_EX_CLIENTEDGE);
     SendMessageW(nm, EM_LIMITTEXT, 120, 0);
-    if (!InClipFolder(gPadFile[PADS + c])) SendMessageW(nm, EM_SETREADONLY, TRUE, 0);   // an imported file: leave its name alone
+    if (!InClipFolder(gPadFile[CLIP0 + c])) SendMessageW(nm, EM_SETREADONLY, TRUE, 0);   // an imported file: leave its name alone
     mk(L"LagWave", L"", WS_TABSTOP, WAVE_X, WAVE_Y, WAVE_W, WAVE_H, IDT_WAVE);
     mk(L"STATIC", L"", SS_CENTER, 16, 190, WAVE_W, 20, IDT_INFO);
-    mk(L"BUTTON", L"\x25B6  Listen", WS_TABSTOP, 16, 218, 96, 30, IDT_PLAY);
-    mk(L"BUTTON", L"Undo", WS_TABSTOP, 120, 218, 80, 30, IDT_UNDO);
-    mk(L"BUTTON", L"Redo", WS_TABSTOP, 206, 218, 80, 30, IDT_REDO);
-    mk(L"BUTTON", L"Reset", WS_TABSTOP, 292, 218, 80, 30, IDT_RESET);
-    mk(L"BUTTON", L"Export...", WS_TABSTOP, 400, 218, 96, 30, IDT_EXPORT);
-    mk(L"BUTTON", L"Done", WS_TABSTOP | BS_DEFPUSHBUTTON, 508, 218, 96, 30, IDT_DONE);
+    mk(L"BUTTON", L"\x25B6  Listen", WS_TABSTOP, 16, 218, 92, 30, IDT_PLAY);
+    mk(L"BUTTON", L"Undo", WS_TABSTOP, 114, 218, 68, 30, IDT_UNDO);
+    mk(L"BUTTON", L"Redo", WS_TABSTOP, 188, 218, 68, 30, IDT_REDO);
+    mk(L"BUTTON", L"Reset", WS_TABSTOP, 262, 218, 68, 30, IDT_RESET);
+    mk(L"BUTTON", L"Cut silence", WS_TABSTOP, 336, 218, 92, 30, IDT_AUTO);
+    mk(L"BUTTON", L"Export...", WS_TABSTOP, 434, 218, 80, 30, IDT_EXPORT);
+    mk(L"BUTTON", L"Done", WS_TABSTOP | BS_DEFPUSHBUTTON, 520, 218, 84, 30, IDT_DONE);
     mk(L"STATIC", L"Drag the edges to trim. Listen plays only to you. Space plays, Ctrl+Z undoes, arrows nudge the edge. "
                   L"The full recording is always kept, so Reset brings it all back.", 0, 16, 254, WAVE_W, 34, IDT_HINT);
     ThemeTitleBar(gTrimWnd);
@@ -4360,6 +4545,166 @@ static void OpenTrim(int c)
     SetTimer(gTrimWnd, 1, 30, nullptr);
     ShowWindow(gTrimWnd, SW_SHOW);
     SetFocus(GetDlgItem(gTrimWnd, IDT_WAVE));
+}
+
+// ======================= soundboard pages =======================
+static void SetPadBank(int b)
+{
+    gPadBank = Iclamp(b, 0, PAD_BANKS - 1);
+    for (int i = 0; i < PADS; i++) {            // show this page's volumes (the box writes back the same value)
+        SetDlgItemInt(gWnd, IDC_PADVOL + i, (UINT)gPads[PadSlot(i)].vol, FALSE);
+        InvalidateRect(GetDlgItem(gWnd, IDC_PADPLAY + i), nullptr, FALSE);
+    }
+    for (int i = 0; i < PAD_BANKS; i++) InvalidateRect(GetDlgItem(gWnd, IDC_PADBANK0 + i), nullptr, FALSE);
+}
+
+static void DrawPadBank(DRAWITEMSTRUCT* d)      // page button: A-D, filled when showing, dot if it has sounds
+{
+    int b = (int)d->CtlID - IDC_PADBANK0;
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    bool active = b == gPadBank, any = false, playing = false;
+    for (int i = 0; i < PADS; i++) { any |= gPads[b * PADS + i].data != nullptr; playing |= gPads[b * PADS + i].playing; }
+    HBRUSH br = CreateSolidBrush(active ? ACCENT : gDark ? DK_CTL : LT_CARD);
+    HPEN   pn = CreatePen(PS_SOLID, 1, active || playing ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
+    HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pn);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 12, 12);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
+    wchar_t t[8]; wsprintfW(t, any ? L"%c \x2022" : L"%c", L'A' + b);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, active ? RGB(255, 255, 255) : gDark ? DK_TEXT : RGB(40, 40, 40));
+    HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
+    DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, of);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) { RECT fr = rc; InflateRect(&fr, -3, -3); DrawFocusRect(dc, &fr); }
+}
+
+// ======================= text to speech (Windows voices, SAPI) =======================
+// The line is rendered to 48 kHz audio in the background, then played like a pad (and through the
+// voice effects if the soundboard is set to). Voices: the classic SAPI list plus the newer OneCore ones.
+static const GUID kCLSID_SpVoice   = { 0x96749377, 0x3391, 0x11D2, { 0x9E, 0xE3, 0x00, 0xC0, 0x4F, 0x79, 0x73, 0x96 } };
+static const GUID kIID_ISpVoice    = { 0x6C44DF74, 0x72B9, 0x4992, { 0xA1, 0xEC, 0xEF, 0x99, 0x6E, 0x04, 0x22, 0xD4 } };
+static const GUID kCLSID_SpStream  = { 0x715D9C59, 0x4442, 0x11D2, { 0x96, 0x05, 0x00, 0xC0, 0x4F, 0x8E, 0xE6, 0x28 } };
+static const GUID kIID_ISpStream   = { 0x12E3CCA9, 0x7518, 0x44C5, { 0xA5, 0xE7, 0xBA, 0x5A, 0x79, 0xCB, 0x92, 0x9E } };
+static const GUID kSPDFID_WaveFormatEx = { 0xC31ADBAE, 0x527F, 0x4FF5, { 0xA2, 0x30, 0xF6, 0x2B, 0xB6, 0x1F, 0xF7, 0x0C } };
+static const GUID kCLSID_SpObjectTokenCategory = { 0xA910187F, 0x0C7A, 0x45AC, { 0x92, 0xCC, 0x59, 0xED, 0xAF, 0xB7, 0x7B, 0x53 } };
+static const GUID kIID_ISpObjectTokenCategory  = { 0x2D3D3845, 0x39AF, 0x4850, { 0xBB, 0xF9, 0x40, 0xB4, 0x97, 0x80, 0x01, 0x1D } };
+static const GUID kCLSID_SpObjectToken = { 0xEF411752, 0x3736, 0x4CB4, { 0x9C, 0x8C, 0x8E, 0xF4, 0xCC, 0xB5, 0x8E, 0xFE } };
+static const GUID kIID_ISpObjectToken  = { 0x14056589, 0xE16C, 0x11D2, { 0xBB, 0x90, 0x00, 0xC0, 0x4F, 0x8E, 0xE6, 0xC0 } };
+
+#define TTS_MAX_VOICES 32
+static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][256];
+static int     gTtsCount = 0;
+static volatile LONG gTtsBusy = 0;
+
+static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI thread)
+{
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED); // usually already done by the audio library; harmless if so
+    gTtsCount = 0;
+    static const wchar_t* cats[] = { L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices",
+                                     L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices" };
+    for (const wchar_t* catId : cats) {
+        ISpObjectTokenCategory* cat = nullptr;
+        if (FAILED(CoCreateInstance(kCLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL, kIID_ISpObjectTokenCategory, (void**)&cat))) continue;
+        IEnumSpObjectTokens* en = nullptr;
+        if (SUCCEEDED(cat->SetId(catId, FALSE)) && SUCCEEDED(cat->EnumTokens(nullptr, nullptr, &en)) && en) {
+            ISpObjectToken* tok = nullptr;
+            while (gTtsCount < TTS_MAX_VOICES && en->Next(1, &tok, nullptr) == S_OK) {
+                LPWSTR id = nullptr, name = nullptr;
+                if (SUCCEEDED(tok->GetId(&id)) && SUCCEEDED(tok->GetStringValue(nullptr, &name)) && name) {
+                    bool dup = false;
+                    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsNames[i], name)) dup = true;
+                    if (!dup) { lstrcpynW(gTtsNames[gTtsCount], name, 128); lstrcpynW(gTtsIds[gTtsCount], id, 256); gTtsCount++; }
+                }
+                if (id) CoTaskMemFree(id);
+                if (name) CoTaskMemFree(name);
+                tok->Release();
+            }
+            en->Release();
+        }
+        cat->Release();
+    }
+}
+
+struct TtsJob { wchar_t text[600]; wchar_t voice[256]; short* data; unsigned len; bool ok; };
+
+static bool TtsRender(TtsJob* j, bool useVoice)
+{
+    bool ok = false;
+    ISpVoice* v = nullptr; ISpStream* ss = nullptr; IStream* mem = nullptr;
+    if (FAILED(CoCreateInstance(kCLSID_SpVoice, nullptr, CLSCTX_ALL, kIID_ISpVoice, (void**)&v))) return false;
+    if (useVoice && j->voice[0]) {
+        ISpObjectToken* tok = nullptr;
+        if (SUCCEEDED(CoCreateInstance(kCLSID_SpObjectToken, nullptr, CLSCTX_ALL, kIID_ISpObjectToken, (void**)&tok))) {
+            if (SUCCEEDED(tok->SetId(nullptr, j->voice, FALSE))) v->SetVoice(tok);
+            tok->Release();
+        }
+    }
+    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0 };
+    if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &mem)) &&
+        SUCCEEDED(CoCreateInstance(kCLSID_SpStream, nullptr, CLSCTX_ALL, kIID_ISpStream, (void**)&ss)) &&
+        SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
+        SUCCEEDED(v->SetOutput(ss, TRUE)) &&
+        SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
+        STATSTG st = {};
+        HGLOBAL hg = nullptr;
+        if (SUCCEEDED(mem->Stat(&st, STATFLAG_NONAME)) && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
+            unsigned n = (unsigned)(st.cbSize.QuadPart / 2);
+            if (n > (unsigned)RATE * 60) n = RATE * 60;
+            const short* src = (const short*)GlobalLock(hg);
+            if (src && n > RATE / 20) {
+                j->data = (short*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(short));
+                if (j->data) { memcpy(j->data, src, n * sizeof(short)); j->len = n; ok = true; }
+            }
+            if (src) GlobalUnlock(hg);
+        }
+    }
+    if (ss) { ss->Close(); ss->Release(); }
+    if (mem) mem->Release();
+    v->Release();
+    return ok;
+}
+
+static DWORD WINAPI TtsThread(LPVOID arg)
+{
+    TtsJob* j = (TtsJob*)arg;
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    CoUninitialize();
+    PostMessageW(gWnd, WM_TTS_DONE, 0, (LPARAM)j);
+    return 0;
+}
+
+static void TtsSpeak()
+{
+    wchar_t text[600];
+    GetDlgItemTextW(gWnd, IDC_TTSTEXT, text, 600);
+    bool any = false; for (wchar_t* q = text; *q; q++) if (*q > L' ') any = true;
+    if (!any || InterlockedCompareExchange(&gTtsBusy, 1, 0) != 0) return;
+    TtsJob* j = (TtsJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TtsJob));
+    if (!j) { gTtsBusy = 0; return; }
+    lstrcpynW(j->text, text, 600);
+    int sel = (int)SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_GETCURSEL, 0, 0);
+    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 256);
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
+    HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
+    if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
+}
+
+static void OnTtsDone(TtsJob* j)
+{
+    if (j->ok) {
+        PadSetData(TTS_SLOT, j->data, j->len);
+        gPads[TTS_SLOT].vol = 100;
+        gPads[TTS_SLOT].trigger = true;
+    } else {
+        MessageBoxW(gWnd, L"Windows couldn't speak that. Check that a voice is installed "
+                          L"(Settings > Time & language > Speech).", L"Lag Effect - Text to speech", MB_ICONWARNING);
+    }
+    HeapFree(GetProcessHeap(), 0, j);
+    gTtsBusy = 0;
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak");
 }
 
 // ======================= tooltips =======================
@@ -4518,7 +4863,23 @@ static void AddTips()
         TipId(IDC_PADLOAD + i, L"Pick an MP3, WAV or FLAC file for this pad (up to 60 seconds are used).");
         TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
     }
-    TipId(IDC_PADMASTER, L"Volume of the whole soundboard.");
+    TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
+    for (int b = 0; b < PAD_BANKS; b++) TipId(IDC_PADBANK0 + b, L"Soundboard pages: 8 pads each. The dot means the page has sounds. "
+                                                                L"Pad hotkeys play the pad in that spot on whichever page is showing.");
+    TipId(IDC_PADBANKKEY, L"A hotkey that flips to the next soundboard page (A > B > C > D > A). Right-click to clear it.");
+    TipId(IDC_PADFX,      L"Pads and text to speech go through your voice effects first, as if you said them: "
+                          L"a robot or demon soundboard. Off: they play clean.");
+    TipId(IDC_TTSTEXT,    L"Type a line and press Enter (or Speak): Windows says it into Discord and your outputs.");
+    TipId(IDC_TTSVOICE,   L"Which Windows voice speaks. More voices: Windows Settings > Time & language > Speech > Add voices.");
+    TipId(IDC_TTSSPEAK,   L"Say the text. It plays like a pad, at the soundboard volume.");
+    TipId(IDC_CLIPAUTOTRIM, L"New clips start just before the first sound and end just after the last, so there's no dead air. "
+                            L"The whole recording is kept: Reset in Trim brings it back.");
+    TipId(IDC_CLIPFX,     L"Clips go through your voice effects when played, e.g. a robot-ified clip. Off: they play as recorded.");
+    TipId(IDC_RANDLAG,    L"The stutter fires by itself now and then, with random loop lengths, so it sounds like really bad internet "
+                          L"without you touching the key.");
+    TipId(IDC_RANDSEC,    L"How often random lag happens, on average (in seconds).");
+    TipId(IDC_REWINDKEY,  L"A hotkey that plays your last 2 seconds backwards, speeding up like a tape rewinding. Right-click to clear it.");
+    TipId(IDC_REPEATKEY,  L"A hotkey that repeats the last word you said 3 times, DJ style: \"word-word-word\". Right-click to clear it.");
     TipId(IDC_PADSTOP,   L"Stop every pad and clip that's playing.");
 
     // Main
@@ -4810,6 +5171,7 @@ static void OsdTick()                           // shows ~1.1 s, then fades out 
 }
 
 static void ClipNow();
+static void SetPadBank(int b);
 static void PollFxKeys()
 {
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
@@ -4817,9 +5179,17 @@ static void PollFxKeys()
         bool pressed = down && !gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
         if (!pressed) continue;
-        if (slot >= SLOT_CLIP0)   { gPads[PADS + slot - SLOT_CLIP0].trigger = true; continue; }   // a clip
+        if (slot == SLOT_REWIND)  { if (gRunning) gRewindReq = true; continue; }
+        if (slot == SLOT_REPEAT)  { if (gRunning) gRepeatReq = true; continue; }
+        if (slot == SLOT_PADBANK) {
+            SetPadBank((gPadBank + 1) % PAD_BANKS);
+            wchar_t m[48]; wsprintfW(m, L"Soundboard page %c", L'A' + gPadBank);
+            ShowOsd(m, true);
+            continue;
+        }
+        if (slot >= SLOT_CLIP0)   { gPads[CLIP0 + slot - SLOT_CLIP0].trigger = true; continue; }   // a clip
         if (slot == SLOT_CLIPNOW) { ClipNow(); continue; }                                       // save the last N s
-        if (slot >= SLOT_PAD0)    { gPads[slot - SLOT_PAD0].trigger = true; continue; }           // soundboard pad
+        if (slot >= SLOT_PAD0)    { gPads[PadSlot(slot - SLOT_PAD0)].trigger = true; continue; }  // pad on this page
         wchar_t msg[64];
         bool on;
         if (slot == SLOT_MUTE) {
@@ -5616,9 +5986,13 @@ static void ShowHelp()
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Sharing your whole screen in Discord? Tick Settings > Hide from screen share, or people hear you twice.\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
+        L"LAG EXTRAS (Main tab)\n"
+        L"Random lag fires the stutter by itself now and then. Rewind plays your last 2 seconds backwards like a tape. "
+        L"Repeat word plays the last word you said 3 times. (Change the 2 s / 3 times in the settings file: rewind_ms, repeat_word_times.)\n\n"
         L"SOUNDBOARD\n"
         L"Drop sound files onto the 8 pads (or click Load), set hotkeys, and play them into Discord. "
-        L"They play on every output that isn't Off; Mute mic and voice effects don't touch them.\n\n"
+        L"They play on every output that isn't Off; Mute mic doesn't touch them. Pages A-D give you 32 pads (a hotkey flips pages). "
+        L"Tick \"Play through my voice effects\" for a robot or demon soundboard. Text to speech: type a line, press Enter.\n\n"
         L"CLIPS (INSTANT REPLAY)\n"
         L"Lag Effect keeps the last few seconds of your voice, PC sound or just Discord (pick in Record) in memory. Press Clip it (or its hotkey) "
         L"to save them as a clip. Trim lets you listen back privately, cut the start and end, and undo. "
@@ -5639,12 +6013,19 @@ static int           gCapButton = IDC_HOTKEY;  // button that shows it
 
 static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 {
-    ComboName(gFxKeys[slot], MAX_KEYS, buf, cap);
-    if (!buf[0]) lstrcpynW(buf, L"Set hotkey", cap);
+    wchar_t k[100];
+    ComboName(gFxKeys[slot], MAX_KEYS, k, 100);
+    if (!k[0]) lstrcpynW(k, L"Set hotkey", 100);
+    const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
+                       : slot == SLOT_PADBANK ? L"Next page: " : L"";
+    wsprintfW(buf, L"%s%s", pre, k);
 }
 
 static int FxKeyButtonId(int slot)
 {
+    if (slot == SLOT_REWIND)  return IDC_REWINDKEY;
+    if (slot == SLOT_REPEAT)  return IDC_REPEATKEY;
+    if (slot == SLOT_PADBANK) return IDC_PADBANKKEY;
     if (slot >= SLOT_CLIP0)   return IDC_CLIPKEY + slot - SLOT_CLIP0;
     if (slot == SLOT_CLIPNOW) return IDC_CLIPNOWKEY;
     if (slot >= SLOT_PAD0) return IDC_PADKEY + slot - SLOT_PAD0;
@@ -5912,23 +6293,30 @@ static void CreateUI()
     Spin(IDC_FADE, 392, 290, 76, 0, 50, gFadeMs);
     Ctl(L"STATIC", L"ms", 0, 474, 293, 40, 20, -1);
 
-    Ctl(L"BUTTON", L"Noise gate", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 327, 104, 20, IDC_GATEON);
-    CheckDlgButton(gWnd, IDC_GATEON, gGateMode != GATE_OFF ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Threshold, AI noise suppression and more are on the Mic tab.", 0, 136, 328, 390, 18, IDC_HDR);
-
-    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 361, 250, 20, IDC_TALKON);
+    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 327, 250, 20, IDC_TALKON);
     CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Voice level:", 0, 290, 361, 100, 20, -1);
-    Spin(IDC_TALKVOL, 392, 358, 76, 0, 200, gTalkVolPct);
-    Ctl(L"STATIC", L"%", 0, 474, 361, 40, 20, -1);
+    Ctl(L"STATIC", L"Voice level:", 0, 290, 327, 100, 20, -1);
+    Spin(IDC_TALKVOL, 392, 324, 76, 0, 200, gTalkVolPct);
+    Ctl(L"STATIC", L"%", 0, 474, 327, 40, 20, -1);
 
-    // Hotkey
+    // the stutter hotkey (the noise gate switch moved to the Mic tab)
     wchar_t key[120]; HotkeyName(key, 120);
-    AddSection(14, 417, 532, 69, L"Hotkey");
-    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 440, 260, 30, IDC_HOTKEY);
-    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 310, 445, 80, 20, IDC_HOLD);
-    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 400, 445, 100, 20, IDC_TOGGLE);
+    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 356, 260, 30, IDC_HOTKEY);
+    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 310, 361, 80, 20, IDC_HOLD);
+    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 400, 361, 100, 20, IDC_TOGGLE);
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
+
+    // Extras: random lag, rewind, repeat word
+    AddSection(14, 417, 532, 69, L"Lag extras");
+    Ctl(L"BUTTON", L"Random lag, every ~", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 445, 140, 20, IDC_RANDLAG);
+    CheckDlgButton(gWnd, IDC_RANDLAG, gRandLagOn ? BST_CHECKED : BST_UNCHECKED);
+    Spin(IDC_RANDSEC, 172, 442, 54, 2, 120, gRandLagSec);
+    Ctl(L"STATIC", L"s", 0, 230, 445, 12, 20, -1);
+    {
+        wchar_t kn[120];
+        FxKeyButtonText(SLOT_REWIND, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 248, 440, 136, 30, IDC_REWINDKEY);
+        FxKeyButtonText(SLOT_REPEAT, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 390, 440, 140, 30, IDC_REPEATKEY);
+    }
 
     // Status + buttons
     gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
@@ -6080,31 +6468,58 @@ static void CreateUI()
     gBuildSub = -1;
 
     // ---------------- Soundboard page ----------------
+    // Pages A-D of 8 pads each, text to speech, and playback options.
     gBuildPage = PAGE_SOUND;
-    AddSection(14, 60, 532, 384, L"Pads");
-    Ctl(L"STATIC", L"Sound", 0, 30, 76, 120, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Volume %", 0, 212, 76, 70, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Hotkey", 0, 292, 76, 120, 16, IDC_HDR);
-    for (int i = 0; i < PADS; i++) {
-        int y = 96 + i * 42;
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 34, IDC_PADPLAY + i);
-        Spin(IDC_PADVOL + i, 212, y + 5, 70, 0, 200, gPads[i].vol);
-        wchar_t kn[120]; FxKeyButtonText(SLOT_PAD0 + i, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 3, 128, 28, IDC_PADKEY + i);
-        Ctl(L"BUTTON", L"Load...", WS_TABSTOP, 424, y + 3, 74, 28, IDC_PADLOAD + i);
-        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 3, 26, 28, IDC_PADCLR + i);
-        if (gPadFile[i][0]) PadLoad(i, gPadFile[i], true);   // reload last time's sounds, quietly
+    Ctl(L"STATIC", L"Page:", 0, 16, 63, 40, 20, -1);
+    for (int b2 = 0; b2 < PAD_BANKS; b2++)
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 58 + b2 * 48, 58, 44, 28, IDC_PADBANK0 + b2);
+    {
+        wchar_t kn[120]; FxKeyButtonText(SLOT_PADBANK, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP | WS_GROUP, 290, 58, 256, 28, IDC_PADBANKKEY);
     }
-    AddSection(14, 464, 532, 104, L"Playback");
-    Ctl(L"STATIC", L"Master volume:", 0, 30, 490, 110, 20, -1);
-    Spin(IDC_PADMASTER, 142, 487, 70, 0, 200, gPadMaster);
-    Ctl(L"STATIC", L"%", 0, 218, 490, 20, 20, -1);
-    Ctl(L"BUTTON", L"Stop all", WS_TABSTOP, 290, 484, 128, 28, IDC_PADSTOP);
-    Ctl(L"STATIC", L"", 0, 30, 522, 500, 36, IDC_PADHINT);
+    AddSection(14, 98, 532, 342, L"Pads");
+    Ctl(L"STATIC", L"Sound", 0, 30, 112, 120, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 212, 112, 70, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Hotkey", 0, 292, 112, 120, 16, IDC_HDR);
+    for (int i = 0; i < PADS; i++) {
+        int y = 130 + i * 38;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 32, IDC_PADPLAY + i);
+        Spin(IDC_PADVOL + i, 212, y + 4, 70, 0, 200, gPads[PadSlot(i)].vol);
+        wchar_t kn[120]; FxKeyButtonText(SLOT_PAD0 + i, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 2, 128, 28, IDC_PADKEY + i);
+        Ctl(L"BUTTON", L"Load...", WS_TABSTOP, 424, y + 2, 74, 28, IDC_PADLOAD + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 2, 26, 28, IDC_PADCLR + i);
+    }
+    for (int i = 0; i < PAD_N; i++)
+        if (gPadFile[i][0]) PadLoad(i, gPadFile[i], true);   // reload last time's sounds (every page), quietly
+    AddSection(14, 456, 532, 62, L"Text to speech");
+    {
+        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 478, 250, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
+        SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type something, press Enter");
+        SendMessageW(te, EM_LIMITTEXT, 500, 0);
+        HWND tv = Ctl(L"COMBOBOX", L"", COMBO, 286, 478, 140, 300, IDC_TTSVOICE);
+        SendMessageW(tv, CB_SETDROPPEDWIDTH, 280, 0);
+        TtsListVoices();
+        SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
+        int sel = 0;
+        for (int i = 0; i < gTtsCount; i++) {
+            SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsNames[i]);
+            if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1;
+        }
+        SendMessageW(tv, CB_SETCURSEL, sel, 0);
+        Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 476, 98, 28, IDC_TTSSPEAK);
+    }
+    AddSection(14, 532, 532, 50, L"Playback");
+    Ctl(L"STATIC", L"Volume:", 0, 30, 555, 56, 20, -1);
+    Spin(IDC_PADMASTER, 88, 552, 64, 0, 200, gPadMaster);
+    Ctl(L"STATIC", L"%", 0, 158, 555, 16, 20, -1);
+    Ctl(L"BUTTON", L"Play through my voice effects", BS_AUTOCHECKBOX | WS_TABSTOP, 186, 555, 220, 20, IDC_PADFX);
+    CheckDlgButton(gWnd, IDC_PADFX, gPadsFx ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Stop all", WS_TABSTOP, 424, 550, 106, 26, IDC_PADSTOP);
 
     // ---------------- Clips page ----------------
     gBuildPage = PAGE_CLIPS;
-    AddSection(14, 60, 532, 136, L"Instant replay");
+    AddSection(14, 60, 532, 166, L"Instant replay");
     Ctl(L"BUTTON", L"Clip it", WS_TABSTOP, 30, 82, 100, 30, IDC_CLIPNOW);
     {
         wchar_t kn[120]; FxKeyButtonText(SLOT_CLIPNOW, kn, 120);
@@ -6128,20 +6543,24 @@ static void CreateUI()
     Spin(IDC_CLIPMASTER, 320, 123, 64, 0, 200, gClipMaster);
     Ctl(L"STATIC", L"%", 0, 390, 126, 16, 20, -1);
     Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 424, 121, 106, 28, IDC_CLIPFOLDER);
-    Ctl(L"STATIC", L"", 0, 30, 157, 500, 34, IDC_RECSTATUS);
-    AddSection(14, 208, 532, 360, L"Clips");
-    Ctl(L"STATIC", L"Clip", 0, 30, 224, 120, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Volume %", 0, 212, 224, 70, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Hotkey", 0, 292, 224, 120, 16, IDC_HDR);
+    Ctl(L"STATIC", L"", 0, 30, 156, 500, 34, IDC_RECSTATUS);
+    Ctl(L"BUTTON", L"Cut silence off new clips", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 196, 190, 20, IDC_CLIPAUTOTRIM);
+    CheckDlgButton(gWnd, IDC_CLIPAUTOTRIM, gClipAutoTrim ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Play clips through my voice effects", BS_AUTOCHECKBOX | WS_TABSTOP, 236, 196, 260, 20, IDC_CLIPFX);
+    CheckDlgButton(gWnd, IDC_CLIPFX, gClipsFx ? BST_CHECKED : BST_UNCHECKED);
+    AddSection(14, 236, 532, 342, L"Clips");
+    Ctl(L"STATIC", L"Clip", 0, 30, 250, 120, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 212, 250, 70, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Hotkey", 0, 292, 250, 120, 16, IDC_HDR);
     for (int i = 0; i < CLIPS; i++) {
-        int y = 244 + i * 40;
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 34, IDC_CLIPPLAY + i);
-        Spin(IDC_CLIPVOL + i, 212, y + 5, 70, 0, 200, gPads[PADS + i].vol);
+        int y = 268 + i * 38;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 32, IDC_CLIPPLAY + i);
+        Spin(IDC_CLIPVOL + i, 212, y + 4, 70, 0, 200, gPads[CLIP0 + i].vol);
         wchar_t kn[120]; FxKeyButtonText(SLOT_CLIP0 + i, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 3, 128, 28, IDC_CLIPKEY + i);
-        Ctl(L"BUTTON", L"Trim...", WS_TABSTOP, 424, y + 3, 74, 28, IDC_CLIPTRIM + i);
-        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 3, 26, 28, IDC_CLIPCLR + i);
-        if (gPadFile[PADS + i][0]) PadLoad(PADS + i, gPadFile[PADS + i], true);   // last time's clips, quietly
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 2, 128, 28, IDC_CLIPKEY + i);
+        Ctl(L"BUTTON", L"Trim...", WS_TABSTOP, 424, y + 2, 74, 28, IDC_CLIPTRIM + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 2, 26, 28, IDC_CLIPCLR + i);
+        if (gPadFile[CLIP0 + i][0]) PadLoad(CLIP0 + i, gPadFile[CLIP0 + i], true);   // last time's clips, quietly
     }
 
     // ---------------- Settings page ----------------
@@ -6385,11 +6804,11 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) {
-        if (code == BN_CLICKED) { int i = id - IDC_PADPLAY; if (gPads[i].data) gPads[i].trigger = true; else PadBrowse(i); }
+        if (code == BN_CLICKED) { int i = PadSlot(id - IDC_PADPLAY); if (gPads[i].data) gPads[i].trigger = true; else PadBrowse(i); }
         return;
     }
-    if (id >= IDC_PADLOAD && id < IDC_PADLOAD + PADS) { if (code == BN_CLICKED) PadBrowse(id - IDC_PADLOAD); return; }
-    if (id >= IDC_PADCLR && id < IDC_PADCLR + PADS)   { if (code == BN_CLICKED) PadClear(id - IDC_PADCLR); return; }
+    if (id >= IDC_PADLOAD && id < IDC_PADLOAD + PADS) { if (code == BN_CLICKED) PadBrowse(PadSlot(id - IDC_PADLOAD)); return; }
+    if (id >= IDC_PADCLR && id < IDC_PADCLR + PADS)   { if (code == BN_CLICKED) PadClear(PadSlot(id - IDC_PADCLR)); return; }
     if (id >= IDC_PADKEY && id < IDC_PADKEY + PADS) {
         if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PAD0 + id - IDC_PADKEY], id);
         return;
@@ -6398,16 +6817,40 @@ static void OnCommand(int id, int code)
         id == IDC_PADMASTER || id == IDC_CLIPMASTER) {
         if (!gUiReady) return;
         volatile int* var = id == IDC_PADMASTER ? &gPadMaster : id == IDC_CLIPMASTER ? &gClipMaster
-                          : id >= IDC_CLIPVOL ? &gPads[PADS + id - IDC_CLIPVOL].vol : &gPads[id - IDC_PADVOL].vol;
+                          : id >= IDC_CLIPVOL ? &gPads[CLIP0 + id - IDC_CLIPVOL].vol : &gPads[PadSlot(id - IDC_PADVOL)].vol;
         BOOL ok = FALSE;
         int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
         if (code == EN_CHANGE && ok) *var = Iclamp(v, 0, 200);
         else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)*var, FALSE);
         return;
     }
+    if (id >= IDC_PADBANK0 && id < IDC_PADBANK0 + PAD_BANKS) { if (code == BN_CLICKED) SetPadBank(id - IDC_PADBANK0); return; }
+    if (id == IDC_PADBANKKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PADBANK], id); return; }
+    if (id == IDC_REWINDKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REWIND], id); return; }
+    if (id == IDC_REPEATKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REPEAT], id); return; }
+    if (id == IDC_RANDLAG)    { gRandLagOn = Checked(id); return; }
+    if (id == IDC_RANDSEC) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE;
+        int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v >= 2) gRandLagSec = Iclamp(v, 2, 120);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gRandLagSec, FALSE);
+        return;
+    }
+    if (id == IDC_PADFX)       { gPadsFx = Checked(id); return; }
+    if (id == IDC_CLIPFX)      { gClipsFx = Checked(id); return; }
+    if (id == IDC_CLIPAUTOTRIM){ gClipAutoTrim = Checked(id); return; }
+    if (id == IDC_TTSSPEAK)    { if (code == BN_CLICKED) TtsSpeak(); return; }
+    if (id == IDC_TTSVOICE) {
+        if (code == CBN_SELCHANGE) {
+            int sel = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            lstrcpynW(gTtsVoice, sel > 0 && sel - 1 < gTtsCount ? gTtsNames[sel - 1] : L"", 128);
+        }
+        return;
+    }
     if (id == IDC_PADSTOP) { if (code == BN_CLICKED) for (int i = 0; i < SB_N; i++) gPads[i].stop = true; return; }
     if (id >= IDC_CLIPPLAY && id < IDC_CLIPPLAY + CLIPS) {
-        if (code == BN_CLICKED) { int c = id - IDC_CLIPPLAY; if (gClips[c].base) gPads[PADS + c].trigger = true; else ClipBrowse(c); }
+        if (code == BN_CLICKED) { int c = id - IDC_CLIPPLAY; if (gClips[c].base) gPads[CLIP0 + c].trigger = true; else ClipBrowse(c); }
         return;
     }
     if (id >= IDC_CLIPTRIM && id < IDC_CLIPTRIM + CLIPS) {
@@ -6421,7 +6864,7 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_CLIPNOWKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_CLIPNOW], id); return; }
     if (id == IDC_CLIPNOW)    { if (code == BN_CLICKED) ClipNow(); return; }
-    if (id == IDC_CLIPSTOP)   { if (code == BN_CLICKED) for (int i = PADS; i < SB_N; i++) gPads[i].stop = true; return; }
+    if (id == IDC_CLIPSTOP)   { if (code == BN_CLICKED) for (int i = CLIP0; i < CLIP0 + CLIPS; i++) gPads[i].stop = true; return; }
     if (id == IDC_CLIPFOLDER) {
         if (code == BN_CLICKED) { ClipFolder(); ShellExecuteW(nullptr, L"open", gClipDir, nullptr, nullptr, SW_SHOWNORMAL); }
         return;
@@ -6657,6 +7100,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DROPFILES:
         OnDropFiles((HDROP)w);
         return 0;
+    case WM_TTS_DONE:
+        OnTtsDone((TtsJob*)l);
+        return 0;
     case WM_SHOW_ME:                            // someone opened Lag Effect again: show this one
         FromTray();
         return 0;
@@ -6684,6 +7130,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) { DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank((DRAWITEMSTRUCT*)l); return TRUE; }
         if ((w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) || (w >= IDC_CLIPPLAY && w < IDC_CLIPPLAY + CLIPS)) {
             DrawPadButton((DRAWITEMSTRUCT*)l); return TRUE;
         }
@@ -6699,10 +7146,13 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
         if (id == IDC_MUTEKEY) { ClearFxKey(SLOT_MUTE); return 0; }
         if (id >= IDC_PADKEY && id < IDC_PADKEY + PADS) { ClearFxKey(SLOT_PAD0 + id - IDC_PADKEY); return 0; }
-        if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) { gPads[id - IDC_PADPLAY].stop = true; return 0; }   // right-click: stop
+        if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) { gPads[PadSlot(id - IDC_PADPLAY)].stop = true; return 0; }   // right-click: stop
+        if (id == IDC_REWINDKEY)  { ClearFxKey(SLOT_REWIND); return 0; }
+        if (id == IDC_REPEATKEY)  { ClearFxKey(SLOT_REPEAT); return 0; }
+        if (id == IDC_PADBANKKEY) { ClearFxKey(SLOT_PADBANK); return 0; }
         if (id >= IDC_CLIPKEY && id < IDC_CLIPKEY + CLIPS) { ClearFxKey(SLOT_CLIP0 + id - IDC_CLIPKEY); return 0; }
         if (id == IDC_CLIPNOWKEY) { ClearFxKey(SLOT_CLIPNOW); return 0; }
-        if (id >= IDC_CLIPPLAY && id < IDC_CLIPPLAY + CLIPS) { gPads[PADS + id - IDC_CLIPPLAY].stop = true; return 0; }
+        if (id >= IDC_CLIPPLAY && id < IDC_CLIPPLAY + CLIPS) { gPads[CLIP0 + id - IDC_CLIPPLAY].stop = true; return 0; }
         break;
     }
     case WM_MEASUREITEM:
@@ -6870,6 +7320,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             continue;
         }
         if (TrimKey(&msg)) continue;
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && msg.hwnd == GetDlgItem(h, IDC_TTSTEXT)) {
+            TtsSpeak();                         // Enter in the text-to-speech box speaks it
+            continue;
+        }
         if (gTrimWnd && IsDialogMessageW(gTrimWnd, &msg)) continue;
         if (!IsDialogMessageW(h, &msg)) {
             TranslateMessage(&msg);
