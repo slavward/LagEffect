@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.26.0"
+#define APP_VERSION L"1.26.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -2320,7 +2320,7 @@ enum {
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
     IDC_HARMMUTE, IDC_HEARLBL, IDC_HEARON, IDC_FONTSIZE, IDC_LAYEDIT, IDC_LAYRESET, IDC_STKLIST, IDC_STKADD, IDC_STKDEL,
-    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT,
+    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT, IDC_PICPLACE,
     IDC_COLSW0 = 1400,                          // + colour slot (USERCOL_N): its own range
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
@@ -2338,6 +2338,8 @@ enum {
 #define WM_SONGFILE_LOADED (WM_APP + 5)
 #define WM_SHOW_ME         (WM_APP + 6)          // another copy was started: come to the front
 #define WM_TTS_DONE        (WM_APP + 7)          // text-to-speech finished rendering
+#define WM_PIC_DECODED     (WM_APP + 8)          // a picture / GIF finished decoding in the background
+#define WM_VOICE_INSTALLED (WM_APP + 9)          // Windows finished installing a text-to-speech voice
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -2752,7 +2754,7 @@ static HWND   gTip;                             // hover-help tooltip window (se
 // Each theme has an accent (knobs, switches, tabs, checkboxes) in a bright version for dark mode and a
 // deeper one for light mode, plus how strongly it tints the backgrounds. Add a row to add a theme.
 struct ColorTheme { const wchar_t* name; COLORREF dark, light; float tint; };
-static const ColorTheme COLOR_THEMES[] = {
+static ColorTheme COLOR_THEMES[] = {             // (not const: the last one, Custom, takes your colour)
     { L"Classic",  RGB(76, 160, 255),  RGB(0, 103, 192),   0.0f  },   // the original look: blue on neutral grey
     { L"Blue",     RGB(76, 160, 255),  RGB(0, 103, 192),   1.0f  },
     { L"Purple",   RGB(170, 128, 255), RGB(118, 70, 220),  1.0f  },
@@ -2775,9 +2777,18 @@ static const ColorTheme COLOR_THEMES[] = {
     { L"Sunset",   RGB(255, 120, 70),  RGB(200, 70, 30),   1.8f  },
     { L"Midnight", RGB(120, 140, 255), RGB(50, 60, 190),   2.4f  },
     { L"Mono",     RGB(235, 235, 235), RGB(30, 30, 30),    0.0f  },
+    { L"Midnight purple", RGB(165, 120, 255), RGB(78, 40, 168), 3.0f },
+    { L"Custom (hex)...", RGB(76, 160, 255), RGB(0, 103, 192), 1.0f },   // set from gCustomAccent
 };
 #define COLOR_THEME_N ((int)(sizeof(COLOR_THEMES) / sizeof(COLOR_THEMES[0])))
 static int gColorTheme = 0;
+static COLORREF gCustomAccent = RGB(255, 110, 190);   // the Custom theme's colour (typed as hex)
+static void CustomThemeSync()                   // the Custom theme's swatch / colours follow gCustomAccent
+{
+    ColorTheme& c = COLOR_THEMES[COLOR_THEME_N - 1];
+    c.dark = gCustomAccent;
+    c.light = RGB(GetRValue(gCustomAccent) * 3 / 4, GetGValue(gCustomAccent) * 3 / 4, GetBValue(gCustomAccent) * 3 / 4);   // deeper for light mode
+}
 
 // The palette in use (set by ApplyPalette). The old constant names now point at these.
 static COLORREF gDkBg, gDkCtl, gDkBorder, gDkSection, gDkText = RGB(235, 235, 235), gDkDim = RGB(160, 160, 160);
@@ -2820,6 +2831,7 @@ static COLORREF Mix(COLORREF a, COLORREF b, float t)   // a blended toward b by 
 
 static void ApplyPalette()
 {
+    CustomThemeSync();
     const ColorTheme& t = COLOR_THEMES[Iclamp(gColorTheme, 0, COLOR_THEME_N - 1)];
     const float k = t.tint;
     gDkBg      = Mix(RGB(32, 32, 32), t.dark, 0.06f * k);
@@ -3014,7 +3026,11 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
 
     HDC dc = cd->hdc;
     RECT rc = cd->rc;
-    FillRect(dc, &rc, gBrDarkBg);
+    if (gBrPicture) {                           // over a picture: show the picture behind it, not a box
+        POINT pt = { 0, 0 }; MapWindowPoints(h, gWnd, &pt, 1);
+        SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
+        FillRect(dc, &rc, gBrPicture);
+    } else FillRect(dc, &rc, gBrDarkBg);
     bool checked = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
     bool hot = (cd->uItemState & CDIS_HOT) != 0;
 
@@ -3132,6 +3148,7 @@ static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds (4 pages),
 static bool    gClipAutoTrim = true;             // cut silence off the ends of new clips
 static wchar_t gTtsVoice[128];                   // text-to-speech voice (its name; empty = Windows' default)
 static int     gTtsAccent = 0;                    // text-to-speech accent (TTS_ACCENTS index; 0 = none)
+static bool    gVoiceInstalling = false;          // Windows is installing a voice for an accent
 static int     gRecSeconds = 15;                 // instant replay length
 // What clips keep. The numbers are saved in the settings file, so new ones go at the end.
 enum { REC_BOTH = 0, REC_VOICE = 1, REC_PC = 2, REC_OFF = 3, REC_DISCORD = 4, REC_VOICE_DISCORD = 5, REC_N };
@@ -3208,6 +3225,7 @@ static void LoadSettings()
     gAutoStart     = INI_INT(L"autostart", 0) != 0;
     gThemeMode     = Iclamp(INI_INT(L"theme", THEME_SYSTEM), 0, 2);
     gColorTheme    = Iclamp(INI_INT(L"color_theme", 0), 0, COLOR_THEME_N - 1);
+    gCustomAccent  = (COLORREF)INI_INT(L"color_theme_custom", (int)RGB(255, 110, 190)) & 0xFFFFFF;
     gUpdateOnStart = INI_INT(L"update_on_start", 1) != 0;
 
     gFxOn = INI_INT(L"fx_on", 0) != 0;
@@ -3438,6 +3456,9 @@ struct PicImg {
     int*   delayAll;                            // each frame's delay (ms)
     int    w, h, n, fps;                        // decoded: size, frame count, the frame-rate limit used
     int    rw, rh;                              // the size that was asked for (huge sizes are decoded smaller)
+    int    uid;                                 // finds it again when its background decode finishes
+    struct PicJob* job;                         // decoding in the background (owns gp while it runs)
+    int    wantW, wantH;                        // asked for another size while that was running
     DWORD* px;                                  // n frames of w*h premultiplied BGRA
     int*   delay;                               // how long each decoded frame shows (ms)
     int    cur; ULONGLONG due;                  // frame showing and when the next one is due
@@ -3448,10 +3469,24 @@ static void PicFreeFrames(PicImg& m)
     if (m.delay) HeapFree(GetProcessHeap(), 0, m.delay);
     m.px = nullptr; m.delay = nullptr; m.w = m.h = m.n = 0; m.cur = 0;
 }
+struct PicJob {                                 // one background decode: everything it needs is its own copy
+    volatile LONG orphan;                       // the picture was closed meanwhile: throw the result (and gp) away
+    void* gp; GUID dim; int nAll; int* delays; int tw, th, askW, askH, fps, uid;
+    DWORD* px; int* delay; int n;
+};
+static void PicJobFree(PicJob* j, bool withGp)
+{
+    if (j->px) HeapFree(GetProcessHeap(), 0, j->px);
+    if (j->delay) HeapFree(GetProcessHeap(), 0, j->delay);
+    if (j->delays) HeapFree(GetProcessHeap(), 0, j->delays);
+    if (withGp && j->gp && gGp.ok) gGp.dispose(j->gp);
+    HeapFree(GetProcessHeap(), 0, j);
+}
 static void PicClose(PicImg& m)
 {
     PicFreeFrames(m);
     if (m.delayAll) HeapFree(GetProcessHeap(), 0, m.delayAll);
+    if (m.job) { InterlockedExchange(&m.job->orphan, 1); m.gp = nullptr; }   // the job disposes of it when done
     if (m.gp && gGp.ok) gGp.dispose(m.gp);
     m = {};
 }
@@ -3460,6 +3495,7 @@ static bool PicOpen(PicImg& m, const wchar_t* path)
     PicClose(m);
     if (!path || !path[0] || !GpReady()) return false;
     if (gGp.load(path, &m.gp) != 0 || !m.gp) { m.gp = nullptr; return false; }
+    static int uids = 0; m.uid = ++uids;
     UINT w = 0, h = 0, dims = 0, n = 1;
     gGp.width(m.gp, &w); gGp.height(m.gp, &h);
     if (!w || !h) { PicClose(m); return false; }
@@ -3484,52 +3520,76 @@ static bool PicOpen(PicImg& m, const wchar_t* path)
     }
     return true;
 }
-#define PIC_PX_BUDGET (12 * 1024 * 1024)        // pixels of decoded frames per picture (48 MB)
-static bool PicDecode(PicImg& m, int tw, int th)   // all (kept) frames at tw x th
+#define PIC_PX_BUDGET (10 * 1024 * 1024)        // pixels of decoded frames per picture (40 MB)
+static void PicJobRun(PicJob* j)                // (worker thread) all kept frames at tw x th
 {
-    if (!m.gp || tw < 1 || th < 1) return false;
-    if (m.px && m.rw == tw && m.rh == th && m.fps == gGifFps) return true;
-    PicFreeFrames(m);
-    const int askW = tw, askH = th;
+    int tw = j->tw, th = j->th;
     const double big = (double)tw * th;         // never more than ~6 megapixels a frame (drawn bigger if needed)
     if (big > 6.0e6) { double k = sqrt(6.0e6 / big); tw = Imax(1, (int)(tw * k)); th = Imax(1, (int)(th * k)); }
     // which frames to keep: never faster than the limit, and within the memory budget
-    int keep[2000], kdel[2000], nk = 0;
+    static thread_local int keep[2000], kdel[2000];
+    int nk = 0;
     const int maxFrames = Imax(1, Imin(2000, (int)(PIC_PX_BUDGET / ((long long)tw * th))));
-    int minMs = gGifFps > 0 ? 1000 / gGifFps : 0;
+    int minMs = j->fps > 0 ? 1000 / j->fps : 0;
     for (int pass = 0; pass < 12; pass++) {
         nk = 0; int t = 0, nextAt = 0;
-        for (int i = 0; i < m.nAll; i++) {
+        for (int i = 0; i < j->nAll; i++) {
             if (i == 0 || t >= nextAt) { keep[nk] = i; kdel[nk] = 0; nk++; nextAt = t + minMs; }
-            kdel[nk - 1] += m.delayAll[i];
-            t += m.delayAll[i];
+            kdel[nk - 1] += j->delays[i];
+            t += j->delays[i];
         }
         if (nk <= maxFrames) break;
         minMs = Imax(minMs * 2, 20);              // too many to fit: fewer, longer frames
     }
-    m.px = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)tw * th * 4 * nk);
-    m.delay = (int*)HeapAlloc(GetProcessHeap(), 0, nk * sizeof(int));
-    if (!m.px || !m.delay) { PicFreeFrames(m); return false; }
-    const bool blocky = tw >= m.w0 * 2 && th >= m.h0 * 2;   // big enlargements of small (pixel-art) GIFs stay crisp
+    j->px = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)tw * th * 4 * nk);
+    j->delay = (int*)HeapAlloc(GetProcessHeap(), 0, nk * sizeof(int));
+    if (!j->px || !j->delay) { j->n = 0; return; }
+    int w0 = 0, h0 = 0; { UINT a = 0, b = 0; gGp.width(j->gp, &a); gGp.height(j->gp, &b); w0 = (int)a; h0 = (int)b; }
+    const bool blocky = tw >= w0 * 2 && th >= h0 * 2;   // big enlargements of small (pixel-art) GIFs stay crisp
     for (int k = 0; k < nk; k++) {
-        if (m.nAll > 1) gGp.selFrame(m.gp, &m.dim, (UINT)keep[k]);
+        if (j->orphan) break;                   // nobody wants it any more
+        if (j->nAll > 1) gGp.selFrame(j->gp, &j->dim, (UINT)keep[k]);
         void* bmp = nullptr; void* g = nullptr;
-        if (gGp.fromScan0(tw, th, tw * 4, 0x000E200B /* 32bpp PARGB */, (BYTE*)(m.px + (size_t)tw * th * k), &bmp) == 0 && bmp) {
+        if (gGp.fromScan0(tw, th, tw * 4, 0x000E200B /* 32bpp PARGB */, (BYTE*)(j->px + (size_t)tw * th * k), &bmp) == 0 && bmp) {
             if (gGp.ctx(bmp, &g) == 0 && g) {
                 gGp.clear(g, 0);
                 gGp.interp(g, blocky ? 5 /* nearest */ : 7 /* high-quality bicubic */);
                 gGp.pixOff(g, blocky ? 4 /* half */ : 2 /* high quality */);
-                gGp.draw(g, m.gp, 0, 0, tw, th);
+                gGp.draw(g, j->gp, 0, 0, tw, th);
                 gGp.delG(g);
             }
             gGp.dispose(bmp);
         }
-        m.delay[k] = Imax(kdel[k], 15);
+        j->delay[k] = Imax(kdel[k], 15);
     }
-    m.w = tw; m.h = th; m.rw = askW; m.rh = askH; m.n = nk; m.fps = gGifFps; m.cur = 0; m.due = GetTickCount64() + m.delay[0];
-    return true;
+    j->tw = tw; j->th = th; j->n = nk;
 }
-
+static DWORD WINAPI PicJobThread(LPVOID arg)
+{
+    PicJob* j = (PicJob*)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);   // never in the way of the audio or the window
+    PicJobRun(j);
+    if (!PostMessageW(gWnd, WM_PIC_DECODED, 0, (LPARAM)j)) PicJobFree(j, j->orphan != 0);
+    return 0;
+}
+// Ask for a picture at tw x th: decoded in the background, shown when ready (meanwhile the old frames, stretched).
+static void PicWant(PicImg& m, int tw, int th)
+{
+    if (!m.gp || tw < 1 || th < 1) return;
+    if (m.job) { m.wantW = tw; m.wantH = th; return; }          // one at a time: this size next
+    if (m.px && m.rw == tw && m.rh == th && m.fps == gGifFps) return;
+    PicJob* j = (PicJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PicJob));
+    if (!j) return;
+    j->gp = m.gp; j->dim = m.dim; j->nAll = m.nAll; j->tw = tw; j->th = th; j->askW = tw; j->askH = th;
+    j->fps = gGifFps; j->uid = m.uid;
+    j->delays = (int*)HeapAlloc(GetProcessHeap(), 0, m.nAll * sizeof(int));
+    if (!j->delays) { HeapFree(GetProcessHeap(), 0, j); return; }
+    memcpy(j->delays, m.delayAll, m.nAll * sizeof(int));
+    m.job = j; m.wantW = m.wantH = 0;
+    HANDLE t = CreateThread(nullptr, 0, PicJobThread, j, 0, nullptr);
+    if (t) CloseHandle(t);
+    else { m.job = nullptr; PicJobRun(j); PostMessageW(gWnd, WM_PIC_DECODED, 0, (LPARAM)j); m.job = j; }
+}
 #define STK_MAX 8
 struct Sticker { wchar_t path[MAX_PATH]; int x, y, size, opacity; PicImg img; bool stale; };
 static Sticker  gStk[STK_MAX];  static int gStkN = 0, gStkSel = 0;
@@ -3589,7 +3649,7 @@ static void BlitOver(DWORD* dst, int W, int H, const DWORD* src, int sw, int sh,
 static void StkEnsureDecoded(Sticker& s)
 {
     RECT r; StkRect(s, &r);
-    PicDecode(s.img, r.right - r.left, r.bottom - r.top);
+    PicWant(s.img, r.right - r.left, r.bottom - r.top);
     s.stale = false;
 }
 static void PicComposeBase()                    // theme colour, background picture, fade
@@ -3657,7 +3717,7 @@ static void PictureRebuild()                    // everything, at the window's s
         if (!gCompBmp || !gBaseBuf) { PicFreeComposite(); return; }
         gCompBits = (DWORD*)bits; gCW = W; gCH = H;
     }
-    if (gBase.gp) { int tw, th, dx, dy; BaseTarget(W, H, &tw, &th, &dx, &dy); PicDecode(gBase, tw, th); }
+    if (gBase.gp) { int tw, th, dx, dy; BaseTarget(W, H, &tw, &th, &dx, &dy); PicWant(gBase, tw, th); }
     for (int i = 0; i < gStkN; i++) StkEnsureDecoded(gStk[i]);
     PicComposeBase();
     RECT all = { 0, 0, W, H };
@@ -3690,6 +3750,11 @@ static void PicAnimTimer()                      // run the animation timer only 
 {
     bool any = gBase.n > 1;
     for (int i = 0; i < gStkN; i++) if (gStk[i].img.n > 1) any = true;
+    // While a GIF plays, paint the whole window double-buffered: the text over it would flicker otherwise.
+    bool gifs = gBase.nAll > 1;
+    for (int i = 0; i < gStkN; i++) if (gStk[i].img.nAll > 1) gifs = true;
+    LONG ex = GetWindowLongW(gWnd, GWL_EXSTYLE), want = gifs ? (ex | WS_EX_COMPOSITED) : (ex & ~WS_EX_COMPOSITED);
+    if (want != ex) SetWindowLongW(gWnd, GWL_EXSTYLE, want);
     if (any) SetTimer(gWnd, TIMER_PICANIM, gGifFps > 0 ? Imax(15, 1000 / gGifFps) : 15, nullptr);
     else KillTimer(gWnd, TIMER_PICANIM);
 }
@@ -3719,6 +3784,26 @@ static void PicAnimTick()
     if (!any) return;
     PicComposeTop(u); PicMakeBrush(); PicRedraw(&u);
 }
+static void OnPicDecoded(PicJob* j)
+{
+    if (j->orphan) { PicJobFree(j, true); return; }
+    PicImg* m = gBase.uid == j->uid && gBase.job == j ? &gBase : nullptr;
+    int stk = -1;
+    for (int i = 0; i < gStkN && !m; i++) if (gStk[i].img.uid == j->uid && gStk[i].img.job == j) { m = &gStk[i].img; stk = i; }
+    if (!m) { PicJobFree(j, true); return; }
+    m->job = nullptr;
+    if (j->n > 0 && j->px) {                    // swap in the new frames
+        PicFreeFrames(*m);
+        m->px = j->px; m->delay = j->delay; j->px = nullptr; j->delay = nullptr;
+        m->w = j->tw; m->h = j->th; m->rw = j->askW; m->rh = j->askH; m->n = j->n; m->fps = j->fps;
+        m->cur = 0; m->due = GetTickCount64() + m->delay[0];
+    }
+    PicJobFree(j, false);
+    if (m->wantW) { int w = m->wantW, h = m->wantH; m->wantW = m->wantH = 0; PicWant(*m, w, h); }
+    if (stk >= 0 && gCompBmp) { StkRefresh(nullptr); PicAnimTimer(); }
+    else { PictureRebuild(); PicRedraw(nullptr); }
+}
+
 // ---- pictures on top: add / remove / save ----
 static bool StkAdd(const wchar_t* path)
 {
@@ -3860,7 +3945,7 @@ static void SaveSettings()
     SaveInt(L"radio_preset", gRadioPreset);
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare);
     SaveInt(L"hotkey_popup", gShowOsd); SaveInt(L"always_on_top", gTopMost); SaveInt(L"autostart", gAutoStart);
-    SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"update_on_start", gUpdateOnStart);
+    SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"color_theme_custom", (int)gCustomAccent); SaveInt(L"update_on_start", gUpdateOnStart);
     SaveInt(L"fx_on", gFxOn);
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
@@ -4266,6 +4351,12 @@ static void FitFontOf(int i, int kind)
     }
     HFONT want = FitFont(lvl);
     if ((HFONT)SendMessageW(d.h, WM_GETFONT, 0, 0) != want) SendMessageW(d.h, WM_SETFONT, (WPARAM)want, TRUE);
+    if (kind == 1) {                            // a one-line note that still doesn't fit: "..." rather than a cut-off 2nd line
+        LONG st = GetWindowLongW(d.h, GWL_STYLE);
+        bool fits = FitNeed(d, kind, want) <= w;
+        LONG nst = fits ? (st & ~SS_ENDELLIPSIS) : (st | SS_ENDELLIPSIS);
+        if (nst != st) { SetWindowLongW(d.h, GWL_STYLE, nst); InvalidateRect(d.h, nullptr, TRUE); }
+    }
 }
 static void FitText()
 {
@@ -6708,6 +6799,98 @@ static void ImportSettings()
     PostMessageW(gWnd, WM_CLOSE, 0, 0);
 }
 
+// ======================= hex colour picker =======================
+// Type a colour as #RRGGBB (or #RGB), see it, or open Windows' palette. Used by "Your colours" and the Custom theme.
+static struct { HWND wnd, edit, sw; COLORREF col; bool done, ok; HBRUSH br; } gHex;
+static bool HexParse(const wchar_t* t, COLORREF* out)
+{
+    while (*t == L' ' || *t == L'#') t++;
+    wchar_t h[8] = {}; int n = 0;
+    for (; *t && n < 7; t++) { if (iswxdigit(*t)) h[n++] = *t; else if (*t != L' ') return false; }
+    if (n == 3) { wchar_t e[7] = { h[0], h[0], h[1], h[1], h[2], h[2], 0 }; lstrcpyW(h, e); n = 6; }
+    if (n != 6) return false;
+    unsigned v = (unsigned)wcstoul(h, nullptr, 16);
+    *out = RGB((v >> 16) & 255, (v >> 8) & 255, v & 255);
+    return true;
+}
+static void HexShow(bool setText)
+{
+    if (gHex.br) DeleteObject(gHex.br);
+    gHex.br = CreateSolidBrush(gHex.col);
+    if (setText) { wchar_t t[16]; wsprintfW(t, L"#%02X%02X%02X", GetRValue(gHex.col), GetGValue(gHex.col), GetBValue(gHex.col)); SetWindowTextW(gHex.edit, t); }
+    InvalidateRect(gHex.sw, nullptr, TRUE);
+}
+static LRESULT CALLBACK HexProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_COMMAND:
+        if (LOWORD(w) == 11 && HIWORD(w) == EN_CHANGE) {
+            wchar_t t[32]; GetWindowTextW(gHex.edit, t, 32);
+            COLORREF c; if (HexParse(t, &c)) { gHex.col = c; HexShow(false); }
+        } else if (LOWORD(w) == 13) {
+            static COLORREF custom[16];
+            CHOOSECOLORW cc = {}; cc.lStructSize = sizeof(cc); cc.hwndOwner = h; cc.lpCustColors = custom;
+            cc.rgbResult = gHex.col; cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+            if (ChooseColorW(&cc)) { gHex.col = cc.rgbResult; HexShow(true); }
+        } else if (LOWORD(w) == IDOK) {
+            wchar_t t[32]; GetWindowTextW(gHex.edit, t, 32);
+            COLORREF c; if (HexParse(t, &c)) { gHex.col = c; gHex.ok = true; gHex.done = true; } else MessageBeep(MB_ICONWARNING);
+        } else if (LOWORD(w) == IDCANCEL) gHex.done = true;
+        return 0;
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)l == gHex.sw) return (LRESULT)gHex.br;
+        return CtlColor(h, m, w, l);
+    case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
+        return CtlColor(h, m, w, l);
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CLOSE: gHex.done = true; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static bool HexColorPick(const wchar_t* title, COLORREF init, COLORREF* out)
+{
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = HexProc; wc.hInstance = gInst; wc.hIcon = gIcon; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+                wc.lpszClassName = L"LagHexColor"; RegisterClassW(&wc); reg = true; }
+    RECT pr; GetWindowRect(gWnd, &pr);
+    RECT r = { 0, 0, SC(300), SC(132) };
+    DWORD st = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&r, st, FALSE);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+    gHex = {}; gHex.col = init;
+    gHex.wnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LagHexColor", title, st, (pr.left + pr.right - ww) / 2, (pr.top + pr.bottom - wh) / 2,
+                               ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!gHex.wnd) return false;
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD sty, int x, int y, int w, int hh, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | sty, SC(x), SC(y), SC(w), SC(hh), gHex.wnd, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"STATIC", L"Hex colour:", 0, 14, 18, 80, 20, -1);
+    gHex.edit = mk(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 96, 14, 104, 24, 11, WS_EX_CLIENTEDGE);
+    SendMessageW(gHex.edit, EM_LIMITTEXT, 9, 0);
+    gHex.sw = mk(L"STATIC", L"", WS_BORDER, 210, 12, 76, 28, 12);
+    mk(L"BUTTON", L"Pick from a palette...", WS_TABSTOP, 14, 52, 272, 28, 13);
+    mk(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, 110, 92, 84, 28, IDOK);
+    mk(L"BUTTON", L"Cancel", WS_TABSTOP, 202, 92, 84, 28, IDCANCEL);
+    HexShow(true);
+    ThemeTitleBar(gHex.wnd); EnumChildWindows(gHex.wnd, ThemeChild, 0);
+    EnableWindow(gWnd, FALSE);
+    ShowWindow(gHex.wnd, SW_SHOW);
+    SetFocus(gHex.edit); SendMessageW(gHex.edit, EM_SETSEL, 1, -1);
+    MSG msg;
+    while (!gHex.done && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (IsDialogMessageW(gHex.wnd, &msg)) continue;   // Tab, Enter = OK, Esc = Cancel
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+    if (!gHex.done) PostQuitMessage(0);          // (the app is closing)
+    EnableWindow(gWnd, TRUE);
+    DestroyWindow(gHex.wnd); gHex.wnd = nullptr;
+    if (gHex.br) { DeleteObject(gHex.br); gHex.br = nullptr; }
+    SetForegroundWindow(gWnd);
+    if (gHex.ok) *out = gHex.col;
+    return gHex.ok;
+}
+
 static bool gPicUiBusy = false;                 // (filling the Pictures page: not a change by you)
 static void PicUiRefresh()
 {
@@ -6738,6 +6921,7 @@ static void PictureInfo()
     wchar_t t[MAX_PATH]; wsprintfW(t, gPicPath[0] ? L"%s" : L"No picture", base ? base + 1 : gPicPath);
     SetDlgItemTextW(gWnd, IDC_PICINFO, t);
     EnableWindow(GetDlgItem(gWnd, IDC_PICREMOVE), gPicPath[0] != 0);
+    EnableWindow(GetDlgItem(gWnd, IDC_PICPLACE), gPicPath[0] != 0 && gPicFit == 4);
     PicUiRefresh();
 }
 
@@ -7222,24 +7406,84 @@ static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI
     }
 }
 
-struct TtsJob { wchar_t text[600]; wchar_t voice[256]; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t voice[256]; int rate; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
-// English sounds Mexican, and so on). Windows only has voices for some places; the rest can't be done honestly.
-// American and Canadian also add a little stereotypical phrasing.
-struct TtsAccent { const wchar_t* name; int lang, alt, primary; const wchar_t* voiceName; int phrasing; };
-static const TtsAccent TTS_ACCENTS[] = {
-    { L"No accent",  0,      0,      0,    nullptr,                   0 },
-    { L"American",   0x0409, 0,      0,    L"English (United States)", 1 },
-    { L"Canadian",   0x1009, 0x0409, 0,    L"English (Canada)",        2 },
-    { L"Irish",      0x1809, 0,      0,    L"English (Ireland)",       0 },
-    { L"Indian",     0x4009, 0x0439, 0,    L"English (India)",         0 },
-    { L"Mexican",    0x080A, 0,      0x0A, L"Spanish (Mexico)",        0 },
-    { L"French",     0x040C, 0x0C0C, 0x0C, L"French (France)",         0 },
-    { L"Russian",    0x0419, 0,      0x19, L"Russian",                 0 },
-    { L"Syrian (Arabic voice)", 0x2801, 0x0401, 0x01, L"Arabic",       0 },
+// English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
+// the words swapped for that language's own (picked at random, so it doesn't say the same thing every time).
+// Windows only has voices for some places; missing ones can be installed from here. American and Canadian are
+// deliberately stereotypical.
+struct TtsSwap { const wchar_t* from; const wchar_t* to[4]; };     // a word / phrase and what it can become
+struct TtsAccent {
+    const wchar_t* name; int lang, alt, primary; const wchar_t* voiceName; const wchar_t* tag;   // tag: e.g. es-MX
+    int rate; const TtsSwap* swaps; int nSwaps; const wchar_t* open[5]; const wchar_t* close[5];
 };
+static const TtsSwap SW_US[] = {
+    { L"very much", { L"so much", L"a ton" } }, { L"very", { L"super", L"so", L"totally" } }, { L"good", { L"awesome", L"rad", L"sick" } },
+    { L"great", { L"awesome", L"epic", L"amazing" } }, { L"hello", { L"hey", L"what's up", L"yo" } }, { L"hi", { L"hey", L"yo" } },
+    { L"yes", { L"yeah", L"yep", L"totally" } }, { L"friend", { L"dude", L"bro", L"buddy" } } };
+static const TtsSwap SW_CA[] = {
+    { L"thank you very much", { L"thanks a bunch", L"thank you kindly" } }, { L"about", { L"aboot" } }, { L"out", { L"oot" } }, { L"sorry", { L"soary", L"sorry", L"soary" } },
+    { L"friend", { L"buddy", L"bud" } }, { L"hello", { L"hey there", L"hello there" } }, { L"yes", { L"yeah", L"you bet", L"for sure" } } };
+static const TtsSwap SW_IE[] = {
+    { L"thank you very much", { L"thanks a million", L"thanks a mill" } }, { L"thanks", { L"thanks a million", L"cheers" } },
+    { L"very much", { L"a million", L"loads" } }, { L"good", { L"grand", L"deadly", L"savage" } }, { L"great", { L"grand", L"deadly" } }, { L"very", { L"fierce", L"wicked", L"very" } },
+    { L"hello", { L"how's the form", L"hiya", L"how's it going" } }, { L"hi", { L"hiya" } }, { L"friend", { L"pal", L"lad" } },
+    { L"yes", { L"yeah", L"it is" } } };
+static const TtsSwap SW_IN[] = {
+    { L"thank you very much", { L"bahut dhanyavaad", L"thank you so much ji" } }, { L"very much", { L"very very much", L"bahut" } },
+    { L"hello", { L"namaste", L"hello ji" } }, { L"hi", { L"namaste" } }, { L"thank you", { L"dhanyavaad", L"thank you ji" } },
+    { L"thanks", { L"dhanyavaad", L"shukriya" } }, { L"friend", { L"dost", L"yaar" } }, { L"yes", { L"haan", L"haan ji" } },
+    { L"very", { L"very very", L"bahut" } } };
+static const TtsSwap SW_MX[] = {
+    { L"thank you very much", { L"muchas gracias", L"mil gracias" } }, { L"very much", { L"mucho" } }, { L"hello", { L"hola", L"qué onda" } }, { L"hi", { L"hola" } }, { L"thank you", { L"gracias", L"muchas gracias" } },
+    { L"thanks", { L"gracias" } }, { L"friend", { L"amigo", L"compadre" } }, { L"yes", { L"sí", L"órale" } },
+    { L"very", { L"muy" } }, { L"goodbye", { L"adiós", L"nos vemos" } }, { L"bye", { L"adiós", L"nos vemos" } } };
+static const TtsSwap SW_FR[] = {
+    { L"thank you very much", { L"merci beaucoup", L"merci mille fois" } }, { L"very much", { L"beaucoup" } }, { L"hello", { L"bonjour", L"salut" } }, { L"hi", { L"salut" } }, { L"thank you", { L"merci", L"merci beaucoup" } },
+    { L"thanks", { L"merci" } }, { L"yes", { L"oui", L"ouais" } }, { L"no", { L"non" } }, { L"friend", { L"mon ami", L"mon pote" } },
+    { L"very", { L"très" } }, { L"goodbye", { L"au revoir", L"à plus" } }, { L"bye", { L"salut", L"à plus" } } };
+static const TtsSwap SW_RU[] = {
+    { L"thank you very much", { L"большое спасибо", L"спасибо огромное" } }, { L"very much", { L"очень" } }, { L"hello", { L"привет", L"здравствуй" } }, { L"hi", { L"привет" } }, { L"thank you", { L"спасибо", L"большое спасибо" } },
+    { L"thanks", { L"спасибо" } }, { L"yes", { L"да", L"конечно" } }, { L"no", { L"нет" } }, { L"friend", { L"друг", L"братан" } },
+    { L"very", { L"очень" } }, { L"goodbye", { L"пока", L"до свидания" } }, { L"bye", { L"пока" } } };
+static const TtsSwap SW_SY[] = {
+    { L"thank you very much", { L"يسلمو كتير", L"ألف شكر" } }, { L"very much", { L"كتير" } }, { L"hello", { L"مرحبا", L"أهلين" } }, { L"hi", { L"مرحبا" } }, { L"thank you", { L"يسلمو", L"شكراً" } }, { L"thanks", { L"يسلمو" } },
+    { L"yes", { L"إي", L"أكيد" } }, { L"no", { L"لأ" } }, { L"friend", { L"حبيبي", L"خيي" } }, { L"bye", { L"يلا باي", L"مع السلامة" } } };
+static const TtsSwap SW_AR[] = {
+    { L"thank you very much", { L"شكراً جزيلاً", L"ألف شكر" } }, { L"very much", { L"جداً" } }, { L"hello", { L"مرحبا", L"السلام عليكم" } }, { L"hi", { L"مرحبا" } }, { L"thank you", { L"شكراً", L"شكراً جزيلاً" } },
+    { L"thanks", { L"شكراً" } }, { L"yes", { L"نعم", L"أيوه" } }, { L"no", { L"لا" } }, { L"friend", { L"صديقي", L"حبيبي" } },
+    { L"goodbye", { L"مع السلامة" } }, { L"bye", { L"مع السلامة" } } };
+#define SWN(a) a, (int)(sizeof(a) / sizeof(a[0]))
+static const TtsAccent TTS_ACCENTS[] = {
+    { L"No accent", 0, 0, 0, nullptr, nullptr, 0, nullptr, 0, {}, {} },
+    { L"American", 0x0409, 0, 0, L"English (United States)", L"en-US", 1, SWN(SW_US),
+      { L"Dude, ", L"Bro, ", L"Okay so, ", L"Oh my gosh, ", L"" }, { L". Like, totally.", L". For real.", L". Let's go!", L". No cap.", L"." } },
+    { L"Canadian", 0x1009, 0x0409, 0, L"English (Canada)", L"en-CA", 0, SWN(SW_CA),
+      { L"", L"Oh, ", L"Sorry, but ", L"Well, ", L"" }, { L", eh?", L", eh.", L", eh buddy?", L", bud.", L"." } },
+    { L"Irish", 0x1809, 0, 0, L"English (Ireland)", L"en-IE", 1, SWN(SW_IE),
+      { L"", L"Ah sure, ", L"Ah here, ", L"Well, ", L"" }, { L".", L", so it is.", L", sure look.", L", like.", L"." } },
+    { L"Indian", 0x4009, 0x0439, 0, L"English (India)", L"en-IN", 1, SWN(SW_IN),
+      { L"", L"Arre, ", L"Accha, ", L"", L"" }, { L".", L", na?", L", yaar.", L".", L"." } },
+    { L"Mexican", 0x080A, 0, 0x0A, L"Spanish (Mexico)", L"es-MX", 1, SWN(SW_MX),
+      { L"", L"Órale, ", L"Oye, ", L"Ándale, ", L"" }, { L".", L", amigo.", L", ¿no?", L".", L"." } },
+    { L"French", 0x040C, 0x0C0C, 0x0C, L"French (France)", L"fr-FR", 0, SWN(SW_FR),
+      { L"", L"Alors, ", L"Eh bien, ", L"Bon, ", L"" }, { L".", L", voilà.", L", hein?", L", n'est-ce pas?", L"." } },
+    { L"Russian", 0x0419, 0, 0x19, L"Russian", L"ru-RU", -1, SWN(SW_RU),
+      { L"", L"Ну, ", L"Слушай, ", L"Короче, ", L"" }, { L".", L", да?", L", понимаешь?", L".", L"." } },
+    { L"Syrian", 0x2801, 0x0C01, 0x01, L"Arabic (Egypt)", L"ar-EG", 0, SWN(SW_SY),
+      { L"", L"يلا، ", L"والله، ", L"شو، ", L"" }, { L".", L"، يا حبيبي.", L"، والله.", L".", L"." } },
+    { L"Arabic", 0x0401, 0x0C01, 0x01, L"Arabic (Saudi Arabia)", L"ar-SA", 0, SWN(SW_AR),
+      { L"", L"يلا، ", L"والله، ", L"طيب، ", L"" }, { L".", L"، يا صديقي.", L"، إن شاء الله.", L".", L"." } },
+};
+#undef SWN
 #define TTS_ACCENT_N ((int)(sizeof(TTS_ACCENTS) / sizeof(TTS_ACCENTS[0])))
+static unsigned TtsRand(unsigned n)             // a different pick every line
+{
+    static unsigned s = GetTickCount() | 1;
+    s = s * 1664525u + 1013904223u;
+    return n ? (s >> 8) % n : 0;
+}
 static int TtsVoiceFor(int accent)              // index into the voice list, -1 if none installed
 {
     if (accent <= 0 || accent >= TTS_ACCENT_N) return -1;
@@ -7254,38 +7498,48 @@ static int TtsVoiceFor(int accent)              // index into the voice list, -1
     return -1;
 }
 static bool TtsIsWordChar(wchar_t c) { return iswalnum(c) || c == L'\''; }
-static void TtsSwapWord(wchar_t* t, int cap, const wchar_t* from, const wchar_t* to)   // whole words, any case
+static void TtsSwapWord(wchar_t* t, int cap, const TtsSwap& sw)   // whole words, any case, a random choice each time
 {
-    wchar_t out[1200]; int o = 0; const int fl = lstrlenW(from), tl = lstrlenW(to);
+    int nOpt = 0; while (nOpt < 4 && sw.to[nOpt]) nOpt++;
+    if (!nOpt) return;
+    wchar_t out[1200]; int o = 0; const int fl = lstrlenW(sw.from);
     for (int i = 0; t[i] && o < 1190;) {
+        if (t[i] == 1) {                        // already swapped: \1...\2 isn't touched again
+            while (t[i] && t[i] != 2 && o < 1190) out[o++] = t[i++];
+            if (t[i] == 2) out[o++] = t[i++];
+            continue;
+        }
         bool start = i == 0 || !TtsIsWordChar(t[i - 1]);
-        if (start && !_wcsnicmp(t + i, from, fl) && !TtsIsWordChar(t[i + fl])) {
-            for (int k = 0; k < tl && o < 1190; k++)
-                out[o++] = k == 0 && iswupper(t[i]) ? towupper(to[0]) : to[k];
+        if (start && !_wcsnicmp(t + i, sw.from, fl) && !TtsIsWordChar(t[i + fl])) {
+            const wchar_t* to = sw.to[TtsRand(nOpt)];
+            out[o++] = 1;
+            for (int k = 0; to[k] && o < 1188; k++) out[o++] = k == 0 && iswupper(t[i]) ? towupper(to[0]) : to[k];
+            out[o++] = 2;
             i += fl;
         } else out[o++] = t[i++];
     }
     out[o] = 0;
     lstrcpynW(t, out, cap);
 }
-static void TtsPhrase(wchar_t* t, int cap, int style)   // 1 = American, 2 = Canadian (light, stereotypical)
+static int TtsPhrase(wchar_t* t, int cap, int accent)   // the accent's words, opener and ending; returns its speaking rate
 {
+    if (accent <= 0 || accent >= TTS_ACCENT_N) return 0;
+    const TtsAccent& a = TTS_ACCENTS[accent];
+    for (int i = 0; i < a.nSwaps; i++) TtsSwapWord(t, cap, a.swaps[i]);
+    { int o = 0; for (int i = 0; t[i]; i++) if (t[i] != 1 && t[i] != 2) t[o++] = t[i]; t[o] = 0; }   // drop the markers
     int n = lstrlenW(t);
     while (n > 0 && t[n - 1] == L' ') t[--n] = 0;
-    if (!n) return;
-    bool question = t[n - 1] == L'?';
-    if (t[n - 1] == L'.' || t[n - 1] == L'!') t[--n] = 0;
-    if (style == 1) {
-        TtsSwapWord(t, cap, L"very", L"super"); TtsSwapWord(t, cap, L"good", L"awesome");
-        TtsSwapWord(t, cap, L"great", L"awesome"); TtsSwapWord(t, cap, L"hello", L"hey");
-        wchar_t b[1200]; wsprintfW(b, question ? L"Dude, %s" : L"Dude, %s. Like, totally.", t);
-        lstrcpynW(t, b, cap);
-    } else {
-        TtsSwapWord(t, cap, L"about", L"aboot"); TtsSwapWord(t, cap, L"out", L"oot");
-        TtsSwapWord(t, cap, L"sorry", L"soary");
-        wchar_t b[1200]; wsprintfW(b, question ? L"%s" : L"%s, eh?", t);
+    if (n) {
+        bool question = t[n - 1] == L'?';
+        if (!question && (t[n - 1] == L'.' || t[n - 1] == L'!')) t[--n] = 0;
+        const wchar_t* op = a.open[TtsRand(5)];   const wchar_t* cl = question ? L"" : a.close[TtsRand(5)];
+        if (!op) op = L""; if (!cl) cl = L".";
+        wchar_t b[1300];
+        if (op[0] && n > 1 && iswupper(t[0]) && !iswupper(t[1]) && t[1] != L' ') t[0] = towlower(t[0]);   // "Dude, this..."
+        wsprintfW(b, L"%s%s%s", op, t, cl);
         lstrcpynW(t, b, cap);
     }
+    return Iclamp(a.rate + (int)TtsRand(3) - 1, -3, 4);   // its own pace, a little different every line
 }
 
 static bool TtsRender(TtsJob* j, bool useVoice)
@@ -7305,6 +7559,7 @@ static bool TtsRender(TtsJob* j, bool useVoice)
         SUCCEEDED(CoCreateInstance(kCLSID_SpStream, nullptr, CLSCTX_ALL, kIID_ISpStream, (void**)&ss)) &&
         SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
         SUCCEEDED(v->SetOutput(ss, TRUE)) &&
+        SUCCEEDED(v->SetRate(j->rate)) &&
         SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
         STATSTG st = {};
         HGLOBAL hg = nullptr;
@@ -7349,7 +7604,7 @@ static void TtsSpeak()
     if (gTtsAccent > 0 && gTtsAccent < TTS_ACCENT_N) {   // the accent's voice wins (if it's installed)
         int v = TtsVoiceFor(gTtsAccent);
         if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
-        if (TTS_ACCENTS[gTtsAccent].phrasing) TtsPhrase(j->text, 600, TTS_ACCENTS[gTtsAccent].phrasing);
+        j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
@@ -7368,7 +7623,7 @@ static void OnTtsDone(TtsJob* j)
     }
     HeapFree(GetProcessHeap(), 0, j);
     gTtsBusy = 0;
-    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak");
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, gVoiceInstalling ? L"Installing voice..." : L"Speak");
 }
 
 // ======================= moving things around (layout + pictures) =======================
@@ -7731,6 +7986,78 @@ static void EdEnd()
 }
 static void EdFollow() { if (gEdWnd) EdRender(); }   // the window moved / changed page: redraw the layer over it
 
+// ---- installing a voice (Windows' "Text-to-speech" feature for a language), then refreshing the list ----
+struct VoiceInstall { HANDLE proc; int accent; };
+static DWORD WINAPI VoiceInstallWait(LPVOID arg)
+{
+    VoiceInstall* vi = (VoiceInstall*)arg;
+    WaitForSingleObject(vi->proc, 30 * 60 * 1000);
+    DWORD code = 1; GetExitCodeProcess(vi->proc, &code);
+    CloseHandle(vi->proc);
+    PostMessageW(gWnd, WM_VOICE_INSTALLED, (WPARAM)code, (LPARAM)vi->accent);
+    HeapFree(GetProcessHeap(), 0, vi);
+    return 0;
+}
+static void TtsInstallVoice(int accent)
+{
+    if (accent <= 0 || accent >= TTS_ACCENT_N || gVoiceInstalling) return;
+    wchar_t args[700];
+    wsprintfW(args, L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"try { "
+                    L"Add-WindowsCapability -Online -Name 'Language.TextToSpeech~~~%s~0.0.1.0' -ErrorAction Stop | Out-Null; exit 0 } "
+                    L"catch { exit 1 }\"", TTS_ACCENTS[accent].tag);
+    SHELLEXECUTEINFOW se = {}; se.cbSize = sizeof(se);
+    se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC; se.hwnd = gWnd;
+    se.lpVerb = L"runas"; se.lpFile = L"powershell.exe"; se.lpParameters = args; se.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&se) || !se.hProcess) return;   // (you said no to Windows' permission prompt)
+    VoiceInstall* vi = (VoiceInstall*)HeapAlloc(GetProcessHeap(), 0, sizeof(VoiceInstall));
+    if (!vi) { CloseHandle(se.hProcess); return; }
+    vi->proc = se.hProcess; vi->accent = accent;
+    HANDLE t = CreateThread(nullptr, 0, VoiceInstallWait, vi, 0, nullptr);
+    if (!t) { CloseHandle(se.hProcess); HeapFree(GetProcessHeap(), 0, vi); return; }
+    CloseHandle(t);
+    gVoiceInstalling = true;
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Installing voice...");
+}
+static void TtsFillVoices()                     // the voice dropdown, after the list changed
+{
+    HWND tv = GetDlgItem(gWnd, IDC_TTSVOICE);
+    SendMessageW(tv, CB_RESETCONTENT, 0, 0);
+    SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
+    int sel = 0;
+    for (int i = 0; i < gTtsCount; i++) { SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsNames[i]); if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1; }
+    SendMessageW(tv, CB_SETCURSEL, sel, 0);
+}
+static void AppRestart()
+{
+    SaveSettings(); gNoSaveOnExit = true;
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    ShellExecuteW(nullptr, L"open", exe, gWantRunning ? L"--updated --resume" : L"--updated", nullptr, SW_SHOWNORMAL);
+    PostMessageW(gWnd, WM_CLOSE, 0, 0);
+}
+static void OnVoiceInstalled(DWORD code, int accent)
+{
+    gVoiceInstalling = false;
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, gTtsBusy ? L"Speaking..." : L"Speak");
+    TtsListVoices();
+    TtsFillVoices();
+    const TtsAccent& a = TTS_ACCENTS[Iclamp(accent, 0, TTS_ACCENT_N - 1)];
+    int v = TtsVoiceFor(accent);
+    wchar_t m[600];
+    if (v >= 0) {
+        if (gTtsAccent == accent) { SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_SETCURSEL, v + 1, 0); lstrcpynW(gTtsVoice, gTtsNames[v], 128); }
+        wsprintfW(m, L"The %s voice is installed: the %s accent is ready.", a.voiceName, a.name);
+        MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_ICONINFORMATION);
+    } else if (code == 0) {
+        wsprintfW(m, L"Windows installed the %s voice. Lag Effect needs a restart to start using it.\n\nRestart Lag Effect now?", a.voiceName);
+        if (MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_YESNO | MB_ICONQUESTION) == IDYES) AppRestart();
+    } else {
+        wsprintfW(m, L"Windows couldn't install the %s voice (no internet, or Windows Update is blocked on this PC).\n\n"
+                     L"You can add it yourself: Settings > Time & language > Speech > Manage voices > Add voices.\n\nOpen the speech settings?", a.voiceName);
+        if (MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_YESNO | MB_ICONWARNING) == IDYES)
+            ShellExecuteW(nullptr, L"open", L"ms-settings:speech", nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+
 // ======================= tooltips =======================
 // Hover help for every setting. Labels get SS_NOTIFY so they can be hovered too
 // (clicking one still takes focus out of text boxes, see OnCommand). gTip is declared with the theme code.
@@ -7936,8 +8263,9 @@ static void AddTips()
     for (int i = 0; i < USERCOL_N; i++) TipId(IDC_COLSW0 + i, L"Click to pick this colour; right-click to use the theme's again. Bold = your own colour.");
     TipId(IDC_PICCHOOSE, L"Use a picture as the window's background (PNG, JPG, BMP or GIF).");
     TipId(IDC_PICREMOVE, L"Remove the background picture.");
-    TipId(IDC_PICFIT,  L"Fill: covers the window and crops the edges. Stretch: squashes to fit. Centre: actual size. Tile: repeats.");
-    TipId(IDC_PICDIM,  L"How much of the theme colour is laid over the picture, so text stays readable. 0% = the raw picture.");
+    TipId(IDC_PICFIT,  L"Fill: covers the window and crops the edges. Stretch: squashes to fit. Centre: actual size. Tile: repeats. "
+                       L"Place it yourself: drag it anywhere and scroll to resize.");
+    TipId(IDC_PICDIM,  L"How much of the theme colour is laid over the picture: higher = easier to read. 0% = the raw picture.");
     TipId(IDC_PTTMODE,   L"Push-to-talk: your mic is silent unless you hold the key. Push-to-mute: holding the key mutes you.");
     TipId(IDC_PTTKEY,    L"The push-to-talk / push-to-mute key. Right-click to clear it.");
     TipId(IDC_OVERLAY,   L"A small always-on-top badge: live / muted / lagging, your effects and profile. Drag it anywhere; "
@@ -7985,8 +8313,8 @@ static void AddTips()
                           L"a robot or demon soundboard. Off: they play clean.");
     TipId(IDC_TTSTEXT,    L"Type a line and press Enter (or Speak): Windows says it into Discord and your outputs.");
     TipId(IDC_TTSVOICE,   L"Which Windows voice speaks. More voices: Windows Settings > Time & language > Speech > Add voices.");
-    TipId(IDC_TTSACCENT,  L"Read your words with an accent, using a Windows voice from that country (installed from Windows' speech settings). "
-                          L"American and Canadian add some stereotypical phrasing too.");
+    TipId(IDC_TTSACCENT,  L"Read your words with an accent: a Windows voice from that country (installed for you if it's missing), "
+                          L"its own pace, and some of its own words, mixed up every time. American and Canadian are stereotypical.");
     TipId(IDC_FONTSIZE,   L"How big the text is, in pixels (at 100% size).");
     TipId(IDC_LAYEDIT,    L"Drag any control or box to where you want it. Saved for the profile you're using.");
     TipId(IDC_LAYRESET,   L"Put every control and box back where it started.");
@@ -7995,6 +8323,7 @@ static void AddTips()
     TipId(IDC_STKDEL,     L"Remove the picked picture.");
     TipId(IDC_STKSIZE,    L"Size of the picked picture (100% = its own size).");
     TipId(IDC_STKOPAC,    L"How see-through the picked picture is (100% = solid).");
+    TipId(IDC_PICPLACE,   L"With Fit set to \"Place it yourself\": drag the background where you want it and scroll to resize it.");
     TipId(IDC_STKMOVE,    L"Drag pictures to move them, scroll over one to resize it, Delete removes it.");
     TipId(IDC_GIFFPS,     L"The most frames per second GIFs play at. Lower uses less CPU and memory.");
     TipId(IDC_GIFPAUSE,   L"Stop GIFs while you're in another window (saves CPU while gaming).");
@@ -8121,7 +8450,7 @@ static void AddTips()
     TipId(IDC_EXCL,     L"Takes over the mic and output 1 for the lowest delay. Other apps can't use them while it's on.");
     TipId(IDC_THEME,    L"Light, dark, or follow Windows.");
     TipId(IDC_COLORTHEME, L"The app's color: knobs, switches, tabs and a matching tint on the background. "
-                          L"Classic is the original look. Works with light and dark.");
+                          L"Classic is the original look. Custom (hex) lets you type any colour (pick another theme, then Custom again to change it).");
     TipId(IDC_AUTO,     L"When Lag Effect opens, start audio straight away and hide in the tray.");
     TipId(IDC_REPO,     L"The GitHub repo Lag Effect checks for new versions.");
     TipId(IDC_CHECKUPD, L"Check GitHub for a newer version now.");
@@ -10080,7 +10409,7 @@ static void CreateUI()
     AddSection(14, 398, 532, 70, L"Screen share");
     Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 418, 300, 20, IDC_HIDESHARE);
     CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Stops Discord screen shares from picking up your voice a second time (hover for more).", 0, 30, 442, 500, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Stops screen shares picking up your voice twice (hover for more).", 0, 30, 442, 500, 18, IDC_HDR);
 
     AddSection(14, 482, 532, 104, L"Shortcuts & window");      // painted text: a single & shows as &
     Ctl(L"STATIC", L"Mute hotkey:", 0, 30, 503, 90, 20, -1);
@@ -10136,13 +10465,13 @@ static void CreateUI()
     AddSection(14, 198, 532, 148, L"Your colours");
     for (int i = 0; i < USERCOL_N; i++)
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + (i % 4) * 126, 218 + (i / 4) * 32, 120, 28, IDC_COLSW0 + i);
-    Ctl(L"STATIC", L"Click a colour to change it; right-click it to go back to the theme's.", 0, 30, 318, 390, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Click: change it. Right-click: theme's colour.", 0, 30, 318, 390, 18, IDC_HDR);
     Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 314, 100, 26, IDC_COLRESET);
 
     AddSection(14, 360, 532, 84, L"Layout");
     Ctl(L"BUTTON", L"Move things around...", WS_TABSTOP | WS_GROUP, 30, 382, 180, 28, IDC_LAYEDIT);
     Ctl(L"BUTTON", L"Put everything back", WS_TABSTOP, 218, 382, 160, 28, IDC_LAYRESET);
-    Ctl(L"STATIC", L"Saved for the profile you're using: each profile can have its own layout.", 0, 30, 418, 500, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Saved per profile: each one can have its own layout.", 0, 30, 418, 500, 18, IDC_HDR);
     gBuildSub = -1;
 
     // ---- Pictures ----
@@ -10161,7 +10490,7 @@ static void CreateUI()
     Ctl(L"STATIC", L"Fade:", 0, 226, 150, 40, 20, -1);
     Spin(IDC_PICDIM, 268, 147, 60, 0, 95, gPicDim);
     Ctl(L"STATIC", L"%", 0, 332, 150, 16, 20, -1);
-    Ctl(L"STATIC", L"(higher = easier to read)", 0, 352, 150, 178, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Move && resize...", WS_TABSTOP, 352, 145, 178, 28, IDC_PICPLACE);
 
     AddSection(14, 208, 532, 120, L"Pictures on top");
     Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 30, 230, 226, 300, IDC_STKLIST);
@@ -10174,7 +10503,7 @@ static void CreateUI()
     Spin(IDC_STKOPAC, 224, 265, 64, 5, 100, 100);
     Ctl(L"STATIC", L"%", 0, 292, 268, 16, 20, -1);
     Ctl(L"BUTTON", L"Move && resize...", WS_TABSTOP, 360, 263, 170, 28, IDC_STKMOVE);
-    Ctl(L"STATIC", L"Up to 8, over every page. They aren't faded, so keep them off text you need.", 0, 30, 302, 500, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Up to 8, shown on every page and not faded.", 0, 30, 302, 500, 18, IDC_HDR);
 
     AddSection(14, 342, 532, 84, L"GIFs");
     Ctl(L"STATIC", L"Frame-rate limit:", 0, 30, 364, 110, 20, -1);
@@ -10188,7 +10517,7 @@ static void CreateUI()
     }
     Ctl(L"BUTTON", L"Pause while another window is in front", BS_AUTOCHECKBOX | WS_TABSTOP, 266, 364, 264, 20, IDC_GIFPAUSE);
     CheckDlgButton(gWnd, IDC_GIFPAUSE, gGifPauseBg ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Lower = less CPU and memory. Skipped frames are merged, so GIFs still play at their own speed.", 0, 30, 396, 500, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Lower = less CPU and memory (GIFs keep their speed).", 0, 30, 396, 500, 18, IDC_HDR);
     gBuildSub = -1;
 
     // compact mode's own buttons (shown only in compact mode)
@@ -10501,14 +10830,13 @@ static void OnCommand(int id, int code)
             if (v >= 0) {                       // show which voice will speak
                 SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_SETCURSEL, v + 1, 0);
                 lstrcpynW(gTtsVoice, gTtsNames[v], 128);
-            } else if (gTtsAccent > 0 && !a.phrasing) {
-                wchar_t m[512];
-                wsprintfW(m, L"The %s accent needs a Windows voice for %s, and none is installed.\n\n"
-                             L"Add one in Windows Settings > Time & language > Speech > Manage voices > Add voices "
-                             L"(pick \"%s\"), then restart Lag Effect.\n\nOpen the speech settings now?", a.name, a.voiceName, a.voiceName);
-                if (MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_YESNO | MB_ICONINFORMATION) == IDYES)
-                    ShellExecuteW(nullptr, L"open", L"ms-settings:speech", nullptr, nullptr, SW_SHOWNORMAL);
-                gTtsAccent = 0; SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, 0, 0);
+            } else if (gTtsAccent > 0 && !gVoiceInstalling) {
+                wchar_t m[600];
+                wsprintfW(m, L"The %s accent needs Windows' %s voice, and it isn't installed yet.\n\n"
+                             L"Download and install it now? Windows will ask for permission, then it downloads in the "
+                             L"background (usually a minute or two). Until then the accent's words are used with your current voice.",
+                          a.name, a.voiceName);
+                if (MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_YESNO | MB_ICONQUESTION) == IDYES) TtsInstallVoice(gTtsAccent);
             }
         }
         return;
@@ -10545,11 +10873,11 @@ static void OnCommand(int id, int code)
     if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) {
         if (code == BN_CLICKED) {
             int i = id - IDC_COLSW0;
-            static COLORREF custom[16];
-            CHOOSECOLORW cc = {}; cc.lStructSize = sizeof(cc); cc.hwndOwner = gWnd; cc.lpCustColors = custom;
-            cc.rgbResult = gUserCol[i] != CLR_NONE ? gUserCol[i] : i == 0 ? ACCENT : BgColor();
-            cc.Flags = CC_FULLOPEN | CC_RGBINIT;
-            if (ChooseColorW(&cc)) { gUserCol[i] = cc.rgbResult; ApplyTheme(); }
+            const COLORREF nows[USERCOL_N] = { ACCENT, BgColor(), gDark ? DK_CTL : LT_CARD, gDark ? DK_SECTION : LT_BORDER, TXT_C,
+                                               gDark ? DK_DIM : gLtDim, TITLE_C, KNOB_C, gDark ? DK_TRACK : LT_TRACK, METER_C, TAB_C, STATUS_C };
+            wchar_t title[64]; wsprintfW(title, L"Colour: %s", USERCOL_NAMES[i]);
+            COLORREF c;
+            if (HexColorPick(title, nows[i], &c)) { gUserCol[i] = c; ApplyTheme(); }
         }
         return;
     }
@@ -10587,7 +10915,21 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_PICREMOVE) { if (code == BN_CLICKED) { gPicPath[0] = 0; PictureLoad(gPicPath); ApplyTheme(); PictureInfo(); } return; }
-    if (id == IDC_PICFIT) { if (code == CBN_SELCHANGE) { gPicFit = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 4); ApplyTheme(); } return; }
+    if (id == IDC_PICFIT) {
+        if (code == CBN_SELCHANGE) {
+            int was = gPicFit;
+            gPicFit = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 4);
+            if (gPicFit == 4 && was != 4 && gBase.gp) {   // start small, in the middle, then let you place it
+                int big = Imax(gBase.w0, gBase.h0);
+                gPicSize = Iclamp(big > 0 ? 24000 / big : 100, 5, 400);
+                gPicX = (CLIENT_W - gBase.w0 * gPicSize / 100) / 2; gPicY = 180;
+            }
+            ApplyTheme(); PictureInfo();
+            if (gPicFit == 4 && was != 4 && gBase.gp) EdBegin(ED_PICS);
+        }
+        return;
+    }
+    if (id == IDC_PICPLACE) { if (code == BN_CLICKED && gBase.gp && gPicFit == 4) EdBegin(ED_PICS); return; }
     if (id == IDC_FONTSIZE) {
         if (code == CBN_SELCHANGE) {
             gFontPx = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) + 11, 11, 18);
@@ -10663,9 +11005,7 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) {
             static const int fpsV[] = { 10, 15, 24, 30, 60, 0 };
             gGifFps = fpsV[Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 5)];
-            HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
-            PictureRebuild(); PicRedraw(nullptr);  // frames are decoded again for the new limit
-            SetCursor(old);
+            PictureRebuild(); PicRedraw(nullptr);  // frames are decoded again (in the background) for the new limit
         }
         return;
     }
@@ -10893,7 +11233,13 @@ static void OnCommand(int id, int code)
         break;
     case IDC_COLORTHEME:
         if (code == CBN_SELCHANGE) {
+            int was = gColorTheme;
             gColorTheme = Iclamp((int)SendDlgItemMessageW(gWnd, IDC_COLORTHEME, CB_GETCURSEL, 0, 0), 0, COLOR_THEME_N - 1);
+            if (gColorTheme == COLOR_THEME_N - 1) {   // Custom: type its colour
+                COLORREF c;
+                if (HexColorPick(L"Custom theme colour", gCustomAccent, &c)) gCustomAccent = c;
+                else if (was != COLOR_THEME_N - 1) { gColorTheme = was; SendDlgItemMessageW(gWnd, IDC_COLORTHEME, CB_SETCURSEL, was, 0); }
+            }
             ApplyTheme();                       // live preview
         }
         break;
@@ -10998,6 +11344,12 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_UPDATE_CHECKED:
         OnUpdateChecked((UpdateJob*)l);
+        return 0;
+    case WM_PIC_DECODED:
+        OnPicDecoded((PicJob*)l);
+        return 0;
+    case WM_VOICE_INSTALLED:
+        OnVoiceInstalled((DWORD)w, (int)l);
         return 0;
     case WM_DROPFILES:
         OnDropFiles((HDROP)w);
