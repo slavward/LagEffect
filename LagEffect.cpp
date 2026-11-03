@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.26.4"
+#define APP_VERSION L"1.27.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -110,6 +110,7 @@ static float gOutShow[8] = { -80, -80, -80, -80, -80, -80, -80, -80 };
 // Random lag: the stutter fires by itself now and then. Rewind / Repeat word: hotkey requests to the audio thread.
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
+static volatile int  gRewindTop = 350, gRewindRamp = 30, gRewindPitch = 0;   // Rewind: top speed %, % of it spent speeding up, semitones
 static volatile bool gTapeReq = false, gDiveHeld = false, gBeatSync = false, gFxBypass = false;   // A/B: hear yourself dry
 static volatile int  gDiveSemis = -12, gBpm = 120, gBeatDiv = 1;   // beat division: 0 = 1/4, 1 = 1/8, 2 = 1/16, 3 = 1/32
 // Mic test: 5 s of exactly what Discord hears, recorded by the audio thread, played back on your speakers.
@@ -1879,9 +1880,10 @@ static size_t spStart = 0;
 static void SpStartRewind()
 {
     spMode = SP_REWIND; spT = 0; spTravel = 0;
-    spTotal = Iclamp(gRewindMs, 300, 3000) * (double)RATE / 1000.0;
+    spTotal = Iclamp(gRewindMs, 300, 3500) * (double)RATE / 1000.0;   // how far back it goes
     spPos = (double)((wpos + HIST - 1) % HIST);
 }
+static PShift gPsRewind;                        // Rewind's pitch
 
 static void SpStartRepeat()                     // find the last word: the most recent burst of sound
 {
@@ -1933,7 +1935,8 @@ static float SpSample()
     }
     if (spMode == SP_REWIND) {
         double prog = spTravel / spTotal;
-        double speed = 1.0 + 2.5 * (prog < 0.3 ? prog / 0.3 : 1.0);   // speeds up, like a tape spinning faster
+        const double top = Iclamp(gRewindTop, 100, 800) / 100.0, ramp = Iclamp(gRewindRamp, 0, 100) / 100.0;
+        double speed = 1.0 + (top - 1.0) * (ramp <= 0.0 || prog >= ramp ? 1.0 : prog / ramp);   // speeds up, like a tape spinning faster
         size_t i0 = (size_t)spPos; float t = (float)(spPos - (double)i0);
         v = hist[i0 % HIST] * (1.0f - t) + hist[(i0 + HIST - 1) % HIST] * t;
         spPos -= speed; if (spPos < 0) spPos += HIST;
@@ -1942,6 +1945,7 @@ static float SpSample()
         double left = spTotal - spTravel;
         if (left < 1440) env *= (float)(left > 0 ? left / 1440.0 : 0.0);
         v *= env * 0.9f;
+        if (gRewindPitch) v = PitchShift(gPsRewind, v, pow(2.0, gRewindPitch / 12.0), 1200, 1.0f);
         spT++;
         if (spTravel >= spTotal) spMode = SP_NONE;
     } else if (spMode == SP_REPEAT) {
@@ -2315,7 +2319,7 @@ enum {
     IDC_CLIPBANK0, IDC_CLIPBANK1, IDC_CLIPBANK2, IDC_CLIPBANK3,   // clip pages: consecutive
     IDC_LAGPRESET, IDC_BEATSYNC, IDC_BPM, IDC_BEATDIV, IDC_TAPEKEY, IDC_DIVEKEY, IDC_DIVESEMIS, IDC_SURPRISE, IDC_ABTEST,
     IDC_FXCHAR, IDC_ECHOSTYLE, IDC_DISTSTYLE, IDC_CHOSTYLE, IDC_MUFSTYLE, IDC_FXORDER,
-    IDC_RANDLAG, IDC_RANDSEC, IDC_REWINDKEY, IDC_REPEATKEY,
+    IDC_RANDLAG, IDC_RANDSEC, IDC_REWINDKEY, IDC_REPEATKEY, IDC_RWLEN, IDC_RWTOP, IDC_RWRAMP, IDC_RWPITCH,
     IDC_PADBANK0, IDC_PADBANK1, IDC_PADBANK2, IDC_PADBANK3, IDC_PADBANKKEY, IDC_PADFX,   // bank buttons: consecutive
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
@@ -2520,6 +2524,10 @@ static Range gRanges[] = {
     { IDC_PITCH,   25, 400,  &gPitchPct,   L"pitch"           },
     { IDC_FADE,    0,  50,   &gFadeMs,     L"smoothing_ms"    },
     { IDC_TALKVOL, 0,  200,  &gTalkVolPct, L"talkover_volume" },
+    { IDC_RWLEN,   300, 3500, &gRewindMs,  L"rewind_ms"       },
+    { IDC_RWTOP,   100, 800, &gRewindTop,  L"rewind_top_speed" },
+    { IDC_RWRAMP,  0,   100, &gRewindRamp, L"rewind_speed_up" },
+    { IDC_RWPITCH, -12, 12,  &gRewindPitch, L"rewind_pitch"   },
 };
 
 static const wchar_t* CHARACTERS[] = { L"Pick a voice...", L"Demon", L"Giant", L"Deeper voice", L"Higher voice", L"Child",
@@ -3294,7 +3302,6 @@ static void LoadSettings()
     gClipAutoTrim = INI_INT(L"clip_auto_trim", 1) != 0;
     gRandLagOn    = INI_INT(L"random_lag", 0) != 0;
     gRandLagSec   = Iclamp(INI_INT(L"random_lag_every_s", 8), 2, 120);
-    gRewindMs     = Iclamp(INI_INT(L"rewind_ms", 2000), 300, 3000);
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
     gTtsAccent = INI_INT(L"tts_accent", 0);
@@ -3931,7 +3938,7 @@ static void SaveSettings()
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
     SaveInt(L"random_lag", gRandLagOn);
     SaveInt(L"random_lag_every_s", gRandLagSec);
-    SaveInt(L"rewind_ms", gRewindMs);
+
     SaveInt(L"repeat_word_times", gRepeatN);
     WritePrivateProfileStringW(L"settings", L"tts_voice", gTtsVoice, gIni);
     SaveInt(L"tts_accent", gTtsAccent);
@@ -6175,7 +6182,7 @@ static bool ProfileSave(const wchar_t* name)
 
 static void RefreshSoundUI()                    // after a profile changed lots of settings at once
 {
-    for (const Range& r : gRanges) SetDlgItemInt(gWnd, r.id, (UINT)*r.var, FALSE);
+    for (const Range& r : gRanges) SetDlgItemInt(gWnd, r.id, (UINT)*r.var, TRUE);
     for (int g = 0; g < FX_GROUPS; g++) CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
     SendDlgItemMessageW(gWnd, IDC_VOCSTYLE, CB_SETCURSEL, gVocStyle, 0);
     SendDlgItemMessageW(gWnd, IDC_VOCKEY, CB_SETCURSEL, gVocKey, 0);
@@ -8418,7 +8425,11 @@ static void AddTips()
     TipId(IDC_RANDLAG,    L"The stutter fires by itself now and then, with random loop lengths, so it sounds like really bad internet "
                           L"without you touching the key.");
     TipId(IDC_RANDSEC,    L"How often random lag happens, on average (in seconds).");
-    TipId(IDC_REWINDKEY,  L"A hotkey that plays your last 2 seconds backwards, speeding up like a tape rewinding. Right-click to clear it.");
+    TipId(IDC_REWINDKEY,  L"A hotkey that plays your last few seconds backwards, speeding up like a tape rewinding (set it up in the Rewind box). Right-click to clear it.");
+    TipId(IDC_RWLEN,      L"How far back the rewind goes (300-3500 ms of what you just said).");
+    TipId(IDC_RWTOP,      L"How fast it ends up spinning: 100% = normal speed backwards, 350% = the classic tape rewind.");
+    TipId(IDC_RWRAMP,     L"How much of the rewind is spent speeding up. 0% = full speed straight away.");
+    TipId(IDC_RWPITCH,    L"Make the rewind higher or lower, in semitones (on top of the speed-up).");
     TipId(IDC_REPEATKEY,  L"A hotkey that repeats the last word you said 3 times, DJ style: \"word-word-word\". Right-click to clear it.");
     TipId(IDC_PADSTOP,   L"Stop every pad and clip that's playing.");
 
@@ -10224,6 +10235,21 @@ static void CreateUI()
         SendMessageW(dv, CB_SETCURSEL, sel, 0);
         Ctl(L"STATIC", L"These work any time audio is running, even with Voice effects off. Right-click a button to clear its hotkey.",
             0, 28, y + 80, 500, 28, IDC_HDR);
+        y += 120;                               // Rewind: how it sounds
+        AddSection(14, y, 532, 110, L"Rewind");
+        Ctl(L"STATIC", L"Length:", 0, 30, y + 25, 60, 20, -1);
+        Spin(IDC_RWLEN, 92, y + 22, 76, 300, 3500, gRewindMs);
+        Ctl(L"STATIC", L"ms", 0, 172, y + 25, 30, 20, -1);
+        Ctl(L"STATIC", L"Top speed:", 0, 230, y + 25, 76, 20, -1);
+        Spin(IDC_RWTOP, 308, y + 22, 70, 100, 800, gRewindTop);
+        Ctl(L"STATIC", L"%", 0, 382, y + 25, 20, 20, -1);
+        Ctl(L"STATIC", L"Speed-up:", 0, 30, y + 57, 60, 20, -1);
+        Spin(IDC_RWRAMP, 92, y + 54, 76, 0, 100, gRewindRamp);
+        Ctl(L"STATIC", L"% of it", 0, 172, y + 57, 54, 20, -1);
+        Ctl(L"STATIC", L"Pitch:", 0, 230, y + 57, 76, 20, -1);
+        Spin(IDC_RWPITCH, 308, y + 54, 70, -12, 12, gRewindPitch);
+        Ctl(L"STATIC", L"semitones", 0, 382, y + 57, 80, 20, -1);
+        Ctl(L"STATIC", L"How far back, how fast it spins, how soon it gets there, and how high.", 0, 30, y + 86, 500, 18, IDC_HDR);
         gBuildSub = -1;
     }
     const int FX_SEC_Y0 = 144, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
@@ -11202,13 +11228,14 @@ static void OnCommand(int id, int code)
     if (id >= 1260 && id < 1260 + PAD_BANKS) { SetPadBank(id - 1260); return; }
     switch (id) {
     case IDC_LOOP: case IDC_SPEED: case IDC_PITCH: case IDC_FADE: case IDC_TALKVOL:
+    case IDC_RWLEN: case IDC_RWTOP: case IDC_RWRAMP: case IDC_RWPITCH:
         if (!gUiReady) break;
         for (Range& r : gRanges) {
             if (r.id != id) continue;
             BOOL ok = FALSE;
-            int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+            int v = (int)GetDlgItemInt(gWnd, id, &ok, TRUE);
             if (code == EN_CHANGE && ok) *r.var = Iclamp(v, r.lo, r.hi);
-            else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)*r.var, FALSE);
+            else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)*r.var, TRUE);
         }
         break;
     case IDC_REPO:
