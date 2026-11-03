@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.26.2"
+#define APP_VERSION L"1.26.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -3524,7 +3524,17 @@ static bool PicOpen(PicImg& m, const wchar_t* path)
     }
     return true;
 }
-#define PIC_PX_BUDGET (10 * 1024 * 1024)        // pixels of decoded frames per picture (40 MB)
+// How many decoded pixels one picture may keep: a share of the memory that's free right now (so big GIFs keep
+// all their frames instead of being merged down to a slideshow), between 64 MB and 1.5 GB.
+static long long PicPxBudget()
+{
+    MEMORYSTATUSEX ms = { sizeof(ms) };
+    unsigned long long bytes = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPhys / 4 : 256ull << 20;
+    if (bytes < (64ull << 20)) bytes = 64ull << 20;
+    if (bytes > (1536ull << 20)) bytes = 1536ull << 20;
+    return (long long)(bytes / 4);
+}
+#define PIC_PX_BUDGET PicPxBudget()
 static void PicJobRun(PicJob* j)                // (worker thread) all kept frames at tw x th
 {
     int tw = j->tw, th = j->th;
@@ -3533,7 +3543,7 @@ static void PicJobRun(PicJob* j)                // (worker thread) all kept fram
     // which frames to keep: never faster than the limit, and within the memory budget
     static thread_local int keep[2000], kdel[2000];
     int nk = 0;
-    const int maxFrames = Imax(1, Imin(2000, (int)(PIC_PX_BUDGET / ((long long)tw * th))));
+    const int maxFrames = (int)Imax(1, (int)Min<long long>(2000, PIC_PX_BUDGET / ((long long)tw * th)));
     int minMs = j->fps > 0 ? 1000 / j->fps : 0;
     for (int pass = 0; pass < 12; pass++) {
         nk = 0; int t = 0, nextAt = 0;
@@ -3734,9 +3744,9 @@ static bool PictureLoad(const wchar_t* path)    // the background picture (empty
     PicClose(gBase);
     return path && path[0] && PicOpen(gBase, path);
 }
-static void PicRedraw(const RECT* r)            // repaint the window (or part of it) and its controls
+static void PicRedraw(const RECT* r)            // repaint the window (or part of it) and its controls, now
 {
-    RedrawWindow(gWnd, r, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+    RedrawWindow(gWnd, r, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 static void StkRefresh(const RECT* also)        // pictures on top changed: re-compose and repaint just there
 {
@@ -3759,22 +3769,37 @@ static void PicAnimTimer()                      // run the animation timer only 
     for (int i = 0; i < gStkN; i++) if (gStk[i].img.nAll > 1) gifs = true;
     LONG ex = GetWindowLongW(gWnd, GWL_EXSTYLE), want = gifs ? (ex | WS_EX_COMPOSITED) : (ex & ~WS_EX_COMPOSITED);
     if (want != ex) SetWindowLongW(gWnd, GWL_EXSTYLE, want);
-    if (any) SetTimer(gWnd, TIMER_PICANIM, gGifFps > 0 ? Imax(15, 1000 / gGifFps) : 15, nullptr);
+    // Frames are shown when they're due, checked every 5 ms with Windows' timer made precise (1 ms) only while
+    // something animates: the default ~16 ms steps make GIF timing uneven.
+    static bool fine = false;
+    typedef UINT (WINAPI* PTimePeriod)(UINT);
+    static HMODULE wm = LoadLibraryW(L"winmm.dll");
+    static PTimePeriod begin = wm ? (PTimePeriod)(void*)GetProcAddress(wm, "timeBeginPeriod") : nullptr;
+    static PTimePeriod end   = wm ? (PTimePeriod)(void*)GetProcAddress(wm, "timeEndPeriod") : nullptr;
+    if (any && !fine && begin) { begin(1); fine = true; }
+    if (!any && fine && end)   { end(1); fine = false; }
+    if (any) SetTimer(gWnd, TIMER_PICANIM, 5, nullptr);
     else KillTimer(gWnd, TIMER_PICANIM);
+}
+static ULONGLONG PicNow()                       // ms, precise (GetTickCount64 moves in ~16 ms steps)
+{
+    static LARGE_INTEGER f = {}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (ULONGLONG)(c.QuadPart * 1000 / f.QuadPart);
 }
 static bool PicAdvance(PicImg& m, ULONGLONG now)
 {
     if (m.n <= 1 || now < m.due) return false;
+    if (now - m.due > 250) { m.cur = (m.cur + 1) % m.n; m.due = now + m.delay[m.cur]; return true; }   // was paused / hidden
     int steps = 0;
-    while (now >= m.due && steps++ < m.n) { m.cur = (m.cur + 1) % m.n; m.due += m.delay[m.cur]; }
-    if (now >= m.due) m.due = now + m.delay[m.cur];   // fell far behind (e.g. was hidden): carry on from now
+    while (now >= m.due && steps++ < m.n) { m.cur = (m.cur + 1) % m.n; m.due += m.delay[m.cur]; }   // keeps its speed
     return true;
 }
 static void PicAnimTick()
 {
     if (!gWnd || !IsWindowVisible(gWnd) || IsIconic(gWnd) || !gCompBmp) return;   // nobody can see it
     if (gGifPauseBg && GetForegroundWindow() != gWnd) return;
-    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG now = PicNow();
     if (PicAdvance(gBase, now)) {               // the background moved: everything changes
         for (int i = 0; i < gStkN; i++) PicAdvance(gStk[i].img, now);
         PicComposeBase();
@@ -3800,7 +3825,7 @@ static void OnPicDecoded(PicJob* j)
         PicFreeFrames(*m);
         m->px = j->px; m->delay = j->delay; j->px = nullptr; j->delay = nullptr;
         m->w = j->tw; m->h = j->th; m->rw = j->askW; m->rh = j->askH; m->n = j->n; m->fps = j->fps;
-        m->cur = 0; m->due = GetTickCount64() + m->delay[0];
+        m->cur = 0; m->due = PicNow() + m->delay[0];
     }
     PicJobFree(j, false);
     if (m->wantW) { int w = m->wantW, h = m->wantH; m->wantW = m->wantH = 0; PicWant(*m, w, h); }
