@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.26.3"
+#define APP_VERSION L"1.26.4"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4254,11 +4254,11 @@ static void PlaceAll()
         int w = d.ud ? r.right - r.left : d.w + d.dw;          // a number box keeps the width its arrows left it
         int h = d.combo ? d.ht : r.bottom - r.top;              // a dropdown's height is its list
         if (r.left != x || r.top != y || r.right - r.left != w)
-            SetWindowPos(d.h, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            SetWindowPos(d.h, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
         if (d.ud) {
             RECT u; GetWindowRect(d.ud, &u); MapWindowPoints(nullptr, gWnd, (POINT*)&u, 2);
             if (u.left != x + d.udx || u.top != y + d.udy)
-                SetWindowPos(d.ud, nullptr, x + d.udx, y + d.udy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                SetWindowPos(d.ud, nullptr, x + d.udx, y + d.udy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
         }
     }
 }
@@ -7733,7 +7733,10 @@ static bool LayoutLoad(const wchar_t* path, bool apply)   // false (and nothing 
         }
     }
     HeapFree(GetProcessHeap(), 0, buf);
-    if (saved && apply && gWnd) { PlaceAll(); RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN); }
+    if (saved && apply && gWnd) {
+        SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0); PlaceAll(); SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
+        RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+    }
     return saved;
 }
 static void LayoutSaveNow()                     // to the settings and the profile in use
@@ -7815,6 +7818,15 @@ static void EdGetOffset(int item, int* x, int* y)
     if (item >= 0) { *x = gDesign[item].ox; *y = gDesign[item].oy; return; }
     *x = gSections[-2 - item].ox; *y = gSections[-2 - item].oy;
 }
+// Move everything to its new place without drawing half-way, then repaint the whole window at once
+// (moving controls piecemeal left copies of them behind, especially while a GIF makes the window double-buffered).
+static void EdReplace()
+{
+    SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0);
+    PlaceAll();
+    SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
+    RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN | RDW_UPDATENOW);
+}
 static void EdSetOffset(int item, int x, int y)
 {
     if (gEdMode == ED_PICS) {
@@ -7830,12 +7842,10 @@ static void EdSetOffset(int item, int x, int y)
             Design& o = gDesign[i];
             if (o.page == d.page && o.sub == d.sub && o.rx == d.rx && o.ry == d.ry) { o.ox = x; o.oy = y; }
         }
-        PlaceAll();
-        return;
+    } else {
+        gSections[-2 - item].ox = x; gSections[-2 - item].oy = y;
     }
-    gSections[-2 - item].ox = x; gSections[-2 - item].oy = y;
-    PlaceAll();
-    RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);   // the box frame is painted by the window
+    EdReplace();
 }
 
 // ---- the see-through layer ----
@@ -11017,8 +11027,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_LAYRESET) {
         if (code == BN_CLICKED && MessageBoxW(gWnd, L"Put everything back where it started (for this profile)?", L"Lag Effect - Layout",
                                               MB_YESNO | MB_ICONQUESTION) == IDYES) {
-            LayoutReset(); PlaceAll(); LayoutSaveNow();
-            RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+            LayoutReset(); EdReplace(); LayoutSaveNow();
         }
         return;
     }
