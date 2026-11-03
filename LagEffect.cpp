@@ -3357,6 +3357,7 @@ static void SelectedName(int comboId, ma_device_info* list, ma_uint32 count, wch
     if (i >= 0 && i < (int)count) Widen(list[i].name, out, cap); else out[0] = 0;
 }
 
+static void LayoutSave(const wchar_t* path);    // (moving things around: defined with the editor)
 static void SaveInt(const wchar_t* k, int v)
 {
     wchar_t b[32]; wsprintfW(b, L"%d", v);
