@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.20.0"
+#define APP_VERSION L"1.21.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -95,6 +95,8 @@ static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / 
 // Random lag: the stutter fires by itself now and then. Rewind / Repeat word: hotkey requests to the audio thread.
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
+static volatile bool gTapeReq = false, gDiveHeld = false, gBeatSync = false, gFxBypass = false;   // A/B: hear yourself dry
+static volatile int  gDiveSemis = -12, gBpm = 120, gBeatDiv = 1;   // beat division: 0 = 1/4, 1 = 1/8, 2 = 1/16, 3 = 1/32
 // Mic test: 5 s of exactly what Discord hears, recorded by the audio thread, played back on your speakers.
 #define TEST_LEN (RATE * 5)
 static short gTestBuf[TEST_LEN];
@@ -1792,7 +1794,7 @@ static void FxPack2Reset()
 
 
 // ---- Rewind (your last ~2 s backwards, speeding up like a tape) and Repeat word ("word-word-word") ----
-enum { SP_NONE = 0, SP_REWIND, SP_REPEAT };
+enum { SP_NONE = 0, SP_REWIND, SP_REPEAT, SP_TAPE };
 static int    spMode = SP_NONE, spT = 0, spIdx = 0, spRep = 0, spReps = 0, spLen = 0;
 static double spPos = 0, spTravel = 0, spTotal = 0;
 static size_t spStart = 0;
@@ -1831,9 +1833,27 @@ static void SpStartRepeat()                     // find the last word: the most 
     spMode = SP_REPEAT; spIdx = 0; spRep = 0;
 }
 
+static void SpStartTape()                       // tape stop: your voice slows down to nothing
+{
+    spMode = SP_TAPE; spT = 0; spTravel = 0;
+    spTotal = RATE * 0.9;                       // 0.9 s from full speed to stopped
+    spPos = (double)((wpos + HIST - 1) % HIST);
+}
+
 static float SpSample()
 {
     float v = 0;
+    if (spMode == SP_TAPE) {
+        double prog = spT / spTotal, speed = 1.0 - prog;           // slows evenly to a stop
+        speed *= speed > 0 ? 1.0 : 0.0;
+        size_t i0 = (size_t)spPos; float t = (float)(spPos - (double)i0);
+        v = hist[i0 % HIST] * (1.0f - t) + hist[(i0 + 1) % HIST] * t;
+        spPos += speed; if (spPos >= HIST) spPos -= HIST;
+        float env = prog > 0.8 ? (float)((1.0 - prog) / 0.2) : 1.0f;
+        v *= env;
+        if (++spT >= (int)spTotal) spMode = SP_NONE;
+        return v;
+    }
     if (spMode == SP_REWIND) {
         double prog = spTravel / spTotal;
         double speed = 1.0 + 2.5 * (prog < 0.3 ? prog / 0.3 : 1.0);   // speeds up, like a tape spinning faster
@@ -1857,6 +1877,8 @@ static float SpSample()
 }
 
 static int randLeft = 0, randWait = 0, randLoopMs = 100;   // random lag state (audio thread)
+static PShift gPsDive;                          // Pitch dive hotkey
+static float  diveBend = 0;
 
 static void FxReset()                          // audio thread only
 {
@@ -1902,7 +1924,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     active = keyActive || randActive;
 
     if (active && !looping) {                  // freeze the most recent audio
-        size_t len = (size_t)(keyActive ? gLoopMs : randLoopMs) * RATE / 1000;
+        int beatMs = 240000 / Iclamp(gBpm, 40, 300) / (4 << Iclamp(gBeatDiv, 0, 3));   // 1/4 note = 60000 / BPM
+        size_t len = (size_t)(keyActive ? (gBeatSync ? Imin(beatMs, 2000) : (int)gLoopMs) : randLoopMs) * RATE / 1000;
         if (len < 1) len = 1;
         if (len > (size_t)HIST) len = HIST;
         size_t start = (wpos + HIST - len) % HIST;
@@ -1925,6 +1948,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     gLooping = looping;
     if (gRewindReq) { gRewindReq = false; if (!looping) SpStartRewind(); }
     if (gRepeatReq) { gRepeatReq = false; if (!looping) SpStartRepeat(); }
+    if (gTapeReq)   { gTapeReq = false;   if (!looping) SpStartTape(); }
     if (looping) spMode = SP_NONE;
 
     int      mode[MAX_OUT];
@@ -1948,16 +1972,17 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (fade * 2 > len) fade = len / 2.0;
 
     if (gFxResetReq) { FxReset(); gFxResetReq = false; }
-    const bool   fxPitch = gFxOn && gFxPitchOn;
-    const bool   fxRev   = gFxOn && gFxRevOn;
-    const bool   fxVoc   = gFxOn && gFxVocOn;
+    const bool fxNow = gFxOn && !gFxBypass;     // A/B button held: you hear yourself without effects
+    const bool   fxPitch = fxNow && gFxPitchOn;
+    const bool   fxRev   = fxNow && gFxRevOn;
+    const bool   fxVoc   = fxNow && gFxVocOn;
     if (fxVoc) VocBlock();
-    const bool   fxRadio = gFxOn && gFxRadioOn;
+    const bool   fxRadio = fxNow && gFxRadioOn;
     if (fxRadio) RadioBlock();
     // the newer effects (Voice FX sub-tabs)
-    const bool   fxForm = gFxOn && gFxFormantOn, fxEcho = gFxOn && gFxEchoOn, fxRvs = gFxOn && gFxRvsOn,
-                 fxDist = gFxOn && gFxDistOn, fxCho = gFxOn && gFxChorusOn, fxWob = gFxOn && gFxWobbleOn,
-                 fxMuf  = gFxOn && gFxMuffleOn, fxGl = gFxOn && gFxGlitchOn;
+    const bool   fxForm = fxNow && gFxFormantOn, fxEcho = fxNow && gFxEchoOn, fxRvs = fxNow && gFxRvsOn,
+                 fxDist = fxNow && gFxDistOn, fxCho = fxNow && gFxChorusOn, fxWob = fxNow && gFxWobbleOn,
+                 fxMuf  = fxNow && gFxMuffleOn, fxGl = fxNow && gFxGlitchOn;
     const float  fmFactor = powf(2.0f, gFormantShift / 12.0f), fmMix = gFormantMix / 100.0f;
     const EchoStyle& ecSt = ECHO_STYLES[Iclamp(gEchoStyle, 0, ECHO_N - 1)];
     const double ecD = (double)gEchoMs * RATE / 1000.0;
@@ -1973,9 +1998,9 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const float  mfWarble = gMufWarble / 100.0f, mfBubbles = gMufBubbles / 100.0f;
     const float  glRate = gGlAmount / 100.0f * 3.0f, glDrop = gGlDrop / 100.0f, glStut = gGlStutter / 100.0f, glRobot = gGlRobot / 100.0f;
     // effect pack 2
-    const bool   fxRing = gFxOn && gFxRingOn, fxWah = gFxOn && gFxWahOn, fxWhisper = gFxOn && gFxWhisperOn,
-                 fxGrowl = gFxOn && gFxGrowlOn, fxHarm = gFxOn && gFxHarmOn, fxShim = gFxOn && gFxShimOn,
-                 fxGender = gFxOn && gFxGenderOn;
+    const bool   fxRing = fxNow && gFxRingOn, fxWah = fxNow && gFxWahOn, fxWhisper = fxNow && gFxWhisperOn,
+                 fxGrowl = fxNow && gFxGrowlOn, fxHarm = fxNow && gFxHarmOn, fxShim = fxNow && gFxShimOn,
+                 fxGender = fxNow && gFxGenderOn;
     const float  rmHz = (float)Iclamp(gRingHz, 10, 1000), rmMix = gRingMix / 100.0f;
     const float  whSens = gWahSens / 100.0f, whRange = gWahRange / 100.0f, whRes = gWahRes / 100.0f, whMix = gWahMix / 100.0f;
     const float  wsAmt = gWhisperAmt / 100.0f, wsAir = gWhisperAir / 100.0f;
@@ -2069,6 +2094,13 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (fxRev)    s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
         if (fxRadio) s = Radio(s);                  // you're heard *through* the device...
         if (fxGl)    s = Glitch(s, glRate, glDrop, glStut, glRobot);   // ...over a bad connection
+        {                                       // Pitch dive hotkey: bend down (or up) while held, spring back
+            float target = gDiveHeld ? (float)gDiveSemis : 0.0f;
+            float step = (gDiveHeld ? 12.0f / (0.35f * RATE) : 12.0f / (0.15f * RATE));
+            if (diveBend < target) diveBend = diveBend + step > target ? target : diveBend + step;
+            else if (diveBend > target) diveBend = diveBend - step < target ? target : diveBend - step;
+            if (diveBend != 0.0f || gPsDive.primed) s = PitchShift(gPsDive, s, pow(2.0, diveBend / 12.0), 2400, 1.0f);
+        }
 
         float effect = 0.0f, everything;
         if (looping) {
@@ -2167,6 +2199,7 @@ enum {
     IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6,   // Voice FX sub-tabs: consecutive
     IDC_MICSUB0, IDC_MICSUB1,                   // Mic tab sub-tabs: consecutive
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
+    IDC_LAGPRESET, IDC_BEATSYNC, IDC_BPM, IDC_BEATDIV, IDC_TAPEKEY, IDC_DIVEKEY, IDC_DIVESEMIS, IDC_SURPRISE, IDC_ABTEST,
     IDC_FXCHAR, IDC_ECHOSTYLE, IDC_DISTSTYLE, IDC_CHOSTYLE, IDC_MUFSTYLE, IDC_FXORDER,
     IDC_RANDLAG, IDC_RANDSEC, IDC_REWINDKEY, IDC_REPEATKEY,
     IDC_PADBANK0, IDC_PADBANK1, IDC_PADBANK2, IDC_PADBANK3, IDC_PADBANKKEY, IDC_PADFX,   // bank buttons: consecutive
@@ -2370,8 +2403,36 @@ static Range gRanges[] = {
 };
 
 static const wchar_t* CHARACTERS[] = { L"Pick a voice...", L"Demon", L"Giant", L"Deeper voice", L"Higher voice", L"Child",
-                                       L"Chipmunk", L"Alien", L"Ghost", L"Underwater", L"Bad connection", L"Clear all effects" };
-#define CHAR_N ((int)(sizeof(CHARACTERS) / sizeof(CHARACTERS[0])))
+                                       L"Chipmunk", L"Alien", L"Ghost", L"Underwater", L"Bad connection",
+                                       L"Robot announcer", L"Old man", L"Stadium announcer", L"Cave troll", L"Space helmet",
+                                       L"Dark lord", L"Radio DJ", L"Angel", L"Monster", L"Whisperer" };
+#define CHAR_N ((int)(sizeof(CHARACTERS) / sizeof(CHARACTERS[0])))   // built-ins (0 = the prompt)
+#define MAX_MYCHARS 16
+static wchar_t gMyChars[MAX_MYCHARS][64];       // your saved characters
+static int     gMyCharN = 0;
+
+// A/B button: effects bypassed only while the mouse button is held on it.
+static LRESULT CALLBACK AbButtonProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    if (m == WM_LBUTTONDOWN || m == WM_LBUTTONDBLCLK) gFxBypass = true;
+    else if (m == WM_LBUTTONUP || m == WM_CAPTURECHANGED || m == WM_KILLFOCUS) gFxBypass = false;
+    else if (m == WM_KEYDOWN && w == VK_SPACE) gFxBypass = true;
+    else if (m == WM_KEYUP && w == VK_SPACE) gFxBypass = false;
+    return DefSubclassProc(h, m, w, l);
+}
+
+struct LagPreset { const wchar_t* name; int loopMs, speed, pitch, fade, randSec; };   // randSec 0 = leave random lag alone
+static const LagPreset LAG_PRESETS[] = {
+    { L"Lag preset...", 0, 0, 0, 0, 0 },
+    { L"Bad Wi-Fi",     120, 100, 100, 5,  6 },
+    { L"Frozen call",    60, 100, 100, 2,  0 },
+    { L"Robot glitch",   25, 100, 100, 0,  0 },
+    { L"Buffering",     400, 100, 100, 10, 0 },
+    { L"Slow-mo",       600,  50,  70, 10, 0 },
+    { L"Chipmunk loop", 300, 150, 160, 8,  0 },
+    { L"Default",       300, 100, 100, 5,  0 },
+};
+#define LAG_PRESET_N ((int)(sizeof(LAG_PRESETS) / sizeof(LAG_PRESETS[0])))
 
 // Voice FX page: one group (section) per effect, each with an on/off box and a row of knobs.
 // The page has four sub-tabs (sub) of three effects each (slot = row on the sub-tab).
@@ -2417,7 +2478,9 @@ static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
 #define SLOT_PADBANK (SLOT_REPEAT + 1)           // soundboard: next page
 #define SLOT_PROFNEXT (SLOT_PADBANK + 1)         // Settings: next profile
 #define PROF_MAX     8                           // profiles (each can have a hotkey)
-#define SLOT_PROF0   (SLOT_PROFNEXT + 1)
+#define SLOT_TAPESTOP (SLOT_PROFNEXT + 1)        // Voice FX > Fun: hotkey tricks
+#define SLOT_DIVE    (SLOT_TAPESTOP + 1)
+#define SLOT_PROF0   (SLOT_DIVE + 1)
 #define KEY_SLOTS    (SLOT_PROF0 + PROF_MAX)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
@@ -2835,6 +2898,8 @@ static const wchar_t* FxKeyIniName(int slot)
     static const wchar_t* clipKeys[CLIPS] = { L"clip1_hotkey", L"clip2_hotkey", L"clip3_hotkey", L"clip4_hotkey",
                                               L"clip5_hotkey", L"clip6_hotkey", L"clip7_hotkey", L"clip8_hotkey" };
     if (slot >= SLOT_PROF0)    return nullptr;           // saved by profile name (ProfileKeysSave)
+    if (slot == SLOT_TAPESTOP) return L"tape_stop_hotkey";
+    if (slot == SLOT_DIVE)     return L"pitch_dive_hotkey";
     if (slot == SLOT_PROFNEXT) return L"profile_next_hotkey";
     if (slot == SLOT_REWIND)  return L"rewind_hotkey";
     if (slot == SLOT_REPEAT)  return L"repeat_word_hotkey";
@@ -2970,6 +3035,10 @@ static void LoadSettings()
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
     gEchoStyle = Iclamp(INI_INT(L"fx_echo_style", 0), 0, ECHO_N - 1);
     gHarmStyle = Iclamp(INI_INT(L"fx_harm_style", 0), 0, HARM_N - 1);
+    gBeatSync  = INI_INT(L"beat_sync", 0) != 0;
+    gBpm       = Iclamp(INI_INT(L"bpm", 120), 40, 300);
+    gBeatDiv   = Iclamp(INI_INT(L"beat_division", 1), 0, 3);
+    gDiveSemis = Iclamp(INI_INT(L"pitch_dive_semitones", -12), -12, 12);
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
     gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 1);
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
@@ -3077,6 +3146,8 @@ static void SaveSettings()
     WritePrivateProfileStringW(L"settings", L"tts_voice", gTtsVoice, gIni);
     SaveInt(L"fx_echo_style", gEchoStyle);
     SaveInt(L"fx_harm_style", gHarmStyle);
+    SaveInt(L"beat_sync", gBeatSync); SaveInt(L"bpm", gBpm); SaveInt(L"beat_division", gBeatDiv);
+    SaveInt(L"pitch_dive_semitones", gDiveSemis);
     SaveInt(L"broadcast_voice", gBroadcast);
     SaveInt(L"mic_subtab", gMicSub);
     SaveInt(L"fx_dist_style", gDistStyle);
@@ -4918,6 +4989,7 @@ static const ProfVar PROF_VARS[] = {
     { L"talkover", nullptr, &gTalkOver, nullptr },  { L"toggle", nullptr, &gToggleMode, nullptr },
     { L"random_lag", nullptr, &gRandLagOn, nullptr }, { L"random_lag_every_s", &gRandLagSec, nullptr, nullptr },
     { L"fx_harm_style", &gHarmStyle, nullptr, nullptr }, { L"broadcast_voice", nullptr, &gBroadcast, nullptr },
+    { L"beat_sync", nullptr, &gBeatSync, nullptr }, { L"bpm", &gBpm, nullptr, nullptr }, { L"beat_division", &gBeatDiv, nullptr, nullptr },
 };
 
 static void ProfileDir(wchar_t* out)
@@ -5020,6 +5092,9 @@ static void RefreshSoundUI()                    // after a profile changed lots 
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
     CheckDlgButton(gWnd, IDC_RANDLAG, gRandLagOn ? BST_CHECKED : BST_UNCHECKED);
     SetDlgItemInt(gWnd, IDC_RANDSEC, (UINT)gRandLagSec, FALSE);
+    CheckDlgButton(gWnd, IDC_BEATSYNC, gBeatSync ? BST_CHECKED : BST_UNCHECKED);
+    SetDlgItemInt(gWnd, IDC_BPM, (UINT)gBpm, FALSE);
+    SendDlgItemMessageW(gWnd, IDC_BEATDIV, CB_SETCURSEL, gBeatDiv, 0);
     InvalidateRect(GetDlgItem(gWnd, IDC_FXON), nullptr, FALSE);
     gFxResetReq = true;                         // start the effects clean
     SongStyleChanged();                         // Song style shows different controls; also redraws knobs
@@ -5164,6 +5239,200 @@ static void MicTestTick()                       // every 50 ms: countdown, then 
     wasRec = gTestRec;
     EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), gTestLen > 0 && !gTestRec);
     if (gPrevRunning && !gTrimWnd && gPrevPos >= gPrevEnd) PrevStop();       // finished playing
+}
+
+static void SetFxStyle(int g, int style);
+static void ApplyCharacter(int c);
+static void ResetFxGroup(int g);
+static void SetKnobVar(volatile int* var, int v);
+// ======================= small text prompt (name a character, rename a pad...) =======================
+static HWND gInputWnd = nullptr;
+static bool gInputDone = false, gInputOk = false;
+static wchar_t* gInputBuf = nullptr; static int gInputCap = 0;
+static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_COMMAND:
+        if (LOWORD(w) == IDOK)     { GetDlgItemTextW(h, 101, gInputBuf, gInputCap); gInputOk = true; gInputDone = true; }
+        if (LOWORD(w) == IDCANCEL) { gInputOk = false; gInputDone = true; }
+        return 0;
+    case WM_CLOSE: gInputOk = false; gInputDone = true; return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgBrush()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: return CtlColor(h, m, w, l);
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static bool InputBox(const wchar_t* title, const wchar_t* prompt, wchar_t* buf, int cap)
+{
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = InputProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagInput"; RegisterClassW(&wc); reg = true; }
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT r = { 0, 0, 360, 128 }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+    gInputWnd = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LagInput", title, style, (mr.left + mr.right - ww) / 2, mr.top + 150, ww, wh,
+                                gWnd, nullptr, gInst, nullptr);
+    if (!gInputWnd) return false;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, x, y, w2, h2, gInputWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"STATIC", prompt, 0, 16, 14, 328, 20, 100);
+    HWND e = mk(L"EDIT", buf, WS_TABSTOP | ES_AUTOHSCROLL, 16, 40, 328, 24, 101, WS_EX_CLIENTEDGE);
+    SendMessageW(e, EM_LIMITTEXT, cap - 1, 0);
+    SendMessageW(e, EM_SETSEL, 0, -1);
+    mk(L"BUTTON", L"OK", WS_TABSTOP | BS_DEFPUSHBUTTON, 168, 82, 84, 28, IDOK);
+    mk(L"BUTTON", L"Cancel", WS_TABSTOP, 260, 82, 84, 28, IDCANCEL);
+    ThemeTitleBar(gInputWnd);
+    EnumChildWindows(gInputWnd, ThemeChild, 0);
+    gInputBuf = buf; gInputCap = cap; gInputDone = false; gInputOk = false;
+    EnableWindow(gWnd, FALSE);
+    ShowWindow(gInputWnd, SW_SHOW);
+    SetFocus(e);
+    MSG msg;
+    while (!gInputDone && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (IsDialogMessageW(gInputWnd, &msg)) continue;
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+    EnableWindow(gWnd, TRUE);
+    DestroyWindow(gInputWnd); gInputWnd = nullptr;
+    SetForegroundWindow(gWnd);
+    return gInputOk && buf[0];
+}
+
+// ======================= your own characters =======================
+// Saved as %APPDATA%\LagEffect\Characters\<name>.ini: every Voice FX effect (on/off, knobs, styles), nothing else.
+static void MyCharDir(wchar_t* out)
+{
+    lstrcpynW(out, gIni, MAX_PATH);
+    wchar_t* slash = wcsrchr(out, L'\\'); if (slash) slash[1] = 0; else out[0] = 0;
+    lstrcatW(out, L"Characters"); CreateDirectoryW(out, nullptr);
+}
+static void MyCharsScan()
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH]; MyCharDir(dir); wsprintfW(pat, L"%s\\*.ini", dir);
+    gMyCharN = 0;
+    WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY || gMyCharN >= MAX_MYCHARS) continue;
+        wchar_t n[64]; lstrcpynW(n, fd.cFileName, 64); wchar_t* dot = wcsrchr(n, L'.'); if (dot) *dot = 0;
+        if (n[0]) lstrcpynW(gMyChars[gMyCharN++], n, 64);
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+}
+// FX-only settings: the effects' on/off, every Voice FX knob, and the styles
+static void MyCharSave(const wchar_t* name)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH]; MyCharDir(dir); wsprintfW(path, L"%s\\%s.ini", dir, name);
+    auto put = [&](const wchar_t* key, int v) { wchar_t b[16]; wsprintfW(b, L"%d", v); WritePrivateProfileStringW(L"character", key, b, path); };
+    for (const FxGroup& g : gFxGroups) put(g.key, *g.on ? 1 : 0);
+    for (const Knob& k : gKnobs) if (k.group < FX_GROUPS) put(k.key, *k.var);
+    put(L"voc_style", gVocStyle); put(L"voc_key", gVocKey); put(L"voc_scale", gVocScale); put(L"voc_range", gVocRange);
+    put(L"radio_preset", gRadioPreset); put(L"fx_echo_style", gEchoStyle); put(L"fx_dist_style", gDistStyle);
+    put(L"fx_chorus_style", gChoStyle); put(L"fx_muffle_style", gMufStyle); put(L"fx_harm_style", gHarmStyle);
+}
+static void MyCharLoad(const wchar_t* name)
+{
+    wchar_t dir[MAX_PATH], path[MAX_PATH]; MyCharDir(dir); wsprintfW(path, L"%s\\%s.ini", dir, name);
+    auto get = [&](const wchar_t* key, int cur, int lo, int hi) {
+        wchar_t b[32]; GetPrivateProfileStringW(L"character", key, L"", b, 32, path);
+        return b[0] ? Iclamp(_wtoi(b), lo, hi) : cur;
+    };
+    for (const FxGroup& g : gFxGroups) *g.on = get(g.key, 0, 0, 1) != 0;   // effects it doesn't mention: off
+    for (const Knob& k : gKnobs) if (k.group < FX_GROUPS) *k.var = get(k.key, k.def, k.lo, k.hi);
+    gVocStyle = get(L"voc_style", gVocStyle, 0, VOC_STYLES - 1); gVocKey = get(L"voc_key", gVocKey, 0, 11);
+    gVocScale = get(L"voc_scale", gVocScale, 0, VOC_SCALES - 1); gVocRange = get(L"voc_range", gVocRange, 0, 2);
+    gRadioPreset = get(L"radio_preset", gRadioPreset, 0, RADIO_N - 1);
+    gEchoStyle = get(L"fx_echo_style", gEchoStyle, 0, ECHO_N - 1); gDistStyle = get(L"fx_dist_style", gDistStyle, 0, DIST_N - 1);
+    gChoStyle = get(L"fx_chorus_style", gChoStyle, 0, CHO_N - 1); gMufStyle = get(L"fx_muffle_style", gMufStyle, 0, MUF_N - 1);
+    gHarmStyle = get(L"fx_harm_style", gHarmStyle, 0, HARM_N - 1);
+    gFxOn = true;
+    RefreshSoundUI();
+    wchar_t m[96]; wsprintfW(m, L"Character: %s", name); ShowOsd(m, true);
+}
+static void FillCharCombo()                     // built-ins, then yours, then the actions
+{
+    HWND c = GetDlgItem(gWnd, IDC_FXCHAR);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < CHAR_N; i++) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)CHARACTERS[i]);
+    for (int i = 0; i < gMyCharN; i++) { wchar_t t[80]; wsprintfW(t, L"\x2605 %s", gMyChars[i]); SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)t); }
+    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Save my current voice...");
+    if (gMyCharN) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Delete one of mine...");
+    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Clear all effects");
+    SendMessageW(c, CB_SETCURSEL, 0, 0);
+}
+static void OnCharacterPicked(int sel)
+{
+    int saveAt = CHAR_N + gMyCharN, delAt = gMyCharN ? saveAt + 1 : -1, clearAt = saveAt + (gMyCharN ? 2 : 1);
+    if (sel > 0 && sel < CHAR_N) ApplyCharacter(sel);
+    else if (sel >= CHAR_N && sel < saveAt) MyCharLoad(gMyChars[sel - CHAR_N]);
+    else if (sel == saveAt) {
+        wchar_t name[64] = L"";
+        if (InputBox(L"Save my voice", L"Name for this character (it goes in the Character list):", name, 40)) {
+            for (wchar_t* q = name; *q; q++) if (wcschr(L"\\/:*?\"<>|.", *q)) *q = L'_';
+            if (gMyCharN >= MAX_MYCHARS) MessageBoxW(gWnd, L"You can save up to 16 characters. Delete one first.", L"Lag Effect", MB_ICONINFORMATION);
+            else { MyCharSave(name); MyCharsScan(); wchar_t m[96]; wsprintfW(m, L"Saved: %s", name); ShowOsd(m, true); }
+        }
+    } else if (sel == delAt) {
+        HMENU menu = CreatePopupMenu();
+        for (int i = 0; i < gMyCharN; i++) AppendMenuW(menu, MF_STRING, 1 + i, gMyChars[i]);
+        POINT pt; GetCursorPos(&pt);
+        int pick = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, gWnd, nullptr);
+        DestroyMenu(menu);
+        if (pick > 0) {
+            wchar_t q[128]; wsprintfW(q, L"Delete your character \"%s\"?", gMyChars[pick - 1]);
+            if (MessageBoxW(gWnd, q, L"Lag Effect", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                wchar_t dir[MAX_PATH], path[MAX_PATH]; MyCharDir(dir); wsprintfW(path, L"%s\\%s.ini", dir, gMyChars[pick - 1]);
+                DeleteFileW(path); MyCharsScan();
+            }
+        }
+    } else if (sel == clearAt) {
+        for (int g = 0; g < FX_GROUPS; g++) SetFxGroupOn(g, false);
+        ShowOsd(L"All voice effects cleared", false);
+    }
+    FillCharCombo();
+}
+
+// Surprise me: a random but sensible voice.
+static void SurpriseMe()
+{
+    static unsigned seed = GetTickCount() | 1;
+    auto rnd = [&](int n) { seed = seed * 1664525u + 1013904223u; return (int)((seed >> 8) % (unsigned)n); };
+    for (int g = 0; g < FX_GROUPS; g++) SetFxGroupOn(g, false);
+    static const int pool[] = { KG_PITCH, KG_FORMANT, KG_GENDER, KG_HARM, KG_WHISPER, KG_GROWL, KG_RING, KG_DIST, KG_WAH,
+                                KG_CHORUS, KG_WOBBLE, KG_MUFFLE, KG_ECHO, KG_GHOST, KG_SHIMMER, KG_REVERB, KG_RADIO };
+    const int poolN = (int)(sizeof(pool) / sizeof(pool[0]));
+    int want = 2 + rnd(3), picked[5], n = 0;
+    wchar_t msg[160] = L"Surprise: ";
+    while (n < want) {
+        int g = pool[rnd(poolN)];
+        bool dup = false; for (int i = 0; i < n; i++) if (picked[i] == g) dup = true;
+        if (dup) continue;
+        picked[n++] = g;
+        ResetFxGroup(g);
+        for (int i = 0; i < KNOB_N; i++) {      // near the default, within a sensible part of the range
+            const Knob& k = gKnobs[i];
+            if (k.group != g) continue;
+            int span = k.hi - k.lo, v = k.def + (rnd(1001) - 500) * span * 6 / 10000;
+            if (k.offText && v <= k.lo) v = k.lo + span / 4;            // don't pick "off"
+            SetKnobValue(GetDlgItem(gWnd, IDC_KNOB + i), i, Iclamp(v, k.lo, k.hi));
+        }
+        if (g == KG_ECHO)  SetFxStyle(KG_ECHO, rnd(ECHO_N));
+        if (g == KG_DIST)  SetFxStyle(KG_DIST, rnd(DIST_N));
+        if (g == KG_CHORUS) SetFxStyle(KG_CHORUS, rnd(CHO_N));
+        if (g == KG_MUFFLE) SetFxStyle(KG_MUFFLE, rnd(MUF_N));
+        if (g == KG_HARM)  { gHarmStyle = rnd(HARM_N); SendDlgItemMessageW(gWnd, IDC_HARMSTYLE, CB_SETCURSEL, gHarmStyle, 0); }
+        if (g == KG_RADIO) { gRadioPreset = rnd(RADIO_N); SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, gRadioPreset, 0);
+                             SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[gRadioPreset]); }
+        SetFxGroupOn(g, true);
+        if (n > 1) lstrcatW(msg, L" + ");
+        lstrcatW(msg, gFxGroups[g].title);
+    }
+    SetFxOn(true);
+    ShowOsd(msg, true);
+    UpdateStatus(true);
 }
 
 // ======================= soundboard pages =======================
@@ -5508,6 +5777,15 @@ static void AddTips()
         TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
     }
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
+    TipId(IDC_LAGPRESET, L"Ready-made settings for the stutter: Bad Wi-Fi, Frozen call, Robot glitch, Buffering, Slow-mo...");
+    TipId(IDC_BEATSYNC,  L"Beat repeat: the stutter's loop length follows a tempo instead of Loop length, so it sounds musical.");
+    TipId(IDC_BPM,       L"Tempo in beats per minute.");
+    TipId(IDC_BEATDIV,   L"How long each repeat is: a quarter note, an eighth, a sixteenth or a thirty-second.");
+    TipId(IDC_TAPEKEY,   L"A hotkey that makes your voice slow down to nothing, like a record being stopped. Right-click to clear it.");
+    TipId(IDC_DIVEKEY,   L"Hold this hotkey and your voice bends down (or up) smoothly; let go and it springs back. Right-click to clear it.");
+    TipId(IDC_DIVESEMIS, L"How far Pitch dive bends: -12 = an octave down, +12 = an octave up.");
+    TipId(IDC_SURPRISE,  L"Turns on 2-4 random effects with random (but sensible) settings. Keep clicking until you like one.");
+    TipId(IDC_ABTEST,    L"Hold this to hear (and send) your voice without effects for a moment, to compare.");
     TipId(IDC_PROFILE,   L"Profiles save how you sound: the stutter effect, every Voice FX effect and knob, and the Mic tab. "
                          L"Pick one to switch to it. To make one, type a name and click Save (or press Enter). "
                          L"Devices, hotkeys, soundboard and clips aren't part of profiles.");
@@ -5855,8 +6133,10 @@ static void PollFxKeys()
             if (pressed) HoldPress(slot); else if (released) HoldRelease(slot);
             continue;
         }
+        if (slot == SLOT_DIVE) { gDiveHeld = down; continue; }   // hold to bend
         if (!pressed) continue;
         if (slot >= SLOT_PROF0)    { ProfileLoad(slot - SLOT_PROF0, true); continue; }
+        if (slot == SLOT_TAPESTOP) { if (gRunning) gTapeReq = true; continue; }
         if (slot == SLOT_PROFNEXT) { if (gProfCount) ProfileLoad((gProfCur + 1) % gProfCount, true); continue; }
         if (slot == SLOT_REWIND)  { if (gRunning) gRewindReq = true; continue; }
         if (slot == SLOT_REPEAT)  { if (gRunning) gRepeatReq = true; continue; }
@@ -6047,7 +6327,6 @@ static void ApplyCharacter(int c)
 {
     if (c <= 0 || c >= CHAR_N) return;
     for (int g = 0; g < FX_GROUPS; g++) SetFxGroupOn(g, false);
-    if (c == CHAR_N - 1) { ShowOsd(L"All voice effects cleared", false); return; }   // "Clear all effects"
     auto use = [](int g) { ResetFxGroup(g); SetFxGroupOn(g, true); };
     switch (c) {
     case 1:  // Demon
@@ -6092,6 +6371,59 @@ static void ApplyCharacter(int c)
         break;
     case 10: // Bad connection
         use(KG_GLITCH);  SetKnobVar(&gGlAmount, 45);
+        break;
+    case 11: // Robot announcer
+        use(KG_RING);    SetKnobVar(&gRingHz, 50); SetKnobVar(&gRingMix, 60);
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -2);
+        use(KG_ECHO);    SetFxStyle(KG_ECHO, 1);
+        break;
+    case 12: // Old man
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -2);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -1);
+        use(KG_WOBBLE);  SetKnobVar(&gWobSpeed, 5); SetKnobVar(&gWobTrem, 15); SetKnobVar(&gWobVib, 30);
+        use(KG_GROWL);   SetKnobVar(&gGrowlSub, 0); SetKnobVar(&gGrowlRasp, 35); SetKnobVar(&gGrowlGrit, 0);
+        break;
+    case 13: // Stadium announcer
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -1);
+        use(KG_ECHO);    SetFxStyle(KG_ECHO, 3); SetKnobVar(&gEchoMix, 22);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 30); SetKnobVar(&gFxRevSize, 95);
+        break;
+    case 14: // Cave troll
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -7);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -4);
+        use(KG_GROWL);   SetKnobVar(&gGrowlSub, 60); SetKnobVar(&gGrowlRasp, 30); SetKnobVar(&gGrowlGrit, 20);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 25); SetKnobVar(&gFxRevSize, 80); SetKnobVar(&gFxRevDamp, 70);
+        break;
+    case 15: // Space helmet
+        use(KG_RADIO);   gRadioPreset = 4; SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, 4, 0);
+                         SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[4]);
+        use(KG_CHORUS);  SetFxStyle(KG_CHORUS, 3);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 12); SetKnobVar(&gFxRevSize, 20);
+        break;
+    case 16: // Dark lord
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -5);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -1);
+        use(KG_GROWL);   SetKnobVar(&gGrowlSub, 30); SetKnobVar(&gGrowlRasp, 0); SetKnobVar(&gGrowlGrit, 15);
+        use(KG_DIST);    SetFxStyle(KG_DIST, 0); SetKnobVar(&gDistDrive, 20); SetKnobVar(&gDistMix, 25);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 15); SetKnobVar(&gFxRevSize, 40);
+        break;
+    case 17: // Radio DJ
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -1);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -1);
+        use(KG_ECHO);    SetFxStyle(KG_ECHO, 1); SetKnobVar(&gEchoMix, 25);
+        break;
+    case 18: // Angel
+        use(KG_HARM);    gHarmStyle = 7; SendDlgItemMessageW(gWnd, IDC_HARMSTYLE, CB_SETCURSEL, 7, 0); SetKnobVar(&gHarmLevel, 55);
+        use(KG_SHIMMER); SetKnobVar(&gShimMix, 45); SetKnobVar(&gShimAmt, 60);
+        break;
+    case 19: // Monster
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -5);
+        use(KG_GROWL);   SetKnobVar(&gGrowlSub, 70); SetKnobVar(&gGrowlRasp, 50); SetKnobVar(&gGrowlGrit, 40);
+        use(KG_DIST);    SetFxStyle(KG_DIST, 1); SetKnobVar(&gDistDrive, 40); SetKnobVar(&gDistMix, 40);
+        break;
+    case 20: // Whisperer
+        use(KG_WHISPER); SetKnobVar(&gWhisperAmt, 100); SetKnobVar(&gWhisperAir, 50);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 25); SetKnobVar(&gFxRevSize, 70);
         break;
     }
     SetFxOn(true);
@@ -6665,6 +6997,10 @@ static void ShowHelp()
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Sharing your whole screen in Discord? Tick Settings > Hide from screen share, or people hear you twice.\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
+        L"MORE LAG AND TRICKS\n"
+        L"Main tab: lag presets and beat repeat (loop synced to a tempo). Voice FX > Fun: Rewind, Repeat word, Tape stop and "
+        L"Pitch dive hotkeys. Bottom of Voice FX: Character (save your own with \"Save my current voice\"), Surprise me, "
+        L"and hold the A/B button to hear yourself without effects.\n\n"
         L"PROFILES (Settings tab)\n"
         L"Save how you sound as a named profile (Gaming, Streaming, Trolling...) and switch by picking it or with its hotkey. "
         L"Effect hotkeys can be Hold: the effect is on only while you hold the key.\n\n"
@@ -6702,13 +7038,16 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     if (!k[0]) lstrcpynW(k, L"Set hotkey", 100);
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
                        : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
-                       : slot >= SLOT_PROF0 ? L"This profile: " : L"";
+                       : slot >= SLOT_PROF0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
+                       : slot == SLOT_DIVE ? L"Pitch dive (hold): " : L"";
     wsprintfW(buf, L"%s%s", pre, k);
 }
 
 static int FxKeyButtonId(int slot)
 {
     if (slot >= SLOT_PROF0)    return slot - SLOT_PROF0 == gProfSel ? IDC_PROFKEY : 0;   // the selected profile's button
+    if (slot == SLOT_TAPESTOP) return IDC_TAPEKEY;
+    if (slot == SLOT_DIVE)     return IDC_DIVEKEY;
     if (slot == SLOT_PROFNEXT) return IDC_PROFNEXTKEY;
     if (slot == SLOT_REWIND)  return IDC_REWINDKEY;
     if (slot == SLOT_REPEAT)  return IDC_REPEATKEY;
@@ -6965,52 +7304,62 @@ static void CreateUI()
     gRecordShift = true;                        // everything below on this page moves with the output list
 
     // Effect
-    AddSection(14, 232, 532, 165, L"Effect");
-    Ctl(L"STATIC", L"Loop length:", 0, 30, 259, 104, 20, -1);
-    Spin(IDC_LOOP, 136, 256, 76, 10, 2000, gLoopMs);
-    Ctl(L"STATIC", L"ms", 0, 218, 259, 40, 20, -1);
-    Ctl(L"STATIC", L"Speed:", 0, 290, 259, 100, 20, -1);
-    Spin(IDC_SPEED, 392, 256, 76, 10, 400, gSpeedPct);
-    Ctl(L"STATIC", L"%", 0, 474, 259, 40, 20, -1);
+    AddSection(14, 232, 532, 148, L"Effect");
+    Ctl(L"STATIC", L"Loop length:", 0, 30, 255, 104, 20, -1);
+    Spin(IDC_LOOP, 136, 252, 76, 10, 2000, gLoopMs);
+    Ctl(L"STATIC", L"ms", 0, 218, 255, 40, 20, -1);
+    Ctl(L"STATIC", L"Speed:", 0, 290, 255, 100, 20, -1);
+    Spin(IDC_SPEED, 392, 252, 76, 10, 400, gSpeedPct);
+    Ctl(L"STATIC", L"%", 0, 474, 255, 40, 20, -1);
 
-    Ctl(L"STATIC", L"Pitch:", 0, 30, 293, 104, 20, -1);
-    Spin(IDC_PITCH, 136, 290, 76, 25, 400, gPitchPct);
-    Ctl(L"STATIC", L"%", 0, 218, 293, 40, 20, -1);
-    Ctl(L"STATIC", L"Smoothing:", 0, 290, 293, 100, 20, -1);
-    Spin(IDC_FADE, 392, 290, 76, 0, 50, gFadeMs);
-    Ctl(L"STATIC", L"ms", 0, 474, 293, 40, 20, -1);
+    Ctl(L"STATIC", L"Pitch:", 0, 30, 285, 104, 20, -1);
+    Spin(IDC_PITCH, 136, 282, 76, 25, 400, gPitchPct);
+    Ctl(L"STATIC", L"%", 0, 218, 285, 40, 20, -1);
+    Ctl(L"STATIC", L"Smoothing:", 0, 290, 285, 100, 20, -1);
+    Spin(IDC_FADE, 392, 282, 76, 0, 50, gFadeMs);
+    Ctl(L"STATIC", L"ms", 0, 474, 285, 40, 20, -1);
 
-    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 327, 250, 20, IDC_TALKON);
+    Ctl(L"BUTTON", L"Keep talking during the effect", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 315, 250, 20, IDC_TALKON);
     CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Voice level:", 0, 290, 327, 100, 20, -1);
-    Spin(IDC_TALKVOL, 392, 324, 76, 0, 200, gTalkVolPct);
-    Ctl(L"STATIC", L"%", 0, 474, 327, 40, 20, -1);
+    Ctl(L"STATIC", L"Voice level:", 0, 290, 315, 100, 20, -1);
+    Spin(IDC_TALKVOL, 392, 312, 76, 0, 200, gTalkVolPct);
+    Ctl(L"STATIC", L"%", 0, 474, 315, 40, 20, -1);
 
-    // the stutter hotkey (the noise gate switch moved to the Mic tab)
-    wchar_t key[120]; HotkeyName(key, 120);
-    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 356, 260, 30, IDC_HOTKEY);
-    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 310, 361, 80, 20, IDC_HOLD);
-    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 400, 361, 100, 20, IDC_TOGGLE);
+    wchar_t key[120]; HotkeyName(key, 120);     // the stutter hotkey
+    Ctl(L"BUTTON", key, WS_TABSTOP, 30, 341, 260, 28, IDC_HOTKEY);
+    Ctl(L"BUTTON", L"Hold", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 310, 345, 80, 20, IDC_HOLD);
+    Ctl(L"BUTTON", L"Toggle", BS_AUTORADIOBUTTON, 400, 345, 100, 20, IDC_TOGGLE);
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
 
-    // Extras: random lag, rewind, repeat word
-    AddSection(14, 417, 532, 69, L"Lag extras");
-    Ctl(L"BUTTON", L"Random lag, every ~", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 445, 140, 20, IDC_RANDLAG);
+    // Extras: random lag + presets, beat sync
+    AddSection(14, 394, 532, 90, L"Lag extras");
+    Ctl(L"BUTTON", L"Random lag, every ~", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 416, 140, 20, IDC_RANDLAG);
     CheckDlgButton(gWnd, IDC_RANDLAG, gRandLagOn ? BST_CHECKED : BST_UNCHECKED);
-    Spin(IDC_RANDSEC, 172, 442, 54, 2, 120, gRandLagSec);
-    Ctl(L"STATIC", L"s", 0, 230, 445, 12, 20, -1);
+    Spin(IDC_RANDSEC, 172, 413, 54, 2, 120, gRandLagSec);
+    Ctl(L"STATIC", L"s", 0, 230, 416, 12, 20, -1);
     {
-        wchar_t kn[120];
-        FxKeyButtonText(SLOT_REWIND, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 248, 440, 136, 30, IDC_REWINDKEY);
-        FxKeyButtonText(SLOT_REPEAT, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 390, 440, 140, 30, IDC_REPEATKEY);
+        HWND lp = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 290, 412, 240, 300, IDC_LAGPRESET);
+        for (int i = 0; i < LAG_PRESET_N; i++) SendMessageW(lp, CB_ADDSTRING, 0, (LPARAM)LAG_PRESETS[i].name);
+        SendMessageW(lp, CB_SETCURSEL, 0, 0);
     }
+    Ctl(L"BUTTON", L"Sync the loop to", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 450, 124, 20, IDC_BEATSYNC);
+    CheckDlgButton(gWnd, IDC_BEATSYNC, gBeatSync ? BST_CHECKED : BST_UNCHECKED);
+    Spin(IDC_BPM, 156, 447, 60, 40, 300, gBpm);
+    Ctl(L"STATIC", L"BPM, every", 0, 222, 450, 66, 20, -1);
+    {
+        HWND bd = Ctl(L"COMBOBOX", L"", COMBO, 290, 446, 120, 200, IDC_BEATDIV);
+        const wchar_t* divs[] = { L"1/4 note", L"1/8 note", L"1/16 note", L"1/32 note" };
+        for (const wchar_t* n : divs) SendMessageW(bd, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(bd, CB_SETCURSEL, gBeatDiv, 0);
+    }
+    Ctl(L"STATIC", L"(beat repeat)", 0, 418, 450, 110, 20, IDC_HDR);
 
     // Status + buttons
-    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 504, 532, 30, IDC_STATUS);
-    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 544, 127, 34, IDC_START);
-    Ctl(L"BUTTON", L"Mute mic", WS_TABSTOP, 149, 544, 127, 34, IDC_MUTEBTN);
-    Ctl(L"BUTTON", L"Hide to tray", WS_TABSTOP, 284, 544, 127, 34, IDC_TRAY);
-    Ctl(L"BUTTON", L"Help && setup", WS_TABSTOP, 419, 544, 127, 34, IDC_HELPBTN);
+    gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 498, 532, 30, IDC_STATUS);
+    Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 540, 127, 34, IDC_START);
+    Ctl(L"BUTTON", L"Mute mic", WS_TABSTOP, 149, 540, 127, 34, IDC_MUTEBTN);
+    Ctl(L"BUTTON", L"Hide to tray", WS_TABSTOP, 284, 540, 127, 34, IDC_TRAY);
+    Ctl(L"BUTTON", L"Help && setup", WS_TABSTOP, 419, 540, 127, 34, IDC_HELPBTN);
 
     gRecordShift = false;
 
@@ -7097,12 +7446,37 @@ static void CreateUI()
         Ctl(L"BUTTON", FX_SUB_NAMES[t], BS_OWNERDRAW | WS_TABSTOP | (t == 0 ? WS_GROUP : 0), 14 + t * 76, 104, 72, 28, IDC_FXSUB0 + t);
     Ctl(L"STATIC", L"Character:", 0, 16, 514, 66, 18, -1);
     {
-        HWND ch = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 84, 510, 160, 400, IDC_FXCHAR);
-        for (int c = 0; c < CHAR_N; c++) SendMessageW(ch, CB_ADDSTRING, 0, (LPARAM)CHARACTERS[c]);
-        SendMessageW(ch, CB_SETCURSEL, 0, 0);
-        SendMessageW(ch, CB_SETDROPPEDWIDTH, 160, 0);
+        HWND ch = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 84, 510, 160, 500, IDC_FXCHAR);
+        SendMessageW(ch, CB_SETDROPPEDWIDTH, 200, 0);
+        MyCharsScan();
+        FillCharCombo();
     }
 
+    Ctl(L"BUTTON", L"Surprise me", WS_TABSTOP, 252, 509, 104, 26, IDC_SURPRISE);
+    Ctl(L"BUTTON", L"Hold: hear without effects", WS_TABSTOP, 362, 509, 184, 26, IDC_ABTEST);
+    SetWindowSubclass(GetDlgItem(gWnd, IDC_ABTEST), AbButtonProc, 1, 0);
+    {                                           // Fun sub-tab: hotkey tricks (work without Voice effects on)
+        gBuildSub = 6;
+        int y = 144 + 120;
+        AddSection(14, y, 532, 110, L"Hotkey tricks");
+        wchar_t kn[120];
+        FxKeyButtonText(SLOT_REWIND, kn, 120);   Ctl(L"BUTTON", kn, WS_TABSTOP | WS_GROUP, 26, y + 14, 250, 28, IDC_REWINDKEY);
+        FxKeyButtonText(SLOT_REPEAT, kn, 120);   Ctl(L"BUTTON", kn, WS_TABSTOP, 282, y + 14, 250, 28, IDC_REPEATKEY);
+        FxKeyButtonText(SLOT_TAPESTOP, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 26, y + 46, 250, 28, IDC_TAPEKEY);
+        FxKeyButtonText(SLOT_DIVE, kn, 120);     Ctl(L"BUTTON", kn, WS_TABSTOP, 282, y + 46, 170, 28, IDC_DIVEKEY);
+        HWND dv = Ctl(L"COMBOBOX", L"", COMBO, 458, y + 48, 74, 300, IDC_DIVESEMIS);
+        static const int diveOpts[] = { -12, -7, -5, 5, 7, 12 };
+        int sel = 0;
+        for (int i = 0; i < 6; i++) {
+            wchar_t t[16]; wsprintfW(t, L"%+d st", diveOpts[i]);
+            SendMessageW(dv, CB_ADDSTRING, 0, (LPARAM)t);
+            if (diveOpts[i] == gDiveSemis) sel = i;
+        }
+        SendMessageW(dv, CB_SETCURSEL, sel, 0);
+        Ctl(L"STATIC", L"These work any time audio is running, even with Voice effects off. Right-click a button to clear its hotkey.",
+            0, 28, y + 80, 500, 28, IDC_HDR);
+        gBuildSub = -1;
+    }
     const int FX_SEC_Y0 = 144, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
     for (int g = 0; g < FX_GROUPS; g++) {
         int y = FX_SEC_Y0 + FX_SEC_STEP * gFxGroups[g].slot;
@@ -7587,6 +7961,38 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_PADFX)       { gPadsFx = Checked(id); return; }
+    if (id == IDC_TAPEKEY)     { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_TAPESTOP], id); return; }
+    if (id == IDC_DIVEKEY)     { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_DIVE], id); return; }
+    if (id == IDC_DIVESEMIS)   {
+        static const int diveOpts[] = { -12, -7, -5, 5, 7, 12 };
+        if (code == CBN_SELCHANGE) gDiveSemis = diveOpts[Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 5)];
+        return;
+    }
+    if (id == IDC_BEATSYNC)    { gBeatSync = Checked(id); return; }
+    if (id == IDC_BEATDIV)     { if (code == CBN_SELCHANGE) gBeatDiv = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3); return; }
+    if (id == IDC_BPM) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v >= 40) gBpm = Iclamp(v, 40, 300);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gBpm, FALSE);
+        return;
+    }
+    if (id == IDC_LAGPRESET) {
+        if (code == CBN_SELCHANGE) {
+            int i = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            if (i > 0 && i < LAG_PRESET_N) {
+                const LagPreset& p = LAG_PRESETS[i];
+                gLoopMs = p.loopMs; gSpeedPct = p.speed; gPitchPct = p.pitch; gFadeMs = p.fade;
+                if (p.randSec) { gRandLagOn = true; gRandLagSec = p.randSec; }
+                gBeatSync = false;
+                RefreshSoundUI();
+                wchar_t m[64]; wsprintfW(m, L"Lag: %s", p.name); ShowOsd(m, true);
+            }
+            SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, 0, 0);
+        }
+        return;
+    }
+    if (id == IDC_SURPRISE)    { if (code == BN_CLICKED) SurpriseMe(); return; }
     if (id == IDC_FXHOLD)      { if (gHoldActive[0]) HoldRelease(0); gFxHold[0] = Checked(id); return; }
     if (id == IDC_MICTEST)     {
         if (code == BN_CLICKED) { if (gPrevRunning && gPrevData == gTestBuf) PrevStop(); else if (!gTestRec) MicTestStart(); }
@@ -7737,9 +8143,7 @@ static void OnCommand(int id, int code)
         break;
     case IDC_FXCHAR:
         if (code == CBN_SELCHANGE) {
-            int c = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
-            ApplyCharacter(c);
-            SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, 0, 0);   // back to "Pick a voice...", ready for the next
+            OnCharacterPicked((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0));   // back to "Pick a voice..." after
         }
         break;
     case IDC_ECHOSTYLE: case IDC_DISTSTYLE: case IDC_CHOSTYLE: case IDC_MUFSTYLE:
@@ -7944,6 +8348,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) { gPads[PadSlot(id - IDC_PADPLAY)].stop = true; return 0; }   // right-click: stop
         if (id == IDC_REWINDKEY)  { ClearFxKey(SLOT_REWIND); return 0; }
         if (id == IDC_PROFNEXTKEY) { ClearFxKey(SLOT_PROFNEXT); return 0; }
+        if (id == IDC_TAPEKEY)     { ClearFxKey(SLOT_TAPESTOP); return 0; }
+        if (id == IDC_DIVEKEY)     { ClearFxKey(SLOT_DIVE); return 0; }
         if (id == IDC_PROFKEY && gProfSel >= 0) { ClearFxKey(SLOT_PROF0 + gProfSel); return 0; }
         if (id == IDC_REPEATKEY)  { ClearFxKey(SLOT_REPEAT); return 0; }
         if (id == IDC_PADBANKKEY) { ClearFxKey(SLOT_PADBANK); return 0; }
