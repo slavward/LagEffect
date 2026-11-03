@@ -2763,6 +2763,18 @@ static const ColorTheme COLOR_THEMES[] = {
     { L"Green",    RGB(80, 205, 120),  RGB(24, 140, 64),   1.0f  },
     { L"Teal",     RGB(56, 204, 204),  RGB(0, 132, 140),   1.0f  },
     { L"Graphite", RGB(200, 200, 200), RGB(80, 80, 80),    0.0f  },
+    { L"Crimson",  RGB(235, 70, 110),  RGB(170, 20, 60),   1.2f  },
+    { L"Coral",    RGB(255, 127, 110), RGB(210, 80, 60),   1.0f  },
+    { L"Gold",     RGB(230, 185, 80),  RGB(150, 110, 20),  0.9f  },
+    { L"Lime",     RGB(170, 230, 70),  RGB(90, 150, 0),    0.9f  },
+    { L"Mint",     RGB(110, 230, 180), RGB(20, 150, 110),  1.0f  },
+    { L"Ocean",    RGB(60, 140, 230),  RGB(10, 80, 170),   1.6f  },
+    { L"Lavender", RGB(190, 165, 255), RGB(120, 95, 200),  1.3f  },
+    { L"Magenta",  RGB(240, 90, 240),  RGB(170, 30, 170),  1.2f  },
+    { L"Forest",   RGB(90, 180, 100),  RGB(30, 110, 50),   1.8f  },
+    { L"Sunset",   RGB(255, 120, 70),  RGB(200, 70, 30),   1.8f  },
+    { L"Midnight", RGB(120, 140, 255), RGB(50, 60, 190),   2.4f  },
+    { L"Mono",     RGB(235, 235, 235), RGB(30, 30, 30),    0.0f  },
 };
 #define COLOR_THEME_N ((int)(sizeof(COLOR_THEMES) / sizeof(COLOR_THEMES[0])))
 static int gColorTheme = 0;
@@ -3564,9 +3576,9 @@ static void BlitOver(DWORD* dst, int W, int H, const DWORD* src, int sw, int sh,
             const DWORD a = s >> 24;
             if (a == 0) continue;
             if (a == 255) { drow[x] = s | 0xFF000000; continue; }
-            const DWORD d = drow[x], ia = 255 - a;
-            const DWORD rb = ((d & 0x00FF00FF) * ia / 255) & 0x00FF00FF;   // (per-channel, no carries: each < 256)
-            const DWORD g  = ((d & 0x0000FF00) * ia / 255) & 0x0000FF00;
+            const DWORD d = drow[x], ia = 256 - a;   // channels are 16 bits apart: one multiply does red and blue
+            const DWORD rb = (((d & 0x00FF00FF) * ia) >> 8) & 0x00FF00FF;
+            const DWORD g  = (((d & 0x0000FF00) * ia) >> 8) & 0x0000FF00;
             drow[x] = 0xFF000000 | ((s & 0x00FFFFFF) + rb + g);
         }
     }
@@ -4142,7 +4154,11 @@ static void AssignSections()                    // which section each control si
         for (int k = 0; k < gSectionN; k++) {
             const Section& s = gSections[k];
             if (s.page != d.page || !(s.sub == d.sub || s.sub < 0 || d.sub < 0)) continue;
-            if (d.rx >= s.x && d.rx < s.x + s.w && d.ry >= s.y - 10 && d.ry < s.y + s.h) { d.sec = k; break; }
+            // the Outputs box grows with the list: all its rows belong to it (the "+ Add output" row too)
+            const bool dev = k == gDevSectionIdx;
+            if (!dev && d.shifted != s.shifts) continue;
+            const int bottom = dev && !d.shifted ? ROW_Y0 + ROW_H * MAX_OUT + 6 : s.y + s.h;
+            if (d.rx >= s.x && d.rx < s.x + s.w && d.ry >= s.y - 10 && d.ry < bottom) { d.sec = k; break; }
         }
     }
 }
