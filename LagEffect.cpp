@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.24.1"
+#define APP_VERSION L"1.24.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -2311,7 +2311,7 @@ enum {
     IDC_CLIPPLAY = 750, IDC_CLIPVOL = 760, IDC_CLIPKEY = 770, IDC_CLIPTRIM = 780, IDC_CLIPCLR = 790, // + clip index
     ID_TRAY_OPEN = 900, ID_TRAY_RUN, ID_TRAY_EXIT, ID_TRAY_FX, ID_TRAY_SONG, ID_TRAY_NS, ID_TRAY_GATE, ID_TRAY_MUTE
 };
-#define SPIN_UD(id)        ((id) + 100)      // up-down control paired with a number box
+#define SPIN_UD(id)        ((id) + 2000)     // up-down control paired with a number box (its own range: +100 used to collide with real controls)
 #define WM_TRAY            (WM_APP + 1)
 #define WM_DEVICE_LOST     (WM_APP + 2)
 #define WM_UPDATE_CHECKED  (WM_APP + 3)
@@ -2962,6 +2962,9 @@ static void ApplyOpacity()
     SetLayeredWindowAttributes(gWnd, 0, (BYTE)(Iclamp(gOpacity, 40, 100) * 255 / 100), LWA_ALPHA);
 }
 
+static void FitText();
+static void FitOne(HWND h);
+static HFONT gFontFit[3];                       // smaller copies of the font for text that would not fit otherwise
 static BOOL CALLBACK SetFontProc(HWND c, LPARAM) { SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return TRUE; }
 static void ApplyFont()                         // re-create the fonts and hand them to every control
 {
@@ -2972,6 +2975,8 @@ static void ApplyFont()                         // re-create the fonts and hand 
     gFont = f; gFontBold = b;
     if (gWnd) EnumChildWindows(gWnd, SetFontProc, 0);
     if (of) DeleteObject(of); if (ob) DeleteObject(ob);
+    for (HFONT& ff : gFontFit) if (ff) { DeleteObject(ff); ff = nullptr; }
+    if (gWnd) FitText();                        // a wider font needs more room: re-measure every label
 }
 
 static void ThemeTitleBar(HWND w)
@@ -3637,6 +3642,10 @@ struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; in
 struct Framed  { HWND edit, ud; };
 struct Paged   { HWND h; int page; int sub; };   // sub: Voice FX sub-tab (-1 = every sub-tab)
 static Shifted gShift[96];   static int gShiftN = 0;
+// Every control's position as laid out (already scaled), plus how far FitText has moved / widened it.
+struct Design  { HWND h; int x, y, w, ht, page, sub, dx, dw, adx, adw; };
+#define MAX_DESIGN 1400
+static Design  gDesign[MAX_DESIGN];  static int gDesignN = 0;
 #define MAX_SECTIONS 48
 #define MAX_FRAMED   48
 #define MAX_PAGED    800
@@ -3661,6 +3670,7 @@ static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int
     SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE);
     if (gRecordShift && gShiftN < 96) gShift[gShiftN++] = { c, x, y };
     RecordPage(c);
+    if (gDesignN < MAX_DESIGN) gDesign[gDesignN++] = { c, x, y, w, h, gBuildPage, gBuildSub, 0, 0, 0, 0 };
     return c;
 }
 
@@ -3686,6 +3696,177 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
     if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub };
+}
+
+
+// ======================= fitting text to its space =======================
+// The layout uses fixed sizes that suit Segoe UI. Wider fonts (Verdana, Comic Sans, ...) or different text
+// rendering would push labels under the box next to them or past the end of a note, so after building the
+// window (and whenever the font changes) every label is measured:
+//  1. a one-line label or checkbox that is too narrow gets wider, and everything to its right on that row moves along;
+//  2. if that runs a row past its section's edge, dropdowns on the row give up some width, then trailing notes are cut;
+//  3. text that still does not fit (wrapped notes, squeezed labels) gets a slightly smaller font.
+static bool FitSameGroup(const Design& a, const Design& b)
+{
+    return a.page >= 0 && a.page == b.page && (a.sub == b.sub || a.sub < 0 || b.sub < 0);
+}
+static int gFitKinds[MAX_DESIGN];               // FitKind of each control, worked out once per FitText
+static int FitVisH(const Design& d)
+{
+    return gFitKinds[&d - gDesign] == 4 ? SC(24) : d.ht;   // a combo's height includes its drop-down list
+}
+static bool FitSameRow(const Design& a, const Design& b)
+{
+    int ah = FitVisH(a), bh = FitVisH(b);
+    int ov = Imin(a.y + ah, b.y + bh) - Imax(a.y, b.y);
+    return ov > 0 && ov * 10 >= Imin(ah, bh) * 6;
+}
+static int FitKind(const Design& d)            // 0 = other, 1 = one-line label, 2 = checkbox / radio, 3 = wrapped note, 4 = combo, 5 = push button
+{
+    wchar_t cls[16]; GetClassNameW(d.h, cls, 16);
+    LONG st = GetWindowLongW(d.h, GWL_STYLE);
+    if (!lstrcmpiW(cls, L"ComboBox")) return 4;
+    if (!lstrcmpiW(cls, L"Button")) {
+        LONG t = st & BS_TYPEMASK;
+        if (t == BS_PUSHBUTTON || t == BS_DEFPUSHBUTTON) return 5;
+        return t == BS_AUTOCHECKBOX || t == BS_CHECKBOX || t == BS_AUTORADIOBUTTON || t == BS_RADIOBUTTON ? 2 : 0;
+    }
+    if (!lstrcmpiW(cls, L"Static")) {
+        int id = GetDlgCtrlID(d.h);
+        if ((st & SS_TYPEMASK) != SS_LEFT || !(id == 0xFFFF || id == IDC_HDR || id == IDC_RADIODESC)) return 0;
+        return d.ht <= SC(24) ? 1 : 3;
+    }
+    return 0;
+}
+static SIZE FitMeasure(HWND h, HFONT f, int wrapW)   // wrapW = 0: one line
+{
+    wchar_t t[600]; SIZE sz = { 0, 0 };
+    if (GetWindowTextW(h, t, 600) <= 0) return sz;
+    HDC dc = GetDC(h);
+    HGDIOBJ of = SelectObject(dc, f);
+    RECT r = { 0, 0, wrapW > 0 ? wrapW : 0, 0 };
+    DrawTextW(dc, t, -1, &r, DT_CALCRECT | (wrapW > 0 ? DT_WORDBREAK | DT_EXPANDTABS : DT_SINGLELINE));
+    SelectObject(dc, of); ReleaseDC(h, dc);
+    sz.cx = r.right; sz.cy = r.bottom;
+    return sz;
+}
+static int FitNeed(const Design& d, int kind, HFONT f)
+{
+    int tw = FitMeasure(d.h, f, 0).cx;
+    if (!tw) return 0;
+    if (kind == 2) return tw + Imax(21, GetSystemMetrics(SM_CXMENUCHECK) + SC(6)) + SC(3);   // box + gap + text
+    if (kind == 5) return tw + SC(12);                                                      // button edges
+    return tw + SC(2);
+}
+static int FitLimit(const Design& d)            // right edge of the section the control sits in
+{
+    for (int i = 0; i < gSectionN; i++) {
+        const Section& s = gSections[i];
+        if (s.page != d.page || !(s.sub == d.sub || s.sub < 0 || d.sub < 0)) continue;
+        if (d.x >= SC(s.x) && d.x < SC(s.x + s.w) && d.y >= SC(s.y) && d.y < SC(s.y + s.h)) return SC(s.x + s.w) - SC(6);
+    }
+    return SC(CLIENT_W) - SC(10);
+}
+static void FitPush(int from, int depth = 0)   // gDesign[from] got wider or moved: push whatever it now runs into
+{
+    if (depth > 12) return;
+    const Design& a = gDesign[from];
+    int right = a.x + a.dx + a.w + a.dw;
+    for (int j = 0; j < gDesignN; j++) {
+        Design& b = gDesign[j];
+        if (j == from || !FitSameGroup(a, b) || !FitSameRow(a, b) || b.x < a.x + a.w - SC(4)) continue;
+        int gap  = Imax(0, b.x - (a.x + a.w));            // the space the layout left between them, up to 6 px
+        int push = right + Imin(gap, SC(6)) - (b.x + b.dx);
+        if (push > 0) { b.dx += push; FitPush(j, depth + 1); }
+    }
+}
+static HFONT FitFont(int level)                 // level 0 = the normal font, 1-3 = 1-3 px smaller
+{
+    if (level <= 0) return gFont;
+    HFONT& f = gFontFit[level - 1];
+    if (!f) f = CreateFontW(-SC(13 - level), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    return f ? f : gFont;
+}
+static void FitFontOf(int i, int kind)
+{
+    if (kind != 1 && kind != 2 && kind != 3 && kind != 5) return;
+    Design& d = gDesign[i];
+    int w = d.w + d.dw, lvl = 0;
+    for (; lvl < 3; lvl++) {
+        HFONT f = FitFont(lvl);
+        bool fits = kind == 3 ? FitMeasure(d.h, f, w).cy <= d.ht : FitNeed(d, kind, f) <= w;
+        if (fits) break;
+    }
+    HFONT want = FitFont(lvl);
+    if ((HFONT)SendMessageW(d.h, WM_GETFONT, 0, 0) != want) SendMessageW(d.h, WM_SETFONT, (WPARAM)want, TRUE);
+}
+static void FitText()
+{
+    if (!gWnd || !gFont) return;
+    int* kinds = gFitKinds;
+    for (int i = 0; i < gDesignN; i++) { gDesign[i].dx = 0; gDesign[i].dw = 0; kinds[i] = gDesign[i].page >= 0 ? FitKind(gDesign[i]) : 0; }
+
+    // 1. widen labels, left to right, pushing the rest of the row along
+    for (int pass = 0; pass < 2; pass++)        // twice, so a label pushed by an earlier one is measured at its final place
+        for (int i = 0; i < gDesignN; i++) {
+            if (kinds[i] != 1 && kinds[i] != 2) continue;
+            Design& d = gDesign[i];
+            int lack = FitNeed(d, kinds[i], gFont) - (d.w + d.dw);
+            if (lack > 0) { d.dw += lack; FitPush(i); }
+        }
+
+    // 2. rows that now run past their section: dropdowns give up width, then trailing notes are cut short
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = 0; i < gDesignN; i++) {
+            Design& c = gDesign[i];
+            if (c.page < 0) continue;
+            int over = c.x + c.dx + c.w + c.dw - FitLimit(c);
+            if (over <= 0) continue;
+            for (int k = gDesignN - 1; k >= 0 && over > 0; k--) {
+                Design& cb = gDesign[k];
+                if (kinds[k] != 4 || !FitSameGroup(c, cb) || !FitSameRow(c, cb) || cb.x > c.x) continue;
+                int slack = cb.w + cb.dw - Imax(SC(70), cb.w * 55 / 100);
+                int take = Imin(slack, over);
+                if (take <= 0) continue;
+                cb.dw -= take; over -= take;
+                for (int j = 0; j < gDesignN; j++) {
+                    Design& b = gDesign[j];
+                    if (j != k && FitSameGroup(cb, b) && FitSameRow(cb, b) && b.x > cb.x) b.dx -= take;
+                }
+            }
+            if (over > 0 && (kinds[i] == 1 || kinds[i] == 3)) c.dw -= Imin(over, c.w + c.dw - SC(20));
+        }
+
+    // 3. move / resize what changed (number boxes take their arrows along; rows that slide down remember the new x)
+    for (int i = 0; i < gDesignN; i++) {
+        Design& d = gDesign[i];
+        int ddx = d.dx - d.adx, ddw = d.dw - d.adw;
+        if (!ddx && !ddw) continue;
+        RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+        int hgt = kinds[i] == 4 ? d.ht : r.bottom - r.top;
+        SetWindowPos(d.h, nullptr, r.left + ddx, r.top, r.right - r.left + ddw, hgt,
+                     SWP_NOZORDER | SWP_NOACTIVATE | (ddw ? 0 : SWP_NOSIZE));
+        for (int k = 0; k < gShiftN; k++) if (gShift[k].h == d.h) gShift[k].x += ddx;
+        if (ddx)
+            for (int f = 0; f < gFramedN; f++)
+                if (gFramed[f].edit == d.h && gFramed[f].ud) {
+                    RECT u; GetWindowRect(gFramed[f].ud, &u); MapWindowPoints(nullptr, gWnd, (POINT*)&u, 2);
+                    SetWindowPos(gFramed[f].ud, nullptr, u.left + ddx, u.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+                    for (int k = 0; k < gShiftN; k++) if (gShift[k].h == gFramed[f].ud) gShift[k].x += ddx;
+                }
+        d.adx = d.dx; d.adw = d.dw;
+    }
+
+    // 4. still too big for its space: a slightly smaller font (down to 3 px smaller)
+    for (int i = 0; i < gDesignN; i++) FitFontOf(i, kinds[i]);
+}
+
+// Text of one control changed (a hotkey name, a description): just pick the font size it needs.
+static void FitOne(HWND h)
+{
+    if (!h || !gFont) return;
+    for (int i = 0; i < gDesignN; i++)
+        if (gDesign[i].h == h) { FitFontOf(i, gDesign[i].page >= 0 ? FitKind(gDesign[i]) : 0); return; }
 }
 
 // ======================= knob control (Voice FX page) =======================
@@ -5416,7 +5597,7 @@ static void RefreshSoundUI()                    // after a profile changed lots 
     SendDlgItemMessageW(gWnd, IDC_VOCSCALE, CB_SETCURSEL, gVocScale, 0);
     SendDlgItemMessageW(gWnd, IDC_VOCRANGE, CB_SETCURSEL, gVocRange, 0);
     SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, gRadioPreset, 0);
-    SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[Iclamp(gRadioPreset, 0, RADIO_N - 1)]);
+    { SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[Iclamp(gRadioPreset, 0, RADIO_N - 1)]); FitOne(GetDlgItem(gWnd, IDC_RADIODESC)); }
     SendDlgItemMessageW(gWnd, IDC_ECHOSTYLE, CB_SETCURSEL, gEchoStyle, 0);
     SendDlgItemMessageW(gWnd, IDC_DISTSTYLE, CB_SETCURSEL, gDistStyle, 0);
     SendDlgItemMessageW(gWnd, IDC_CHOSTYLE, CB_SETCURSEL, gChoStyle, 0);
@@ -5480,7 +5661,7 @@ static void ProfilesFill(const wchar_t* select)   // refresh the Settings dropdo
     if (gProfSel >= 0) SendMessageW(c, CB_SETCURSEL, gProfSel, 0); else SetWindowTextW(c, select ? select : L"");
     wchar_t kn[120];
     if (gProfSel >= 0) FxKeyButtonText(SLOT_PROF0 + gProfSel, kn, 120); else lstrcpynW(kn, L"This profile: (save one first)", 120);
-    SetDlgItemTextW(gWnd, IDC_PROFKEY, kn);
+    SetDlgItemTextW(gWnd, IDC_PROFKEY, kn); FitOne(GetDlgItem(gWnd, IDC_PROFKEY));
     EnableWindow(GetDlgItem(gWnd, IDC_PROFKEY), gProfSel >= 0);
     EnableWindow(GetDlgItem(gWnd, IDC_PROFDEL), gProfSel >= 0);
 }
@@ -5767,7 +5948,7 @@ static void SurpriseMe()
         if (g == KG_MUFFLE) SetFxStyle(KG_MUFFLE, rnd(MUF_N));
         if (g == KG_HARM)  { gHarmStyle = rnd(HARM_N); SendDlgItemMessageW(gWnd, IDC_HARMSTYLE, CB_SETCURSEL, gHarmStyle, 0); }
         if (g == KG_RADIO) { gRadioPreset = rnd(RADIO_N); SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, gRadioPreset, 0);
-                             SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[gRadioPreset]); }
+                             { SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[gRadioPreset]); FitOne(GetDlgItem(gWnd, IDC_RADIODESC)); } }
         SetFxGroupOn(g, true);
         if (n > 1) lstrcatW(msg, L" + ");
         lstrcatW(msg, gFxGroups[g].title);
@@ -6178,7 +6359,7 @@ static void PadMenu(int i, HWND anchor)          // the "..." menu on a pad row
     static const int speeds[] = { 50, 75, 90, 100, 110, 125, 150, 200 };
     for (int k = 0; k < 8; k++) { wchar_t t[24]; wsprintfW(t, L"%d%%", speeds[k]); AppendMenuW(spd, MF_STRING | ((p.speed ? p.speed : 100) == speeds[k] ? MF_CHECKED : 0), 10 + k, t); }
     static const int pitches[] = { -12, -7, -5, -3, 0, 3, 5, 7, 12 };
-    for (int k = 0; k < 9; k++) { wchar_t t[24]; wsprintfW(t, pitches[k] ? L"%+d semitones" : L"Normal", pitches[k]); AppendMenuW(pit, MF_STRING | (p.pitch == pitches[k] ? MF_CHECKED : 0), 30 + k, t); }
+    for (int k = 0; k < 9; k++) { wchar_t t[24]; if (pitches[k]) wsprintfW(t, L"%s%d semitones", pitches[k] > 0 ? L"+" : L"", pitches[k]); else lstrcpyW(t, L"Normal"); AppendMenuW(pit, MF_STRING | (p.pitch == pitches[k] ? MF_CHECKED : 0), 30 + k, t); }
     static const int fades[] = { 0, 20, 100, 300, 1000 };
     for (int k = 0; k < 5; k++) {
         wchar_t t[24]; wsprintfW(t, fades[k] ? L"%d ms" : L"None", fades[k]);
@@ -6635,7 +6816,10 @@ static void Tip(HWND c, const wchar_t* text)
 static void TipId(int id, const wchar_t* text)    // a control, plus its spin arrows if it's a number box
 {
     Tip(GetDlgItem(gWnd, id), text);
-    Tip(GetDlgItem(gWnd, SPIN_UD(id)), text);
+    HWND ud = GetDlgItem(gWnd, SPIN_UD(id));
+    wchar_t cls[32] = L"";
+    if (ud) GetClassNameW(ud, cls, 32);
+    if (!lstrcmpiW(cls, UPDOWN_CLASSW)) Tip(ud, text);
 }
 
 struct TipText { const wchar_t* key; const wchar_t* text; };
@@ -7513,7 +7697,7 @@ static void ApplyCharacter(int c)
         break;
     case 15: // Space helmet
         use(KG_RADIO);   gRadioPreset = 4; SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, 4, 0);
-                         SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[4]);
+                         { SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[4]); FitOne(GetDlgItem(gWnd, IDC_RADIODESC)); }
         use(KG_CHORUS);  SetFxStyle(KG_CHORUS, 3);
         use(KG_REVERB);  SetKnobVar(&gFxRevMix, 12); SetKnobVar(&gFxRevSize, 20);
         break;
@@ -8218,6 +8402,7 @@ static void ShowCaptureTarget()
         FxKeyButtonText(slot, name, 120);
     }
     SetDlgItemTextW(gWnd, gCapButton, name);
+    FitOne(GetDlgItem(gWnd, gCapButton));
 }
 
 static void EndKeyCapture();
@@ -8252,6 +8437,7 @@ static void ClearFxKey(int slot)
     for (int i = 0; i < MAX_KEYS; i++) gFxKeys[slot][i] = 0;
     wchar_t name[120]; FxKeyButtonText(slot, name, 120);
     SetDlgItemTextW(gWnd, FxKeyButtonId(slot), name);
+    FitOne(GetDlgItem(gWnd, FxKeyButtonId(slot)));
 }
 
 // Left/right Shift, Ctrl and Alt are stored as plain Shift/Ctrl/Alt so either side works.
@@ -8641,12 +8827,12 @@ static void CreateUI()
         FxKeyButtonText(SLOT_REWIND, kn, 120);   Ctl(L"BUTTON", kn, WS_TABSTOP | WS_GROUP, 26, y + 14, 250, 28, IDC_REWINDKEY);
         FxKeyButtonText(SLOT_REPEAT, kn, 120);   Ctl(L"BUTTON", kn, WS_TABSTOP, 282, y + 14, 250, 28, IDC_REPEATKEY);
         FxKeyButtonText(SLOT_TAPESTOP, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 26, y + 46, 250, 28, IDC_TAPEKEY);
-        FxKeyButtonText(SLOT_DIVE, kn, 120);     Ctl(L"BUTTON", kn, WS_TABSTOP, 282, y + 46, 170, 28, IDC_DIVEKEY);
-        HWND dv = Ctl(L"COMBOBOX", L"", COMBO, 458, y + 48, 74, 300, IDC_DIVESEMIS);
+        FxKeyButtonText(SLOT_DIVE, kn, 120);     Ctl(L"BUTTON", kn, WS_TABSTOP, 282, y + 46, 186, 28, IDC_DIVEKEY);
+        HWND dv = Ctl(L"COMBOBOX", L"", COMBO, 472, y + 48, 60, 300, IDC_DIVESEMIS);
         static const int diveOpts[] = { -12, -7, -5, 5, 7, 12 };
         int sel = 0;
         for (int i = 0; i < 6; i++) {
-            wchar_t t[16]; wsprintfW(t, L"%+d st", diveOpts[i]);
+            wchar_t t[16]; wsprintfW(t, L"%s%d st", diveOpts[i] > 0 ? L"+" : L"", diveOpts[i]);   // wsprintf has no %+d
             SendMessageW(dv, CB_ADDSTRING, 0, (LPARAM)t);
             if (diveOpts[i] == gDiveSemis) sel = i;
         }
@@ -8719,17 +8905,16 @@ static void CreateUI()
             Ctl(L"STATIC", L"Extra voices at fixed intervals, following your pitch.", 0, 28, y + 56, 152, 48, IDC_HDR);
             kx = 186; kstep = 80; kw = 80;
         } else if (g == KG_GENDER || g == KG_RING || g == KG_WHISPER) {   // two knobs + a note
-            const wchar_t* note = g == KG_GENDER ? L"One knob for a convincing voice change: below 0 = deeper and more masculine, "
-                                                   L"above 0 = higher and more feminine. Pitch and throat size move together."
+            const wchar_t* note = g == KG_GENDER ? L"One-knob voice change: below 0 = deeper, more masculine; above 0 = higher, "
+                                                   L"more feminine. Moves pitch and throat size together."
                                 : g == KG_RING   ? L"Multiplies your voice by a tone. 30-60 Hz = the classic sci-fi robot / Dalek; "
                                                    L"higher = metallic and bell-like."
                                 :                  L"Turns your voice into a breathy whisper, even when you talk normally. "
                                                    L"Air brightens the breath.";
             Ctl(L"STATIC", note, 0, 226, y + 14, 194, 86, IDC_HDR);
         } else if (g == KG_FORMANT) {
-            Ctl(L"STATIC", L"Changes how big your throat sounds without changing your pitch. "
-                           L"Below 0 = bigger, deeper, older; above 0 = smaller, younger. "
-                           L"With Pitch, it makes a voice sound like someone else instead of sped up.",
+            Ctl(L"STATIC", L"How big your throat sounds, without changing pitch. Below 0 = bigger, deeper, "
+                           L"older; above 0 = smaller, younger. Add Pitch to sound like someone else.",
                 0, 226, y + 14, 194, 86, IDC_HDR);
         }
         int col = 0;
@@ -9000,6 +9185,7 @@ static void CreateUI()
     gBuildPage = -1;
     gUiReady = true;
     AddTips();
+    FitText();
     Layout();
 }
 
@@ -9278,7 +9464,7 @@ static void OnCommand(int id, int code)
             for (int i = 0; i < gProfCount; i++) if (!lstrcmpiW(gProfNames[i], t)) gProfSel = i;
             wchar_t kn[120];
             if (gProfSel >= 0) FxKeyButtonText(SLOT_PROF0 + gProfSel, kn, 120); else lstrcpynW(kn, L"This profile: (save it first)", 120);
-            SetDlgItemTextW(gWnd, IDC_PROFKEY, kn);
+            SetDlgItemTextW(gWnd, IDC_PROFKEY, kn); FitOne(GetDlgItem(gWnd, IDC_PROFKEY));
             EnableWindow(GetDlgItem(gWnd, IDC_PROFKEY), gProfSel >= 0);
             EnableWindow(GetDlgItem(gWnd, IDC_PROFDEL), gProfSel >= 0);
         }
@@ -9515,7 +9701,7 @@ static void OnCommand(int id, int code)
     case IDC_RADIOPRESET:
         if (code == CBN_SELCHANGE) {
             gRadioPreset = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, RADIO_N - 1);
-            SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[gRadioPreset]);
+            { SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[gRadioPreset]); FitOne(GetDlgItem(gWnd, IDC_RADIODESC)); }
             RedrawKnobs();                      // dims knobs the preset doesn't use
         }
         break;
