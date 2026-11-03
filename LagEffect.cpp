@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.21.0"
+#define APP_VERSION L"1.22.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -41,6 +41,10 @@
 #include <tlhelp32.h>                           // process names without opening the process (browsers' audio helpers)
 #include <commdlg.h>                            // "Audio file..." picker
 #include <sapi.h>                               // text to speech (Windows' own voices)
+#include <shlobj.h>                             // folder picker (Load a folder of sounds)
+#include <mfapi.h>                              // MP3 export (Windows' own encoder, loaded at run time)
+#include <mfidl.h>
+#include <mfreadwrite.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
@@ -102,6 +106,11 @@ static volatile int  gDiveSemis = -12, gBpm = 120, gBeatDiv = 1;   // beat divis
 static short gTestBuf[TEST_LEN];
 static volatile unsigned gTestPos = 0, gTestLen = 0;
 static volatile bool gTestRec = false;
+#define PADREC_LEN (RATE * 10)                  // "record a pad from your mic": up to 10 s
+static short gPadRecBuf[PADREC_LEN];
+static volatile unsigned gPadRecPos = 0;
+static volatile bool gPadRec = false, gPadDuck = false, gPadChoke = false;
+static int gPadRecSlot = -1;                    // pad being recorded from the mic
 
 // ---- Soundboard: 8 pads of short clips, mixed into every output that isn't Off ----
 // Not recorded into the stutter loop, not run through the voice effects, not silenced by Mute mic.
@@ -109,9 +118,11 @@ static volatile bool gTestRec = false;
 #define PADS  8                                 // soundboard pads on screen (one page)
 #define PAD_BANKS 4                             // pages A-D
 #define PAD_N (PADS * PAD_BANKS)                // every pad
-#define CLIPS 8                                 // instant-replay clips (Clips tab)
+#define CLIPS 8                                 // instant-replay clips on screen (one page)
+#define CLIP_BANKS 4                            // clip pages A-D
+#define CLIP_N (CLIPS * CLIP_BANKS)             // every clip slot
 #define CLIP0 PAD_N                             // where clips start in gPads
-#define TTS_SLOT (CLIP0 + CLIPS)                // text-to-speech plays in this slot
+#define TTS_SLOT (CLIP0 + CLIP_N)               // text-to-speech plays in this slot
 #define SB_N  (TTS_SLOT + 1)                    // all share one mixer: pads, clips, then text-to-speech
 struct Pad {
     short* volatile   data;                      // 48 kHz mono 16-bit
@@ -122,7 +133,14 @@ struct Pad {
     volatile unsigned pos;
     float             fade;                      // short fade-out when stopped or restarted (no clicks)
     unsigned          fadePos;
+    // per-pad options (soundboard): play mode, speed (varispeed %), pitch (semitones), fades (ms)
+    volatile int      mode, speed, pitch, fadeInMs, fadeOutMs;
+    double            fpos;                      // play position (fractional when the speed isn't 100%)
+    bool              stopping;                  // fading out after Stop
+    float             outEnv;
+    int               lastPitch; double ratio;
 };
+enum { PM_ONESHOT = 0, PM_LOOP, PM_HOLD, PM_TOGGLE };
 template <class T> static inline T Min(T a, T b) { return a < b ? a : b; }
 template <class T> static inline T Max(T a, T b) { return a > b ? a : b; }
 static Pad gPads[SB_N];
@@ -132,22 +150,30 @@ static volatile bool gPadsFx = false, gClipsFx = false;   // play through the vo
 static int gPadBank = 0;                        // soundboard page on screen
 static inline int PadSlot(int row) { return gPadBank * PADS + row; }
 
-static inline float PadsMix(float& viaFx)        // audio thread: one output sample of all playing pads
+struct PShift;
+static float PadPitch(int i, float x, double ratio);   // per-pad pitch shifter (defined with the DSP)
+static inline float PadsMix(float& viaFx, int& padsPlaying)   // audio thread: one output sample of all playing pads
 {                                               // (viaFx gets the ones that go through the voice effects)
-    viaFx = 0;
+    viaFx = 0; padsPlaying = 0;
     float sum = 0;
     const float padMaster = gPadMaster / 100.0f, clipMaster = gClipMaster / 100.0f;
     for (int i = 0; i < SB_N; i++) {
         Pad& p = gPads[i];
-        const bool  isClip = i >= CLIP0 && i < CLIP0 + CLIPS;
+        const bool  isClip = i >= CLIP0 && i < CLIP0 + CLIP_N;
         const float master = isClip ? clipMaster : padMaster;
         float& acc = (isClip ? gClipsFx : gPadsFx) ? viaFx : sum;
         short* d = p.data; unsigned n = p.len;
-        if (p.stop) { p.stop = false; if (p.playing) { p.fade = 1.0f; p.fadePos = p.pos; } p.playing = false; }
+        if (p.stop) {
+            p.stop = false;
+            if (p.playing) {
+                if (p.fadeOutMs > 0 && !p.stopping) { p.stopping = true; p.outEnv = 1.0f; }   // fade out, then stop
+                else if (!p.stopping) { p.fade = 1.0f; p.fadePos = (unsigned)p.fpos; p.playing = false; }
+            }
+        }
         if (p.trigger) {                         // (re)start: fade the old play-through out, start fresh
             p.trigger = false;
-            if (p.playing) { p.fade = 1.0f; p.fadePos = p.pos; }
-            p.pos = 0; p.playing = d && n;
+            if (p.playing) { p.fade = 1.0f; p.fadePos = (unsigned)p.fpos; }
+            p.fpos = 0; p.pos = 0; p.playing = d && n; p.stopping = false; p.outEnv = 1.0f;
         }
         if (!d || !n) { p.playing = false; p.fade = 0; continue; }
         const float g = p.vol / 100.0f * master * (1.0f / 32768.0f);
@@ -156,12 +182,30 @@ static inline float PadsMix(float& viaFx)        // audio thread: one output sam
             p.fade -= 1.0f / 240.0f;              // 5 ms
         }
         if (p.playing) {
-            unsigned pos = p.pos;
-            float env = pos < 48 ? pos / 48.0f : 1.0f;                       // 1 ms fade-in
-            if (n - pos < 240) env *= (n - pos) / 240.0f;                    // 5 ms fade-out at the end
-            acc += d[pos] * g * env;
-            if (++pos >= n) p.playing = false;
-            p.pos = pos;
+            if (!isClip && i < CLIP0) padsPlaying++;
+            const double rate = p.speed > 0 && p.speed != 100 ? p.speed / 100.0 : 1.0;
+            double fp = p.fpos;
+            unsigned i0 = (unsigned)fp;
+            float smp = d[i0];
+            if (rate != 1.0) { float t = (float)(fp - i0); smp = smp * (1.0f - t) + (i0 + 1 < n ? d[i0 + 1] : 0) * t; }
+            const double fin = p.fadeInMs > 1 ? p.fadeInMs * (RATE / 1000.0) : 48.0;
+            float env = fp < fin ? (float)(fp / fin) : 1.0f;
+            double left = (n - fp) / rate;
+            if (p.mode != PM_LOOP && left < 240) env *= (float)(left / 240.0);   // 5 ms fade-out at the end
+            if (p.stopping) {
+                p.outEnv -= 1.0f / (Imax(1, (int)p.fadeOutMs) * (RATE / 1000.0f));
+                if (p.outEnv <= 0) { p.outEnv = 0; p.playing = false; p.stopping = false; }
+                env *= p.outEnv;
+            }
+            float v = smp * g * env;
+            if (p.pitch != 0 && i < PAD_N) {
+                if (p.lastPitch != p.pitch) { p.lastPitch = p.pitch; p.ratio = pow(2.0, p.pitch / 12.0); }
+                v = PadPitch(i, v, p.ratio);
+            }
+            acc += v;
+            fp += rate;
+            if (fp >= n) { if (p.mode == PM_LOOP) fp -= n; else p.playing = false; }
+            p.fpos = fp; p.pos = (unsigned)fp;
         }
     }
     return sum;
@@ -344,6 +388,8 @@ struct PShift {
     bool   primed;
 };
 static PShift gPsFx, gPsTune;
+static PShift* gPadPs[PAD_N];                    // created the first time a pad is pitched
+static float PitchShift(PShift& p, float x, double ratio, int span, float mix, bool centered, int search, int corr);
 
 static void PsReset(PShift& p) { memset(&p, 0, sizeof(p)); }
 
@@ -1781,6 +1827,12 @@ static float ToneRun(float x, float deEss, bool broadcast)
     return x;
 }
 
+static float PadPitch(int i, float x, double ratio)
+{
+    if (!gPadPs[i]) { gPadPs[i] = (PShift*)calloc(1, sizeof(PShift)); if (!gPadPs[i]) return x; }   // first use only
+    return PitchShift(*gPadPs[i], x, ratio, 2400, 1.0f, false, PS_SEARCH, PS_CORR);
+}
+
 static void FxPack2Reset()
 {
     gRingPh = 0;
@@ -1877,6 +1929,7 @@ static float SpSample()
 }
 
 static int randLeft = 0, randWait = 0, randLoopMs = 100;   // random lag state (audio thread)
+static float duckGain = 1.0f;
 static PShift gPsDive;                          // Pitch dive hotkey
 static float  diveBend = 0;
 
@@ -2037,8 +2090,9 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     float blockPeak = 0;
 
     for (ma_uint32 f = 0; f < frames; f++) {
-        float sbFx;
-        const float sb = PadsMix(sbFx);         // soundboard: every output that isn't Off (sbFx: through the effects)
+        float sbFx; int padsOn;
+        const float sb = PadsMix(sbFx, padsOn); // soundboard: every output that isn't Off (sbFx: through the effects)
+        duckGain += ((gPadDuck && padsOn ? 0.32f : 1.0f) - duckGain) * 0.002f;   // "lower my voice while a pad plays"
         float s = in ? in[f] * boost : 0.0f;
         muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
         s *= muteGain;
@@ -2138,7 +2192,15 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             }
         }
 
+        if (duckGain < 0.999f) { everything *= duckGain; effect *= duckGain; }
         if (gRecVoiceOn) RecPut(gRecVoice, everything + sb);   // instant replay: what Discord hears
+        if (gPadRec) {                          // recording a pad from the mic (what Discord hears from you)
+            float t = everything; t = t > 1 ? 1 : t < -1 ? -1 : t;
+            unsigned rp = gPadRecPos;
+            gPadRecBuf[rp] = (short)(t * 32767.0f);
+            if (++rp >= PADREC_LEN) gPadRec = false;
+            gPadRecPos = rp;
+        }
         if (gTestRec) {                         // mic test
             float t = everything + sb; t = t > 1 ? 1 : t < -1 ? -1 : t;
             unsigned tp = gTestPos;
@@ -2199,6 +2261,8 @@ enum {
     IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6,   // Voice FX sub-tabs: consecutive
     IDC_MICSUB0, IDC_MICSUB1,                   // Mic tab sub-tabs: consecutive
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
+    IDC_PADCHOKE, IDC_PADDUCK, IDC_PADFOLDER, IDC_CLIPSEP, IDC_CLIPREPLACE, IDC_CLIPHIST,
+    IDC_CLIPBANK0, IDC_CLIPBANK1, IDC_CLIPBANK2, IDC_CLIPBANK3,   // clip pages: consecutive
     IDC_LAGPRESET, IDC_BEATSYNC, IDC_BPM, IDC_BEATDIV, IDC_TAPEKEY, IDC_DIVEKEY, IDC_DIVESEMIS, IDC_SURPRISE, IDC_ABTEST,
     IDC_FXCHAR, IDC_ECHOSTYLE, IDC_DISTSTYLE, IDC_CHOSTYLE, IDC_MUFSTYLE, IDC_FXORDER,
     IDC_RANDLAG, IDC_RANDSEC, IDC_REWINDKEY, IDC_REPEATKEY,
@@ -2206,6 +2270,7 @@ enum {
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
+    IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
     IDC_PADPLAY = 700, IDC_PADVOL = 710, IDC_PADKEY = 720, IDC_PADLOAD = 730, IDC_PADCLR = 740,   // + pad index
@@ -2937,7 +3002,15 @@ struct Clip {
     TrimState undo[TRIM_HIST]; int nUndo;
     TrimState redo[TRIM_HIST]; int nRedo;
 };
-static Clip    gClips[CLIPS];
+static Clip    gClips[CLIP_N];
+static int     gClipBank = 0;                    // clip page on screen
+static inline int ClipSlot(int row) { return gClipBank * CLIPS + row; }
+static bool    gClipPinned[CLIP_N];              // never replaced when the board is full
+static unsigned gClipStamp[CLIP_N], gClipStampNext = 1;   // capture order (oldest gets replaced)
+static bool    gClipSeparate = false, gClipReplace = true;
+// pads: names and colours (CLR_NONE = the theme's card colour)
+static wchar_t gPadName[PAD_N][48];
+static COLORREF gPadColor[PAD_N];
 static bool    gUpdateOnStart = true;
 
 static void LoadSettings()
@@ -3047,8 +3120,26 @@ static void LoadSettings()
     gFxSub     = Iclamp(INI_INT(L"fx_subtab", 0), 0, FX_SUBS - 1);
     gRecSource  = Iclamp(INI_INT(L"rec_source", REC_BOTH), 0, REC_N - 1);
     gClipMaster = Iclamp(INI_INT(L"clip_master", 100), 0, 200);
-    for (int i = 0; i < CLIPS; i++) {
+    gClipBank     = Iclamp(INI_INT(L"clip_page", 0), 0, CLIP_BANKS - 1);
+    gClipSeparate = INI_INT(L"clip_separate_tracks", 0) != 0;
+    gClipReplace  = INI_INT(L"clip_replace_oldest", 1) != 0;
+    gPadChoke     = INI_INT(L"pads_one_at_a_time", 0) != 0;
+    gPadDuck      = INI_INT(L"pads_duck_voice", 0) != 0;
+    gClipStampNext = (unsigned)Imax(1, INI_INT(L"clip_stamp_next", 1));
+    for (int i = 0; i < PAD_N; i++) {
+        wchar_t key[32]; Pad& p = gPads[i];
+        wsprintfW(key, L"pad%d_mode", i + 1);     p.mode = Iclamp(INI_INT(key, 0), 0, 3);
+        wsprintfW(key, L"pad%d_speed", i + 1);    p.speed = Iclamp(INI_INT(key, 100), 25, 400);
+        wsprintfW(key, L"pad%d_pitch", i + 1);    p.pitch = Iclamp(INI_INT(key, 0), -12, 12);
+        wsprintfW(key, L"pad%d_fade_in", i + 1);  p.fadeInMs = Iclamp(INI_INT(key, 0), 0, 5000);
+        wsprintfW(key, L"pad%d_fade_out", i + 1); p.fadeOutMs = Iclamp(INI_INT(key, 0), 0, 5000);
+        wsprintfW(key, L"pad%d_name", i + 1);     GetPrivateProfileStringW(L"settings", key, L"", gPadName[i], 48, gIni);
+        wsprintfW(key, L"pad%d_color", i + 1);    gPadColor[i] = (COLORREF)INI_INT(key, (int)CLR_NONE);
+    }
+    for (int i = 0; i < CLIP_N; i++) {
         wchar_t key[32];
+        wsprintfW(key, L"clip%d_pinned", i + 1); gClipPinned[i] = INI_INT(key, 0) != 0;
+        wsprintfW(key, L"clip%d_stamp", i + 1);  gClipStamp[i] = (unsigned)Imax(0, INI_INT(key, 0));
         wsprintfW(key, L"clip%d_file", i + 1);   GetPrivateProfileStringW(L"settings", key, L"", gPadFile[CLIP0 + i], MAX_PATH, gIni);
         wsprintfW(key, L"clip%d_volume", i + 1); gPads[CLIP0 + i].vol = Iclamp(INI_INT(key, 100), 0, 200);
         wsprintfW(key, L"clip%d_start", i + 1);  gClips[i].pendTs = (unsigned)Iclamp(INI_INT(key, 0), 0, REC_LEN);
@@ -3156,9 +3247,23 @@ static void SaveSettings()
     SaveInt(L"fx_subtab", gFxSub);
     SaveInt(L"rec_source", gRecSource);
     SaveInt(L"clip_master", gClipMaster);
-    for (int i = 0; i < CLIPS; i++) {
+    SaveInt(L"clip_page", gClipBank); SaveInt(L"clip_separate_tracks", gClipSeparate); SaveInt(L"clip_replace_oldest", gClipReplace);
+    SaveInt(L"pads_one_at_a_time", gPadChoke); SaveInt(L"pads_duck_voice", gPadDuck); SaveInt(L"clip_stamp_next", (int)gClipStampNext);
+    for (int i = 0; i < PAD_N; i++) {
+        wchar_t key[32]; const Pad& p = gPads[i];
+        wsprintfW(key, L"pad%d_mode", i + 1);     SaveInt(key, p.mode);
+        wsprintfW(key, L"pad%d_speed", i + 1);    SaveInt(key, p.speed ? p.speed : 100);
+        wsprintfW(key, L"pad%d_pitch", i + 1);    SaveInt(key, p.pitch);
+        wsprintfW(key, L"pad%d_fade_in", i + 1);  SaveInt(key, p.fadeInMs);
+        wsprintfW(key, L"pad%d_fade_out", i + 1); SaveInt(key, p.fadeOutMs);
+        wsprintfW(key, L"pad%d_name", i + 1);     WritePrivateProfileStringW(L"settings", key, gPadName[i], gIni);
+        wsprintfW(key, L"pad%d_color", i + 1);    SaveInt(key, (int)gPadColor[i]);
+    }
+    for (int i = 0; i < CLIP_N; i++) {
         wchar_t key[32];
         const Clip& c = gClips[i];
+        wsprintfW(key, L"clip%d_pinned", i + 1); SaveInt(key, gClipPinned[i]);
+        wsprintfW(key, L"clip%d_stamp", i + 1);  SaveInt(key, (int)gClipStamp[i]);
         bool loaded = c.base != nullptr;
         wsprintfW(key, L"clip%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[CLIP0 + i], gIni);
         wsprintfW(key, L"clip%d_volume", i + 1); SaveInt(key, gPads[CLIP0 + i].vol);
@@ -4095,7 +4200,7 @@ static void PadSetData(int i, short* data, unsigned len)   // swap a pad's clip 
 
 static int SbButtonId(int s)                    // the play button showing slot s (pads: the row on screen)
 {
-    return s < PAD_N ? IDC_PADPLAY + s % PADS : s < CLIP0 + CLIPS ? IDC_CLIPPLAY + s - CLIP0 : 0;
+    return s < PAD_N ? IDC_PADPLAY + s % PADS : s < CLIP0 + CLIP_N ? IDC_CLIPPLAY + (s - CLIP0) % CLIPS : 0;
 }
 static void ClipSetBase(int c, short* data, unsigned len);
 
@@ -4149,13 +4254,17 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
 {
     const bool clip = (int)d->CtlID >= IDC_CLIPPLAY;
     const int  shown = (int)d->CtlID - (clip ? IDC_CLIPPLAY : IDC_PADPLAY);   // 0..7 on its own tab
-    const int  i = clip ? CLIP0 + shown : PadSlot(shown);                      // slot in gPads
+    const int  i = clip ? CLIP0 + ClipSlot(shown) : PadSlot(shown);            // slot in gPads
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
     const Pad& p = gPads[i];
     bool has = p.data != nullptr, playing = p.playing && p.len;
-    HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : LT_CARD);
+    COLORREF cardC = gDark ? DK_CTL : LT_CARD;
+    bool custom = !clip && gPadColor[i] != CLR_NONE;
+    if (custom) cardC = gPadColor[i];
+    bool lightCard = (GetRValue(cardC) * 299 + GetGValue(cardC) * 587 + GetBValue(cardC) * 114) / 1000 > 140;
+    HBRUSH card = CreateSolidBrush(cardC);
     HPEN   pen  = CreatePen(PS_SOLID, 1, playing ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, pen);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
@@ -4172,10 +4281,22 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
     RECT nr = { rc.left + 8, rc.top, rc.left + 26, rc.bottom - 2 };
     DrawTextW(dc, playing ? L"\x25B6" : num, -1, &nr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
     wchar_t name[MAX_PATH];
-    if (has) PadName(i, name, MAX_PATH);
+    if (has) { if (!clip && gPadName[i][0]) lstrcpynW(name, gPadName[i], MAX_PATH); else PadName(i, name, MAX_PATH); }
     else lstrcpynW(name, clip ? L"Empty: press Clip it" : L"Empty: drop a sound here", MAX_PATH);
+    if (clip && gClipPinned[i - CLIP0]) { wchar_t t[MAX_PATH]; wsprintfW(t, L"\x2605 %s", name); lstrcpynW(name, t, MAX_PATH); }
+    if (!clip && gPadRec && gPadRecSlot == i) {
+        wsprintfW(name, L"\x25CF Recording %u s... click to stop", gPadRecPos / RATE);
+        has = true;
+    }
+    if (!clip && has && (p.mode != PM_ONESHOT || (p.speed && p.speed != 100) || p.pitch)) {   // little tags for options
+        wchar_t t[MAX_PATH]; lstrcpynW(t, name, MAX_PATH - 16);
+        if (p.mode == PM_LOOP) lstrcatW(t, L"  \x221E"); else if (p.mode == PM_HOLD) lstrcatW(t, L"  [hold]"); else if (p.mode == PM_TOGGLE) lstrcatW(t, L"  [tog]");
+        lstrcpynW(name, t, MAX_PATH);
+    }
     SelectObject(dc, has ? gFontBold : gFont);
-    SetTextColor(dc, has ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(120, 120, 120)));
+    COLORREF txt = has ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(120, 120, 120));
+    if (custom) txt = lightCard ? RGB(20, 20, 20) : RGB(250, 250, 250);
+    SetTextColor(dc, txt);
     RECT tr = { rc.left + 28, rc.top, rc.right - 6, rc.bottom - 2 };
     DrawTextW(dc, name, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
     SelectObject(dc, of);
@@ -4188,15 +4309,28 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
 
 static void ClipTick();
 static void MicTestTick();
+static void PadRecordFinish();
+static void PadMenu(int i, HWND anchor);
+static void PadLoadFolder();
+static void ClipMenu(int c, HWND anchor);
+static void ClipHistory(HWND anchor);
+static void SetClipBank(int b);
+static void DrawClipBank(DRAWITEMSTRUCT* d);
 static void PadTick()                           // every 50 ms: redraw pads that are playing or just stopped
 {
     static bool was[SB_N];
     for (int i = 0; i < SB_N; i++) {
         bool now = gPads[i].playing;
-        if ((now || was[i]) && i < TTS_SLOT && gPage == (i < PAD_N ? PAGE_SOUND : PAGE_CLIPS) && (i >= PAD_N || i / PADS == gPadBank))
+        if ((now || was[i]) && i < TTS_SLOT && gPage == (i < PAD_N ? PAGE_SOUND : PAGE_CLIPS) &&
+            (i < PAD_N ? i / PADS == gPadBank : (i - CLIP0) / CLIPS == gClipBank))
             InvalidateRect(GetDlgItem(gWnd, SbButtonId(i)), nullptr, FALSE);
         was[i] = now;
     }
+    static bool wasPadRec = false;               // "record from my mic" finished (clicked again, or 10 s)
+    if (gPadRec && !gRunning) gPadRec = false;
+    if (wasPadRec && !gPadRec) PadRecordFinish();
+    if (gPadRec && gPadRecSlot >= 0) InvalidateRect(GetDlgItem(gWnd, SbButtonId(gPadRecSlot)), nullptr, FALSE);
+    wasPadRec = gPadRec;
     static DWORD lastBankDraw = 0;
     if (gPage == PAGE_SOUND && GetTickCount() - lastBankDraw > 200) {
         lastBankDraw = GetTickCount();
@@ -4218,7 +4352,7 @@ static void OnDropFiles(HDROP drop)             // files dragged onto the window
 {
     POINT pt; DragQueryPoint(drop, &pt);
     const bool clips = gPage == PAGE_CLIPS;     // on the Clips tab files become clips, otherwise pads
-    const int  first = clips ? CLIP0 : gPadBank * PADS, count = clips ? CLIPS : PADS;
+    const int  first = clips ? CLIP0 + gClipBank * CLIPS : gPadBank * PADS, count = clips ? CLIPS : PADS;
     int target = -1;
     if (gPage == PAGE_SOUND || clips)
         for (int i = 0; i < count; i++) {       // dropped on a row?
@@ -4240,7 +4374,7 @@ static void OnDropFiles(HDROP drop)             // files dragged onto the window
             }
             if (slot < 0) break;                // all full
         }
-        if (clips) gClips[slot].pendTs = gClips[slot].pendTe = 0;
+        if (clips) gClips[first - CLIP0 + slot].pendTs = gClips[first - CLIP0 + slot].pendTe = 0;
         lstrcpynW(gPadFile[first + slot], path, MAX_PATH);   // mark as taken so the next file goes elsewhere
         PadLoad(first + slot, path);
     }
@@ -4288,7 +4422,7 @@ static void ClipApply(int c)                    // play the trimmed part (after 
     p.len = 0; p.data = nullptr;
     Sleep(30);                                  // the audio thread has let go of the old range
     if (k.base && k.te > k.ts) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
 }
 
 static void ClipSetBase(int c, short* data, unsigned len)   // a new recording for a slot (or none)
@@ -4308,7 +4442,7 @@ static void ClipSetBase(int c, short* data, unsigned len)   // a new recording f
     k.pendTs = k.pendTe = 0;
     k.nUndo = k.nRedo = 0;
     if (data) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
 }
 
 static bool InClipFolder(const wchar_t* path)
@@ -4399,20 +4533,46 @@ static void ClipNow()                           // save the last N seconds as a 
         wsprintfW(path, L"%s\\Clip %02d-%02d %02d.%02d.%02d (%d).wav", gClipDir, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, n);
     bool saved = WriteWav(path, out, len);
 
+    if (gClipSeparate && nv && np) {            // also: your voice and the PC / Discord sound on their own
+        short* tr = (short*)HeapAlloc(GetProcessHeap(), 0, len * sizeof(short));
+        if (tr) {
+            wchar_t base[MAX_PATH], tp[MAX_PATH]; lstrcpynW(base, path, MAX_PATH);
+            wchar_t* dot = wcsrchr(base, L'.'); if (dot) *dot = 0;
+            for (unsigned k = 0; k < len; k++) tr[k] = (short)(at(gRecVoice, wv, nv, k) * 32767.0f);
+            wsprintfW(tp, L"%s (voice).wav", base); WriteWav(tp, tr, len);
+            for (unsigned k = 0; k < len; k++) tr[k] = (short)(at(gRecPc, wp, np, k) * 32767.0f);
+            wsprintfW(tp, L"%s (%s).wav", base, RecIsDiscord(gRecSource) ? L"discord" : L"pc"); WriteWav(tp, tr, len);
+            HeapFree(GetProcessHeap(), 0, tr);
+        }
+    }
     int slot = -1;
-    for (int c = 0; c < CLIPS && slot < 0; c++) if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c;
+    for (int k = 0; k < CLIP_N && slot < 0; k++) {   // first empty slot, starting on the page you're looking at
+        int c = (gClipBank * CLIPS + k) % CLIP_N;
+        if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c;
+    }
+    if (slot < 0 && gClipReplace) {             // full: replace the oldest clip that isn't pinned
+        unsigned oldest = 0xFFFFFFFF;
+        for (int c = 0; c < CLIP_N; c++) if (!gClipPinned[c] && gClipStamp[c] < oldest) { oldest = gClipStamp[c]; slot = c; }
+        if (slot >= 0) {
+            ClipSetBase(slot, nullptr, 0);      // its file stays in the Clips folder (see History)
+            gPadFile[CLIP0 + slot][0] = 0;
+        }
+    }
     wchar_t msg[64];
     if (slot >= 0) {
+        gClipStamp[slot] = gClipStampNext++;
+        gClipPinned[slot] = false;
         gClips[slot].pendTs = gClips[slot].pendTe = 0;
         unsigned a, b;                          // Auto-trim: start where the sound starts (Reset in Trim undoes it)
         if (gClipAutoTrim && FindSoundEnds(out, len, &a, &b)) { gClips[slot].pendTs = a; gClips[slot].pendTe = b >= len ? 0 : b; }
         ClipSetBase(slot, out, len);
+        if (slot / CLIPS != gClipBank) SetClipBank(slot / CLIPS);   // show the page it landed on
         if (saved) lstrcpynW(gPadFile[CLIP0 + slot], path, MAX_PATH);
         else       wsprintfW(gPadFile[CLIP0 + slot], L"%s\\Clip %02d.%02d.%02d (not saved)", gClipDir, t.wHour, t.wMinute, t.wSecond);
         wsprintfW(msg, L"Clipped the last %d s", (len + RATE / 2) / RATE);
     } else {
         HeapFree(GetProcessHeap(), 0, out);
-        lstrcpynW(msg, saved ? L"Clip saved (all 8 slots full)" : L"Couldn't save the clip", 64);
+        lstrcpynW(msg, saved ? L"Clip saved (all slots pinned / full)" : L"Couldn't save the clip", 64);
     }
     ShowOsd(msg, slot >= 0 || saved);
 }
@@ -4745,7 +4905,7 @@ static void TrimRename()                        // the Name box renames the clip
     lstrcatW(np, dot && dot > slash ? dot : L".wav");
     if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES || MoveFileW(old, np)) lstrcpynW(old, np, MAX_PATH);
     else MessageBoxW(gTrimWnd, L"Couldn't rename the clip (is that name already taken?).", L"Lag Effect - Clips", MB_ICONWARNING);
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + gTrimClip), nullptr, FALSE);
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + gTrimClip % CLIPS), nullptr, FALSE);
 }
 
 static void TrimClose()
@@ -4759,7 +4919,7 @@ static void TrimClose()
     gTrimWnd = nullptr;
     DestroyWindow(w);
     SetForegroundWindow(gWnd);
-    SetFocus(GetDlgItem(gWnd, IDC_CLIPTRIM + gTrimClip));
+    SetFocus(GetDlgItem(gWnd, IDC_CLIPTRIM + gTrimClip % CLIPS));
     gTrimClip = -1;
 }
 
@@ -5435,6 +5595,387 @@ static void SurpriseMe()
     UpdateStatus(true);
 }
 
+// ======================= soundboard: play modes, options, recording, folders =======================
+static void PadSetData(int i, short* data, unsigned len);
+static void PadBrowse(int i);
+static void PadClear(int i);
+
+static void PadTrigger(int i)
+{
+    if (gPadChoke && i < PAD_N) for (int k = 0; k < PAD_N; k++) if (k != i && gPads[k].playing) gPads[k].stop = true;   // one at a time
+    gPads[i].trigger = true;
+}
+
+static void PadKey(int i, bool pressed, bool released)   // hotkey or click, by the pad's play mode
+{
+    Pad& p = gPads[i];
+    if (!p.data) return;
+    switch (p.mode) {
+    case PM_HOLD:   if (pressed) PadTrigger(i); else if (released) p.stop = true; break;
+    case PM_LOOP:
+    case PM_TOGGLE: if (pressed) { if (p.playing) p.stop = true; else PadTrigger(i); } break;
+    default:        if (pressed) PadTrigger(i); break;
+    }
+}
+
+static void PadsFolder(wchar_t* out)
+{
+    lstrcpynW(out, gIni, MAX_PATH);
+    wchar_t* slash = wcsrchr(out, L'\\'); if (slash) slash[1] = 0; else out[0] = 0;
+    lstrcatW(out, L"Pads"); CreateDirectoryW(out, nullptr);
+}
+
+static void PadRecordStart(int i)
+{
+    if (!gRunning) { MessageBoxW(gWnd, L"Press Start on the Main tab first, then record.", L"Lag Effect - Soundboard", MB_ICONINFORMATION); return; }
+    gPadRecSlot = i; gPadRecPos = 0; gPadRec = true;
+    InvalidateRect(GetDlgItem(gWnd, SbButtonId(i)), nullptr, FALSE);
+}
+
+static void PadRecordFinish()                   // trim, save as a WAV in %APPDATA%\LagEffect\Pads, put on the pad
+{
+    int i = gPadRecSlot; gPadRecSlot = -1;
+    unsigned n = gPadRecPos;
+    if (i < 0 || n < RATE / 4) return;
+    unsigned a = 0, b = n;
+    FindSoundEnds(gPadRecBuf, n, &a, &b);
+    short* d = (short*)HeapAlloc(GetProcessHeap(), 0, (b - a) * sizeof(short));
+    if (!d) return;
+    memcpy(d, gPadRecBuf + a, (b - a) * sizeof(short));
+    wchar_t dir[MAX_PATH], path[MAX_PATH]; PadsFolder(dir);
+    SYSTEMTIME t; GetLocalTime(&t);
+    wsprintfW(path, L"%s\\Recording %02d-%02d %02d.%02d.%02d.wav", dir, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+    WriteWav(path, d, b - a);
+    PadSetData(i, d, b - a);
+    lstrcpynW(gPadFile[i], path, MAX_PATH);
+    gPadName[i][0] = 0;
+    InvalidateRect(GetDlgItem(gWnd, SbButtonId(i)), nullptr, FALSE);
+}
+
+static void PadLoadFolder()                     // fill empty pads (this page onward) from a folder of sounds
+{
+    BROWSEINFOW bi = {};
+    bi.hwndOwner = gWnd;
+    bi.lpszTitle = L"Pick a folder of sounds (MP3, WAV, FLAC). They fill your empty pads.";
+    bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if (!pidl) return;
+    wchar_t dir[MAX_PATH];
+    BOOL ok = SHGetPathFromIDListW(pidl, dir);
+    CoTaskMemFree(pidl);
+    if (!ok) return;
+    int loaded = 0, next = gPadBank * PADS;
+    static const wchar_t* exts[] = { L"*.mp3", L"*.wav", L"*.flac" };
+    for (const wchar_t* e : exts) {
+        wchar_t pat[MAX_PATH]; wsprintfW(pat, L"%s\\%s", dir, e);
+        WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
+        if (f == INVALID_HANDLE_VALUE) continue;
+        do {
+            while (next < PAD_N && (gPads[next].data || gPadFile[next][0])) next++;
+            if (next >= PAD_N) break;
+            wchar_t full[MAX_PATH]; wsprintfW(full, L"%s\\%s", dir, fd.cFileName);
+            lstrcpynW(gPadFile[next], full, MAX_PATH); gPadName[next][0] = 0;
+            PadLoad(next, full);
+            loaded++; next++;
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    wchar_t m[96]; wsprintfW(m, loaded ? L"Loaded %d sounds" : L"No empty pads (or no sounds in that folder)", loaded);
+    ShowOsd(m, loaded > 0);
+}
+
+static const COLORREF PAD_COLORS[8] = { RGB(214, 69, 65), RGB(232, 126, 4), RGB(241, 196, 15), RGB(46, 160, 67),
+                                        RGB(22, 160, 133), RGB(52, 120, 220), RGB(142, 68, 173), RGB(230, 90, 160) };
+static const wchar_t* PAD_COLOR_NAMES[8] = { L"Red", L"Orange", L"Yellow", L"Green", L"Teal", L"Blue", L"Purple", L"Pink" };
+
+static void PadMenu(int i, HWND anchor)          // the "..." menu on a pad row
+{
+    Pad& p = gPads[i];
+    HMENU m = CreatePopupMenu(), mode = CreatePopupMenu(), spd = CreatePopupMenu(), pit = CreatePopupMenu(),
+          fin = CreatePopupMenu(), fout = CreatePopupMenu(), col = CreatePopupMenu();
+    const wchar_t* modes[4] = { L"One-shot (click restarts)", L"Loop (click again to stop)", L"Hold (plays while the hotkey is held)", L"Toggle (click again to stop)" };
+    for (int k = 0; k < 4; k++) AppendMenuW(mode, MF_STRING | (p.mode == k ? MF_CHECKED : 0), 1 + k, modes[k]);
+    static const int speeds[] = { 50, 75, 90, 100, 110, 125, 150, 200 };
+    for (int k = 0; k < 8; k++) { wchar_t t[24]; wsprintfW(t, L"%d%%", speeds[k]); AppendMenuW(spd, MF_STRING | ((p.speed ? p.speed : 100) == speeds[k] ? MF_CHECKED : 0), 10 + k, t); }
+    static const int pitches[] = { -12, -7, -5, -3, 0, 3, 5, 7, 12 };
+    for (int k = 0; k < 9; k++) { wchar_t t[24]; wsprintfW(t, pitches[k] ? L"%+d semitones" : L"Normal", pitches[k]); AppendMenuW(pit, MF_STRING | (p.pitch == pitches[k] ? MF_CHECKED : 0), 30 + k, t); }
+    static const int fades[] = { 0, 20, 100, 300, 1000 };
+    for (int k = 0; k < 5; k++) {
+        wchar_t t[24]; wsprintfW(t, fades[k] ? L"%d ms" : L"None", fades[k]);
+        AppendMenuW(fin,  MF_STRING | (p.fadeInMs == fades[k] ? MF_CHECKED : 0), 50 + k, t);
+        AppendMenuW(fout, MF_STRING | (p.fadeOutMs == fades[k] ? MF_CHECKED : 0), 60 + k, t);
+    }
+    for (int k = 0; k < 8; k++) AppendMenuW(col, MF_STRING | (gPadColor[i] == PAD_COLORS[k] ? MF_CHECKED : 0), 80 + k, PAD_COLOR_NAMES[k]);
+    AppendMenuW(col, MF_STRING, 89, L"Pick a colour...");
+    AppendMenuW(col, MF_STRING | (gPadColor[i] == CLR_NONE ? MF_CHECKED : 0), 90, L"Default");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mode, L"Play mode");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)spd, L"Speed");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)pit, L"Pitch");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)fin, L"Fade in");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)fout, L"Fade out");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 70, L"Rename...");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)col, L"Colour");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 95, L"Record from my mic (up to 10 s)");
+    AppendMenuW(m, MF_STRING, 96, L"Load a sound...");
+    AppendMenuW(m, MF_STRING | (p.data ? 0 : MF_GRAYED), 97, L"Clear");
+    RECT r; GetWindowRect(anchor, &r);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd >= 1 && cmd <= 4)        p.mode = cmd - 1;
+    else if (cmd >= 10 && cmd < 18)  p.speed = speeds[cmd - 10];
+    else if (cmd >= 30 && cmd < 39)  p.pitch = pitches[cmd - 30];
+    else if (cmd >= 50 && cmd < 55)  p.fadeInMs = fades[cmd - 50];
+    else if (cmd >= 60 && cmd < 65)  p.fadeOutMs = fades[cmd - 60];
+    else if (cmd >= 80 && cmd < 88)  gPadColor[i] = PAD_COLORS[cmd - 80];
+    else if (cmd == 90)              gPadColor[i] = CLR_NONE;
+    else if (cmd == 89) {
+        static COLORREF custom[16];
+        CHOOSECOLORW cc = {}; cc.lStructSize = sizeof(cc); cc.hwndOwner = gWnd; cc.lpCustColors = custom;
+        cc.rgbResult = gPadColor[i] == CLR_NONE ? PAD_COLORS[5] : gPadColor[i]; cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+        if (ChooseColorW(&cc)) gPadColor[i] = cc.rgbResult;
+    } else if (cmd == 70) {
+        wchar_t nm[48]; lstrcpynW(nm, gPadName[i], 48);
+        if (!nm[0] && p.data) PadName(i, nm, 48);
+        if (InputBox(L"Rename pad", L"Name shown on this pad (leave empty for the file name):", nm, 40)) lstrcpynW(gPadName[i], nm, 48);
+        else if (!nm[0]) gPadName[i][0] = 0;
+    }
+    else if (cmd == 95) PadRecordStart(i);
+    else if (cmd == 96) PadBrowse(i);
+    else if (cmd == 97) { PadClear(i); gPadName[i][0] = 0; }
+    InvalidateRect(GetDlgItem(gWnd, SbButtonId(i)), nullptr, FALSE);
+}
+
+// ======================= clips: pages, copy, MP3, history =======================
+static void SetClipBank(int b)
+{
+    gClipBank = Iclamp(b, 0, CLIP_BANKS - 1);
+    for (int r = 0; r < CLIPS; r++) {
+        SetDlgItemInt(gWnd, IDC_CLIPVOL + r, (UINT)gPads[CLIP0 + ClipSlot(r)].vol, FALSE);
+        InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + r), nullptr, FALSE);
+    }
+    for (int k = 0; k < CLIP_BANKS; k++) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPBANK0 + k), nullptr, FALSE);
+}
+
+static bool ClipTrimmedFile(int c, wchar_t* out)  // the clip as you hear it (trimmed): the file itself, or a temp copy
+{
+    const Clip& k = gClips[c];
+    if (!k.base) return false;
+    if (k.ts == 0 && k.te >= k.baseLen && GetFileAttributesW(gPadFile[CLIP0 + c]) != INVALID_FILE_ATTRIBUTES) {
+        lstrcpynW(out, gPadFile[CLIP0 + c], MAX_PATH); return true;
+    }
+    wchar_t tmp[MAX_PATH], name[MAX_PATH];
+    GetTempPathW(MAX_PATH, tmp);
+    PadName(CLIP0 + c, name, MAX_PATH);
+    wsprintfW(out, L"%s%s.wav", tmp, name);
+    DeleteFileW(out);
+    return WriteWav(out, k.base + k.ts, k.te - k.ts);
+}
+
+static void ClipCopy(int c)                     // copy as a file: paste it straight into Discord
+{
+    wchar_t path[MAX_PATH];
+    if (!ClipTrimmedFile(c, path)) return;
+    size_t chars = lstrlenW(path) + 2;
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, sizeof(DROPFILES) + chars * sizeof(wchar_t));
+    if (!h) return;
+    DROPFILES* df = (DROPFILES*)GlobalLock(h);
+    df->pFiles = sizeof(DROPFILES); df->fWide = TRUE;
+    lstrcpyW((wchar_t*)(df + 1), path);
+    GlobalUnlock(h);
+    if (OpenClipboard(gWnd)) {
+        EmptyClipboard();
+        if (!SetClipboardData(CF_HDROP, h)) GlobalFree(h);
+        CloseClipboard();
+        ShowOsd(L"Clip copied: paste it in Discord", true);
+    } else GlobalFree(h);
+}
+
+// MP3 through Windows' own encoder (Media Foundation, Windows 8+), loaded at run time.
+static const GUID kMFMediaType_Audio  = { 0x73647561, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kMFAudioFormat_MP3  = { 0x00000055, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kMFAudioFormat_PCM  = { 0x00000001, 0x0000, 0x0010, { 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71 } };
+static const GUID kMF_MT_MAJOR_TYPE   = { 0x48eba18e, 0xf8c9, 0x4687, { 0xbf, 0x11, 0x0a, 0x74, 0xc9, 0xf9, 0x6a, 0x8f } };
+static const GUID kMF_MT_SUBTYPE      = { 0xf7e34c9a, 0x42e8, 0x4714, { 0xb7, 0x4b, 0xcb, 0x29, 0xd7, 0x2c, 0x35, 0xe5 } };
+static const GUID kMF_MT_AUDIO_SAMPLES_PER_SECOND = { 0x5faeeae7, 0x0290, 0x4c31, { 0x9e, 0x8a, 0xc5, 0x34, 0xf6, 0x8d, 0x9d, 0xba } };
+static const GUID kMF_MT_AUDIO_NUM_CHANNELS       = { 0x37e48bf5, 0x645e, 0x4c5b, { 0x89, 0xde, 0xad, 0xa9, 0xe2, 0x9b, 0x69, 0x6a } };
+static const GUID kMF_MT_AUDIO_BITS_PER_SAMPLE    = { 0xf2deb57f, 0x40fa, 0x4764, { 0xaa, 0x33, 0xed, 0x4f, 0x2d, 0x1f, 0xf6, 0x69 } };
+static const GUID kMF_MT_AUDIO_AVG_BYTES_PER_SECOND = { 0x1aab75c8, 0xcfef, 0x451c, { 0xab, 0x95, 0xac, 0x03, 0x4b, 0x8e, 0x17, 0x31 } };
+static const GUID kMF_MT_AUDIO_BLOCK_ALIGNMENT    = { 0x322de230, 0x9eeb, 0x43bd, { 0xab, 0x7a, 0xff, 0x41, 0x22, 0x51, 0x54, 0x1d } };
+static const GUID kMF_TRANSCODE_CONTAINERTYPE     = { 0x150ff23f, 0x4abc, 0x478b, { 0xac, 0x4f, 0xe1, 0x91, 0x6f, 0xba, 0x1c, 0xca } };
+static const GUID kMFTranscodeContainerType_MP3   = { 0xe438b912, 0x83f1, 0x4de6, { 0x9e, 0x3a, 0x9f, 0xfb, 0xc6, 0xdd, 0x24, 0xd1 } };
+
+static bool WriteMp3(const wchar_t* path, const short* d, unsigned n)
+{
+    HMODULE plat = LoadLibraryW(L"mfplat.dll"), rw = LoadLibraryW(L"mfreadwrite.dll");
+    if (!plat || !rw) return false;
+    typedef HRESULT (WINAPI* PStartup)(ULONG, DWORD);
+    typedef HRESULT (WINAPI* PShutdown)();
+    typedef HRESULT (WINAPI* PCreateAttr)(IMFAttributes**, UINT32);
+    typedef HRESULT (WINAPI* PCreateType)(IMFMediaType**);
+    typedef HRESULT (WINAPI* PCreateBuf)(DWORD, IMFMediaBuffer**);
+    typedef HRESULT (WINAPI* PCreateSample)(IMFSample**);
+    typedef HRESULT (WINAPI* PCreateWriter)(LPCWSTR, IMFByteStream*, IMFAttributes*, IMFSinkWriter**);
+    auto startup = (PStartup)(void*)GetProcAddress(plat, "MFStartup");
+    auto shutdown = (PShutdown)(void*)GetProcAddress(plat, "MFShutdown");
+    auto mkAttr = (PCreateAttr)(void*)GetProcAddress(plat, "MFCreateAttributes");
+    auto mkType = (PCreateType)(void*)GetProcAddress(plat, "MFCreateMediaType");
+    auto mkBuf = (PCreateBuf)(void*)GetProcAddress(plat, "MFCreateMemoryBuffer");
+    auto mkSample = (PCreateSample)(void*)GetProcAddress(plat, "MFCreateSample");
+    auto mkWriter = (PCreateWriter)(void*)GetProcAddress(rw, "MFCreateSinkWriterFromURL");
+    if (!startup || !shutdown || !mkAttr || !mkType || !mkBuf || !mkSample || !mkWriter) return false;
+    if (FAILED(startup(0x00020070, 0))) return false;           // MF_VERSION, full startup
+    bool ok = false;
+    IMFAttributes* at = nullptr; IMFSinkWriter* w = nullptr; IMFMediaType *outT = nullptr, *inT = nullptr;
+    DWORD stream = 0;
+    if (SUCCEEDED(mkAttr(&at, 1)) && SUCCEEDED(at->SetGUID(kMF_TRANSCODE_CONTAINERTYPE, kMFTranscodeContainerType_MP3)) &&
+        SUCCEEDED(mkWriter(path, nullptr, at, &w)) && SUCCEEDED(mkType(&outT)) && SUCCEEDED(mkType(&inT))) {
+        outT->SetGUID(kMF_MT_MAJOR_TYPE, kMFMediaType_Audio); outT->SetGUID(kMF_MT_SUBTYPE, kMFAudioFormat_MP3);
+        outT->SetUINT32(kMF_MT_AUDIO_SAMPLES_PER_SECOND, RATE); outT->SetUINT32(kMF_MT_AUDIO_NUM_CHANNELS, 1);
+        outT->SetUINT32(kMF_MT_AUDIO_AVG_BYTES_PER_SECOND, 128000 / 8);
+        inT->SetGUID(kMF_MT_MAJOR_TYPE, kMFMediaType_Audio); inT->SetGUID(kMF_MT_SUBTYPE, kMFAudioFormat_PCM);
+        inT->SetUINT32(kMF_MT_AUDIO_SAMPLES_PER_SECOND, RATE); inT->SetUINT32(kMF_MT_AUDIO_NUM_CHANNELS, 1);
+        inT->SetUINT32(kMF_MT_AUDIO_BITS_PER_SAMPLE, 16); inT->SetUINT32(kMF_MT_AUDIO_BLOCK_ALIGNMENT, 2);
+        inT->SetUINT32(kMF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE * 2);
+        if (SUCCEEDED(w->AddStream(outT, &stream)) && SUCCEEDED(w->SetInputMediaType(stream, inT, nullptr)) && SUCCEEDED(w->BeginWriting())) {
+            ok = true;
+            const unsigned CH = RATE / 10;      // 100 ms per sample
+            for (unsigned off = 0; off < n && ok; off += CH) {
+                unsigned cnt = Min(CH, n - off);
+                IMFMediaBuffer* b = nullptr; IMFSample* smp = nullptr; BYTE* dst = nullptr;
+                ok = SUCCEEDED(mkBuf(cnt * 2, &b)) && SUCCEEDED(b->Lock(&dst, nullptr, nullptr));
+                if (ok) { memcpy(dst, d + off, cnt * 2); b->Unlock(); b->SetCurrentLength(cnt * 2); }
+                ok = ok && SUCCEEDED(mkSample(&smp)) && SUCCEEDED(smp->AddBuffer(b)) &&
+                     SUCCEEDED(smp->SetSampleTime((LONGLONG)off * 10000000 / RATE)) &&
+                     SUCCEEDED(smp->SetSampleDuration((LONGLONG)cnt * 10000000 / RATE)) && SUCCEEDED(w->WriteSample(stream, smp));
+                if (smp) smp->Release(); if (b) b->Release();
+            }
+            ok = SUCCEEDED(w->Finalize()) && ok;
+        }
+    }
+    if (inT) inT->Release(); if (outT) outT->Release(); if (w) w->Release(); if (at) at->Release();
+    shutdown();
+    if (!ok) DeleteFileW(path);
+    return ok;
+}
+
+static void ClipSaveMp3(int c)
+{
+    const Clip& k = gClips[c];
+    if (!k.base) return;
+    wchar_t path[MAX_PATH], name[MAX_PATH];
+    PadName(CLIP0 + c, name, MAX_PATH);
+    wsprintfW(path, L"%s.mp3", name);
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o); o.hwndOwner = gWnd; o.lpstrFilter = L"MP3 audio\0*.mp3\0"; o.lpstrFile = path; o.nMaxFile = MAX_PATH;
+    o.lpstrDefExt = L"mp3"; o.lpstrTitle = L"Save the clip as MP3"; o.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetSaveFileNameW(&o)) return;
+    DeleteFileW(path);
+    if (WriteMp3(path, k.base + k.ts, k.te - k.ts)) ShowOsd(L"Saved as MP3", true);
+    else MessageBoxW(gWnd, L"Windows' MP3 encoder isn't available here, so the MP3 couldn't be made. "
+                           L"Use Copy or the WAV in the Clips folder instead.", L"Lag Effect - Clips", MB_ICONWARNING);
+}
+
+static void ClipRename(int c)
+{
+    wchar_t* old = gPadFile[CLIP0 + c];
+    if (!old[0] || !InClipFolder(old)) { MessageBoxW(gWnd, L"Only clips you recorded can be renamed here.", L"Lag Effect - Clips", MB_ICONINFORMATION); return; }
+    wchar_t name[64]; PadName(CLIP0 + c, name, 64);
+    if (!InputBox(L"Rename clip", L"New name for this clip:", name, 60)) return;
+    for (wchar_t* q = name; *q; q++) if (wcschr(L"\\/:*?\"<>|", *q)) *q = L'_';
+    wchar_t np[MAX_PATH]; wsprintfW(np, L"%s\\%s.wav", gClipDir, name);
+    if (MoveFileW(old, np)) lstrcpynW(old, np, MAX_PATH);
+    else MessageBoxW(gWnd, L"Couldn't rename the clip (is that name already taken?).", L"Lag Effect - Clips", MB_ICONWARNING);
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+}
+
+static void OpenTrim(int c);
+static void ClipMenu(int c, HWND anchor)
+{
+    bool has = gClips[c].base != nullptr;
+    HMENU m = CreatePopupMenu();
+    UINT g = has ? 0 : MF_GRAYED;
+    AppendMenuW(m, MF_STRING | g, 1, L"Copy (paste into Discord)");
+    AppendMenuW(m, MF_STRING | g, 2, L"Save as MP3...");
+    AppendMenuW(m, MF_STRING | g, 3, L"Show in folder");
+    AppendMenuW(m, MF_STRING | g, 4, L"Rename...");
+    AppendMenuW(m, MF_STRING | g | (gClipPinned[c] ? MF_CHECKED : 0), 5, L"Pin (never replaced when full)");
+    AppendMenuW(m, MF_STRING | g, 6, L"Trim...");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | g, 7, L"Remove");
+    RECT r; GetWindowRect(anchor, &r);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == 1) ClipCopy(c);
+    else if (cmd == 2) ClipSaveMp3(c);
+    else if (cmd == 3) { wchar_t a[MAX_PATH + 16]; wsprintfW(a, L"/select,\"%s\"", gPadFile[CLIP0 + c]); ShellExecuteW(nullptr, L"open", L"explorer.exe", a, nullptr, SW_SHOWNORMAL); }
+    else if (cmd == 4) ClipRename(c);
+    else if (cmd == 5) gClipPinned[c] = !gClipPinned[c];
+    else if (cmd == 6) OpenTrim(c);
+    else if (cmd == 7) { ClipClear(c); gClipPinned[c] = false; }
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+}
+
+static void ClipHistory(HWND anchor)            // every clip ever saved: load one back onto the board
+{
+    ClipFolder();
+    struct Item { wchar_t name[MAX_PATH]; FILETIME t; } items[24]; int n = 0;
+    wchar_t pat[MAX_PATH]; wsprintfW(pat, L"%s\\*.wav", gClipDir);
+    WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {                                    // keep the 24 newest
+            int at = n < 24 ? n++ : 23;
+            if (at == 23 && n == 24 && CompareFileTime(&fd.ftLastWriteTime, &items[23].t) <= 0) continue;
+            lstrcpynW(items[at].name, fd.cFileName, MAX_PATH); items[at].t = fd.ftLastWriteTime;
+            for (int k = at; k > 0 && CompareFileTime(&items[k].t, &items[k - 1].t) > 0; k--) { Item tmp = items[k]; items[k] = items[k - 1]; items[k - 1] = tmp; }
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    HMENU m = CreatePopupMenu();
+    for (int k = 0; k < n; k++) {
+        wchar_t t[MAX_PATH]; lstrcpynW(t, items[k].name, MAX_PATH); wchar_t* dot = wcsrchr(t, L'.'); if (dot) *dot = 0;
+        AppendMenuW(m, MF_STRING, 1 + k, t);
+    }
+    if (!n) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No clips saved yet");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 100, L"Open the Clips folder");
+    RECT r; GetWindowRect(anchor, &r);
+    int cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == 100) { ShellExecuteW(nullptr, L"open", gClipDir, nullptr, nullptr, SW_SHOWNORMAL); return; }
+    if (cmd < 1 || cmd > n) return;
+    int slot = -1;
+    for (int k = 0; k < CLIP_N && slot < 0; k++) { int c = (gClipBank * CLIPS + k) % CLIP_N; if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c; }
+    if (slot < 0) { MessageBoxW(gWnd, L"All clip slots are full. Remove one first.", L"Lag Effect - Clips", MB_ICONINFORMATION); return; }
+    wchar_t full[MAX_PATH]; wsprintfW(full, L"%s\\%s", gClipDir, items[cmd - 1].name);
+    gClips[slot].pendTs = gClips[slot].pendTe = 0;
+    gClipStamp[slot] = gClipStampNext++;
+    lstrcpynW(gPadFile[CLIP0 + slot], full, MAX_PATH);
+    PadLoad(CLIP0 + slot, full);
+    if (slot / CLIPS != gClipBank) SetClipBank(slot / CLIPS);
+}
+
+static void DrawClipBank(DRAWITEMSTRUCT* d)     // clip page button (same look as the pad pages)
+{
+    int b = (int)d->CtlID - IDC_CLIPBANK0;
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    bool active = b == gClipBank, any = false;
+    for (int r = 0; r < CLIPS; r++) any |= gClips[b * CLIPS + r].base != nullptr;
+    HBRUSH br = CreateSolidBrush(active ? ACCENT : gDark ? DK_CTL : LT_CARD);
+    HPEN pn = CreatePen(PS_SOLID, 1, active ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
+    HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pn);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
+    wchar_t t[8]; wsprintfW(t, any ? L"%c \x2022" : L"%c", L'A' + b);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, active ? RGB(255, 255, 255) : gDark ? DK_TEXT : RGB(40, 40, 40));
+    HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
+    DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, of);
+}
+
 // ======================= soundboard pages =======================
 static void SetPadBank(int b)
 {
@@ -5762,7 +6303,18 @@ static void AddTips()
     TipId(IDC_CLIPMASTER, L"Volume of all the clips when they're played.");
     TipId(IDC_CLIPFOLDER, L"Open the folder where clips are saved as WAV files.");
     TipId(IDC_CLIPSTOP,   L"Stop every clip that's playing.");
+    for (int i = 0; i < PADS; i++) TipId(IDC_PADMORE + i, L"Options for this pad: play mode (one-shot, loop, hold, toggle), "
+                                                     L"speed, pitch, fades, name, colour, record from your mic.");
+    for (int i = 0; i < CLIP_BANKS; i++) TipId(IDC_CLIPBANK0 + i, L"Clip pages: 8 clips each (32 in all). Clip hotkeys play the clip in "
+                                                                 L"that spot on the page showing. New clips fill this page first.");
+    TipId(IDC_CLIPHIST,  L"Every clip you've saved, newest first: pick one to put it back on the board. Also opens the Clips folder.");
+    TipId(IDC_CLIPSEP,   L"With a mix (your voice + PC or Discord), also save each part as its own WAV, for editing later.");
+    TipId(IDC_CLIPREPLACE, L"When every slot is taken, a new clip replaces the oldest one that isn't pinned (its file is kept; see History).");
+    TipId(IDC_PADCHOKE,  L"Starting a pad stops any other pad that's playing, so sounds don't pile up.");
+    TipId(IDC_PADDUCK,   L"Your voice gets quieter (-10 dB) while a pad is playing, so the sound comes through.");
+    TipId(IDC_PADFOLDER, L"Pick a folder of MP3 / WAV / FLAC files: they fill your empty pads, starting on this page.");
     for (int i = 0; i < CLIPS; i++) {
+        TipId(IDC_CLIPMORE + i, L"Copy (paste straight into Discord), save as MP3, show in folder, rename, pin, trim.");
         TipId(IDC_CLIPPLAY + i, L"Click to play this clip on your outputs (Discord hears it). Right-click to stop.");
         TipId(IDC_CLIPVOL + i,  L"This clip's volume. 100% = as recorded, up to 200%.");
         TipId(IDC_CLIPKEY + i,  L"A hotkey that plays this clip from anywhere. Right-click to clear it.");
@@ -6120,6 +6672,7 @@ static void OsdTick()                           // shows ~1.1 s, then fades out 
 
 static void ClipNow();
 static void SetPadBank(int b);
+static void PadKey(int i, bool pressed, bool released);
 static bool ProfileLoad(int idx, bool osd);
 static void HoldPress(int slot);
 static void HoldRelease(int slot);
@@ -6134,6 +6687,10 @@ static void PollFxKeys()
             continue;
         }
         if (slot == SLOT_DIVE) { gDiveHeld = down; continue; }   // hold to bend
+        if (slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) {      // pads: press (and release, for Hold mode)
+            if (pressed || released) PadKey(PadSlot(slot - SLOT_PAD0), pressed, released);
+            continue;
+        }
         if (!pressed) continue;
         if (slot >= SLOT_PROF0)    { ProfileLoad(slot - SLOT_PROF0, true); continue; }
         if (slot == SLOT_TAPESTOP) { if (gRunning) gTapeReq = true; continue; }
@@ -6146,7 +6703,7 @@ static void PollFxKeys()
             ShowOsd(m, true);
             continue;
         }
-        if (slot >= SLOT_CLIP0)   { gPads[CLIP0 + slot - SLOT_CLIP0].trigger = true; continue; }   // a clip
+        if (slot >= SLOT_CLIP0)   { gPads[CLIP0 + ClipSlot(slot - SLOT_CLIP0)].trigger = true; continue; }   // a clip on this page
         if (slot == SLOT_CLIPNOW) { ClipNow(); continue; }                                       // save the last N s
         if (slot >= SLOT_PAD0)    { gPads[PadSlot(slot - SLOT_PAD0)].trigger = true; continue; }  // pad on this page
         wchar_t msg[64];
@@ -7013,6 +7570,9 @@ static void ShowHelp()
         L"Drop sound files onto the 8 pads (or click Load), set hotkeys, and play them into Discord. "
         L"They play on every output that isn't Off; Mute mic doesn't touch them. Pages A-D give you 32 pads (a hotkey flips pages). "
         L"Tick \"Play through my voice effects\" for a robot or demon soundboard. Text to speech: type a line, press Enter.\n\n"
+        L"SOUNDBOARD OPTIONS\n"
+        L"Each pad's ... button: play mode (one-shot, loop, hold-to-play, toggle), speed, pitch, fade in/out, name, colour, "
+        L"and Record from my mic. Below the pads: one sound at a time, lower my voice while a pad plays, load a folder.\n\n"
         L"CLIPS (INSTANT REPLAY)\n"
         L"Lag Effect keeps the last few seconds of your voice, PC sound or just Discord (pick in Record) in memory. Press Clip it (or its hotkey) "
         L"to save them as a clip. Trim lets you listen back privately, cut the start and end, and undo. "
@@ -7580,27 +8140,28 @@ static void CreateUI()
         wchar_t kn[120]; FxKeyButtonText(SLOT_PADBANK, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP | WS_GROUP, 290, 58, 256, 28, IDC_PADBANKKEY);
     }
-    AddSection(14, 98, 532, 342, L"Pads");
+    AddSection(14, 98, 532, 326, L"Pads");
     Ctl(L"STATIC", L"Sound", 0, 30, 112, 120, 16, IDC_HDR);
     Ctl(L"STATIC", L"Volume %", 0, 212, 112, 70, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Hotkey", 0, 292, 112, 120, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Hotkey", 0, 292, 112, 110, 16, IDC_HDR);
     for (int i = 0; i < PADS; i++) {
-        int y = 130 + i * 38;
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 32, IDC_PADPLAY + i);
-        Spin(IDC_PADVOL + i, 212, y + 4, 70, 0, 200, gPads[PadSlot(i)].vol);
+        int y = 130 + i * 36;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 30, IDC_PADPLAY + i);
+        Spin(IDC_PADVOL + i, 212, y + 3, 70, 0, 200, gPads[PadSlot(i)].vol);
         wchar_t kn[120]; FxKeyButtonText(SLOT_PAD0 + i, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 2, 128, 28, IDC_PADKEY + i);
-        Ctl(L"BUTTON", L"Load...", WS_TABSTOP, 424, y + 2, 74, 28, IDC_PADLOAD + i);
-        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 2, 26, 28, IDC_PADCLR + i);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 1, 110, 28, IDC_PADKEY + i);
+        Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 406, y + 1, 28, 28, IDC_PADMORE + i);
+        Ctl(L"BUTTON", L"Load...", WS_TABSTOP, 440, y + 1, 58, 28, IDC_PADLOAD + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 1, 26, 28, IDC_PADCLR + i);
     }
     for (int i = 0; i < PAD_N; i++)
         if (gPadFile[i][0]) PadLoad(i, gPadFile[i], true);   // reload last time's sounds (every page), quietly
-    AddSection(14, 456, 532, 62, L"Text to speech");
+    AddSection(14, 436, 532, 60, L"Text to speech");
     {
-        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 478, 250, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
+        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 250, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
         SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type something, press Enter");
         SendMessageW(te, EM_LIMITTEXT, 500, 0);
-        HWND tv = Ctl(L"COMBOBOX", L"", COMBO, 286, 478, 140, 300, IDC_TTSVOICE);
+        HWND tv = Ctl(L"COMBOBOX", L"", COMBO, 286, 457, 140, 300, IDC_TTSVOICE);
         SendMessageW(tv, CB_SETDROPPEDWIDTH, 280, 0);
         TtsListVoices();
         SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
@@ -7610,19 +8171,24 @@ static void CreateUI()
             if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1;
         }
         SendMessageW(tv, CB_SETCURSEL, sel, 0);
-        Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 476, 98, 28, IDC_TTSSPEAK);
+        Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 455, 98, 28, IDC_TTSSPEAK);
     }
-    AddSection(14, 532, 532, 50, L"Playback");
-    Ctl(L"STATIC", L"Volume:", 0, 30, 555, 56, 20, -1);
-    Spin(IDC_PADMASTER, 88, 552, 64, 0, 200, gPadMaster);
-    Ctl(L"STATIC", L"%", 0, 158, 555, 16, 20, -1);
-    Ctl(L"BUTTON", L"Play through my voice effects", BS_AUTOCHECKBOX | WS_TABSTOP, 186, 555, 220, 20, IDC_PADFX);
+    AddSection(14, 508, 532, 76, L"Playback");
+    Ctl(L"STATIC", L"Volume:", 0, 30, 529, 56, 20, -1);
+    Spin(IDC_PADMASTER, 88, 526, 64, 0, 200, gPadMaster);
+    Ctl(L"STATIC", L"%", 0, 158, 529, 16, 20, -1);
+    Ctl(L"BUTTON", L"Play through my voice effects", BS_AUTOCHECKBOX | WS_TABSTOP, 186, 529, 220, 20, IDC_PADFX);
     CheckDlgButton(gWnd, IDC_PADFX, gPadsFx ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Stop all", WS_TABSTOP, 424, 550, 106, 26, IDC_PADSTOP);
+    Ctl(L"BUTTON", L"Stop all", WS_TABSTOP, 424, 524, 106, 26, IDC_PADSTOP);
+    Ctl(L"BUTTON", L"One sound at a time", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 557, 150, 20, IDC_PADCHOKE);
+    CheckDlgButton(gWnd, IDC_PADCHOKE, gPadChoke ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Lower my voice while a pad plays", BS_AUTOCHECKBOX | WS_TABSTOP, 186, 557, 230, 20, IDC_PADDUCK);
+    CheckDlgButton(gWnd, IDC_PADDUCK, gPadDuck ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Load folder...", WS_TABSTOP, 424, 553, 106, 26, IDC_PADFOLDER);
 
     // ---------------- Clips page ----------------
     gBuildPage = PAGE_CLIPS;
-    AddSection(14, 60, 532, 166, L"Instant replay");
+    AddSection(14, 60, 532, 184, L"Instant replay");
     Ctl(L"BUTTON", L"Clip it", WS_TABSTOP, 30, 82, 100, 30, IDC_CLIPNOW);
     {
         wchar_t kn[120]; FxKeyButtonText(SLOT_CLIPNOW, kn, 120);
@@ -7645,26 +8211,34 @@ static void CreateUI()
     Ctl(L"STATIC", L"Volume:", 0, 266, 126, 52, 20, -1);
     Spin(IDC_CLIPMASTER, 320, 123, 64, 0, 200, gClipMaster);
     Ctl(L"STATIC", L"%", 0, 390, 126, 16, 20, -1);
-    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 424, 121, 106, 28, IDC_CLIPFOLDER);
+    Ctl(L"BUTTON", L"History...", WS_TABSTOP, 424, 121, 106, 28, IDC_CLIPHIST);
     Ctl(L"STATIC", L"", 0, 30, 156, 500, 34, IDC_RECSTATUS);
     Ctl(L"BUTTON", L"Cut silence off new clips", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 196, 190, 20, IDC_CLIPAUTOTRIM);
     CheckDlgButton(gWnd, IDC_CLIPAUTOTRIM, gClipAutoTrim ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Play clips through my voice effects", BS_AUTOCHECKBOX | WS_TABSTOP, 236, 196, 260, 20, IDC_CLIPFX);
     CheckDlgButton(gWnd, IDC_CLIPFX, gClipsFx ? BST_CHECKED : BST_UNCHECKED);
-    AddSection(14, 236, 532, 342, L"Clips");
-    Ctl(L"STATIC", L"Clip", 0, 30, 250, 120, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Volume %", 0, 212, 250, 70, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Hotkey", 0, 292, 250, 120, 16, IDC_HDR);
+    Ctl(L"BUTTON", L"Also save my voice and the other sound separately", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 218, 330, 20, IDC_CLIPSEP);
+    CheckDlgButton(gWnd, IDC_CLIPSEP, gClipSeparate ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"When full, replace the oldest", BS_AUTOCHECKBOX | WS_TABSTOP, 362, 218, 178, 20, IDC_CLIPREPLACE);
+    CheckDlgButton(gWnd, IDC_CLIPREPLACE, gClipReplace ? BST_CHECKED : BST_UNCHECKED);
+    AddSection(14, 254, 532, 330, L"Clips");
+    Ctl(L"STATIC", L"Clip", 0, 30, 270, 120, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Volume %", 0, 212, 270, 70, 16, IDC_HDR);
+    Ctl(L"STATIC", L"Page:", 0, 300, 270, 40, 16, IDC_HDR);
+    for (int b2 = 0; b2 < CLIP_BANKS; b2++)
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 342 + b2 * 47, 264, 43, 24, IDC_CLIPBANK0 + b2);
     for (int i = 0; i < CLIPS; i++) {
-        int y = 268 + i * 38;
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 32, IDC_CLIPPLAY + i);
-        Spin(IDC_CLIPVOL + i, 212, y + 4, 70, 0, 200, gPads[CLIP0 + i].vol);
+        int y = 292 + i * 36;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
+        Spin(IDC_CLIPVOL + i, 212, y + 3, 70, 0, 200, gPads[CLIP0 + ClipSlot(i)].vol);
         wchar_t kn[120]; FxKeyButtonText(SLOT_CLIP0 + i, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 2, 128, 28, IDC_CLIPKEY + i);
-        Ctl(L"BUTTON", L"Trim...", WS_TABSTOP, 424, y + 2, 74, 28, IDC_CLIPTRIM + i);
-        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 2, 26, 28, IDC_CLIPCLR + i);
-        if (gPadFile[CLIP0 + i][0]) PadLoad(CLIP0 + i, gPadFile[CLIP0 + i], true);   // last time's clips, quietly
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 1, 110, 28, IDC_CLIPKEY + i);
+        Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 406, y + 1, 28, 28, IDC_CLIPMORE + i);
+        Ctl(L"BUTTON", L"Trim...", WS_TABSTOP, 440, y + 1, 58, 28, IDC_CLIPTRIM + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 504, y + 1, 26, 28, IDC_CLIPCLR + i);
     }
+    for (int c = 0; c < CLIP_N; c++)
+        if (gPadFile[CLIP0 + c][0]) PadLoad(CLIP0 + c, gPadFile[CLIP0 + c], true);   // last time's clips (every page), quietly
 
     // ---------------- Settings page ----------------
     gBuildPage = PAGE_SETTINGS;
@@ -7927,7 +8501,11 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) {
-        if (code == BN_CLICKED) { int i = PadSlot(id - IDC_PADPLAY); if (gPads[i].data) gPads[i].trigger = true; else PadBrowse(i); }
+        if (code == BN_CLICKED) {
+            int i = PadSlot(id - IDC_PADPLAY);
+            if (gPadRec && gPadRecSlot == i) gPadRec = false;          // stop recording (finished in the tick)
+            else if (gPads[i].data) PadKey(i, true, false); else PadBrowse(i);
+        }
         return;
     }
     if (id >= IDC_PADLOAD && id < IDC_PADLOAD + PADS) { if (code == BN_CLICKED) PadBrowse(PadSlot(id - IDC_PADLOAD)); return; }
@@ -7940,7 +8518,7 @@ static void OnCommand(int id, int code)
         id == IDC_PADMASTER || id == IDC_CLIPMASTER) {
         if (!gUiReady) return;
         volatile int* var = id == IDC_PADMASTER ? &gPadMaster : id == IDC_CLIPMASTER ? &gClipMaster
-                          : id >= IDC_CLIPVOL ? &gPads[CLIP0 + id - IDC_CLIPVOL].vol : &gPads[PadSlot(id - IDC_PADVOL)].vol;
+                          : id >= IDC_CLIPVOL ? &gPads[CLIP0 + ClipSlot(id - IDC_CLIPVOL)].vol : &gPads[PadSlot(id - IDC_PADVOL)].vol;
         BOOL ok = FALSE;
         int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
         if (code == EN_CHANGE && ok) *var = Iclamp(v, 0, 200);
@@ -8031,21 +8609,30 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_PADSTOP) { if (code == BN_CLICKED) for (int i = 0; i < SB_N; i++) gPads[i].stop = true; return; }
     if (id >= IDC_CLIPPLAY && id < IDC_CLIPPLAY + CLIPS) {
-        if (code == BN_CLICKED) { int c = id - IDC_CLIPPLAY; if (gClips[c].base) gPads[CLIP0 + c].trigger = true; else ClipBrowse(c); }
+        if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPPLAY); if (gClips[c].base) gPads[CLIP0 + c].trigger = true; else ClipBrowse(c); }
         return;
     }
     if (id >= IDC_CLIPTRIM && id < IDC_CLIPTRIM + CLIPS) {
-        if (code == BN_CLICKED) { int c = id - IDC_CLIPTRIM; if (gClips[c].base) OpenTrim(c); else ClipBrowse(c); }
+        if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPTRIM); if (gClips[c].base) OpenTrim(c); else ClipBrowse(c); }
         return;
     }
-    if (id >= IDC_CLIPCLR && id < IDC_CLIPCLR + CLIPS) { if (code == BN_CLICKED) ClipClear(id - IDC_CLIPCLR); return; }
+    if (id >= IDC_CLIPCLR && id < IDC_CLIPCLR + CLIPS) { if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPCLR); ClipClear(c); gClipPinned[c] = false; } return; }
+    if (id >= IDC_CLIPMORE && id < IDC_CLIPMORE + CLIPS) { if (code == BN_CLICKED) ClipMenu(ClipSlot(id - IDC_CLIPMORE), GetDlgItem(gWnd, id)); return; }
+    if (id >= IDC_PADMORE && id < IDC_PADMORE + PADS)    { if (code == BN_CLICKED) PadMenu(PadSlot(id - IDC_PADMORE), GetDlgItem(gWnd, id)); return; }
+    if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
+    if (id == IDC_CLIPHIST)    { if (code == BN_CLICKED) ClipHistory(GetDlgItem(gWnd, id)); return; }
+    if (id == IDC_PADFOLDER)   { if (code == BN_CLICKED) PadLoadFolder(); return; }
+    if (id == IDC_PADCHOKE)    { gPadChoke = Checked(id); return; }
+    if (id == IDC_PADDUCK)     { gPadDuck = Checked(id); return; }
+    if (id == IDC_CLIPSEP)     { gClipSeparate = Checked(id); return; }
+    if (id == IDC_CLIPREPLACE) { gClipReplace = Checked(id); return; }
     if (id >= IDC_CLIPKEY && id < IDC_CLIPKEY + CLIPS) {
         if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_CLIP0 + id - IDC_CLIPKEY], id);
         return;
     }
     if (id == IDC_CLIPNOWKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_CLIPNOW], id); return; }
     if (id == IDC_CLIPNOW)    { if (code == BN_CLICKED) ClipNow(); return; }
-    if (id == IDC_CLIPSTOP)   { if (code == BN_CLICKED) for (int i = CLIP0; i < CLIP0 + CLIPS; i++) gPads[i].stop = true; return; }
+    if (id == IDC_CLIPSTOP)   { if (code == BN_CLICKED) for (int i = CLIP0; i < CLIP0 + CLIP_N; i++) gPads[i].stop = true; return; }
     if (id == IDC_CLIPFOLDER) {
         if (code == BN_CLICKED) { ClipFolder(); ShellExecuteW(nullptr, L"open", gClipDir, nullptr, nullptr, SW_SHOWNORMAL); }
         return;
@@ -8330,6 +8917,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
         if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1) { DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w >= IDC_CLIPBANK0 && w < IDC_CLIPBANK0 + CLIP_BANKS) { DrawClipBank((DRAWITEMSTRUCT*)l); return TRUE; }
         if ((w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) || (w >= IDC_CLIPPLAY && w < IDC_CLIPPLAY + CLIPS)) {
             DrawPadButton((DRAWITEMSTRUCT*)l); return TRUE;
         }
@@ -8355,7 +8943,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_PADBANKKEY) { ClearFxKey(SLOT_PADBANK); return 0; }
         if (id >= IDC_CLIPKEY && id < IDC_CLIPKEY + CLIPS) { ClearFxKey(SLOT_CLIP0 + id - IDC_CLIPKEY); return 0; }
         if (id == IDC_CLIPNOWKEY) { ClearFxKey(SLOT_CLIPNOW); return 0; }
-        if (id >= IDC_CLIPPLAY && id < IDC_CLIPPLAY + CLIPS) { gPads[CLIP0 + id - IDC_CLIPPLAY].stop = true; return 0; }
+        if (id >= IDC_CLIPPLAY && id < IDC_CLIPPLAY + CLIPS) { gPads[CLIP0 + ClipSlot(id - IDC_CLIPPLAY)].stop = true; return 0; }
         break;
     }
     case WM_MEASUREITEM:
