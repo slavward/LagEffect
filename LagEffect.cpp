@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.26.1"
+#define APP_VERSION L"1.26.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -2320,7 +2320,7 @@ enum {
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
     IDC_HARMMUTE, IDC_HEARLBL, IDC_HEARON, IDC_FONTSIZE, IDC_LAYEDIT, IDC_LAYRESET, IDC_STKLIST, IDC_STKADD, IDC_STKDEL,
-    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT, IDC_PICPLACE,
+    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT, IDC_PICPLACE, IDC_VOICEPROG,
     IDC_COLSW0 = 1400,                          // + colour slot (USERCOL_N): its own range
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
@@ -3149,6 +3149,10 @@ static bool    gClipAutoTrim = true;             // cut silence off the ends of 
 static wchar_t gTtsVoice[128];                   // text-to-speech voice (its name; empty = Windows' default)
 static int     gTtsAccent = 0;                    // text-to-speech accent (TTS_ACCENTS index; 0 = none)
 static bool    gVoiceInstalling = false;          // Windows is installing a voice for an accent
+static int     gVoicePct = -1;                    // how far (from DISM's own progress; -1 = not known yet)
+static DWORD   gVoiceStart = 0;                   // when it started (for the time shown until DISM reports)
+static wchar_t gVoiceLog[MAX_PATH];               // DISM's output, read for its progress
+static void    VoiceProgressTick();
 static int     gRecSeconds = 15;                 // instant replay length
 // What clips keep. The numbers are saved in the settings file, so new ones go at the end.
 enum { REC_BOTH = 0, REC_VOICE = 1, REC_PC = 2, REC_OFF = 3, REC_DISCORD = 4, REC_VOICE_DISCORD = 5, REC_N };
@@ -7623,7 +7627,8 @@ static void OnTtsDone(TtsJob* j)
     }
     HeapFree(GetProcessHeap(), 0, j);
     gTtsBusy = 0;
-    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, gVoiceInstalling ? L"Installing voice..." : L"Speak");
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak");
+    if (gVoiceInstalling) VoiceProgressTick();
 }
 
 // ======================= moving things around (layout + pictures) =======================
@@ -7988,6 +7993,43 @@ static void EdFollow() { if (gEdWnd) EdRender(); }   // the window moved / chang
 
 // ---- installing a voice (Windows' "Text-to-speech" feature for a language), then refreshing the list ----
 struct VoiceInstall { HANDLE proc; int accent; };
+static void VoiceProgressTick()                 // (every second while installing) progress bar + button text
+{
+    if (!gVoiceInstalling) return;
+    HANDLE f = CreateFileW(gVoiceLog, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f != INVALID_HANDLE_VALUE) {
+        static char buf[65536];
+        DWORD size = GetFileSize(f, nullptr), got = 0;
+        if (size != INVALID_FILE_SIZE) {
+            if (size > sizeof(buf) - 1) SetFilePointer(f, -(LONG)(sizeof(buf) - 1), nullptr, FILE_END);
+            ReadFile(f, buf, sizeof(buf) - 1, &got, nullptr);
+            buf[got] = 0;
+            for (int i = (int)got - 1; i > 0; i--)       // the last "NN.N%" DISM wrote
+                if (buf[i] == '%' && isdigit((unsigned char)buf[i - 1])) {
+                    int j = i - 1; while (j > 0 && (isdigit((unsigned char)buf[j - 1]) || buf[j - 1] == '.')) j--;
+                    gVoicePct = Iclamp(atoi(buf + j), 0, 100);
+                    break;
+                }
+        }
+        CloseHandle(f);
+    }
+    wchar_t t[32];
+    if (gVoicePct >= 0) wsprintfW(t, L"Installing %d%%", gVoicePct);
+    else { DWORD sec = (GetTickCount() - gVoiceStart) / 1000; wsprintfW(t, L"Installing %u:%02u", sec / 60, sec % 60); }
+    if (!gTtsBusy) { SetDlgItemTextW(gWnd, IDC_TTSSPEAK, t); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK)); }
+    InvalidateRect(GetDlgItem(gWnd, IDC_VOICEPROG), nullptr, FALSE);
+}
+static void DrawVoiceProgress(DRAWITEMSTRUCT* d)   // thin bar: track + accent fill (sliding while the % isn't known yet)
+{
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    RECT tr = rc; tr.top += 1; tr.bottom -= 1;
+    HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(dc, &tr, tb); DeleteObject(tb);
+    RECT fr = tr; const int W = tr.right - tr.left;
+    if (gVoicePct >= 0) fr.right = tr.left + W * gVoicePct / 100;
+    else { int seg = W / 5, pos = (int)((GetTickCount() - gVoiceStart) / 1000 % 5); fr.left = tr.left + pos * seg; fr.right = fr.left + seg; }
+    HBRUSH ab = CreateSolidBrush(ACCENT); FillRect(dc, &fr, ab); DeleteObject(ab);
+}
 static DWORD WINAPI VoiceInstallWait(LPVOID arg)
 {
     VoiceInstall* vi = (VoiceInstall*)arg;
@@ -8001,13 +8043,16 @@ static DWORD WINAPI VoiceInstallWait(LPVOID arg)
 static void TtsInstallVoice(int accent)
 {
     if (accent <= 0 || accent >= TTS_ACCENT_N || gVoiceInstalling) return;
-    wchar_t args[700];
-    wsprintfW(args, L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command \"try { "
-                    L"Add-WindowsCapability -Online -Name 'Language.TextToSpeech~~~%s~0.0.1.0' -ErrorAction Stop | Out-Null; exit 0 } "
-                    L"catch { exit 1 }\"", TTS_ACCENTS[accent].tag);
+    // Windows' DISM tool installs it and writes its progress ("45.0%") to a log we read every second
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    wsprintfW(gVoiceLog, L"%sLagEffect-voice.log", tmp);
+    DeleteFileW(gVoiceLog);
+    wchar_t args[1200];
+    wsprintfW(args, L"/c dism.exe /Online /Add-Capability /CapabilityName:Language.TextToSpeech~~~%s~0.0.1.0 /NoRestart > \"%s\" 2>&1",
+              TTS_ACCENTS[accent].tag, gVoiceLog);
     SHELLEXECUTEINFOW se = {}; se.cbSize = sizeof(se);
     se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC; se.hwnd = gWnd;
-    se.lpVerb = L"runas"; se.lpFile = L"powershell.exe"; se.lpParameters = args; se.nShow = SW_HIDE;
+    se.lpVerb = L"runas"; se.lpFile = L"cmd.exe"; se.lpParameters = args; se.nShow = SW_HIDE;
     if (!ShellExecuteExW(&se) || !se.hProcess) return;   // (you said no to Windows' permission prompt)
     VoiceInstall* vi = (VoiceInstall*)HeapAlloc(GetProcessHeap(), 0, sizeof(VoiceInstall));
     if (!vi) { CloseHandle(se.hProcess); return; }
@@ -8015,8 +8060,9 @@ static void TtsInstallVoice(int accent)
     HANDLE t = CreateThread(nullptr, 0, VoiceInstallWait, vi, 0, nullptr);
     if (!t) { CloseHandle(se.hProcess); HeapFree(GetProcessHeap(), 0, vi); return; }
     CloseHandle(t);
-    gVoiceInstalling = true;
-    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Installing voice...");
+    gVoiceInstalling = true; gVoicePct = -1; gVoiceStart = GetTickCount();
+    VoiceProgressTick();
+    ShowWindow(GetDlgItem(gWnd, IDC_VOICEPROG), gPage == PAGE_SOUND ? SW_SHOWNA : SW_HIDE);
 }
 static void TtsFillVoices()                     // the voice dropdown, after the list changed
 {
@@ -8037,7 +8083,10 @@ static void AppRestart()
 static void OnVoiceInstalled(DWORD code, int accent)
 {
     gVoiceInstalling = false;
-    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, gTtsBusy ? L"Speaking..." : L"Speak");
+    ShowWindow(GetDlgItem(gWnd, IDC_VOICEPROG), SW_HIDE);
+    DeleteFileW(gVoiceLog);
+    if (code == 3010) code = 0;                 // DISM: installed, Windows restart "suggested"
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, gTtsBusy ? L"Speaking..." : L"Speak"); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK));
     TtsListVoices();
     TtsFillVoices();
     const TtsAccent& a = TTS_ACCENTS[Iclamp(accent, 0, TTS_ACCENT_N - 1)];
@@ -9158,6 +9207,7 @@ static void Layout()
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
         if (cid == IDC_SONGSRC || cid == IDC_SONGSTATUS) vis = vis && songStyle;
+        if (cid == IDC_VOICEPROG) vis = vis && gVoiceInstalling;
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
@@ -10263,7 +10313,7 @@ static void CreateUI()
     AddSection(14, 436, 532, 60, L"Text to speech");
     {
         HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 176, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
-        SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type something, press Enter");
+        SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type, then Enter");
         SendMessageW(te, EM_LIMITTEXT, 500, 0);
         HWND ta = Ctl(L"COMBOBOX", L"", COMBO, 212, 457, 104, 400, IDC_TTSACCENT);
         for (int i = 0; i < TTS_ACCENT_N; i++) SendMessageW(ta, CB_ADDSTRING, 0, (LPARAM)TTS_ACCENTS[i].name);
@@ -10281,6 +10331,7 @@ static void CreateUI()
         }
         SendMessageW(tv, CB_SETCURSEL, sel, 0);
         Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 455, 98, 28, IDC_TTSSPEAK);
+        Ctl(L"STATIC", L"", SS_OWNERDRAW, 30, 486, 500, 6, IDC_VOICEPROG);   // voice install progress (only while installing)
     }
     AddSection(14, 508, 532, 76, L"Playback");
     Ctl(L"STATIC", L"Volume:", 0, 30, 529, 56, 20, -1);
@@ -11318,7 +11369,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER:
         if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); SongTick(); PadTick(); }
         else if (w == TIMER_KEY) PollKeyCapture();
-        else if (w == TIMER_CLEANUP) CleanupOldExe();
+        else if (w == TIMER_CLEANUP) { CleanupOldExe(); VoiceProgressTick(); }
         else if (w == TIMER_FXKEYS) PollFxKeys();
         else if (w == TIMER_OSD) OsdTick();
         else if (w == TIMER_PICANIM) PicAnimTick();
@@ -11400,6 +11451,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             SetBrushOrgEx(((DRAWITEMSTRUCT*)l)->hDC, -pt.x, -pt.y, nullptr);
         }
         if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w == IDC_VOICEPROG) { DrawVoiceProgress((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
