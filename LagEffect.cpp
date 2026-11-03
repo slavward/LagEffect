@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.24.0"
+#define APP_VERSION L"1.24.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1203,9 +1203,10 @@ static inline float AutoGainRun(AutoGain& a, float in, float out, float maxGain 
     const float k = 0.0005f;                    // ~40 ms
     a.inE  += (in * in - a.inE) * k;
     a.outE += (out * out - a.outE) * k;
+    if (a.inE < 1e-6f) return out * a.g;        // silence: hold the gain (no loud pop when you start talking)
     float want = a.outE > 1e-9f ? sqrtf((a.inE + 1e-9f) / a.outE) : 1.0f;
     if (want > maxGain) want = maxGain; if (want < 0.1f) want = 0.1f;
-    a.g += (want - a.g) * 0.0005f;
+    a.g += (want - a.g) * (want < a.g ? 0.002f : 0.0005f);   // turning down is quicker than turning up
     return out * a.g;
 }
 
@@ -1713,14 +1714,21 @@ static float Harmonize(float x, const HarmStyle& st, float level, float detuneCt
 
 // ---- Shimmer: reverb whose tail keeps rising an octave ----
 static const int SH_COMB[6] = { 1687, 1601, 2053, 2251, 1931, 1777 }, SH_AP[3] = { 347, 113, 37 };
-static struct ShimState { float comb[6][2600], st[6], ap[3][400]; int ci[6], ai[3]; float last; } gShim;
+static struct ShimState { float comb[6][2600], st[6], ap[3][400]; int ci[6], ai[3]; float last; Biquad lp[2], hp; bool ready; } gShim;
 static PShift gPsShim;
 static float Shimmer(float x, float mix, float decay, float amt)
 {
     ShimState& s = gShim;
-    float up = PitchShift(gPsShim, s.last, 2.0, 2400, 1.0f);   // the tail, an octave up, fed back in
-    float in = (x + up * amt * 0.9f) * 0.012f, acc = 0;
     const float fb = 0.78f + 0.2f * decay;
+    // The tail, an octave up, fed back in. Six combs can add up to 6 / (1 - fb) times what goes in, so the
+    // feedback is scaled by (1 - fb) / 6: the loop always loses energy and can never run away.
+    if (!s.ready) { BqSet(s.lp[0], 0, 5000, 0.5412); BqSet(s.lp[1], 0, 5000, 1.3066); BqSet(s.hp, 2, 150, 0.707); s.ready = true; }
+    float up = PitchShift(gPsShim, s.last, 2.0, 2400, 1.0f);
+    // Octave-up of very high sounds folds back down and would circulate forever: keep the loop to 150 Hz - 5 kHz,
+    // and soft-limit it so it can never grow.
+    up = BqRun(s.hp, BqRun(s.lp[1], BqRun(s.lp[0], up)));
+    up = tanhf(up * 4.0f) * 0.25f;
+    float in = x * 0.012f + up * amt * 0.5f * (1.0f - fb) / 6.0f, acc = 0;
     for (int i = 0; i < 6; i++) {
         int L = SH_COMB[i] * RATE / 44100;
         float y = s.comb[i][s.ci[i]];
@@ -1736,7 +1744,7 @@ static float Shimmer(float x, float mix, float decay, float amt)
         acc = b - acc * 0.6f;
         if (++s.ai[i] >= L) s.ai[i] = 0;
     }
-    s.last = acc;
+    s.last = acc > 4.0f ? 4.0f : acc < -4.0f ? -4.0f : acc;   // belt and braces
     return x + acc * 2.2f * mix;
 }
 
@@ -2164,6 +2172,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (fxRev)    s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
         if (fxRadio) s = Radio(s);                  // you're heard *through* the device...
         if (fxGl)    s = Glitch(s, glRate, glDrop, glStut, glRobot);   // ...over a bad connection
+        if (!(fabsf(s) < 16.0f)) { s = 0.0f; gFxResetReq = true; }    // an effect ran away (or NaN): silence it, reset all effects
         {                                       // Pitch dive hotkey: bend down (or up) while held, spring back
             float target = gDiveHeld ? (float)gDiveSemis : 0.0f;
             float step = (gDiveHeld ? 12.0f / (0.35f * RATE) : 12.0f / (0.15f * RATE));
