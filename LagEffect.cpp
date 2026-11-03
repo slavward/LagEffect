@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.23.0"
+#define APP_VERSION L"1.24.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -97,7 +97,8 @@ static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
 static int gUiScale = 100;                      // Settings > UI size (needs a restart)
-static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;   // gCmdLine: hidden (right-click the version text)
+static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;
+static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }   // UI size   // gCmdLine: hidden (right-click the version text)
 static int  gOverlayX = INT_MIN, gOverlayY = INT_MIN;
 static volatile int  gPttMode = 0;               // 0 off, 1 push-to-talk (mic only while held), 2 push-to-mute
 static volatile bool gPttHeld = false;
@@ -2280,6 +2281,9 @@ enum {
     IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6,   // Voice FX sub-tabs: consecutive
     IDC_MICSUB0, IDC_MICSUB1,                   // Mic tab sub-tabs: consecutive
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
+    IDC_SETSUB0, IDC_SETSUB1,                   // Settings sub-tabs: consecutive
+    IDC_COLSW0, IDC_COLSW1, IDC_COLSW2, IDC_COLSW3, IDC_COLSW4, IDC_COLSW5,   // colour swatches: consecutive
+    IDC_COLRESET, IDC_FONT, IDC_OPACITY, IDC_PICCHOOSE, IDC_PICREMOVE, IDC_PICFIT, IDC_PICDIM, IDC_PICINFO, IDC_CORNERS,
     IDC_PTTMODE, IDC_PTTKEY, IDC_OVERLAY, IDC_BEEPS, IDC_UISCALE, IDC_EXPORT, IDC_IMPORT, IDC_COMPACT, IDC_COMPACTFX,
     IDC_COMPACTFULL, IDC_PROFAUTO, IDC_PROFAUTOINFO, IDC_VERSION,
     IDC_PADCHOKE, IDC_PADDUCK, IDC_PADFOLDER, IDC_CLIPSEP, IDC_CLIPREPLACE, IDC_CLIPHIST,
@@ -2528,6 +2532,7 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun" };
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone
+static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look
 static FxGroup gFxGroups[] = {
     { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
     { L"Reverb",     &gFxRevOn,     L"fx_reverb_on",   true,  L"fx_reverb_hotkey",  3, 0 },
@@ -2736,6 +2741,15 @@ static int gColorTheme = 0;
 
 // The palette in use (set by ApplyPalette). The old constant names now point at these.
 static COLORREF gDkBg, gDkCtl, gDkBorder, gDkSection, gDkText = RGB(235, 235, 235), gDkDim = RGB(160, 160, 160);
+// Look tab: your own colours (CLR_NONE = the theme's), a background picture, font, opacity.
+#define USERCOL_N 6
+static COLORREF gUserCol[USERCOL_N] = { CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE };   // accent, background, panels, borders, text, dim text
+static COLORREF gLtText = RGB(30, 30, 30), gLtDim = RGB(110, 110, 110);
+static wchar_t  gPicPath[MAX_PATH];
+static int      gPicFit = 0, gPicDim = 60;       // fit: 0 cover, 1 stretch, 2 centre, 3 tile; dim: % of the theme colour on top
+static HBRUSH   gBrPicture = nullptr;            // the picture, sized to the window and dimmed (a pattern brush)
+static wchar_t  gFontName[40] = L"Segoe UI";
+static int      gOpacity = 100;
 static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
 #define DK_BG      gDkBg
 #define DK_CTL     gDkCtl
@@ -2774,6 +2788,13 @@ static void ApplyPalette()
     gLtTrack   = Mix(RGB(218, 218, 218), t.light, 0.15f * k);
     gLtStatus  = Mix(RGB(228, 228, 228), t.light, 0.10f * k);
     gAccentNow = gDark ? t.dark : t.light;
+    gDkText = RGB(235, 235, 235); gDkDim = RGB(160, 160, 160); gLtText = RGB(30, 30, 30); gLtDim = RGB(110, 110, 110);
+    if (gUserCol[0] != CLR_NONE) gAccentNow = gUserCol[0];
+    if (gUserCol[1] != CLR_NONE) { gDkBg = gLtBg = gUserCol[1]; }
+    if (gUserCol[2] != CLR_NONE) { gDkCtl = gLtCard = gUserCol[2]; gDkKnob = Mix(gUserCol[2], RGB(0, 0, 0), 0.1f); }
+    if (gUserCol[3] != CLR_NONE) { gDkSection = gLtBorder = gDkBorder = gUserCol[3]; }
+    if (gUserCol[4] != CLR_NONE) { gDkText = gLtText = gUserCol[4]; }
+    if (gUserCol[5] != CLR_NONE) { gDkDim = gLtDim = gUserCol[5]; }
     if (gBrDarkBg)  DeleteObject(gBrDarkBg);
     if (gBrDarkCtl) DeleteObject(gBrDarkCtl);
     if (gBrLightBg) DeleteObject(gBrLightBg);
@@ -2783,7 +2804,9 @@ static void ApplyPalette()
 }
 
 static COLORREF BgColor()  { return gDark ? DK_BG : gLtBg; }
-static HBRUSH   BgBrush()  { return gDark ? gBrDarkBg : gBrLightBg; }
+static HBRUSH   BgBrush()  { return gBrPicture ? gBrPicture : gDark ? gBrDarkBg : gBrLightBg; }
+static HBRUSH   BgSolid()  { return gDark ? gBrDarkBg : gBrLightBg; }   // pop-up windows (not lined up with the picture)
+#define TXT_C (gDark ? DK_TEXT : gLtText)
 
 typedef HRESULT (WINAPI* PFN_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
 typedef HRESULT (WINAPI* PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
@@ -2850,6 +2873,98 @@ static BOOL CALLBACK ThemeChild(HWND h, LPARAM)
     return TRUE;
 }
 
+static HBITMAP gPicSrc = nullptr; static int gPicW = 0, gPicH = 0;
+static bool PictureLoad(const wchar_t* path)    // PNG / JPG / BMP / GIF -> a GDI bitmap
+{
+    if (gPicSrc) { DeleteObject(gPicSrc); gPicSrc = nullptr; }
+    if (!path[0]) return false;
+    static HMODULE gp = LoadLibraryW(L"gdiplus.dll");
+    if (!gp) return false;
+    struct StartupInput { UINT32 ver; void* cb; BOOL noThread, noCodecs; };
+    typedef int (WINAPI* PStartup)(ULONG_PTR*, const StartupInput*, void*);
+    typedef int (WINAPI* PFromFile)(const WCHAR*, void**);
+    typedef int (WINAPI* PToHbm)(void*, HBITMAP*, DWORD);
+    typedef int (WINAPI* PDispose)(void*);
+    typedef int (WINAPI* PGetW)(void*, UINT*);
+    static ULONG_PTR token = 0;
+    auto startup = (PStartup)(void*)GetProcAddress(gp, "GdiplusStartup");
+    auto fromFile = (PFromFile)(void*)GetProcAddress(gp, "GdipCreateBitmapFromFile");
+    auto toHbm = (PToHbm)(void*)GetProcAddress(gp, "GdipCreateHBITMAPFromBitmap");
+    auto dispose = (PDispose)(void*)GetProcAddress(gp, "GdipDisposeImage");
+    auto getW = (PGetW)(void*)GetProcAddress(gp, "GdipGetImageWidth");
+    auto getH = (PGetW)(void*)GetProcAddress(gp, "GdipGetImageHeight");
+    if (!startup || !fromFile || !toHbm || !dispose || !getW || !getH) return false;
+    if (!token) { StartupInput si = { 1, nullptr, FALSE, FALSE }; if (startup(&token, &si, nullptr) != 0) { token = 0; return false; } }
+    void* img = nullptr;
+    if (fromFile(path, &img) != 0 || !img) return false;
+    UINT w = 0, h = 0; getW(img, &w); getH(img, &h);
+    HBITMAP hb = nullptr;
+    toHbm(img, &hb, 0xFF000000);
+    dispose(img);
+    if (!hb || !w || !h) return false;
+    gPicSrc = hb; gPicW = (int)w; gPicH = (int)h;
+    return true;
+}
+
+static void PictureRebuild()                    // the picture at the window's size, fitted and dimmed
+{
+    if (gBrPicture) { DeleteObject(gBrPicture); gBrPicture = nullptr; }
+    if (!gPicSrc || !gWnd) return;
+    RECT rc; GetClientRect(gWnd, &rc);
+    int W = rc.right, H = rc.bottom;
+    if (W <= 0 || H <= 0) return;
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC sdc = GetDC(gWnd);
+    HBITMAP comp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HDC dst = CreateCompatibleDC(sdc), src = CreateCompatibleDC(sdc);
+    ReleaseDC(gWnd, sdc);
+    if (!comp) { DeleteDC(dst); DeleteDC(src); return; }
+    HGDIOBJ od = SelectObject(dst, comp), os = SelectObject(src, gPicSrc);
+    HBRUSH bg = CreateSolidBrush(BgColor()); FillRect(dst, &rc, bg); DeleteObject(bg);
+    SetStretchBltMode(dst, HALFTONE); SetBrushOrgEx(dst, 0, 0, nullptr);
+    if (gPicFit == 1) StretchBlt(dst, 0, 0, W, H, src, 0, 0, gPicW, gPicH, SRCCOPY);
+    else if (gPicFit == 2) BitBlt(dst, (W - gPicW) / 2, (H - gPicH) / 2, gPicW, gPicH, src, 0, 0, SRCCOPY);
+    else if (gPicFit == 3) { for (int y = 0; y < H; y += gPicH) for (int x = 0; x < W; x += gPicW) BitBlt(dst, x, y, gPicW, gPicH, src, 0, 0, SRCCOPY); }
+    else {                                      // cover: fill the window, crop what's left over
+        double sc = Max((double)W / gPicW, (double)H / gPicH);
+        int sw = (int)(W / sc), sh = (int)(H / sc);
+        StretchBlt(dst, 0, 0, W, H, src, (gPicW - sw) / 2, (gPicH - sh) / 2, sw, sh, SRCCOPY);
+    }
+    GdiFlush();
+    COLORREF c = BgColor(); int a = Iclamp(gPicDim, 0, 95) * 256 / 100;   // blend the theme colour on top so text stays readable
+    BYTE* px = (BYTE*)bits;
+    for (int i = 0; i < W * H; i++, px += 4) {
+        px[0] = (BYTE)((px[0] * (256 - a) + GetBValue(c) * a) >> 8);
+        px[1] = (BYTE)((px[1] * (256 - a) + GetGValue(c) * a) >> 8);
+        px[2] = (BYTE)((px[2] * (256 - a) + GetRValue(c) * a) >> 8);
+    }
+    SelectObject(dst, od); SelectObject(src, os); DeleteDC(dst); DeleteDC(src);
+    gBrPicture = CreatePatternBrush(comp);
+    DeleteObject(comp);                         // the brush keeps its own copy
+}
+
+static void ApplyOpacity()
+{
+    LONG ex = GetWindowLongW(gWnd, GWL_EXSTYLE);
+    if (gOpacity >= 100) { if (ex & WS_EX_LAYERED) SetWindowLongW(gWnd, GWL_EXSTYLE, ex & ~WS_EX_LAYERED); return; }
+    if (!(ex & WS_EX_LAYERED)) SetWindowLongW(gWnd, GWL_EXSTYLE, ex | WS_EX_LAYERED);
+    SetLayeredWindowAttributes(gWnd, 0, (BYTE)(Iclamp(gOpacity, 40, 100) * 255 / 100), LWA_ALPHA);
+}
+
+static BOOL CALLBACK SetFontProc(HWND c, LPARAM) { SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return TRUE; }
+static void ApplyFont()                         // re-create the fonts and hand them to every control
+{
+    HFONT f = CreateFontW(-SC(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    HFONT b = CreateFontW(-SC(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    if (!f || !b) { if (f) DeleteObject(f); if (b) DeleteObject(b); return; }
+    HFONT of = gFont, ob = gFontBold;
+    gFont = f; gFontBold = b;
+    if (gWnd) EnumChildWindows(gWnd, SetFontProc, 0);
+    if (of) DeleteObject(of); if (ob) DeleteObject(ob);
+}
+
 static void ThemeTitleBar(HWND w)
 {
     if (!pDwmSetWindowAttribute || !w) return;
@@ -2867,6 +2982,7 @@ static void ApplyTheme()
 {
     gDark = gThemeMode == THEME_DARK || (gThemeMode == THEME_SYSTEM && SystemUsesDark());
     ApplyPalette();
+    PictureRebuild();                           // the dim colour follows the theme
     ThemeTitleBar(gWnd);
     if (pSetPreferredAppMode) {                 // dark tray menu
         pSetPreferredAppMode(gDark ? 2 : 3);
@@ -3126,6 +3242,13 @@ static void LoadSettings()
     gUiScale      = Iclamp(INI_INT(L"ui_scale", 100), 100, 200);
     gCompact      = INI_INT(L"compact", 0) != 0;
     gCmdLine      = INI_INT(L"command_line_control", 0) != 0;
+    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 1);
+    for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); gUserCol[i] = (COLORREF)INI_INT(k, (int)CLR_NONE); }
+    GetPrivateProfileStringW(L"settings", L"background_picture", L"", gPicPath, MAX_PATH, gIni);
+    gPicFit       = Iclamp(INI_INT(L"background_fit", 0), 0, 3);
+    gPicDim       = Iclamp(INI_INT(L"background_dim", 60), 0, 95);
+    GetPrivateProfileStringW(L"settings", L"font", L"Segoe UI", gFontName, 40, gIni);
+    gOpacity      = Iclamp(INI_INT(L"window_opacity", 100), 40, 100);
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
     gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
@@ -3256,6 +3379,12 @@ static void SaveSettings()
     SaveInt(L"push_to_talk_mode", gPttMode); SaveInt(L"overlay", gOverlayOn); SaveInt(L"hotkey_beeps", gBeeps);
     SaveInt(L"overlay_x", gOverlayX); SaveInt(L"overlay_y", gOverlayY);
     SaveInt(L"ui_scale", gUiScale); SaveInt(L"compact", gCompact); SaveInt(L"command_line_control", gCmdLine);
+    SaveInt(L"settings_subtab", gSetSub);
+    for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); SaveInt(k, (int)gUserCol[i]); }
+    WritePrivateProfileStringW(L"settings", L"background_picture", gPicPath, gIni);
+    SaveInt(L"background_fit", gPicFit); SaveInt(L"background_dim", gPicDim);
+    WritePrivateProfileStringW(L"settings", L"font", gFontName, gIni);
+    SaveInt(L"window_opacity", gOpacity);
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); SaveInt(k, gFxHold[1 + g]); }
     ProfileKeysSave();
@@ -3515,7 +3644,6 @@ static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPa
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 
-static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }
 static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0)
 {
     x = SC(x); y = SC(y); w = SC(w); h = SC(h);
@@ -3654,7 +3782,7 @@ static void PaintKnob(HWND h, HDC dc)
     int x1, y1, x2, y2;                         // pointer
     KnobPoint(cx, cy, 6, ang, &x1, &y1);
     KnobPoint(cx, cy, 15, ang, &x2, &y2);
-    LOGBRUSH lb = { BS_SOLID, on ? (gDark ? DK_TEXT : RGB(40, 40, 40)) : (gDark ? DK_DIM : RGB(130, 130, 130)), 0 };
+    LOGBRUSH lb = { BS_SOLID, on ? (TXT_C) : (gDark ? DK_DIM : RGB(130, 130, 130)), 0 };
     HPEN ptr = ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND, 3, &lb, 0, nullptr);
     op = SelectObject(dc, ptr);
     MoveToEx(dc, x1, y1, nullptr); LineTo(dc, x2, y2);
@@ -3671,7 +3799,7 @@ static void PaintKnob(HWND h, HDC dc)
     if (k.offText && *k.var == k.lo) lstrcpynW(txt, k.offText, 32);
     else wsprintfW(txt, k.bipolar && *k.var > 0 ? L"+%d%s" : L"%d%s", *k.var, k.unit);
     SelectObject(dc, gFontBold);
-    SetTextColor(dc, on ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(130, 130, 130)));
+    SetTextColor(dc, on ? (TXT_C) : (gDark ? DK_DIM : RGB(130, 130, 130)));
     RECT vr = { 0, cy + 29, rc.right, rc.bottom };
     DrawTextW(dc, txt, -1, &vr, DT_SINGLELINE | DT_CENTER | DT_TOP);
     SelectObject(dc, of);
@@ -3742,6 +3870,7 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HDC mem = CreateCompatibleDC(dc);
         HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
         HGDIOBJ old = SelectObject(mem, bmp);
+        if (gBrPicture) { POINT pt = { 0, 0 }; MapWindowPoints(h, gWnd, &pt, 1); SetBrushOrgEx(mem, -pt.x, -pt.y, nullptr); }
         PaintKnob(h, mem);
         BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -4195,7 +4324,7 @@ static void DrawSongButton(DRAWITEMSTRUCT* d)
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, gFontBold);
-    COLORREF txt = on ? (gDark ? RGB(20, 20, 20) : RGB(255, 255, 255)) : (gDark ? DK_TEXT : RGB(30, 30, 30));
+    COLORREF txt = on ? (gDark ? RGB(20, 20, 20) : RGB(255, 255, 255)) : (TXT_C);
     SetTextColor(dc, txt);
     RECT t1 = { rc.left, rc.top + 5, rc.right, rc.top + 24 };
     DrawTextW(dc, L"Vocode to song", -1, &t1, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
@@ -4330,7 +4459,7 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
         lstrcpynW(name, t, MAX_PATH);
     }
     SelectObject(dc, has ? gFontBold : gFont);
-    COLORREF txt = has ? (gDark ? DK_TEXT : RGB(30, 30, 30)) : (gDark ? DK_DIM : RGB(120, 120, 120));
+    COLORREF txt = has ? (TXT_C) : (gDark ? DK_DIM : RGB(120, 120, 120));
     if (custom) txt = lightCard ? RGB(20, 20, 20) : RGB(250, 250, 250);
     SetTextColor(dc, txt);
     RECT tr = { rc.left + 28, rc.top, rc.right - 6, rc.bottom - 2 };
@@ -4338,7 +4467,7 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
     SelectObject(dc, of);
     if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
         RECT fr = rc; InflateRect(&fr, -3, -3);
-        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        SetTextColor(dc, TXT_C);
         DrawFocusRect(dc, &fr);
     }
 }
@@ -4976,7 +5105,7 @@ static LRESULT CALLBACK WaveProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HDC dc = CreateCompatibleDC(pdc);
         HBITMAP bmp = CreateCompatibleBitmap(pdc, rc.right, rc.bottom);
         HGDIOBJ obmp = SelectObject(dc, bmp);
-        FillRect(dc, &rc, BgBrush());
+        FillRect(dc, &rc, BgSolid());
         HBRUSH card = CreateSolidBrush(gDark ? DK_CTL : LT_CARD);
         HPEN   cpen = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
         HGDIOBJ ob = SelectObject(dc, card), op = SelectObject(dc, cpen);
@@ -5090,7 +5219,7 @@ static LRESULT CALLBACK TrimProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
     case WM_CLOSE: TrimClose(); return 0;
-    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgBrush()); return 1; }
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
         return CtlColor(h, m, w, l);
     }
@@ -5461,7 +5590,7 @@ static LRESULT CALLBACK InputProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (LOWORD(w) == IDCANCEL) { gInputOk = false; gInputDone = true; }
         return 0;
     case WM_CLOSE: gInputOk = false; gInputDone = true; return 0;
-    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgBrush()); return 1; }
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
     case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: return CtlColor(h, m, w, l);
     }
     return DefWindowProcW(h, m, w, l);
@@ -5642,6 +5771,11 @@ static void SurpriseMe()
 static void UpdateUi();
 static void SaveSettings();
 static bool gNoSaveOnExit = false;
+static void ApplyTheme();
+static bool PictureLoad(const wchar_t* path);
+static void PictureRebuild();
+static void ApplyOpacity();
+static void ApplyFont();
 static void MyCharLoad(const wchar_t* name);
 static void MyCharDir(wchar_t* out);
 static void ApplyCharacter(int c);
@@ -5915,6 +6049,14 @@ static void ImportSettings()
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
     ShellExecuteW(nullptr, L"open", exe, L"--updated", nullptr, SW_SHOWNORMAL);   // --updated: waits for this copy to close
     PostMessageW(gWnd, WM_CLOSE, 0, 0);
+}
+
+static void PictureInfo()
+{
+    const wchar_t* base = wcsrchr(gPicPath, L'\\');
+    wchar_t t[MAX_PATH]; wsprintfW(t, gPicPath[0] ? L"%s" : L"No picture", base ? base + 1 : gPicPath);
+    SetDlgItemTextW(gWnd, IDC_PICINFO, t);
+    EnableWindow(GetDlgItem(gWnd, IDC_PICREMOVE), gPicPath[0] != 0);
 }
 
 static void SetCompact(bool on)
@@ -6299,7 +6441,7 @@ static void DrawClipBank(DRAWITEMSTRUCT* d)     // clip page button (same look a
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
     wchar_t t[8]; wsprintfW(t, any ? L"%c \x2022" : L"%c", L'A' + b);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, active ? RGB(255, 255, 255) : gDark ? DK_TEXT : RGB(40, 40, 40));
+    SetTextColor(dc, active ? RGB(255, 255, 255) : TXT_C);
     HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
     DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
@@ -6331,7 +6473,7 @@ static void DrawPadBank(DRAWITEMSTRUCT* d)      // page button: A-D, filled when
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
     wchar_t t[8]; wsprintfW(t, any ? L"%c \x2022" : L"%c", L'A' + b);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, active ? RGB(255, 255, 255) : gDark ? DK_TEXT : RGB(40, 40, 40));
+    SetTextColor(dc, active ? RGB(255, 255, 255) : TXT_C);
     HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
     DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
@@ -6658,6 +6800,16 @@ static void AddTips()
         TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
     }
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
+    TipId(IDC_SETSUB0, L"Profiles, latency, updates, screen share, shortcuts and the window.");
+    TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, opacity and a background picture.");
+    TipId(IDC_FONT,    L"The font for the whole window.");
+    TipId(IDC_OPACITY, L"See-through window: 100% = solid. Lower lets what's behind show through.");
+    TipId(IDC_COLRESET, L"Go back to the theme's colours.");
+    for (int i = 0; i < USERCOL_N; i++) TipId(IDC_COLSW0 + i, L"Click to pick this colour; right-click to use the theme's again.");
+    TipId(IDC_PICCHOOSE, L"Use a picture as the window's background (PNG, JPG, BMP or GIF).");
+    TipId(IDC_PICREMOVE, L"Remove the background picture.");
+    TipId(IDC_PICFIT,  L"Fill: covers the window and crops the edges. Stretch: squashes to fit. Centre: actual size. Tile: repeats.");
+    TipId(IDC_PICDIM,  L"How much of the theme colour is laid over the picture, so text stays readable. 0% = the raw picture.");
     TipId(IDC_PTTMODE,   L"Push-to-talk: your mic is silent unless you hold the key. Push-to-mute: holding the key mutes you.");
     TipId(IDC_PTTKEY,    L"The push-to-talk / push-to-mute key. Right-click to clear it.");
     TipId(IDC_OVERLAY,   L"A small always-on-top badge: live / muted / lagging, your effects and profile. Drag it anywhere; "
@@ -6849,7 +7001,7 @@ static void DrawOutLabel(DRAWITEMSTRUCT* d)     // "Out 1" with a thin level bar
     FillRect(dc, &rc, BgBrush());
     wchar_t t[16]; wsprintfW(t, L"Out %d", k + 1);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    SetTextColor(dc, TXT_C);
     HGDIOBJ of = SelectObject(dc, gFont);
     RECT tr = { rc.left + 2, rc.top, rc.right, rc.bottom - 5 };
     DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
@@ -6862,28 +7014,51 @@ static void DrawOutLabel(DRAWITEMSTRUCT* d)     // "Out 1" with a thin level bar
     HBRUSH lb = CreateSolidBrush(db > -3.0f ? RGB(220, 70, 60) : ACCENT); FillRect(dc, &lvl, lb); DeleteObject(lb);
 }
 
+static const wchar_t* USERCOL_NAMES[USERCOL_N] = { L"Accent", L"Background", L"Panels", L"Borders", L"Text", L"Dim text" };
+static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "theme" when not set
+{
+    int i = (int)d->CtlID - IDC_COLSW0;
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    COLORREF now = i == 0 ? ACCENT : i == 1 ? BgColor() : i == 2 ? (gDark ? DK_CTL : LT_CARD) : i == 3 ? (gDark ? DK_SECTION : LT_BORDER)
+                 : i == 4 ? TXT_C : (gDark ? DK_DIM : gLtDim);
+    HBRUSH b = CreateSolidBrush(now); HPEN p = CreatePen(PS_SOLID, 1, gDark ? RGB(120, 120, 120) : RGB(150, 150, 150));
+    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
+    RoundRect(dc, rc.left + 2, rc.top + 4, rc.left + 34, rc.bottom - 4, 8, 8);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
+    wchar_t t[48]; wsprintfW(t, gUserCol[i] == CLR_NONE ? L"%s (theme)" : L"%s", USERCOL_NAMES[i]);
+    SetBkMode(dc, TRANSPARENT); SetTextColor(dc, TXT_C);
+    HGDIOBJ of = SelectObject(dc, gFont);
+    RECT tr = { rc.left + 42, rc.top, rc.right, rc.bottom };
+    DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
+    SelectObject(dc, of);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) { RECT fr = rc; InflateRect(&fr, -1, -1); DrawFocusRect(dc, &fr); }
+}
+
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
 static const wchar_t* MIC_SUB_NAMES[2] = { L"Cleanup", L"Tone" };
-static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX and Mic tab sub-tabs
+static const wchar_t* SET_SUB_NAMES[2] = { L"General", L"Look" };
+static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings sub-tabs
 {
-    const bool mic = (int)d->CtlID >= IDC_MICSUB0;
-    int t = (int)d->CtlID - (mic ? IDC_MICSUB0 : IDC_FXSUB0);
+    const bool set = (int)d->CtlID == IDC_SETSUB0 || (int)d->CtlID == IDC_SETSUB1;
+    const bool mic = !set && (int)d->CtlID >= IDC_MICSUB0 && (int)d->CtlID <= IDC_MICSUB1;
+    int t = (int)d->CtlID - (set ? IDC_SETSUB0 : mic ? IDC_MICSUB0 : IDC_FXSUB0);
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
-    bool active = t == (mic ? gMicSub : gFxSub);
+    bool active = t == (set ? gSetSub : mic ? gMicSub : gFxSub);
     int on = 0;
-    if (!mic) for (int g = 0; g < FX_GROUPS; g++) if (gFxGroups[g].sub == t && *gFxGroups[g].on && gFxOn) on++;
+    if (!mic && !set) for (int g = 0; g < FX_GROUPS; g++) if (gFxGroups[g].sub == t && *gFxGroups[g].on && gFxOn) on++;
     HBRUSH b = CreateSolidBrush(active ? ACCENT : gDark ? DK_CTL : LT_CARD);
     HPEN   p = CreatePen(PS_SOLID, 1, active ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
     wchar_t text[32];
-    const wchar_t* nm = mic ? MIC_SUB_NAMES[t] : FX_SUB_NAMES[t];
+    const wchar_t* nm = set ? SET_SUB_NAMES[t] : mic ? MIC_SUB_NAMES[t] : FX_SUB_NAMES[t];
     if (on) wsprintfW(text, L"%s %d", nm, on); else lstrcpynW(text, nm, 32);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, active ? RGB(255, 255, 255) : gDark ? DK_TEXT : RGB(40, 40, 40));
+    SetTextColor(dc, active ? RGB(255, 255, 255) : TXT_C);
     HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
     DrawTextW(dc, text, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
@@ -6924,7 +7099,7 @@ static void DrawFxSwitch(DRAWITEMSTRUCT* d)
 
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, gFontBold);
-    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    SetTextColor(dc, TXT_C);
     RECT tr = { px + pw + 14, rc.top + 5, rc.right - 70, rc.top + 24 };
     DrawTextW(dc, L"Voice effects", -1, &tr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
     SelectObject(dc, gFont);
@@ -6940,7 +7115,7 @@ static void DrawFxSwitch(DRAWITEMSTRUCT* d)
 
     if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
         RECT fr = rc; InflateRect(&fr, -4, -4);
-        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        SetTextColor(dc, TXT_C);
         DrawFocusRect(dc, &fr);
     }
 }
@@ -7134,7 +7309,7 @@ static void DrawMeterTo(HDC dc, RECT rc)
 
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, gFontBold);
-    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    SetTextColor(dc, TXT_C);
     RECT lr = { rc.left + 14, by - 6, x0 - 8, by + bh + 6 };
     DrawTextW(dc, L"Mic level", -1, &lr, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
 
@@ -7182,7 +7357,7 @@ static void DrawMeterTo(HDC dc, RECT rc)
         lstrcpynW(t2, !gateOn ? L"Gate off" : open ? L"Gate open" : L"Gate closed", 32);
     }
     SelectObject(dc, gFontBold);
-    SetTextColor(dc, gDark ? DK_TEXT : RGB(30, 30, 30));
+    SetTextColor(dc, TXT_C);
     RECT r1 = { x1 + 10, rc.top + 8, rc.right - 14, rc.top + 26 };
     DrawTextW(dc, t1, -1, &r1, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
     SelectObject(dc, gFont);
@@ -7484,7 +7659,7 @@ static void Layout()
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
         bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)))
-                && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gFxSub));
+                && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gPaged[i].page == PAGE_SETTINGS ? gSetSub : gFxSub));
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
@@ -7956,6 +8131,9 @@ static void ShowHelp()
         L"Main tab: lag presets and beat repeat (loop synced to a tempo). Voice FX > Fun: Rewind, Repeat word, Tape stop and "
         L"Pitch dive hotkeys. Bottom of Voice FX: Character (save your own with \"Save my current voice\"), Surprise me, "
         L"and hold the A/B button to hear yourself without effects.\n\n"
+        L"LOOK (Settings > Look)\n"
+        L"Theme and colour presets, your own colour for the accent, background, panels, borders and text, a background "
+        L"picture (with how much it fades into the theme), the font, window size and opacity.\n\n"
         L"MORE\n"
         L"Mic tab: push-to-talk / push-to-mute. Outputs: \"Clean voice\" sends your voice without effects (e.g. to OBS). "
         L"Settings: status overlay, hotkey beeps, UI size, compact window (Ctrl+M), export / import, and a profile can "
@@ -8674,23 +8852,26 @@ static void CreateUI()
     // ---------------- Settings page ----------------
     gBuildPage = PAGE_SETTINGS;
 
-    AddSection(14, 60, 532, 110, L"Profiles");
-    Ctl(L"STATIC", L"Profile:", 0, 30, 84, 56, 20, -1);
+    Ctl(L"BUTTON", L"General", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 52, 90, 26, IDC_SETSUB0);
+    Ctl(L"BUTTON", L"Look", BS_OWNERDRAW | WS_TABSTOP, 108, 52, 90, 26, IDC_SETSUB1);
+    gBuildSub = 0;
+    AddSection(14, 88, 532, 108, L"Profiles");
+    Ctl(L"STATIC", L"Profile:", 0, 30, 110, 56, 20, -1);
     {
-        HWND pc = Ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP | WS_GROUP, 88, 80, 214, 300, IDC_PROFILE);
+        HWND pc = Ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP | WS_GROUP, 88, 106, 214, 300, IDC_PROFILE);
         SendMessageW(pc, CB_LIMITTEXT, 40, 0);
         COMBOBOXINFO ci = {}; ci.cbSize = sizeof(ci);
         if (GetComboBoxInfo(pc, &ci) && ci.hwndItem) SendMessageW(ci.hwndItem, EM_SETCUEBANNER, TRUE, (LPARAM)L"Name, e.g. Gaming");
     }
-    Ctl(L"BUTTON", L"Save", WS_TABSTOP, 310, 79, 106, 26, IDC_PROFSAVE);
-    Ctl(L"BUTTON", L"Delete", WS_TABSTOP, 424, 79, 106, 26, IDC_PROFDEL);
-    Ctl(L"BUTTON", L"", WS_TABSTOP, 30, 110, 248, 26, IDC_PROFKEY);
+    Ctl(L"BUTTON", L"Save", WS_TABSTOP, 310, 105, 106, 26, IDC_PROFSAVE);
+    Ctl(L"BUTTON", L"Delete", WS_TABSTOP, 424, 105, 106, 26, IDC_PROFDEL);
+    Ctl(L"BUTTON", L"", WS_TABSTOP, 30, 136, 248, 26, IDC_PROFKEY);
     {
         wchar_t kn[120]; FxKeyButtonText(SLOT_PROFNEXT, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 284, 110, 246, 26, IDC_PROFNEXTKEY);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 284, 136, 246, 26, IDC_PROFNEXTKEY);
     }
-    Ctl(L"BUTTON", L"Use for an app...", WS_TABSTOP, 30, 140, 140, 24, IDC_PROFAUTO);
-    Ctl(L"STATIC", L"", 0, 178, 144, 352, 18, IDC_PROFAUTOINFO);
+    Ctl(L"BUTTON", L"Use for an app...", WS_TABSTOP, 30, 166, 140, 24, IDC_PROFAUTO);
+    Ctl(L"STATIC", L"", 0, 178, 170, 352, 18, IDC_PROFAUTOINFO);
     {
         wchar_t cur[64]; GetPrivateProfileStringW(L"settings", L"profile_current", L"", cur, 64, gIni);
         ProfilesScan();
@@ -8700,69 +8881,107 @@ static void CreateUI()
         ProfileAutoInfo();
     }
 
-    AddSection(14, 184, 532, 52, L"Latency");
-    Ctl(L"STATIC", L"Buffer:", 0, 30, 205, 90, 20, -1);
-    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 124, 201, 168, 200, IDC_BUFFER);
+    AddSection(14, 210, 532, 52, L"Latency");
+    Ctl(L"STATIC", L"Buffer:", 0, 30, 231, 90, 20, -1);
+    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 124, 227, 168, 200, IDC_BUFFER);
     const wchar_t* bufNames[] = { L"32 (fastest)", L"64", L"128 (default)", L"256", L"512 (safest)" };
     for (const wchar_t* n : bufNames) SendMessageW(buf, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(buf, CB_SETCURSEL, gBufIdx, 0);
-    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 204, 220, 20, IDC_EXCL);
+    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 230, 220, 20, IDC_EXCL);
     CheckDlgButton(gWnd, IDC_EXCL, gExclusive ? BST_CHECKED : BST_UNCHECKED);
 
-    AddSection(14, 250, 532, 136, L"App");
-    Ctl(L"STATIC", L"Theme:", 0, 30, 273, 50, 20, -1);
-    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 82, 269, 92, 200, IDC_THEME);
+    AddSection(14, 276, 532, 108, L"App");
+    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 298, 270, 20, IDC_AUTO);
+    CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Export...", WS_TABSTOP, 330, 294, 96, 26, IDC_EXPORT);
+    Ctl(L"BUTTON", L"Import...", WS_TABSTOP, 434, 294, 96, 26, IDC_IMPORT);
+    Ctl(L"STATIC", L"Updates:", 0, 30, 329, 60, 20, -1);
+    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 326, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
+    SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
+    if (gFramedN < MAX_FRAMED) gFramed[gFramedN++] = { repo, nullptr };
+    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 325, 100, 26, IDC_CHECKUPD);
+    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 328, 118, 20, IDC_UPDSTART);
+    CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Lag Effect " APP_VERSION L"  \x00B7  settings are in %APPDATA%\\LagEffect", SS_NOTIFY, 30, 360, 400, 18, IDC_VERSION);
+    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 356, 84, 24, IDC_OPENSET);
+
+    AddSection(14, 398, 532, 70, L"Screen share");
+    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 418, 300, 20, IDC_HIDESHARE);
+    CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Stops Discord screen shares from picking up your voice a second time (hover for more).", 0, 30, 442, 500, 18, IDC_HDR);
+
+    AddSection(14, 482, 532, 104, L"Shortcuts & window");      // painted text: a single & shows as &
+    Ctl(L"STATIC", L"Mute hotkey:", 0, 30, 503, 90, 20, -1);
+    {
+        wchar_t kn[120]; FxKeyButtonText(SLOT_MUTE, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 122, 499, 124, 26, IDC_MUTEKEY);
+    }
+    Ctl(L"BUTTON", L"Pop-up on hotkeys", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 503, 140, 20, IDC_OSD);
+    CheckDlgButton(gWnd, IDC_OSD, gShowOsd ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Beep on hotkeys", BS_AUTOCHECKBOX | WS_TABSTOP, 408, 503, 126, 20, IDC_BEEPS);
+    CheckDlgButton(gWnd, IDC_BEEPS, gBeeps ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Always on top", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 531, 200, 20, IDC_TOPMOST);
+    CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 531, 270, 20, IDC_STARTWIN);
+    CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Status overlay (over games)", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 557, 220, 20, IDC_OVERLAY);
+    CheckDlgButton(gWnd, IDC_OVERLAY, gOverlayOn ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Compact window (Ctrl+M)", WS_TABSTOP, 262, 554, 268, 26, IDC_COMPACT);
+
+    // ---- Look ----
+    gBuildSub = 1;
+    AddSection(14, 88, 532, 96, L"Theme");
+    Ctl(L"STATIC", L"Theme:", 0, 30, 111, 50, 20, -1);
+    HWND th = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 82, 107, 92, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
     for (const wchar_t* n : themeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, gThemeMode, 0);
-    Ctl(L"STATIC", L"Color:", 0, 184, 273, 44, 20, -1);
-    HWND ct = Ctl(L"COMBOBOX", L"", COMBO | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, 228, 269, 134, 400, IDC_COLORTHEME);
+    Ctl(L"STATIC", L"Color:", 0, 184, 111, 44, 20, -1);
+    HWND ct = Ctl(L"COMBOBOX", L"", COMBO | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, 228, 107, 134, 400, IDC_COLORTHEME);
     for (int i = 0; i < COLOR_THEME_N; i++) SendMessageW(ct, CB_ADDSTRING, 0, (LPARAM)COLOR_THEMES[i].name);
     SendMessageW(ct, CB_SETCURSEL, gColorTheme, 0);
-    Ctl(L"STATIC", L"Size:", 0, 372, 273, 36, 20, -1);
+    Ctl(L"STATIC", L"Size:", 0, 372, 111, 36, 20, -1);
     {
-        HWND us = Ctl(L"COMBOBOX", L"", COMBO, 410, 269, 120, 200, IDC_UISCALE);
+        HWND us = Ctl(L"COMBOBOX", L"", COMBO, 410, 107, 120, 200, IDC_UISCALE);
         static const int scales[] = { 100, 125, 150, 175, 200 };
         int sel = 0;
         for (int i = 0; i < 5; i++) { wchar_t t[16]; wsprintfW(t, L"%d%%", scales[i]); SendMessageW(us, CB_ADDSTRING, 0, (LPARAM)t); if (scales[i] == gUiScale) sel = i; }
         SendMessageW(us, CB_SETCURSEL, sel, 0);
     }
-    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 302, 270, 20, IDC_AUTO);
-    CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Export...", WS_TABSTOP, 330, 298, 96, 26, IDC_EXPORT);
-    Ctl(L"BUTTON", L"Import...", WS_TABSTOP, 434, 298, 96, 26, IDC_IMPORT);
-    Ctl(L"STATIC", L"Updates:", 0, 30, 333, 60, 20, -1);
-    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 330, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
-    SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
-    if (gFramedN < MAX_FRAMED) gFramed[gFramedN++] = { repo, nullptr };
-    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 329, 100, 26, IDC_CHECKUPD);
-    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 332, 118, 20, IDC_UPDSTART);
-    CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Lag Effect " APP_VERSION L"  \x00B7  settings are in %APPDATA%\\LagEffect", SS_NOTIFY, 30, 362, 400, 18, IDC_VERSION);
-    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 358, 84, 24, IDC_OPENSET);
-
-    AddSection(14, 400, 532, 70, L"Screen share");
-    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 420, 300, 20, IDC_HIDESHARE);
-    CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Stops Discord screen shares from picking up your voice a second time (hover for more).", 0, 30, 444, 500, 18, IDC_HDR);
-
-    AddSection(14, 484, 532, 102, L"Shortcuts & window");      // painted text: a single & shows as &
-    Ctl(L"STATIC", L"Mute hotkey:", 0, 30, 505, 90, 20, -1);
+    Ctl(L"STATIC", L"Font:", 0, 30, 147, 50, 20, -1);
     {
-        wchar_t kn[120]; FxKeyButtonText(SLOT_MUTE, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 122, 501, 124, 26, IDC_MUTEKEY);
+        HWND fc = Ctl(L"COMBOBOX", L"", COMBO, 82, 143, 170, 300, IDC_FONT);
+        static const wchar_t* fonts[] = { L"Segoe UI", L"Segoe UI Variable Text", L"Bahnschrift", L"Calibri", L"Trebuchet MS", L"Verdana",
+                                          L"Tahoma", L"Consolas", L"Comic Sans MS", L"Georgia" };
+        int sel = 0;
+        for (int i = 0; i < 10; i++) { SendMessageW(fc, CB_ADDSTRING, 0, (LPARAM)fonts[i]); if (!lstrcmpiW(fonts[i], gFontName)) sel = i; }
+        SendMessageW(fc, CB_SETCURSEL, sel, 0);
     }
-    Ctl(L"BUTTON", L"Pop-up on hotkeys", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 505, 140, 20, IDC_OSD);
-    CheckDlgButton(gWnd, IDC_OSD, gShowOsd ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Beep on hotkeys", BS_AUTOCHECKBOX | WS_TABSTOP, 408, 505, 126, 20, IDC_BEEPS);
-    CheckDlgButton(gWnd, IDC_BEEPS, gBeeps ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Always on top", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 533, 200, 20, IDC_TOPMOST);
-    CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 533, 270, 20, IDC_STARTWIN);
-    CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Status overlay (over games)", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 559, 220, 20, IDC_OVERLAY);
-    CheckDlgButton(gWnd, IDC_OVERLAY, gOverlayOn ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Compact window (Ctrl+M)", WS_TABSTOP, 262, 556, 268, 26, IDC_COMPACT);
+    Ctl(L"STATIC", L"Window opacity:", 0, 270, 147, 104, 20, -1);
+    Spin(IDC_OPACITY, 376, 144, 64, 40, 100, gOpacity);
+    Ctl(L"STATIC", L"%", 0, 446, 147, 16, 20, -1);
+
+    AddSection(14, 198, 532, 132, L"Your colours");
+    for (int i = 0; i < USERCOL_N; i++)
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + (i % 3) * 168, 220 + (i / 3) * 40, 160, 34, IDC_COLSW0 + i);
+    Ctl(L"STATIC", L"Click a colour to change it; right-click it to go back to the theme's.", 0, 30, 302, 360, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 298, 100, 26, IDC_COLRESET);
+
+    AddSection(14, 344, 532, 116, L"Background picture");
+    Ctl(L"BUTTON", L"Choose a picture...", WS_TABSTOP | WS_GROUP, 30, 366, 150, 28, IDC_PICCHOOSE);
+    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 186, 366, 90, 28, IDC_PICREMOVE);
+    Ctl(L"STATIC", L"", 0, 286, 372, 244, 18, IDC_PICINFO);
+    Ctl(L"STATIC", L"Fit:", 0, 30, 406, 30, 20, -1);
+    {
+        HWND pf = Ctl(L"COMBOBOX", L"", COMBO, 62, 402, 120, 200, IDC_PICFIT);
+        const wchar_t* fits[] = { L"Fill (crop)", L"Stretch", L"Centre", L"Tile" };
+        for (const wchar_t* n : fits) SendMessageW(pf, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(pf, CB_SETCURSEL, gPicFit, 0);
+    }
+    Ctl(L"STATIC", L"Fade it into the theme:", 0, 200, 406, 150, 20, -1);
+    Spin(IDC_PICDIM, 352, 403, 64, 0, 95, gPicDim);
+    Ctl(L"STATIC", L"%  (higher = easier to read)", 0, 422, 406, 110, 34, IDC_HDR);
+    gBuildSub = -1;
 
     // compact mode's own buttons (shown only in compact mode)
     gBuildPage = -1;
@@ -8810,9 +9029,16 @@ static LRESULT CtlColor(HWND h, UINT m, WPARAM w, LPARAM l)
     bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
                             : cid == IDT_HINT;  // dim helper text
     bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
+    if (gBrPicture && !field && h == gWnd) {    // background picture: text sits on the picture, lined up with it
+        POINT pt = { 0, 0 }; MapWindowPoints((HWND)l, gWnd, &pt, 1);
+        SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, header ? (gDark ? DK_DIM : gLtDim) : TXT_C);
+        return (LRESULT)gBrPicture;
+    }
     if (!gDark) {
         if (field) return DefWindowProcW(h, m, w, l);   // text boxes and lists keep Windows' white
-        SetTextColor(dc, header ? RGB(110, 110, 110) : GetSysColor(COLOR_WINDOWTEXT));
+        SetTextColor(dc, header ? gLtDim : gUserCol[4] != CLR_NONE ? gLtText : GetSysColor(COLOR_WINDOWTEXT));
         SetBkColor(dc, gLtBg);
         return (LRESULT)gBrLightBg;
     }
@@ -8833,7 +9059,7 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     wchar_t text[32]; GetWindowTextW(d->hwndItem, text, 32);
     HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, active ? (gDark ? DK_TEXT : RGB(20, 20, 20)) : (gDark ? DK_DIM : RGB(105, 105, 105)));
+    SetTextColor(dc, active ? (TXT_C) : (gDark ? DK_DIM : RGB(105, 105, 105)));
     RECT tr = rc; tr.bottom -= 3;
     DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
@@ -8845,7 +9071,7 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     }
     if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) {
         RECT fr = rc; InflateRect(&fr, -4, -4);
-        SetTextColor(dc, gDark ? DK_TEXT : RGB(20, 20, 20));
+        SetTextColor(dc, TXT_C);
         DrawFocusRect(dc, &fr);
     }
 }
@@ -8853,7 +9079,7 @@ static void DrawTab(DRAWITEMSTRUCT* d)
 static void PaintWindow(HDC dc)
 {
     int d = RowsDelta();
-    SetBkMode(dc, OPAQUE);
+    SetBkMode(dc, gBrPicture ? TRANSPARENT : OPAQUE);
     HGDIOBJ oldFont = SelectObject(dc, gFontBold);
     HPEN border = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ oldPen = SelectObject(dc, border), oldBr = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -8869,7 +9095,7 @@ static void PaintWindow(HDC dc)
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
         if (s.page >= 0 && s.page != gPage) continue;
-        if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : gFxSub)) continue;
+        if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub)) continue;
         if (gCompact) continue;
         int y = SC(s.y + (s.shifts ? d : 0)), sx = SC(s.x);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
@@ -8877,7 +9103,7 @@ static void PaintWindow(HDC dc)
         RECT tr = { sx + 10, y - sz.cy / 2, sx + 18 + sz.cx, y + sz.cy / 2 + 1 };
         FillRect(dc, &tr, BgBrush());
         SetBkColor(dc, BgColor());
-        SetTextColor(dc, gDark ? DK_TEXT : RGB(40, 40, 40));
+        SetTextColor(dc, TXT_C);
         TextOutW(dc, sx + 14, y - sz.cy / 2, s.title, lstrlenW(s.title));
     }
 
@@ -8906,7 +9132,7 @@ static void DrawStatus(DRAWITEMSTRUCT* d)
     FillRect(dc, &rc, BgBrush());
     bool loop = gLooping || (gRunning && gMicMuted), live = gRunning;   // red while looping or muted
     COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : (gDark ? DK_CTL : LT_STATUS);
-    COLORREF text = loop ? (gDark ? RGB(255, 125, 125) : RGB(185, 20, 20)) : (gDark ? DK_TEXT : RGB(40, 40, 40));
+    COLORREF text = loop ? (gDark ? RGB(255, 125, 125) : RGB(185, 20, 20)) : (TXT_C);
     COLORREF dotc = loop ? RGB(235, 60, 60) : live ? RGB(40, 190, 90) : RGB(150, 150, 150);
 
     HBRUSH br = CreateSolidBrush(fill);
@@ -9074,6 +9300,64 @@ static void OnCommand(int id, int code)
     if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
     if (id == IDC_CLIPHIST)    { if (code == BN_CLICKED) ClipHistory(GetDlgItem(gWnd, id)); return; }
     if (id == IDC_PADFOLDER)   { if (code == BN_CLICKED) PadLoadFolder(); return; }
+    if (id == IDC_SETSUB0 || id == IDC_SETSUB1) {
+        if (code == BN_CLICKED && gSetSub != id - IDC_SETSUB0) {
+            gSetSub = id - IDC_SETSUB0; Layout();
+            InvalidateRect(GetDlgItem(gWnd, IDC_SETSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_SETSUB1), nullptr, FALSE);
+        }
+        return;
+    }
+    if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) {
+        if (code == BN_CLICKED) {
+            int i = id - IDC_COLSW0;
+            static COLORREF custom[16];
+            CHOOSECOLORW cc = {}; cc.lStructSize = sizeof(cc); cc.hwndOwner = gWnd; cc.lpCustColors = custom;
+            cc.rgbResult = gUserCol[i] != CLR_NONE ? gUserCol[i] : i == 0 ? ACCENT : BgColor();
+            cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+            if (ChooseColorW(&cc)) { gUserCol[i] = cc.rgbResult; ApplyTheme(); }
+        }
+        return;
+    }
+    if (id == IDC_COLRESET) { if (code == BN_CLICKED) { for (int i = 0; i < USERCOL_N; i++) gUserCol[i] = CLR_NONE; ApplyTheme(); } return; }
+    if (id == IDC_FONT) {
+        if (code == CBN_SELCHANGE) {
+            int i = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            wchar_t n[40]; SendDlgItemMessageW(gWnd, id, CB_GETLBTEXT, i, (LPARAM)n);
+            lstrcpynW(gFontName, n, 40); ApplyFont(); RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+        return;
+    }
+    if (id == IDC_OPACITY) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v >= 40) { gOpacity = Iclamp(v, 40, 100); ApplyOpacity(); }
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gOpacity, FALSE);
+        return;
+    }
+    if (id == IDC_PICCHOOSE) {
+        if (code == BN_CLICKED) {
+            wchar_t path[MAX_PATH] = L"";
+            OPENFILENAMEW o = {};
+            o.lStructSize = sizeof(o); o.hwndOwner = gWnd; o.lpstrFile = path; o.nMaxFile = MAX_PATH;
+            o.lpstrFilter = L"Pictures (PNG, JPG, BMP, GIF)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All files\0*.*\0";
+            o.lpstrTitle = L"Pick a background picture"; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+            if (GetOpenFileNameW(&o)) {
+                if (PictureLoad(path)) { lstrcpynW(gPicPath, path, MAX_PATH); ApplyTheme(); }
+                else MessageBoxW(gWnd, L"Couldn't open that picture. PNG, JPG, BMP and GIF work.", L"Lag Effect", MB_ICONWARNING);
+            }
+            PictureInfo();
+        }
+        return;
+    }
+    if (id == IDC_PICREMOVE) { if (code == BN_CLICKED) { gPicPath[0] = 0; PictureLoad(gPicPath); ApplyTheme(); PictureInfo(); } return; }
+    if (id == IDC_PICFIT) { if (code == CBN_SELCHANGE) { gPicFit = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3); ApplyTheme(); } return; }
+    if (id == IDC_PICDIM) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) { gPicDim = Iclamp(v, 0, 95); if (gPicSrc) ApplyTheme(); }
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gPicDim, FALSE);
+        return;
+    }
     if (id == IDC_PTTMODE)     { if (code == CBN_SELCHANGE) gPttMode = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 2); return; }
     if (id == IDC_PTTKEY)      { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PTT], id); return; }
     if (id == IDC_OVERLAY)     { gOverlayOn = Checked(id); OverlayUpdate(); return; }
@@ -9342,6 +9626,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         UpdateUi();
         if (gCompact) Layout();
         ExecCommandLine(GetCommandLineW());     // switches given on the first start (only if allowed)
+        if (PictureLoad(gPicPath)) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
+        PictureInfo();
+        ApplyOpacity();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
@@ -9370,6 +9657,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DROPFILES:
         OnDropFiles((HDROP)w);
         return 0;
+    case WM_SIZE:                               // the picture is sized to the window
+        if (gPicSrc && w != SIZE_MINIMIZED) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
+        break;
     case WM_COPYDATA: {                         // command-line control from another LagEffect.exe (if allowed)
         const COPYDATASTRUCT* cd = (const COPYDATASTRUCT*)l;
         if (cd && cd->dwData == 0x4C414731 && cd->cbData >= sizeof(wchar_t)) {
@@ -9404,11 +9694,18 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     }
     case WM_DRAWITEM:
+        if (gBrPicture) {                       // the picture behind owner-drawn controls lines up with the window
+            POINT pt = { 0, 0 }; MapWindowPoints(((DRAWITEMSTRUCT*)l)->hwndItem, gWnd, &pt, 1);
+            SetBrushOrgEx(((DRAWITEMSTRUCT*)l)->hDC, -pt.x, -pt.y, nullptr);
+        }
         if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
-        if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1) { DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE; }
+        if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || w == IDC_SETSUB0 || w == IDC_SETSUB1) {
+            DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE;
+        }
+        if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_CLIPBANK0 && w < IDC_CLIPBANK0 + CLIP_BANKS) { DrawClipBank((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w >= IDC_ROWLBL && w < IDC_ROWLBL + MAX_OUT) { DrawOutLabel((DRAWITEMSTRUCT*)l); return TRUE; }
@@ -9431,6 +9728,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_REWINDKEY)  { ClearFxKey(SLOT_REWIND); return 0; }
         if (id == IDC_PROFNEXTKEY) { ClearFxKey(SLOT_PROFNEXT); return 0; }
         if (id == IDC_PTTKEY)      { ClearFxKey(SLOT_PTT); return 0; }
+        if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) { gUserCol[id - IDC_COLSW0] = CLR_NONE; ApplyTheme(); return 0; }
         if (id == IDC_VERSION) {                // hidden: command-line control for Stream Deck / scripts
             HMENU mm = CreatePopupMenu();
             AppendMenuW(mm, MF_STRING | (gCmdLine ? MF_CHECKED : 0), 1, L"Allow command-line control (Stream Deck, scripts)");
@@ -9547,8 +9845,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
     if (gCtxOk) ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
 
-    gFont     = CreateFontW(-SC(13), 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    gFontBold = CreateFontW(-SC(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    gFont     = CreateFontW(-SC(13), 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    gFontBold = CreateFontW(-SC(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
     gFontOsd  = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     gIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));          // custom icon if built with LagEffect.rc
     if (!gIcon) gIcon = LoadIconW(nullptr, IDI_APPLICATION);
