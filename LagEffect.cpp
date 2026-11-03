@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.24.2"
+#define APP_VERSION L"1.25.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -119,6 +119,7 @@ static volatile bool gTestRec = false;
 static short gPadRecBuf[PADREC_LEN];
 static volatile unsigned gPadRecPos = 0;
 static volatile bool gPadRec = false, gPadDuck = false, gPadChoke = false;
+static volatile int  gHearOut = 0;              // always hear pads / clips / TTS on: 0 = no extra, 1..MAX_OUT = that output, MAX_OUT + 1 = every output
 static int gPadRecSlot = -1;                    // pad being recorded from the mic
 
 // ---- Soundboard: 8 pads of short clips, mixed into every output that isn't Off ----
@@ -1613,7 +1614,8 @@ static void FxMoreReset()
 // ======================= effect pack 2 =======================
 // Ring mod, Wah, Whisper, Growl, Harmonizer, Shimmer, Gender (Voice FX) and EQ, De-esser, Broadcast (Mic tab).
 static volatile bool gFxRingOn = false, gFxWahOn = false, gFxWhisperOn = false, gFxGrowlOn = false,
-                     gFxHarmOn = false, gFxShimOn = false, gFxGenderOn = false, gBroadcast = false;
+                     gFxHarmOn = false, gFxShimOn = false, gFxGenderOn = false, gBroadcast = false,
+                     gHarmMute = false;   // Harmonizer: extra voices silenced (your own voice still passes)
 static volatile int  gRingHz = 40, gRingMix = 100;
 static volatile int  gWahSens = 60, gWahRange = 70, gWahRes = 60, gWahMix = 100;
 static volatile int  gWhisperAmt = 100, gWhisperAir = 40;
@@ -1699,8 +1701,12 @@ static const HarmStyle HARM_STYLES[] = {
 };
 #define HARM_N ((int)(sizeof(HARM_STYLES) / sizeof(HARM_STYLES[0])))
 static PShift gPsHarm[2];
-static float Harmonize(float x, const HarmStyle& st, float level, float detuneCt, float dry)
+static const wchar_t* HarmMuteText() { return gHarmMute ? L"Voices off (click: on)" : L"Turn the voices off"; }
+static float gHarmVoiceG = 1.0f;                // extra voices' level, eased toward 0 / 1 when they're muted / unmuted
+static float Harmonize(float x, const HarmStyle& st, float level, float detuneCt, float dry, bool mute)
 {
+    gHarmVoiceG += ((mute ? 0.0f : 1.0f) - gHarmVoiceG) * 0.002f;   // ~10 ms fade: no click
+    const float g = gHarmVoiceG;
     float wet = 0;
     const int span = 2400;                      // 50 ms grains
     int semis[2] = { st.a, st.b };
@@ -1709,7 +1715,7 @@ static float Harmonize(float x, const HarmStyle& st, float level, float detuneCt
         double r = pow(2.0, (semis[k] + (k ? -detuneCt : detuneCt) / 100.0) / 12.0);
         wet += PitchShift(gPsHarm[k], x, r, span, 1.0f);
     }
-    return x * dry + wet * level * 0.8f;
+    return x * (dry + (1.0f - dry) * (1.0f - g)) + wet * level * 0.8f * g;   // muted: your voice back at full level
 }
 
 // ---- Shimmer: reverb whose tail keeps rising an octave ----
@@ -2022,6 +2028,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (looping) spMode = SP_NONE;
 
     int      mode[MAX_OUT];
+    const int hearOut = gHearOut;
     float    vol[MAX_OUT];
     bool     on[MAX_OUT];
     unsigned w[MAX_OUT], r[MAX_OUT];
@@ -2077,6 +2084,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const float  grSub = gGrowlSub / 100.0f, grRasp = gGrowlRasp / 100.0f, grGrit = gGrowlGrit / 100.0f;
     const HarmStyle& hmSt = HARM_STYLES[Iclamp(gHarmStyle, 0, HARM_N - 1)];
     const float  hmLevel = gHarmLevel / 100.0f, hmDetune = (float)gHarmDetune, hmDry = gHarmDry / 100.0f;
+    const bool   hmMute = gHarmMute;
     const float  shMix = gShimMix / 100.0f, shDecay = gShimDecay / 100.0f, shAmt = gShimAmt / 100.0f;
     const float  gdAmt = gGenderAmt / 100.0f, gdMix = gGenderMix / 100.0f;
     ToneBlock();
@@ -2156,7 +2164,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (fxPitch)  s = PitchShift(gPsFx, s, psRatio, psGrain, psMix);
         if (fxGender) s = Gender(s, gdAmt, gdMix);
         if (fxForm)   s = Formant(s, fmFactor, fmMix);
-        if (fxHarm)   s = Harmonize(s, hmSt, hmLevel, hmDetune, hmDry);
+        if (fxHarm)   s = Harmonize(s, hmSt, hmLevel, hmDetune, hmDry, hmMute);
+        else          gHarmVoiceG = hmMute ? 0.0f : 1.0f;
         if (fxVoc)    s = Vocoder(s);
         if (fxWhisper) s = Whisper(s, wsAmt, wsAir);
         if (fxGrowl)  s = Growl(s, grSub, grRasp, grGrit);
@@ -2233,14 +2242,20 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             if (++tp >= TEST_LEN) { gTestRec = false; gTestLen = TEST_LEN; }
             gTestPos = tp;
         }
-        float o = Limit(0, (RowSignal(mode[0], effect, everything, clean) + (mode[0] != MODE_OFF ? sb : 0.0f)) * vol[0]);
+        // "Always hear sounds on": that output gets the sounds even when it's Off / Effect only, and the ones
+        // going through the voice effects even when its signal doesn't carry your (effected) voice
+        auto sounds = [&](int k) {
+            const bool always = hearOut == MAX_OUT + 1 || hearOut == k + 1;
+            return (mode[k] != MODE_OFF || always ? sb : 0.0f) + (always && mode[k] != MODE_ALL ? sbFx : 0.0f);
+        };
+        float o = Limit(0, (RowSignal(mode[0], effect, everything, clean) + sounds(0)) * vol[0]);
         { float a = o < 0 ? -o : o; if (a > outPk[0]) outPk[0] = a; }
         out[f * 2] = o;
         out[f * 2 + 1] = o;
 
         for (int k = 1; k < MAX_OUT; k++) {
             if (!on[k] || (w[k] - r[k]) >= RING_SIZE) continue;
-            float ov = Limit(k, (RowSignal(mode[k], effect, everything, clean) + (mode[k] != MODE_OFF ? sb : 0.0f)) * vol[k]);
+            float ov = Limit(k, (RowSignal(mode[k], effect, everything, clean) + sounds(k)) * vol[k]);
             ring[k][w[k] & (RING_SIZE - 1)] = ov;
             { float a = ov < 0 ? -ov : ov; if (a > outPk[k]) outPk[k] = a; }
             w[k]++;
@@ -2303,6 +2318,7 @@ enum {
     IDC_PADBANK0, IDC_PADBANK1, IDC_PADBANK2, IDC_PADBANK3, IDC_PADBANKKEY, IDC_PADFX,   // bank buttons: consecutive
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
+    IDC_HARMMUTE, IDC_HEARLBL, IDC_HEARON,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
@@ -3280,6 +3296,7 @@ static void LoadSettings()
     gBeatDiv   = Iclamp(INI_INT(L"beat_division", 1), 0, 3);
     gDiveSemis = Iclamp(INI_INT(L"pitch_dive_semitones", -12), -12, 12);
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
+    gHarmMute = INI_INT(L"fx_harm_mute", 0) != 0;
     gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 1);
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
     gChoStyle  = Iclamp(INI_INT(L"fx_chorus_style", 0), 0, CHO_N - 1);
@@ -3292,6 +3309,7 @@ static void LoadSettings()
     gClipReplace  = INI_INT(L"clip_replace_oldest", 1) != 0;
     gPadChoke     = INI_INT(L"pads_one_at_a_time", 0) != 0;
     gPadDuck      = INI_INT(L"pads_duck_voice", 0) != 0;
+    gHearOut      = Iclamp(INI_INT(L"always_hear_sounds_on", 0), 0, MAX_OUT + 1);
     gClipStampNext = (unsigned)Imax(1, INI_INT(L"clip_stamp_next", 1));
     for (int i = 0; i < PAD_N; i++) {
         wchar_t key[32]; Pad& p = gPads[i];
@@ -3416,6 +3434,7 @@ static void SaveSettings()
     SaveInt(L"beat_sync", gBeatSync); SaveInt(L"bpm", gBpm); SaveInt(L"beat_division", gBeatDiv);
     SaveInt(L"pitch_dive_semitones", gDiveSemis);
     SaveInt(L"broadcast_voice", gBroadcast);
+    SaveInt(L"fx_harm_mute", gHarmMute);
     SaveInt(L"mic_subtab", gMicSub);
     SaveInt(L"fx_dist_style", gDistStyle);
     SaveInt(L"fx_chorus_style", gChoStyle);
@@ -3424,7 +3443,7 @@ static void SaveSettings()
     SaveInt(L"rec_source", gRecSource);
     SaveInt(L"clip_master", gClipMaster);
     SaveInt(L"clip_page", gClipBank); SaveInt(L"clip_separate_tracks", gClipSeparate); SaveInt(L"clip_replace_oldest", gClipReplace);
-    SaveInt(L"pads_one_at_a_time", gPadChoke); SaveInt(L"pads_duck_voice", gPadDuck); SaveInt(L"clip_stamp_next", (int)gClipStampNext);
+    SaveInt(L"pads_one_at_a_time", gPadChoke); SaveInt(L"pads_duck_voice", gPadDuck); SaveInt(L"always_hear_sounds_on", gHearOut); SaveInt(L"clip_stamp_next", (int)gClipStampNext);
     for (int i = 0; i < PAD_N; i++) {
         wchar_t key[32]; const Pad& p = gPads[i];
         wsprintfW(key, L"pad%d_mode", i + 1);     SaveInt(key, p.mode);
@@ -3733,7 +3752,7 @@ static int FitKind(const Design& d)            // 0 = other, 1 = one-line label,
     }
     if (!lstrcmpiW(cls, L"Static")) {
         int id = GetDlgCtrlID(d.h);
-        if ((st & SS_TYPEMASK) != SS_LEFT || !(id == 0xFFFF || id == IDC_HDR || id == IDC_RADIODESC)) return 0;
+        if ((st & SS_TYPEMASK) != SS_LEFT || !(id == 0xFFFF || id == IDC_HDR || id == IDC_RADIODESC || id == IDC_HEARLBL)) return 0;
         return d.ht <= SC(24) ? 1 : 3;
     }
     return 0;
@@ -5508,6 +5527,7 @@ static const ProfVar PROF_VARS[] = {
     { L"talkover", nullptr, &gTalkOver, nullptr },  { L"toggle", nullptr, &gToggleMode, nullptr },
     { L"random_lag", nullptr, &gRandLagOn, nullptr }, { L"random_lag_every_s", &gRandLagSec, nullptr, nullptr },
     { L"fx_harm_style", &gHarmStyle, nullptr, nullptr }, { L"broadcast_voice", nullptr, &gBroadcast, nullptr },
+    { L"fx_harm_mute", nullptr, &gHarmMute, nullptr },
     { L"beat_sync", nullptr, &gBeatSync, nullptr }, { L"bpm", &gBpm, nullptr, nullptr }, { L"beat_division", &gBeatDiv, nullptr, nullptr },
 };
 
@@ -5604,6 +5624,7 @@ static void RefreshSoundUI()                    // after a profile changed lots 
     SendDlgItemMessageW(gWnd, IDC_MUFSTYLE, CB_SETCURSEL, gMufStyle, 0);
     gHarmStyle = Iclamp(gHarmStyle, 0, HARM_N - 1);
     SendDlgItemMessageW(gWnd, IDC_HARMSTYLE, CB_SETCURSEL, gHarmStyle, 0);
+    SetDlgItemTextW(gWnd, IDC_HARMMUTE, HarmMuteText());
     CheckDlgButton(gWnd, IDC_BROADCAST, gBroadcast ? BST_CHECKED : BST_UNCHECKED);
     SetGateMode(gGateMode);
     CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
@@ -7071,6 +7092,10 @@ static void AddTips()
         TipId(IDC_ROWDEL + k,  L"Remove this output.");
     }
     TipId(IDC_ADDOUT,  L"Add another output (up to 5), e.g. VB-Cable for Discord plus your headphones to hear yourself.");
+    TipId(IDC_HEARON,   L"Pick your headphones' output to always hear the soundboard, clips and text to speech there, even if it's set to "
+                        L"Off or Effect only, or the sounds go through your voice effects.");
+    TipId(IDC_HEARLBL,  L"Pick your headphones' output to always hear the soundboard, clips and text to speech there, even if it's set to "
+                        L"Off or Effect only, or the sounds go through your voice effects.");
     TipId(IDC_VBCABLE, L"Set up VB-Cable automatically: output 1 goes to VB-Cable, output 2 to your headphones.");
     TipId(IDC_LOOP,    L"How much of your last words gets repeated when you press the hotkey, in milliseconds.");
     TipId(IDC_SPEED,   L"How fast the loop plays through. 100% = normal; lower = slower and longer.");
@@ -7135,6 +7160,7 @@ static void AddTips()
     TipId(IDC_FXSUB6, L"Fun: Glitch (a bad connection).");
     TipId(IDC_MICSUB0, L"Cleanup: AI noise suppression and the noise gate.");
     TipId(IDC_MICSUB1, L"Tone: mic level, low cut, leveler, de-esser, broadcast voice and a 5-band equalizer.");
+    TipId(IDC_HARMMUTE,  L"Silences the extra voices but keeps the Harmonizer on and your own voice at full level. Click again to bring them back.");
     TipId(IDC_HARMSTYLE, L"Which extra voices sing along: an octave up or down, a chord, a fifth, a power chord or an angel choir.");
     TipId(IDC_BROADCAST, L"Radio-host sound: strong, even compression, a little presence and less mud, and the esses tamed. "
                          L"Every output also has a limiter, so loud moments never clip.");
@@ -7843,6 +7869,22 @@ static void LayoutCompact(bool on)              // slim window: status, Start, M
     SetDlgItemTextW(gWnd, IDC_COMPACTFX, gFxOn ? L"Voice FX: on" : L"Voice FX: off");
 }
 
+// "Always hear sounds on" choices follow the output rows: Off, Out 1..Out n, Every output.
+static void FillHearList()
+{
+    HWND c = GetDlgItem(gWnd, IDC_HEARON);
+    if (!c) return;
+    static int shown = -1;
+    if (shown == gRows && SendMessageW(c, CB_GETCOUNT, 0, 0) > 0) return;
+    shown = gRows;
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Off");
+    for (int k = 0; k < gRows; k++) { wchar_t t[16]; wsprintfW(t, L"Out %d", k + 1); SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)t); }
+    SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Every output");
+    if (gHearOut > gRows && gHearOut <= MAX_OUT) gHearOut = 0;   // that output was removed
+    SendMessageW(c, CB_SETCURSEL, gHearOut == MAX_OUT + 1 ? gRows + 1 : gHearOut, 0);
+}
+
 static void Layout()
 {
     // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
@@ -7865,6 +7907,12 @@ static void Layout()
     int by = ROW_Y0 + ROW_H * gRows + 6;
     SetWindowPos(GetDlgItem(gWnd, IDC_ADDOUT),  nullptr, SC(30),  SC(by), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     SetWindowPos(GetDlgItem(gWnd, IDC_VBCABLE), nullptr, SC(162), SC(by), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    static const int hearIds[] = { IDC_HEARLBL, IDC_HEARON };
+    for (int id : hearIds) {                        // keep their x: FitText may have moved them along
+        HWND c = GetDlgItem(gWnd, id); RECT rc; GetWindowRect(c, &rc); MapWindowPoints(nullptr, gWnd, (POINT*)&rc, 2);
+        SetWindowPos(c, nullptr, rc.left, SC(by + (id == IDC_HEARLBL ? 5 : 1)), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    FillHearList();
     EnableWindow(GetDlgItem(gWnd, IDC_ADDOUT), gRows < MAX_OUT);
     gSections[gDevSectionIdx].h = by + 28 + 14 - gSections[gDevSectionIdx].y;
 
@@ -8650,6 +8698,8 @@ static void CreateUI()
     }
     Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 170, 124, 28, IDC_ADDOUT);
     Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 170, 124, 28, IDC_VBCABLE);
+    Ctl(L"STATIC", L"Always hear sounds on:", SS_NOTIFY, 298, 175, 132, 20, IDC_HEARLBL);
+    Ctl(L"COMBOBOX", L"", COMBO, 432, 171, 102, 200, IDC_HEARON);
     FillDevices();
 
     gRecordShift = true;                        // everything below on this page moves with the output list
@@ -8902,7 +8952,8 @@ static void CreateUI()
             HWND hs = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 27, 152, 300, IDC_HARMSTYLE);
             for (int i = 0; i < HARM_N; i++) SendMessageW(hs, CB_ADDSTRING, 0, (LPARAM)HARM_STYLES[i].name);
             SendMessageW(hs, CB_SETCURSEL, Iclamp(gHarmStyle, 0, HARM_N - 1), 0);
-            Ctl(L"STATIC", L"Extra voices at fixed intervals, following your pitch.", 0, 28, y + 56, 152, 48, IDC_HDR);
+            Ctl(L"BUTTON", HarmMuteText(), WS_TABSTOP, 26, y + 56, 152, 26, IDC_HARMMUTE);
+            Ctl(L"STATIC", L"They follow your pitch.", 0, 28, y + 86, 152, 18, IDC_HDR);
             kx = 186; kstep = 80; kw = 80;
         } else if (g == KG_GENDER || g == KG_RING || g == KG_WHISPER) {   // two knobs + a note
             const wchar_t* note = g == KG_GENDER ? L"One-knob voice change: below 0 = deeper, more masculine; above 0 = higher, "
@@ -9580,6 +9631,13 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_PADCHOKE)    { gPadChoke = Checked(id); return; }
     if (id == IDC_PADDUCK)     { gPadDuck = Checked(id); return; }
+    if (id == IDC_HEARON) {
+        if (code == CBN_SELCHANGE) {
+            int i = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            gHearOut = i <= 0 ? 0 : i > gRows ? MAX_OUT + 1 : i;
+        }
+        return;
+    }
     if (id == IDC_CLIPSEP)     { gClipSeparate = Checked(id); return; }
     if (id == IDC_CLIPREPLACE) { gClipReplace = Checked(id); return; }
     if (id >= IDC_CLIPKEY && id < IDC_CLIPKEY + CLIPS) {
@@ -9678,6 +9736,14 @@ static void OnCommand(int id, int code)
             gMicSub = id - IDC_MICSUB0;
             Layout();
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB1), nullptr, FALSE);
+        }
+        break;
+    case IDC_HARMMUTE:
+        if (code == BN_CLICKED) {
+            gHarmMute = !gHarmMute;
+            SetDlgItemTextW(gWnd, id, HarmMuteText());
+            FitOne(GetDlgItem(gWnd, id));
+            UpdateStatus(true);
         }
         break;
     case IDC_HARMSTYLE:
