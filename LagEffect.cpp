@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.16.0"
+#define APP_VERSION L"1.17.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1089,8 +1089,442 @@ static float Radio(float x)
     return s * powf(10.0f, p.outDb / 20.0f);
 }
 
+// ======================= more voice effects (Voice FX sub-tabs) =======================
+// Formant, Echo, Reverse ("Ghost"), Distortion, Chorus/flanger, Wobble, Muffle and Glitch.
+// All run on the audio thread; their knob values are read once per block.
+static volatile bool gFxFormantOn = false, gFxEchoOn = false, gFxRvsOn = false, gFxDistOn = false,
+                     gFxChorusOn = false, gFxWobbleOn = false, gFxMuffleOn = false, gFxGlitchOn = false;
+static volatile int  gFormantShift = 0, gFormantMix = 100;
+static volatile int  gEchoStyle = 0, gEchoMs = 350, gEchoFb = 35, gEchoMix = 35;
+static volatile int  gRvsLenMs = 400, gRvsMix = 60, gRvsDelayMs = 0;
+static volatile int  gDistStyle = 0, gDistDrive = 50, gDistCrush = 0, gDistMix = 100;
+static volatile int  gChoStyle = 0, gChoSpeed = 35, gChoDepth = 50, gChoMix = 50;
+static volatile int  gWobSpeed = 6, gWobTrem = 50, gWobVib = 0;
+static volatile int  gMufStyle = 0, gMufAmount = 70, gMufWarble = 45, gMufBubbles = 40;
+static volatile int  gGlAmount = 30, gGlDrop = 50, gGlStutter = 50, gGlRobot = 50;
+
+static unsigned gFxSeed = 0x9E3779B9u;
+static inline float FxRand()                    // 0..1
+{
+    gFxSeed = gFxSeed * 1664525u + 1013904223u;
+    return (float)((gFxSeed >> 8) & 0xFFFF) / 65536.0f;
+}
+static inline float FxOnePole(float hz) { return 1.0f - expf(-6.2831853f * hz / RATE); }
+
+// Reads a delay line at a fractional delay (linear interpolation). size must be a power of two.
+static inline float DlRead(const float* buf, int size, int w, double d)
+{
+    double rp = (double)w - d;
+    while (rp < 0) rp += size;
+    int i0 = (int)rp; float t = (float)(rp - i0);
+    return buf[i0 & (size - 1)] * (1.0f - t) + buf[(i0 + 1) & (size - 1)] * t;
+}
+
+// Keeps an effect about as loud as what went into it (distortion changes level a lot).
+struct AutoGain { float inE, outE, g; };
+static inline float AutoGainRun(AutoGain& a, float in, float out, float maxGain = 4.0f)
+{
+    const float k = 0.0005f;                    // ~40 ms
+    a.inE  += (in * in - a.inE) * k;
+    a.outE += (out * out - a.outE) * k;
+    float want = a.outE > 1e-9f ? sqrtf((a.inE + 1e-9f) / a.outE) : 1.0f;
+    if (want > maxGain) want = maxGain; if (want < 0.1f) want = 0.1f;
+    a.g += (want - a.g) * 0.0005f;
+    return out * a.g;
+}
+
+// ---------------- Formant: changes how big your throat sounds, not your pitch ----------------
+// Short-time FFT (1024, 75% overlap). The spectral envelope (cepstrum, smoothed) is stretched up or
+// down and each frame is re-weighted by new envelope / old envelope; pitch and phases are untouched.
+#define FM_N   1024
+#define FM_HOP 256
+#define FM_LIFTER 46                            // envelope detail: below any voice's pitch period
+static float fmCos[FM_N / 2], fmSin[FM_N / 2], fmWin[FM_N];
+static int   fmRev[FM_N];
+static bool  fmReady = false;
+static struct FormantState {
+    float in[FM_N]; int w;                      // last FM_N input samples (ring)
+    float acc[FM_N]; int pos;                   // overlap-add output (ring)
+    int   hop;
+    float re[FM_N], im[FM_N], cr[FM_N], ci[FM_N], env[FM_N / 2 + 1];
+} gFm;
+
+static void FftSetup()
+{
+    if (fmReady) return;
+    for (int i = 0; i < FM_N / 2; i++) { fmCos[i] = (float)cos(2 * 3.141592653589793 * i / FM_N); fmSin[i] = (float)sin(2 * 3.141592653589793 * i / FM_N); }
+    int bits = 0; while ((1 << bits) < FM_N) bits++;
+    for (int i = 0; i < FM_N; i++) { int r = 0; for (int b = 0; b < bits; b++) if (i & (1 << b)) r |= 1 << (bits - 1 - b); fmRev[i] = r; }
+    for (int i = 0; i < FM_N; i++) fmWin[i] = (float)sin(3.141592653589793 * (i + 0.5) / FM_N);   // sqrt-Hann
+    fmReady = true;
+}
+
+static void Fft(float* re, float* im, bool inverse)
+{
+    for (int i = 0; i < FM_N; i++) if (i < fmRev[i]) { float t = re[i]; re[i] = re[fmRev[i]]; re[fmRev[i]] = t; t = im[i]; im[i] = im[fmRev[i]]; im[fmRev[i]] = t; }
+    for (int len = 2; len <= FM_N; len <<= 1) {
+        int half = len >> 1, step = FM_N / len;
+        for (int i = 0; i < FM_N; i += len)
+            for (int j = 0; j < half; j++) {
+                float wr = fmCos[j * step], wi = inverse ? fmSin[j * step] : -fmSin[j * step];
+                int a = i + j, b = a + half;
+                float tr = re[b] * wr - im[b] * wi, ti = re[b] * wi + im[b] * wr;
+                re[b] = re[a] - tr; im[b] = im[a] - ti;
+                re[a] += tr;        im[a] += ti;
+            }
+    }
+    if (inverse) { const float s = 1.0f / FM_N; for (int i = 0; i < FM_N; i++) { re[i] *= s; im[i] *= s; } }
+}
+
+static void FormantFrame(float factor)
+{
+    FormantState& f = gFm;
+    for (int i = 0; i < FM_N; i++) { f.re[i] = f.in[(f.w + i) & (FM_N - 1)] * fmWin[i]; f.im[i] = 0; }
+    Fft(f.re, f.im, false);
+    for (int k = 0; k <= FM_N / 2; k++) {       // log magnitude, mirrored -> real cepstrum
+        float m = logf(sqrtf(f.re[k] * f.re[k] + f.im[k] * f.im[k]) + 1e-7f);
+        f.cr[k] = m; if (k > 0 && k < FM_N / 2) f.cr[FM_N - k] = m;
+    }
+    memset(f.ci, 0, sizeof(f.ci));
+    Fft(f.cr, f.ci, true);
+    for (int q = FM_LIFTER; q <= FM_N - FM_LIFTER; q++) { f.cr[q] = 0; }
+    for (int q = 0; q < FM_N; q++) f.ci[q] = 0;
+    f.cr[FM_LIFTER - 1] *= 0.5f; f.cr[FM_N - FM_LIFTER + 1] *= 0.5f;   // soften the cut a little
+    Fft(f.cr, f.ci, false);
+    for (int k = 0; k <= FM_N / 2; k++) f.env[k] = f.cr[k];             // smooth log envelope
+    for (int k = 0; k <= FM_N / 2; k++) {
+        float src = k / factor, e2;
+        if (src >= FM_N / 2) e2 = f.env[FM_N / 2] - 2.0f;
+        else { int i0 = (int)src; float t = src - i0; e2 = f.env[i0] * (1 - t) + f.env[i0 + 1] * t; }
+        float g = expf(e2 - f.env[k]);
+        if (g > 24.0f) g = 24.0f; if (g < 0.04f) g = 0.04f;
+        f.re[k] *= g; f.im[k] *= g;
+    }
+    for (int k = 1; k < FM_N / 2; k++) { f.re[FM_N - k] = f.re[k]; f.im[FM_N - k] = -f.im[k]; }
+    Fft(f.re, f.im, true);
+    const float norm = 0.5f;                    // sqrt-Hann in and out (= Hann) at 75% overlap adds up to 2
+    for (int i = 0; i < FM_N; i++) f.acc[(f.pos + i) & (FM_N - 1)] += f.re[i] * fmWin[i] * norm;
+}
+
+static float Formant(float x, float factor, float mix)   // ~21 ms of delay while on
+{
+    FormantState& f = gFm;
+    float dry = f.in[f.w];                      // the input from FM_N samples ago (lines up with the output)
+    f.in[f.w] = x; f.w = (f.w + 1) & (FM_N - 1);
+    float y = f.acc[f.pos]; f.acc[f.pos] = 0; f.pos = (f.pos + 1) & (FM_N - 1);
+    if (++f.hop >= FM_HOP) { f.hop = 0; FormantFrame(factor); }
+    return dry + (y - dry) * mix;
+}
+
+// ---------------- Echo ----------------
+#define ECHO_SIZE 131072                        // 2.7 s
+struct EchoStyle { const wchar_t* name; int ms, fb, mix; float lpHz, wow; bool sat; };
+static const EchoStyle ECHO_STYLES[] = {
+    { L"Echo",      350, 35, 35, 7000.0f, 0.0f, false },
+    { L"Slapback",   95,  0, 45, 9000.0f, 0.0f, false },
+    { L"Tape echo", 300, 45, 35, 2800.0f, 1.0f, true  },
+    { L"Canyon",    650, 55, 30, 4500.0f, 0.0f, false },
+};
+#define ECHO_N ((int)(sizeof(ECHO_STYLES) / sizeof(ECHO_STYLES[0])))
+static struct EchoState { float buf[ECHO_SIZE]; int w; double d; float lp; double wowPh; } gEcho;
+
+static float Echo(float x, double targetD, float fb, float mix, float lpA, float wow, bool sat)
+{
+    EchoState& e = gEcho;
+    if (e.d <= 0) e.d = targetD;
+    e.d += (targetD - e.d) * 0.0003;            // turning Time glides, like a real delay
+    double d = e.d;
+    if (wow > 0) { e.wowPh += 2 * 3.141592653589793 * 0.55 / RATE; d += wow * 0.0022 * RATE * sin(e.wowPh) + wow * 0.0006 * RATE * sin(e.wowPh * 3.7); }
+    float r = DlRead(e.buf, ECHO_SIZE, e.w, d);
+    e.lp += (r - e.lp) * lpA;
+    float back = e.lp * fb;
+    if (sat) back = tanhf(back * 1.3f) / 1.3f;
+    e.buf[e.w] = x + back;
+    e.w = (e.w + 1) & (ECHO_SIZE - 1);
+    return x + e.lp * mix;
+}
+
+// ---------------- Reverse ("Ghost"): backwards reverb swells ----------------
+#define RVS_SIZE 131072
+static const int MV_COMB[4] = { 1557, 1617, 1491, 1422 }, MV_AP[2] = { 556, 441 };
+static struct RvsState {
+    float buf[RVS_SIZE]; int w;                 // reverb-washed voice, read backwards
+    float dry[RVS_SIZE]; int dw;                // optional voice delay
+    double ph[2];                               // read heads: 0..1 through a chunk
+    float comb[4][1800], combSt[4], ap[2][640];
+    int   ci[4], ai[2];
+} gRvs;
+
+static float Reverse(float x, int lenS, float mix, int delayS)
+{
+    RvsState& r = gRvs;
+    // a small dedicated reverb (separate from the Reverb effect) makes the wash that gets reversed
+    float in = x * 0.02f, acc = 0;
+    for (int i = 0; i < 4; i++) {
+        int L = MV_COMB[i] * RATE / 44100;
+        float y = r.comb[i][r.ci[i]];
+        r.combSt[i] = y * 0.7f + r.combSt[i] * 0.3f;
+        r.comb[i][r.ci[i]] = in + r.combSt[i] * 0.88f;
+        if (++r.ci[i] >= L) r.ci[i] = 0;
+        acc += y;
+    }
+    for (int i = 0; i < 2; i++) {
+        int L = MV_AP[i] * RATE / 44100;
+        float b = r.ap[i][r.ai[i]];
+        r.ap[i][r.ai[i]] = acc + b * 0.5f;
+        acc = b - acc;
+        if (++r.ai[i] >= L) r.ai[i] = 0;
+    }
+    r.buf[r.w] = acc * 2.2f + x * 0.35f;        // mostly wash, a little backwards voice
+    // two heads read backwards (delay grows by 2 per sample), half a chunk apart, Hann-crossfaded
+    float ghost = 0;
+    for (int k = 0; k < 2; k++) {
+        double d = 1.0 + r.ph[k] * 2.0 * lenS;
+        float s = (float)sin(3.141592653589793 * r.ph[k]);
+        ghost += DlRead(r.buf, RVS_SIZE, r.w, d) * s * s;
+        r.ph[k] += 1.0 / lenS;
+        if (r.ph[k] >= 1.0) r.ph[k] -= 1.0;
+    }
+    r.w = (r.w + 1) & (RVS_SIZE - 1);
+    r.dry[r.dw] = x;
+    float v = delayS > 0 ? r.dry[(r.dw - delayS) & (RVS_SIZE - 1)] : x;
+    r.dw = (r.dw + 1) & (RVS_SIZE - 1);
+    return v + ghost * mix;
+}
+
+// ---------------- Distortion / bitcrusher ----------------
+struct DistStyle { const wchar_t* name; int drive, crush, mix; };
+static const DistStyle DIST_STYLES[] = {
+    { L"Overdrive",  50,  0, 100 },
+    { L"Fuzz",       70,  0, 100 },
+    { L"Bitcrush",   25, 70, 100 },
+    { L"Broken mic", 60, 30, 100 },
+};
+#define DIST_N ((int)(sizeof(DIST_STYLES) / sizeof(DIST_STYLES[0])))
+static struct DistState {
+    int style;                                  // style the filters are set up for
+    Biquad pre, post[2], dc;
+    float hold; int holdCount;
+    AutoGain ag;
+    int dropLeft; float dropEnv;
+} gDist;
+
+static float Distort(float x, int style, float drive, float crush, float mix)
+{
+    DistState& s = gDist;
+    if (s.style != style) {
+        s.style = style;
+        BqSet(s.dc, 2, 30.0, 0.707);
+        if (style == 3) { BqSet(s.pre, 2, 450.0, 0.707); BqSet(s.post[0], 0, 3200.0, 0.707); BqSet(s.post[1], 0, 3200.0, 0.707); }
+        else {
+            BqSet(s.pre, 2, 90.0, 0.707);
+            double lp = style == 1 ? 4500.0 : style == 2 ? 12000.0 : 6500.0;
+            BqSet(s.post[0], 0, lp, 0.5412); BqSet(s.post[1], 0, lp, 1.3066);
+        }
+        if (s.ag.g <= 0) s.ag.g = 1;
+    }
+    const float g = powf(10.0f, drive * 36.0f / 20.0f);    // drive 0..1 -> 0..36 dB
+    float v = BqRun(s.pre, x), y;
+    switch (style) {
+    case 1: {                                   // fuzz: hard, lopsided, with a ghost octave up
+        float u = v * g * 2.0f;
+        y = u > 0.45f ? 0.45f : u < -0.9f ? -0.9f : u;
+        y += 0.35f * fabsf(tanhf(v * g));
+        y = BqRun(s.dc, y);
+        break;
+    }
+    case 2: y = tanhf(v * (1.0f + g * 0.25f)); break;      // bitcrush: mostly clean, the crusher does the work
+    case 3: {                                   // broken mic: thin, clipped, and it cuts out now and then
+        float u = v * g * 1.5f;
+        y = u > 0.6f ? 0.6f : u < -0.6f ? -0.6f : u;
+        if (s.dropLeft <= 0 && FxRand() < 0.6f / RATE) s.dropLeft = (int)(RATE * (0.02f + 0.06f * FxRand()));
+        float want = s.dropLeft > 0 ? 0.0f : 1.0f;
+        if (s.dropLeft > 0) s.dropLeft--;
+        s.dropEnv += (want - s.dropEnv) * 0.02f;
+        y *= s.dropEnv;
+        if (FxRand() < 3.0f / RATE) y += (FxRand() - 0.5f) * 0.4f;   // crackle
+        break;
+    }
+    default: y = tanhf(v * g); break;           // overdrive: warm, rounded
+    }
+    if (crush > 0) {                            // fewer bits + a lower sample rate
+        int holdN = 1 + (int)(crush * 10.0f);
+        if (++s.holdCount >= holdN) { s.holdCount = 0; s.hold = y; }
+        float bits = 16.0f - crush * 13.0f, step = powf(2.0f, 1.0f - bits);
+        y = floorf(s.hold / step + 0.5f) * step;
+    }
+    y = BqRun(s.post[1], BqRun(s.post[0], y));
+    y = AutoGainRun(s.ag, x, y);
+    return x + (y - x) * mix;
+}
+
+// ---------------- Chorus / flanger ----------------
+#define CHO_SIZE 8192
+struct ChoStyle { const wchar_t* name; int speed, depth, mix; float baseMs, depthMs, fb; int voices; };
+static const ChoStyle CHO_STYLES[] = {
+    { L"Chorus",      35, 50, 50, 16.0f, 6.0f, 0.0f,  2 },
+    { L"Flanger",     30, 70, 50,  1.0f, 3.0f, 0.65f, 1 },
+    { L"Jet flanger", 15, 90, 60,  0.6f, 4.0f, 0.85f, 1 },
+    { L"Doubler",     20, 30, 45, 28.0f, 3.0f, 0.0f,  1 },
+};
+#define CHO_N ((int)(sizeof(CHO_STYLES) / sizeof(CHO_STYLES[0])))
+static struct ChoState { float buf[CHO_SIZE]; int w; double ph; float last; } gCho;
+
+static float Chorus(float x, const ChoStyle& st, float hz, float depth, float mix)
+{
+    ChoState& c = gCho;
+    c.buf[c.w] = x + c.last * st.fb;
+    c.ph += 2 * 3.141592653589793 * hz / RATE;
+    if (c.ph > 6.283185307179586) c.ph -= 6.283185307179586;
+    float wet = 0;
+    for (int v = 0; v < st.voices; v++) {
+        double lfo = 0.5 + 0.5 * sin(c.ph + v * 1.5707963);
+        double d = (st.baseMs + st.depthMs * depth * lfo) * RATE / 1000.0;
+        wet += DlRead(c.buf, CHO_SIZE, c.w, d);
+    }
+    wet /= st.voices;
+    c.last = wet;
+    c.w = (c.w + 1) & (CHO_SIZE - 1);
+    // the delayed copies don't line up with your voice, so a 50/50 blend sounds quieter: make up for it
+    return (x * (1.0f - mix) + wet * mix) / sqrtf((1.0f - mix) * (1.0f - mix) + mix * mix);
+}
+
+// ---------------- Wobble: tremolo (volume) + vibrato (pitch) ----------------
+#define WOB_SIZE 2048
+static struct WobState { float buf[WOB_SIZE]; int w; double ph; } gWob;
+
+static float Wobble(float x, float hz, float trem, float vib)
+{
+    WobState& s = gWob;
+    s.ph += 2 * 3.141592653589793 * hz / RATE;
+    if (s.ph > 6.283185307179586) s.ph -= 6.283185307179586;
+    float sn = (float)sin(s.ph);
+    s.buf[s.w] = x;
+    double d = (3.0 + vib * 2.5 * sn) * RATE / 1000.0;     // up to +-2.5 ms around 3 ms
+    float y = DlRead(s.buf, WOB_SIZE, s.w, d);
+    s.w = (s.w + 1) & (WOB_SIZE - 1);
+    return y * (1.0f - trem * (0.5f - 0.5f * sn));
+}
+
+// ---------------- Muffle: underwater / through a wall ----------------
+struct MufStyle { const wchar_t* name; int amount, warble, bubbles; float q, lowHz, lowDb, level; };
+static const MufStyle MUF_STYLES[] = {
+    { L"Underwater",      70, 45, 40, 1.6f, 250.0f, 3.0f, 0.85f },
+    { L"Through a wall",  85,  0,  0, 0.7f, 150.0f, 6.0f, 0.5f  },
+    { L"Under a blanket", 55,  0,  0, 0.6f, 200.0f, 2.0f, 0.8f  },
+};
+#define MUF_N ((int)(sizeof(MUF_STYLES) / sizeof(MUF_STYLES[0])))
+#define MUF_SIZE 2048
+#define MUF_BUBBLES 3
+static struct MufState {
+    int style, amount;                          // what the filters are set up for
+    Biquad lp[2], low;
+    float buf[MUF_SIZE]; int w; double ph1, ph2;
+    AutoGain ag;
+    struct { float f, amp, decay; double ph; } bub[MUF_BUBBLES];
+} gMuf;
+
+static float Muffle(float x, int style, int amount, float warble, float bubbles)
+{
+    MufState& m = gMuf;
+    const MufStyle& st = MUF_STYLES[style];
+    if (m.style != style || m.amount != amount) {
+        bool fresh = m.style < 0;
+        m.style = style; m.amount = amount;
+        double fc = 4000.0 * pow(250.0 / 4000.0, amount / 100.0);
+        Biquad a = m.lp[0], b = m.lp[1];
+        BqSet(m.lp[0], 0, fc, 0.5412); BqSet(m.lp[1], 0, fc, st.q);
+        if (!fresh) { m.lp[0].z1 = a.z1; m.lp[0].z2 = a.z2; m.lp[1].z1 = b.z1; m.lp[1].z2 = b.z2; }   // no click while turning
+        BqPeak(m.low, st.lowHz, st.lowDb, 0.8);
+    }
+    float y = x;
+    if (warble > 0) {                           // slow, uneven pitch drift
+        m.ph1 += 2 * 3.141592653589793 * 0.7 / RATE; m.ph2 += 2 * 3.141592653589793 * 1.9 / RATE;
+        m.buf[m.w] = x;
+        double d = (4.0 + warble * 3.0 * (0.6 * sin(m.ph1) + 0.4 * sin(m.ph2))) * RATE / 1000.0;
+        y = DlRead(m.buf, MUF_SIZE, m.w, d);
+        m.w = (m.w + 1) & (MUF_SIZE - 1);
+    }
+    // muffled = quieter, but only somewhat: bring it back up to the style's level (cutting highs loses a lot)
+    y = AutoGainRun(m.ag, x, BqRun(m.low, BqRun(m.lp[1], BqRun(m.lp[0], y))), 12.0f) * st.level;
+    if (bubbles > 0) {                          // little rising blips
+        if (FxRand() < bubbles * 6.0f / RATE)
+            for (auto& b : m.bub) if (b.amp < 0.001f) {
+                b.f = 350.0f + 1300.0f * FxRand(); b.amp = 0.05f * bubbles * (0.4f + 0.6f * FxRand());
+                b.decay = expf(-1.0f / (RATE * (0.012f + 0.03f * FxRand()))); b.ph = 0; break;
+            }
+        for (auto& b : m.bub) if (b.amp >= 0.001f) {
+            b.ph += 2 * 3.141592653589793 * b.f / RATE;
+            b.f *= 1.00003f;
+            y += (float)sin(b.ph) * b.amp;
+            b.amp *= b.decay;
+        }
+    }
+    return y;
+}
+
+// ---------------- Glitch: a bad connection ----------------
+#define GL_SIZE 32768
+enum { GL_NONE = 0, GL_DROP, GL_STUTTER, GL_ROBOT };
+static struct GlState {
+    float buf[GL_SIZE]; int w;
+    int mode, left, start, len, pos;
+    bool choppy;
+    float mix, env;
+} gGl;
+
+static float Glitch(float x, float rate, float wDrop, float wStut, float wRobot)
+{
+    GlState& g = gGl;
+    g.buf[g.w] = x;
+    if (g.mode == GL_NONE && g.mix < 0.001f) {
+        float total = wDrop + wStut + wRobot;
+        if (total > 0 && FxRand() < rate / RATE) {
+            float pick = FxRand() * total;
+            g.mode = pick < wDrop ? GL_DROP : pick < wDrop + wStut ? GL_STUTTER : GL_ROBOT;
+            g.pos = 0;
+            if (g.mode == GL_DROP)    { g.left = (int)(RATE * (0.04f + 0.2f * FxRand())); g.choppy = FxRand() < 0.5f; }
+            if (g.mode == GL_STUTTER) { g.len = (int)(RATE * (0.03f + 0.06f * FxRand())); g.left = g.len * (2 + (int)(FxRand() * 4)); }
+            if (g.mode == GL_ROBOT)   { g.len = (int)(RATE * (0.006f + 0.008f * FxRand())); g.left = (int)(RATE * (0.12f + 0.23f * FxRand())); }
+            g.start = (g.w - g.len + GL_SIZE) & (GL_SIZE - 1);
+        }
+    }
+    float ev = 0;
+    if (g.mode != GL_NONE) {
+        if (g.mode == GL_DROP) {
+            ev = g.choppy && ((g.pos / (RATE / 50)) & 1) ? x : 0.0f;       // packet loss: 20 ms on, 20 ms off
+            g.pos++;
+        } else {
+            int p = g.pos;
+            ev = g.buf[(g.start + p) & (GL_SIZE - 1)];
+            int edge = Imin(48, g.len / 4);     // soften each repeat's seam
+            if (p < edge) ev *= (float)p / edge; else if (g.len - p < edge) ev *= (float)(g.len - p) / edge;
+            if (g.mode == GL_ROBOT) ev = floorf(ev * 64.0f + 0.5f) / 64.0f;   // a little crunchy
+            if (++g.pos >= g.len) g.pos = 0;
+        }
+        if (--g.left <= 0) g.mode = GL_NONE;
+    }
+    g.mix += ((g.mode != GL_NONE ? 1.0f : 0.0f) - g.mix) * 0.02f;     // ~1 ms fades in and out
+    g.w = (g.w + 1) & (GL_SIZE - 1);
+    return x + (ev - x) * g.mix;
+}
+
+static void FxMoreReset()
+{
+    FftSetup();
+    memset(&gFm, 0, sizeof(gFm));
+    memset(&gEcho, 0, sizeof(gEcho));
+    memset(&gRvs, 0, sizeof(gRvs)); gRvs.ph[1] = 0.5;
+    memset(&gDist, 0, sizeof(gDist)); gDist.style = -1; gDist.ag.g = 1;
+    memset(&gCho, 0, sizeof(gCho));
+    memset(&gWob, 0, sizeof(gWob));
+    memset(&gMuf, 0, sizeof(gMuf)); gMuf.style = -1; gMuf.ag.g = 1;
+    memset(&gGl, 0, sizeof(gGl));
+}
+
 static void FxReset()                          // audio thread only
 {
+    FxMoreReset();
     PsReset(gPsFx); PsReset(gPsTune); VocReset(); RadioReset();
     memset(combBuf, 0, sizeof(combBuf)); memset(combStore, 0, sizeof(combStore));
     memset(apBuf, 0, sizeof(apBuf)); memset(preBuf, 0, sizeof(preBuf)); preW = 0;
@@ -1162,6 +1596,24 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (fxVoc) VocBlock();
     const bool   fxRadio = gFxOn && gFxRadioOn;
     if (fxRadio) RadioBlock();
+    // the newer effects (Voice FX sub-tabs)
+    const bool   fxForm = gFxOn && gFxFormantOn, fxEcho = gFxOn && gFxEchoOn, fxRvs = gFxOn && gFxRvsOn,
+                 fxDist = gFxOn && gFxDistOn, fxCho = gFxOn && gFxChorusOn, fxWob = gFxOn && gFxWobbleOn,
+                 fxMuf  = gFxOn && gFxMuffleOn, fxGl = gFxOn && gFxGlitchOn;
+    const float  fmFactor = powf(2.0f, gFormantShift / 12.0f), fmMix = gFormantMix / 100.0f;
+    const EchoStyle& ecSt = ECHO_STYLES[Iclamp(gEchoStyle, 0, ECHO_N - 1)];
+    const double ecD = (double)gEchoMs * RATE / 1000.0;
+    const float  ecFb = gEchoFb / 100.0f, ecMix = gEchoMix / 100.0f, ecLpA = FxOnePole(ecSt.lpHz);
+    const int    rvLen = Imax(RATE / 20, gRvsLenMs * RATE / 1000), rvDelay = Iclamp(gRvsDelayMs * RATE / 1000, 0, RVS_SIZE - 1);
+    const float  rvGhostMix = gRvsMix / 100.0f;
+    const int    dsStyle = Iclamp(gDistStyle, 0, DIST_N - 1);
+    const float  dsDrive = gDistDrive / 100.0f, dsCrush = gDistCrush / 100.0f, dsMix = gDistMix / 100.0f;
+    const ChoStyle& chSt = CHO_STYLES[Iclamp(gChoStyle, 0, CHO_N - 1)];
+    const float  chHz = 0.05f * powf(100.0f, gChoSpeed / 100.0f), chDepth = gChoDepth / 100.0f, chMix = gChoMix / 100.0f;
+    const float  wbHz = (float)Iclamp(gWobSpeed, 1, 20), wbTrem = gWobTrem / 100.0f, wbVib = gWobVib / 100.0f;
+    const int    mfStyle = Iclamp(gMufStyle, 0, MUF_N - 1), mfAmount = Iclamp(gMufAmount, 0, 100);
+    const float  mfWarble = gMufWarble / 100.0f, mfBubbles = gMufBubbles / 100.0f;
+    const float  glRate = gGlAmount / 100.0f * 3.0f, glDrop = gGlDrop / 100.0f, glStut = gGlStutter / 100.0f, glRobot = gGlRobot / 100.0f;
     const double psRatio = pow(2.0, (gFxSemi + gFxCents / 100.0) / 12.0);
     const int    psGrain = Iclamp(gFxGrainMs * RATE / 1000, 64, PS_SIZE - PS_SEARCH - PS_CORR - 8);
     const float  psMix   = gFxPitchMix / 100.0f;
@@ -1222,9 +1674,17 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         }
 
         if (fxPitch) s = PitchShift(gPsFx, s, psRatio, psGrain, psMix);
+        if (fxForm)  s = Formant(s, fmFactor, fmMix);
         if (fxVoc)   s = Vocoder(s);
+        if (fxDist)  s = Distort(s, dsStyle, dsDrive, dsCrush, dsMix);
+        if (fxCho)   s = Chorus(s, chSt, chHz, chDepth, chMix);
+        if (fxWob)   s = Wobble(s, wbHz, wbTrem, wbVib);
+        if (fxMuf)   s = Muffle(s, mfStyle, mfAmount, mfWarble, mfBubbles);
+        if (fxEcho)  s = Echo(s, ecD, ecFb, ecMix, ecLpA, ecSt.wow, ecSt.sat);
+        if (fxRvs)   s = Reverse(s, rvLen, rvGhostMix, rvDelay);
         if (fxRev)   s = Reverb(s, rvSize, rvDamp, rvMix, rvPre);
-        if (fxRadio) s = Radio(s);                  // last: you're heard *through* the device
+        if (fxRadio) s = Radio(s);                  // you're heard *through* the device...
+        if (fxGl)    s = Glitch(s, glRate, glDrop, glStut, glRobot);   // ...over a bad connection
 
         float effect = 0.0f, everything;
         if (looping) {
@@ -1309,8 +1769,10 @@ enum {
     IDC_MUTEBTN, IDC_MUTEKEY, IDC_OSD, IDC_TOPMOST, IDC_STARTWIN,
     IDC_PADMASTER, IDC_PADSTOP, IDC_PADHINT,
     IDC_CLIPNOW, IDC_CLIPNOWKEY, IDC_RECSECS, IDC_RECSRC, IDC_CLIPMASTER, IDC_CLIPFOLDER, IDC_CLIPSTOP, IDC_RECSTATUS, IDC_RADIOPRESET, IDC_RADIODESC,
+    IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3,   // Voice FX sub-tabs: must stay consecutive
+    IDC_FXCHAR, IDC_ECHOSTYLE, IDC_DISTSTYLE, IDC_CHOSTYLE, IDC_MUFSTYLE, IDC_FXORDER,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
-    IDC_FXGRP_ON = 460, IDC_FXGRP_RESET = 470, IDC_FXGRP_KEY = 490,   // + group index
+    IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
     IDC_PADPLAY = 700, IDC_PADVOL = 710, IDC_PADKEY = 720, IDC_PADLOAD = 730, IDC_PADCLR = 740,   // + pad index
     IDC_CLIPPLAY = 750, IDC_CLIPVOL = 760, IDC_CLIPKEY = 770, IDC_CLIPTRIM = 780, IDC_CLIPCLR = 790, // + clip index
@@ -1505,15 +1967,33 @@ static Range gRanges[] = {
     { IDC_TALKVOL, 0,  200,  &gTalkVolPct, L"talkover_volume" },
 };
 
+static const wchar_t* CHARACTERS[] = { L"Pick a voice...", L"Demon", L"Giant", L"Deeper voice", L"Higher voice", L"Child",
+                                       L"Chipmunk", L"Alien", L"Ghost", L"Underwater", L"Bad connection", L"Clear all effects" };
+#define CHAR_N ((int)(sizeof(CHARACTERS) / sizeof(CHARACTERS[0])))
+
 // Voice FX page: one group (section) per effect, each with an on/off box and a row of knobs.
-struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bool def; const wchar_t* hotkeyKey; };
+// The page has four sub-tabs (sub) of three effects each (slot = row on the sub-tab).
+// New effects start off (def = false), so updating never changes how you sound.
+struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bool def; const wchar_t* hotkeyKey; int sub, slot; };
+#define FX_SUBS 4
+static int gFxSub = 0;                          // which Voice FX sub-tab is showing
+static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Space", L"Texture", L"Fun" };
 static FxGroup gFxGroups[] = {
-    { L"Pitch",  &gFxPitchOn, L"fx_pitch_on",  true, L"fx_pitch_hotkey"  },
-    { L"Reverb", &gFxRevOn,   L"fx_reverb_on", true, L"fx_reverb_hotkey" },
-    { L"Vocoder", &gFxVocOn,  L"fx_vocoder_on", true, L"fx_vocoder_hotkey" },
-    { L"Radio",   &gFxRadioOn, L"fx_radio_on",  true, L"fx_radio_hotkey" },
+    { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
+    { L"Reverb",     &gFxRevOn,     L"fx_reverb_on",   true,  L"fx_reverb_hotkey",  1, 0 },
+    { L"Vocoder",    &gFxVocOn,     L"fx_vocoder_on",  true,  L"fx_vocoder_hotkey", 0, 2 },
+    { L"Radio",      &gFxRadioOn,   L"fx_radio_on",    true,  L"fx_radio_hotkey",   3, 0 },
+    { L"Formant",    &gFxFormantOn, L"fx_formant_on",  false, L"fx_formant_hotkey", 0, 1 },
+    { L"Echo",       &gFxEchoOn,    L"fx_echo_on",     false, L"fx_echo_hotkey",    1, 1 },
+    { L"Ghost",      &gFxRvsOn,     L"fx_ghost_on",    false, L"fx_ghost_hotkey",   1, 2 },
+    { L"Distortion", &gFxDistOn,    L"fx_dist_on",     false, L"fx_dist_hotkey",    2, 0 },
+    { L"Chorus",     &gFxChorusOn,  L"fx_chorus_on",   false, L"fx_chorus_hotkey",  2, 1 },
+    { L"Wobble",     &gFxWobbleOn,  L"fx_wobble_on",   false, L"fx_wobble_hotkey",  2, 2 },
+    { L"Muffle",     &gFxMuffleOn,  L"fx_muffle_on",   false, L"fx_muffle_hotkey",  3, 1 },
+    { L"Glitch",     &gFxGlitchOn,  L"fx_glitch_on",   false, L"fx_glitch_hotkey",  3, 2 },
 };
 #define FX_GROUPS ((int)(sizeof(gFxGroups) / sizeof(gFxGroups[0])))
+static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
 
 // Optional hotkeys that switch Voice FX on/off: slot 0 = the whole page, slot 1+g = effect group g.
 // Each is a combination of up to MAX_KEYS keys (0 = unused). Polled by the window (TIMER_FXKEYS).
@@ -1527,7 +2007,8 @@ static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 
 // Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
-enum { KG_PITCH = 0, KG_REVERB = 1, KG_VOCODER = 2, KG_RADIO = 3, KG_NS = 4, KG_GATE = 5, KG_TONE = 6 };
+enum { KG_PITCH = 0, KG_REVERB, KG_VOCODER, KG_RADIO, KG_FORMANT, KG_ECHO, KG_GHOST, KG_DIST, KG_CHORUS, KG_WOBBLE,
+       KG_MUFFLE, KG_GLITCH, KG_NS, KG_GATE, KG_TONE };
 struct Knob { const wchar_t* label; const wchar_t* unit; int lo, hi, def; volatile int* var; const wchar_t* key; int group; bool bipolar;
               const wchar_t* offText; };          // shown (and the knob dimmed) when the value is at its minimum
 static Knob gKnobs[] = {
@@ -1545,6 +2026,30 @@ static Knob gKnobs[] = {
     { L"Drive",     L"%",   0,   100, 50,  &gRadioDrive,    L"radio_drive",       KG_RADIO, false, nullptr },
     { L"Static",    L"%",   0,   100, 50,  &gRadioStatic,   L"radio_static",      KG_RADIO, false, L"Off" },
     { L"Squelch",   L"%",   0,   100, 70,  &gRadioSquelch,  L"radio_squelch",     KG_RADIO, false, L"Off" },
+    { L"Formant",   L"",    -12, 12,  0,   &gFormantShift,  L"fx_formant_shift",  KG_FORMANT, true, nullptr },
+    { L"Mix",       L"%",   0,   100, 100, &gFormantMix,    L"fx_formant_mix",    KG_FORMANT, false, nullptr },
+    { L"Time",      L" ms", 20,  1500, 350, &gEchoMs,       L"fx_echo_ms",        KG_ECHO, false, nullptr },
+    { L"Feedback",  L"%",   0,   90,  35,  &gEchoFb,        L"fx_echo_feedback",  KG_ECHO, false, L"Off" },
+    { L"Mix",       L"%",   0,   100, 35,  &gEchoMix,       L"fx_echo_mix",       KG_ECHO, false, nullptr },
+    { L"Length",    L" ms", 100, 1000, 400, &gRvsLenMs,     L"fx_ghost_length",   KG_GHOST, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 60,  &gRvsMix,        L"fx_ghost_mix",      KG_GHOST, false, nullptr },
+    { L"Voice delay", L" ms", 0, 600, 0,   &gRvsDelayMs,    L"fx_ghost_delay",    KG_GHOST, false, L"Off" },
+    { L"Drive",     L"%",   0,   100, 50,  &gDistDrive,     L"fx_dist_drive",     KG_DIST, false, nullptr },
+    { L"Crush",     L"%",   0,   100, 0,   &gDistCrush,     L"fx_dist_crush",     KG_DIST, false, L"Off" },
+    { L"Mix",       L"%",   0,   100, 100, &gDistMix,       L"fx_dist_mix",       KG_DIST, false, nullptr },
+    { L"Speed",     L"%",   0,   100, 35,  &gChoSpeed,      L"fx_chorus_speed",   KG_CHORUS, false, nullptr },
+    { L"Depth",     L"%",   0,   100, 50,  &gChoDepth,      L"fx_chorus_depth",   KG_CHORUS, false, nullptr },
+    { L"Mix",       L"%",   0,   100, 50,  &gChoMix,        L"fx_chorus_mix",     KG_CHORUS, false, nullptr },
+    { L"Speed",     L" Hz", 1,   20,  6,   &gWobSpeed,      L"fx_wobble_speed",   KG_WOBBLE, false, nullptr },
+    { L"Tremolo",   L"%",   0,   100, 50,  &gWobTrem,       L"fx_wobble_tremolo", KG_WOBBLE, false, L"Off" },
+    { L"Vibrato",   L"%",   0,   100, 0,   &gWobVib,        L"fx_wobble_vibrato", KG_WOBBLE, false, L"Off" },
+    { L"Muffle",    L"%",   0,   100, 70,  &gMufAmount,     L"fx_muffle_amount",  KG_MUFFLE, false, nullptr },
+    { L"Warble",    L"%",   0,   100, 45,  &gMufWarble,     L"fx_muffle_warble",  KG_MUFFLE, false, L"Off" },
+    { L"Bubbles",   L"%",   0,   100, 40,  &gMufBubbles,    L"fx_muffle_bubbles", KG_MUFFLE, false, L"Off" },
+    { L"Amount",    L"%",   0,   100, 30,  &gGlAmount,      L"fx_glitch_amount",  KG_GLITCH, false, L"Off" },
+    { L"Dropouts",  L"%",   0,   100, 50,  &gGlDrop,        L"fx_glitch_drop",    KG_GLITCH, false, L"Off" },
+    { L"Stutter",   L"%",   0,   100, 50,  &gGlStutter,     L"fx_glitch_stutter", KG_GLITCH, false, L"Off" },
+    { L"Robot",     L"%",   0,   100, 50,  &gGlRobot,       L"fx_glitch_robot",   KG_GLITCH, false, L"Off" },
     { L"Strength",  L"%",   0,   100, 100, &gNsStrength,    L"ns_strength",       KG_NS,   false, nullptr },
     { L"Threshold", L" dB", -90, -10, -50, &gGateThrDb,     L"gate_threshold_db", KG_GATE, false, nullptr },
     { L"Voice",     L"%",   10,  99,  60,  &gGateVoicePct,  L"gate_voice_pct",    KG_GATE, false, nullptr },
@@ -1997,6 +2502,11 @@ static void LoadSettings()
         wsprintfW(key, L"pad%d_volume", i + 1); gPads[i].vol = Iclamp(INI_INT(key, 100), 0, 200);
     }
     gRecSeconds = Iclamp(INI_INT(L"rec_seconds", 15), 3, REC_MAX_S);
+    gEchoStyle = Iclamp(INI_INT(L"fx_echo_style", 0), 0, ECHO_N - 1);
+    gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
+    gChoStyle  = Iclamp(INI_INT(L"fx_chorus_style", 0), 0, CHO_N - 1);
+    gMufStyle  = Iclamp(INI_INT(L"fx_muffle_style", 0), 0, MUF_N - 1);
+    gFxSub     = Iclamp(INI_INT(L"fx_subtab", 0), 0, FX_SUBS - 1);
     gRecSource  = Iclamp(INI_INT(L"rec_source", REC_BOTH), 0, REC_N - 1);
     gClipMaster = Iclamp(INI_INT(L"clip_master", 100), 0, 200);
     for (int i = 0; i < CLIPS; i++) {
@@ -2083,6 +2593,11 @@ static void SaveSettings()
         wsprintfW(key, L"pad%d_volume", i + 1); SaveInt(key, gPads[i].vol);
     }
     SaveInt(L"rec_seconds", gRecSeconds);
+    SaveInt(L"fx_echo_style", gEchoStyle);
+    SaveInt(L"fx_dist_style", gDistStyle);
+    SaveInt(L"fx_chorus_style", gChoStyle);
+    SaveInt(L"fx_muffle_style", gMufStyle);
+    SaveInt(L"fx_subtab", gFxSub);
     SaveInt(L"rec_source", gRecSource);
     SaveInt(L"clip_master", gClipMaster);
     for (int i = 0; i < CLIPS; i++) {
@@ -2284,22 +2799,23 @@ static void StopAudio()
 enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5 };
 
 struct Shifted { HWND h; int x, y; };
-struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; };
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; };
 struct Framed  { HWND edit, ud; };
-struct Paged   { HWND h; int page; };
+struct Paged   { HWND h; int page; int sub; };   // sub: Voice FX sub-tab (-1 = every sub-tab)
 static Shifted gShift[96];   static int gShiftN = 0;
-#define MAX_SECTIONS 32
+#define MAX_SECTIONS 48
 #define MAX_FRAMED   48
-#define MAX_PAGED    400
+#define MAX_PAGED    800
 static Section gSections[MAX_SECTIONS]; static int gSectionN = 0;
 static Framed  gFramed[MAX_FRAMED];     static int gFramedN = 0;
 static Paged   gPaged[MAX_PAGED];       static int gPagedN = 0;
 static bool    gRecordShift = false;
 static int     gDevSectionIdx = 0;
 static int     gBuildPage = -1;                // page new controls go on (-1 = always shown, e.g. the tabs)
+static int     gBuildSub = -1;                 // Voice FX sub-tab new controls go on (-1 = all)
 static int     gPage = 0;                      // page being shown
 
-static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage }; }
+static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage, gBuildSub }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 
@@ -2334,7 +2850,7 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage };
+    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub };
 }
 
 // ======================= knob control (Voice FX page) =======================
@@ -2381,6 +2897,7 @@ static void SetKnobValue(HWND h, int i, int v)
 static void RedrawKnobs()
 {
     for (int i = 0; i < KNOB_N; i++) InvalidateRect(GetDlgItem(gWnd, IDC_KNOB + i), nullptr, FALSE);
+    for (int i = 0; i < 4; i++) InvalidateRect(GetDlgItem(gWnd, IDC_FXSUB0 + i), nullptr, FALSE);   // their "on" counts
 }
 
 static void KnobPoint(int cx, int cy, int r, double deg, int* x, int* y)
@@ -3883,6 +4400,32 @@ static const TipText gKnobTips[] = {
     { L"voc_synth",          L"Tune + harmony: how loud the harmony voices are. Robot and Choir: how much of your voice is replaced by the synth. "
                              L"Song: how much of your voice is replaced by the music." },
     { L"voc_mix",            L"How much of the vocoder you hear. 100% = only the effect; lower blends your original voice back in." },
+    { L"fx_formant_shift",   L"Throat size without changing pitch. Below 0 = bigger and deeper; above 0 = smaller and younger. "
+                             L"Adds ~21 ms of delay while on." },
+    { L"fx_formant_mix",     L"How much of the changed voice you hear. 100% = only the changed voice." },
+    { L"fx_echo_ms",         L"Time between repeats. 80-120 ms = slapback; 300-500 ms = a clear echo." },
+    { L"fx_echo_feedback",   L"How many repeats. Off = just one; higher = more, fading slowly." },
+    { L"fx_echo_mix",        L"How loud the echoes are compared with your voice." },
+    { L"fx_ghost_length",    L"Length of each backwards swell. Longer = slower, eerier." },
+    { L"fx_ghost_mix",       L"How loud the ghostly swells are." },
+    { L"fx_ghost_delay",     L"Delays your voice so the swells come before your words, like a real reverse reverb. "
+                             L"People hear you this much later." },
+    { L"fx_dist_drive",      L"How hard your voice is pushed into distortion. Lower = a little grit; higher = heavily broken up." },
+    { L"fx_dist_crush",      L"Bitcrusher: fewer bits and a lower sample rate, for a crunchy 8-bit sound. Off = none." },
+    { L"fx_dist_mix",        L"How much of the distorted voice you hear. Lower blends your clean voice back in." },
+    { L"fx_chorus_speed",    L"How fast the sound sweeps. Low = slow shimmer; high = fast warble." },
+    { L"fx_chorus_depth",    L"How far it sweeps. Higher = a stronger effect." },
+    { L"fx_chorus_mix",      L"How much of the effect you hear. 50% = the classic sound." },
+    { L"fx_wobble_speed",    L"How fast the wobble is, in wobbles per second." },
+    { L"fx_wobble_tremolo",  L"Volume wobble: a shaky, nervous or old-amp sound." },
+    { L"fx_wobble_vibrato",  L"Pitch wobble: a warbly, old-timey or singing-vibrato sound." },
+    { L"fx_muffle_amount",   L"How muffled you sound. Higher = less treble, further away." },
+    { L"fx_muffle_warble",   L"A slow, uneven wobble, like sound moving through water." },
+    { L"fx_muffle_bubbles",  L"Little bubble blips. Best with the Underwater style." },
+    { L"fx_glitch_amount",   L"How often the connection glitches. 100% = about three times a second." },
+    { L"fx_glitch_drop",     L"How often a glitch is a dropout: you cut out, or go choppy like packet loss." },
+    { L"fx_glitch_stutter",  L"How often a glitch repeats a bit of what you said, \"st-st-stutter\" style." },
+    { L"fx_glitch_robot",    L"How often a glitch freezes into a buzzy robot sound, like a call breaking up." },
     { L"radio_drive",        L"How hard the device distorts. 50% = how the preset is designed; higher = more broken-up and crunchy." },
     { L"radio_static",       L"Background noise while you talk: radio hiss, crackle, hum. 50% = the preset's normal amount." },
     { L"radio_squelch",      L"Volume of the sounds when you start and stop talking: the walkie-talkie \"kssht\", "
@@ -4038,11 +4581,24 @@ static void AddTips()
                         L"(ignores loud non-voice noise). Volume + voice: both.");
 
     // Voice FX
-    TipId(IDC_FXON,         L"Turn all voice effects on or off. Order: Pitch, Vocoder, Reverb, then Radio last, "
-                            L"so you're heard through the device.\n"
+    TipId(IDC_FXON,         L"Turn all voice effects on or off. They run in the order shown at the bottom of the page.\n"
                             L"Knobs: drag up/down or scroll (Shift = fine), double-click to reset. Hotkeys work from anywhere; "
                             L"right-click one (or press Backspace while setting it) to clear it.");
     TipId(IDC_FXKEY_MASTER, L"Set a hotkey that turns all voice effects on/off from anywhere. Right-click to clear it.");
+    TipId(IDC_FXSUB0, L"Voice: Pitch, Formant (throat size) and the Vocoder (auto-tune, harmonies, robot).");
+    TipId(IDC_FXSUB1, L"Space: Reverb (a room), Echo (repeats) and Ghost (backwards reverb swells).");
+    TipId(IDC_FXSUB2, L"Texture: Distortion and bitcrusher, Chorus and flanger, Wobble (tremolo and vibrato).");
+    TipId(IDC_FXSUB3, L"Fun: Radio, phone and megaphone, Muffle (underwater, through a wall) and Glitch (bad connection).");
+    TipId(IDC_FXCHAR, L"One-click voices built from the effects: Demon, Giant, Child, Alien, Ghost and more. Picking one turns off "
+                      L"your other effects and sets the knobs; tweak them afterwards if you like.");
+    TipId(IDC_ECHOSTYLE, L"Echo: clean repeats. Slapback: one quick repeat, the classic radio-DJ / rockabilly sound. "
+                         L"Tape echo: dark, wobbly repeats. Canyon: long and far away.");
+    TipId(IDC_DISTSTYLE, L"Overdrive: warm and rounded. Fuzz: harsh and buzzy. Bitcrush: 8-bit game voice. "
+                         L"Broken mic: thin, clipped, and it cuts out now and then.");
+    TipId(IDC_CHOSTYLE,  L"Chorus: thick and shimmery, like several of you. Flanger: a sweeping swoosh. "
+                         L"Jet flanger: a stronger, slower sweep. Doubler: sounds like two takes at once.");
+    TipId(IDC_MUFSTYLE,  L"Underwater: muffled, wobbly, with bubbles. Through a wall: heavy and boomy, like the next room. "
+                         L"Under a blanket: softly muffled.");
     for (int g = 0; g < FX_GROUPS; g++) {
         static wchar_t on[FX_GROUPS][96], key[FX_GROUPS][128], rst[FX_GROUPS][96];
         wsprintfW(on[g],  L"Turn %s on or off.", gFxGroups[g].title);
@@ -4079,6 +4635,31 @@ static void AddTips()
             }
 
     EnumChildWindows(gWnd, TipLabel, 0);
+}
+
+// Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
+static void DrawFxSub(DRAWITEMSTRUCT* d)
+{
+    int t = (int)d->CtlID - IDC_FXSUB0;
+    HDC dc = d->hDC;
+    RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    bool active = t == gFxSub;
+    int on = 0;
+    for (int g = 0; g < FX_GROUPS; g++) if (gFxGroups[g].sub == t && *gFxGroups[g].on && gFxOn) on++;
+    HBRUSH b = CreateSolidBrush(active ? ACCENT : gDark ? DK_CTL : LT_CARD);
+    HPEN   p = CreatePen(PS_SOLID, 1, active ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
+    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
+    wchar_t text[32];
+    if (on) wsprintfW(text, L"%s \x2022 %d", FX_SUB_NAMES[t], on); else lstrcpynW(text, FX_SUB_NAMES[t], 32);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, active ? RGB(255, 255, 255) : gDark ? DK_TEXT : RGB(40, 40, 40));
+    HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
+    DrawTextW(dc, text, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, of);
+    if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) { RECT fr = rc; InflateRect(&fr, -3, -3); DrawFocusRect(dc, &fr); }
 }
 
 // Master switch at the top of the Voice FX page: a card with an on/off pill.
@@ -4371,10 +4952,103 @@ static void SetGateMode(int m)
     RedrawKnobs();
 }
 
+static void SetKnobVar(volatile int* var, int v)   // set a knob by the setting it controls
+{
+    for (int i = 0; i < KNOB_N; i++)
+        if (gKnobs[i].var == var) { SetKnobValue(GetDlgItem(gWnd, IDC_KNOB + i), i, v); return; }
+}
+
+static void ApplyStyleKnobs(int g)              // a style's suggested knob values
+{
+    if (g == KG_ECHO)   { const EchoStyle& s = ECHO_STYLES[Iclamp(gEchoStyle, 0, ECHO_N - 1)]; SetKnobVar(&gEchoMs, s.ms); SetKnobVar(&gEchoFb, s.fb); SetKnobVar(&gEchoMix, s.mix); }
+    if (g == KG_DIST)   { const DistStyle& s = DIST_STYLES[Iclamp(gDistStyle, 0, DIST_N - 1)]; SetKnobVar(&gDistDrive, s.drive); SetKnobVar(&gDistCrush, s.crush); SetKnobVar(&gDistMix, s.mix); }
+    if (g == KG_CHORUS) { const ChoStyle& s = CHO_STYLES[Iclamp(gChoStyle, 0, CHO_N - 1)]; SetKnobVar(&gChoSpeed, s.speed); SetKnobVar(&gChoDepth, s.depth); SetKnobVar(&gChoMix, s.mix); }
+    if (g == KG_MUFFLE) { const MufStyle& s = MUF_STYLES[Iclamp(gMufStyle, 0, MUF_N - 1)]; SetKnobVar(&gMufAmount, s.amount); SetKnobVar(&gMufWarble, s.warble); SetKnobVar(&gMufBubbles, s.bubbles); }
+}
+
+static void SetFxStyle(int g, int style)        // style dropdown changed (or set by a character)
+{
+    int id = g == KG_ECHO ? IDC_ECHOSTYLE : g == KG_DIST ? IDC_DISTSTYLE : g == KG_CHORUS ? IDC_CHOSTYLE : IDC_MUFSTYLE;
+    volatile int* var = g == KG_ECHO ? &gEchoStyle : g == KG_DIST ? &gDistStyle : g == KG_CHORUS ? &gChoStyle : &gMufStyle;
+    *var = style;
+    SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, style, 0);
+    ApplyStyleKnobs(g);
+    RedrawKnobs();
+}
+
 static void ResetFxGroup(int g)
 {
     for (int i = 0; i < KNOB_N; i++)
         if (gKnobs[i].group == g) SetKnobValue(GetDlgItem(gWnd, IDC_KNOB + i), i, gKnobs[i].def);
+    ApplyStyleKnobs(g);                         // effects with a style go back to that style's values
+}
+
+static void SetFxSub(int t)                     // show another Voice FX sub-tab
+{
+    t = Iclamp(t, 0, FX_SUBS - 1);
+    if (t == gFxSub) return;
+    gFxSub = t;
+    Layout();
+    for (int i = 0; i < FX_SUBS; i++) InvalidateRect(GetDlgItem(gWnd, IDC_FXSUB0 + i), nullptr, FALSE);
+}
+
+static void ShowOsd(const wchar_t* text, bool on);
+// One-click voices, built from the effects. Each turns off every other effect first.
+static void ApplyCharacter(int c)
+{
+    if (c <= 0 || c >= CHAR_N) return;
+    for (int g = 0; g < FX_GROUPS; g++) SetFxGroupOn(g, false);
+    if (c == CHAR_N - 1) { ShowOsd(L"All voice effects cleared", false); return; }   // "Clear all effects"
+    auto use = [](int g) { ResetFxGroup(g); SetFxGroupOn(g, true); };
+    switch (c) {
+    case 1:  // Demon
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -8);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -2);
+        use(KG_DIST);    SetFxStyle(KG_DIST, 0); SetKnobVar(&gDistDrive, 35); SetKnobVar(&gDistMix, 45);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 25); SetKnobVar(&gFxRevSize, 75);
+        break;
+    case 2:  // Giant
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -6);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -2);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 22); SetKnobVar(&gFxRevSize, 85); SetKnobVar(&gFxRevDamp, 60);
+        break;
+    case 3:  // Deeper voice
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, -4);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, 2);
+        break;
+    case 4:  // Higher voice
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, 5);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -2);
+        break;
+    case 5:  // Child
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, 7);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -2);
+        break;
+    case 6:  // Chipmunk
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, 10);
+        break;
+    case 7:  // Alien
+        use(KG_PITCH);   SetKnobVar(&gFxSemi, 2);
+        use(KG_FORMANT); SetKnobVar(&gFormantShift, -5);
+        use(KG_CHORUS);  SetFxStyle(KG_CHORUS, 1); SetKnobVar(&gChoSpeed, 55); SetKnobVar(&gChoDepth, 70);
+        use(KG_WOBBLE);  SetKnobVar(&gWobSpeed, 7); SetKnobVar(&gWobTrem, 0); SetKnobVar(&gWobVib, 25);
+        break;
+    case 8:  // Ghost
+        use(KG_GHOST);   SetKnobVar(&gRvsLenMs, 500); SetKnobVar(&gRvsMix, 70);
+        use(KG_REVERB);  SetKnobVar(&gFxRevMix, 35); SetKnobVar(&gFxRevSize, 90); SetKnobVar(&gFxRevDamp, 40);
+        use(KG_WOBBLE);  SetKnobVar(&gWobSpeed, 4); SetKnobVar(&gWobTrem, 25); SetKnobVar(&gWobVib, 10);
+        break;
+    case 9:  // Underwater
+        use(KG_MUFFLE);  SetFxStyle(KG_MUFFLE, 0);
+        break;
+    case 10: // Bad connection
+        use(KG_GLITCH);  SetKnobVar(&gGlAmount, 45);
+        break;
+    }
+    SetFxOn(true);
+    wchar_t msg[64]; wsprintfW(msg, L"Character: %s", CHARACTERS[c]);
+    ShowOsd(msg, true);
+    UpdateStatus(true);
 }
 
 // ======================= device lists =======================
@@ -4478,7 +5152,8 @@ static void Layout()
     for (int i = 0; i < gPagedN; i++) {
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
-        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)));
+        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)))
+                && (gPaged[i].sub < 0 || gPaged[i].sub == gFxSub);
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
@@ -4900,8 +5575,8 @@ static void ShowHelp()
         L"Speed = how fast the loop plays through.  Pitch = how high or low it sounds.\n"
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
         L"PAGES\n"
-        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX adds pitch, reverb, "
-        L"the vocoder (auto-tune + harmonies) and radio effects to your live voice. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX has 12 effects for your live voice "
+        L"on four sub-tabs, plus one-click Characters. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -4918,7 +5593,11 @@ static void ShowHelp()
         L"Vocode to song: click it and the music playing on your PC (one app, all PC sound, or an audio file) says your words. "
         L"Retune 0 ms gives the hard auto-tune sound. Deep voice? Set Voice to Low / deep (Auto usually picks it for you).\n"
         L"Radio: sound like a walkie-talkie, phone call, megaphone, old radio, space radio, drive-thru, 8-bit or the next room. "
-        L"Drive = distortion, Static = background noise, Squelch = start/stop sounds.\n\n"
+        L"Drive = distortion, Static = background noise, Squelch = start/stop sounds.\n"
+        L"Formant: throat size without changing pitch (with Pitch, a different person instead of sped up). "
+        L"Echo, Ghost (backwards reverb swells), Distortion (overdrive, fuzz, 8-bit), Chorus / flanger, Wobble (tremolo, vibrato), "
+        L"Muffle (underwater, through a wall) and Glitch (a bad connection). Effects run in the order shown at the bottom.\n"
+        L"Character: pick Demon, Giant, Child, Alien, Ghost and more to set everything up in one click.\n\n"
         L"HOTKEY\n"
         L"Click the hotkey button, hold one key or up to 3 together (like Shift + F or Ctrl + Shift + 1), "
         L"then let go. Esc cancels. Mouse side buttons work too.\n\n"
@@ -5312,9 +5991,22 @@ static void CreateUI()
         wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 59, 114, 30, IDC_FXKEY_MASTER);
     }
-    const int FX_SEC_Y0 = 110, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
+    // sub-tabs (three effects each) and the Characters menu
+    for (int t = 0; t < FX_SUBS; t++)
+        Ctl(L"BUTTON", FX_SUB_NAMES[t], BS_OWNERDRAW | WS_TABSTOP | (t == 0 ? WS_GROUP : 0), 14 + t * 84, 104, 80, 28, IDC_FXSUB0 + t);
+    Ctl(L"STATIC", L"Character:", 0, 360, 109, 66, 18, -1);
+    {
+        HWND ch = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 428, 106, 118, 400, IDC_FXCHAR);
+        for (int c = 0; c < CHAR_N; c++) SendMessageW(ch, CB_ADDSTRING, 0, (LPARAM)CHARACTERS[c]);
+        SendMessageW(ch, CB_SETCURSEL, 0, 0);
+        SendMessageW(ch, CB_SETDROPPEDWIDTH, 160, 0);
+    }
+    Ctl(L"STATIC", L"Order: Pitch > Formant > Vocoder > Distortion > Chorus > Wobble > Muffle > Echo > Ghost > Reverb > Radio > Glitch",
+        0, 16, 506, 528, 34, IDC_FXORDER);
+    const int FX_SEC_Y0 = 144, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
     for (int g = 0; g < FX_GROUPS; g++) {
-        int y = FX_SEC_Y0 + FX_SEC_STEP * g;
+        int y = FX_SEC_Y0 + FX_SEC_STEP * gFxGroups[g].slot;
+        gBuildSub = gFxGroups[g].sub;
         AddSection(14, y, 532, FX_SEC_H, gFxGroups[g].title);
         int kx = 26, kstep = 98, kw = KNOB_W;
         if (g == KG_VOCODER) {                  // dropdowns on the left, narrower knobs after them
@@ -5349,6 +6041,29 @@ static void CreateUI()
             SendMessageW(rp, CB_SETCURSEL, gRadioPreset, 0);
             Ctl(L"STATIC", RADIO_DESC[Iclamp(gRadioPreset, 0, RADIO_N - 1)], 0, 28, y + 56, 152, 48, IDC_RADIODESC);
             kx = 186; kstep = 80; kw = 80;
+        } else if (g == KG_ECHO || g == KG_DIST || g == KG_CHORUS || g == KG_MUFFLE) {   // style dropdown
+            int id = g == KG_ECHO ? IDC_ECHOSTYLE : g == KG_DIST ? IDC_DISTSTYLE : g == KG_CHORUS ? IDC_CHOSTYLE : IDC_MUFSTYLE;
+            Ctl(L"STATIC", L"Style", 0, 28, y + 10, 150, 16, IDC_HDR);
+            HWND sc = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 27, 152, 300, id);
+            int n = 0, cur = 0;
+            const wchar_t* names[8];
+            if (g == KG_ECHO)   { n = ECHO_N; cur = gEchoStyle; for (int i = 0; i < n; i++) names[i] = ECHO_STYLES[i].name; }
+            if (g == KG_DIST)   { n = DIST_N; cur = gDistStyle; for (int i = 0; i < n; i++) names[i] = DIST_STYLES[i].name; }
+            if (g == KG_CHORUS) { n = CHO_N;  cur = gChoStyle;  for (int i = 0; i < n; i++) names[i] = CHO_STYLES[i].name; }
+            if (g == KG_MUFFLE) { n = MUF_N;  cur = gMufStyle;  for (int i = 0; i < n; i++) names[i] = MUF_STYLES[i].name; }
+            for (int i = 0; i < n; i++) SendMessageW(sc, CB_ADDSTRING, 0, (LPARAM)names[i]);
+            SendMessageW(sc, CB_SETCURSEL, Iclamp(cur, 0, n - 1), 0);
+            Ctl(L"STATIC", g == KG_ECHO   ? L"Picking a style sets the knobs to suit it."
+                         : g == KG_DIST   ? L"Crush = fewer bits and a lower sample rate (8-bit)."
+                         : g == KG_CHORUS ? L"Flanger = the swooshing jet sound."
+                         :                  L"Bubbles only make sense underwater.",
+                0, 28, y + 56, 152, 48, IDC_HDR);
+            kx = 186; kstep = 80; kw = 80;
+        } else if (g == KG_FORMANT) {
+            Ctl(L"STATIC", L"Changes how big your throat sounds without changing your pitch. "
+                           L"Below 0 = bigger, deeper, older; above 0 = smaller, younger. "
+                           L"With Pitch, it makes a voice sound like someone else instead of sped up.",
+                0, 226, y + 14, 194, 86, IDC_HDR);
         }
         int col = 0;
         for (int i = 0; i < KNOB_N; i++) {
@@ -5362,6 +6077,7 @@ static void CreateUI()
         Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 38, 104, 26, IDC_FXGRP_KEY + g);
         Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
     }
+    gBuildSub = -1;
 
     // ---------------- Soundboard page ----------------
     gBuildPage = PAGE_SOUND;
@@ -5524,7 +6240,7 @@ static LRESULT CtlColor(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     HDC dc = (HDC)w;
     int  cid    = GetDlgCtrlID((HWND)l);
-    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_RECSTATUS)
+    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
                             : cid == IDT_HINT;  // dim helper text
     bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
     if (!gDark) {
@@ -5586,6 +6302,7 @@ static void PaintWindow(HDC dc)
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
         if (s.page >= 0 && s.page != gPage) continue;
+        if (s.sub >= 0 && s.sub != gFxSub) continue;
         int y = s.y + (s.shifts ? d : 0);
         RoundRect(dc, s.x, y, s.x + s.w, y + s.h, 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
@@ -5777,6 +6494,22 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
         break;
     case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3:
+        if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
+        break;
+    case IDC_FXCHAR:
+        if (code == CBN_SELCHANGE) {
+            int c = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            ApplyCharacter(c);
+            SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, 0, 0);   // back to "Pick a voice...", ready for the next
+        }
+        break;
+    case IDC_ECHOSTYLE: case IDC_DISTSTYLE: case IDC_CHOSTYLE: case IDC_MUFSTYLE:
+        if (code == CBN_SELCHANGE) {
+            int g = id == IDC_ECHOSTYLE ? KG_ECHO : id == IDC_DISTSTYLE ? KG_DIST : id == IDC_CHOSTYLE ? KG_CHORUS : KG_MUFFLE;
+            SetFxStyle(g, (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0));
+        }
+        break;
     case IDC_RADIOPRESET:
         if (code == CBN_SELCHANGE) {
             gRadioPreset = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, RADIO_N - 1);
@@ -5950,6 +6683,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) { DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE; }
         if ((w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) || (w >= IDC_CLIPPLAY && w < IDC_CLIPPLAY + CLIPS)) {
             DrawPadButton((DRAWITEMSTRUCT*)l); return TRUE;
         }
