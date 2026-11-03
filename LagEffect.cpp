@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.27.0"
+#define APP_VERSION L"1.27.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -367,6 +367,19 @@ static bool KeysDown(const volatile int* keys)
 }
 
 static bool ComboDown() { return KeysDown(gHotkeys); }
+// Same, but each key is asked about once per poll however many hotkeys use it (cache: 0 unknown, 1 up, 2 down).
+static bool KeysDownCached(const volatile int* keys, BYTE* cache)
+{
+    bool any = false;
+    for (int i = 0; i < MAX_KEYS; i++) {
+        int vk = keys[i] & 255;
+        if (!vk) continue;
+        any = true;
+        if (!cache[vk]) cache[vk] = (GetAsyncKeyState(vk) & 0x8000) ? 2 : 1;
+        if (cache[vk] != 2) return false;
+    }
+    return any;
+}
 
 // ======================= voice effects (Voice FX page) =======================
 // Run on the live mic right after the noise gate, so they're on everything you send, and the
@@ -1877,13 +1890,16 @@ static int    spMode = SP_NONE, spT = 0, spIdx = 0, spRep = 0, spReps = 0, spLen
 static double spPos = 0, spTravel = 0, spTotal = 0;
 static size_t spStart = 0;
 
+static PShift gPsRewind;                        // Rewind's pitch
+static double spRwRatio = 1.0;                  // (worked out once per rewind, not every sample)
 static void SpStartRewind()
 {
     spMode = SP_REWIND; spT = 0; spTravel = 0;
     spTotal = Iclamp(gRewindMs, 300, 3500) * (double)RATE / 1000.0;   // how far back it goes
+    spRwRatio = pow(2.0, Iclamp(gRewindPitch, -12, 12) / 12.0);
     spPos = (double)((wpos + HIST - 1) % HIST);
 }
-static PShift gPsRewind;                        // Rewind's pitch
+
 
 static void SpStartRepeat()                     // find the last word: the most recent burst of sound
 {
@@ -1945,7 +1961,7 @@ static float SpSample()
         double left = spTotal - spTravel;
         if (left < 1440) env *= (float)(left > 0 ? left / 1440.0 : 0.0);
         v *= env * 0.9f;
-        if (gRewindPitch) v = PitchShift(gPsRewind, v, pow(2.0, gRewindPitch / 12.0), 1200, 1.0f);
+        if (spRwRatio != 1.0) v = PitchShift(gPsRewind, v, spRwRatio, 1200, 1.0f);
         spT++;
         if (spTravel >= spTotal) spMode = SP_NONE;
     } else if (spMode == SP_REPEAT) {
@@ -2121,9 +2137,11 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     float blockPeak = 0;
     float outPk[MAX_OUT] = {};
 
+    bool padsIdle = true;                       // nothing playing / starting / stopping: skip the soundboard mixer this block
+    for (int i = 0; i < SB_N && padsIdle; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) padsIdle = false; }
     for (ma_uint32 f = 0; f < frames; f++) {
-        float sbFx; int padsOn;
-        const float sb = PadsMix(sbFx, padsOn); // soundboard: every output that isn't Off (sbFx: through the effects)
+        float sbFx = 0; int padsOn = 0;
+        const float sb = padsIdle ? 0.0f : PadsMix(sbFx, padsOn);   // soundboard: every output that isn't Off (sbFx: through the effects)
         duckGain += ((gPadDuck && padsOn ? 0.32f : 1.0f) - duckGain) * 0.002f;   // "lower my voice while a pad plays"
         float s = in ? in[f] * boost : 0.0f;
         muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
@@ -2344,6 +2362,7 @@ enum {
 #define WM_TTS_DONE        (WM_APP + 7)          // text-to-speech finished rendering
 #define WM_PIC_DECODED     (WM_APP + 8)          // a picture / GIF finished decoding in the background
 #define WM_VOICE_INSTALLED (WM_APP + 9)          // Windows finished installing a text-to-speech voice
+#define WM_VOICES_LISTED   (WM_APP + 10)         // the voice list (read in the background) is ready
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -3032,8 +3051,11 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
     bool radio = type == BS_AUTORADIOBUTTON || type == BS_RADIOBUTTON;
     if (!radio && type != BS_AUTOCHECKBOX && type != BS_CHECKBOX) return CDRF_DODEFAULT;
 
-    HDC dc = cd->hdc;
+    HDC real = cd->hdc;                         // drawn off-screen, then copied in one go (no flicker over a GIF)
     RECT rc = cd->rc;
+    HDC dc = CreateCompatibleDC(real);
+    HBITMAP bmpBuf = CreateCompatibleBitmap(real, Imax(1, (int)rc.right), Imax(1, (int)rc.bottom));
+    HGDIOBJ oldBuf = SelectObject(dc, bmpBuf);
     if (gBrPicture) {                           // over a picture: show the picture behind it, not a box
         POINT pt = { 0, 0 }; MapWindowPoints(h, gWnd, &pt, 1);
         SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
@@ -3082,7 +3104,61 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
         DrawFocusRect(dc, &fr);
     }
     SelectObject(dc, oldFont);
+    BitBlt(real, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, dc, rc.left, rc.top, SRCCOPY);
+    SelectObject(dc, oldBuf); DeleteObject(bmpBuf); DeleteDC(dc);
     return CDRF_SKIPDEFAULT;
+}
+
+// ---- text labels, painted off-screen ----
+// Windows' own label paints its background, then its text: over a moving picture that flickers. This draws
+// both into a buffer first, using the same colours / brush the window hands every label (WM_CTLCOLORSTATIC).
+static LRESULT CALLBACK BufLabelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    if (m == WM_ERASEBKGND) return 1;
+    if (m == WM_PAINT || m == WM_PRINTCLIENT) {
+        PAINTSTRUCT ps = {};
+        HDC dc = m == WM_PAINT ? BeginPaint(h, &ps) : (HDC)w;
+        RECT rc; GetClientRect(h, &rc);
+        if (rc.right > 0 && rc.bottom > 0) {
+            HDC mem = CreateCompatibleDC(dc);
+            HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+            HGDIOBJ ob = SelectObject(mem, bmp);
+            HBRUSH br = (HBRUSH)SendMessageW(GetParent(h), WM_CTLCOLORSTATIC, (WPARAM)mem, (LPARAM)h);   // colours + lined-up brush
+            FillRect(mem, &rc, br ? br : GetSysColorBrush(COLOR_BTNFACE));
+            wchar_t text[1024]; GetWindowTextW(h, text, 1024);
+            HGDIOBJ of = SelectObject(mem, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+            const LONG st = GetWindowLongW(h, GWL_STYLE), type = st & SS_TYPEMASK;
+            UINT fl = DT_EXPANDTABS;
+            if (type == SS_CENTER) fl |= DT_CENTER; else if (type == SS_RIGHT) fl |= DT_RIGHT;
+            if (st & SS_NOPREFIX) fl |= DT_NOPREFIX;
+            if (st & SS_CENTERIMAGE) fl |= DT_SINGLELINE | DT_VCENTER;
+            if (st & SS_ENDELLIPSIS) fl |= DT_END_ELLIPSIS | DT_SINGLELINE;
+            else if (type != SS_LEFTNOWORDWRAP && type != SS_SIMPLE && !(fl & DT_SINGLELINE)) fl |= DT_WORDBREAK;
+            if (!IsWindowEnabled(h)) SetTextColor(mem, gDark ? RGB(110, 110, 110) : GetSysColor(COLOR_GRAYTEXT));
+            DrawTextW(mem, text, -1, &rc, fl);
+            SelectObject(mem, of);
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
+        }
+        if (m == WM_PAINT) EndPaint(h, &ps);
+        return 0;
+    }
+    if (m == WM_SETTEXT || m == WM_ENABLE || m == WM_SETFONT) {
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        InvalidateRect(h, nullptr, FALSE);
+        return r;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+static BOOL CALLBACK BufLabelAttach(HWND c, LPARAM)
+{
+    if (GetParent(c) != gWnd) return TRUE;
+    wchar_t cls[16]; GetClassNameW(c, cls, 16);
+    if (lstrcmpiW(cls, L"Static")) return TRUE;
+    LONG type = GetWindowLongW(c, GWL_STYLE) & SS_TYPEMASK;
+    if (type == SS_LEFT || type == SS_CENTER || type == SS_RIGHT || type == SS_LEFTNOWORDWRAP || type == SS_SIMPLE)
+        SetWindowSubclass(c, BufLabelProc, 7, 0);
+    return TRUE;
 }
 
 // Dark-mode up/down arrows for the number boxes.
@@ -3398,11 +3474,78 @@ static void SelectedName(int comboId, ma_device_info* list, ma_uint32 count, wch
     if (i >= 0 && i < (int)count) Widen(list[i].name, out, cap); else out[0] = 0;
 }
 
+// ---- writing the settings file in one go ----
+// Each WritePrivateProfileString opens, reads and rewrites the whole file; saving hundreds of settings that way is
+// slow. While a batch is open, changes collect here and the [settings] section is written once at the end.
+#define IB_MAX 4000
+static struct { bool on; int n; wchar_t* key[IB_MAX]; wchar_t* val[IB_MAX]; } gIB;
+static wchar_t* IbDup(const wchar_t* t)
+{
+    if (!t) return nullptr;
+    size_t l = (size_t)lstrlenW(t) + 1;
+    wchar_t* d = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, l * sizeof(wchar_t));
+    if (d) memcpy(d, t, l * sizeof(wchar_t));
+    return d;
+}
+static void IbClear() { for (int i = 0; i < gIB.n; i++) { HeapFree(GetProcessHeap(), 0, gIB.key[i]); if (gIB.val[i]) HeapFree(GetProcessHeap(), 0, gIB.val[i]); } gIB.n = 0; gIB.on = false; }
+static void IniBatchBegin()
+{
+    const DWORD cap = 512 * 1024;
+    wchar_t* buf = (wchar_t*)HeapAlloc(GetProcessHeap(), 0, cap * sizeof(wchar_t));
+    if (!buf) return;
+    DWORD got = GetPrivateProfileSectionW(L"settings", buf, cap, gIni);
+    if (got < cap - 2) {                        // (too big to read whole: don't batch, so nothing can be lost)
+        gIB.n = 0; gIB.on = true;
+        for (wchar_t* q = buf; *q && gIB.n < IB_MAX; q += lstrlenW(q) + 1) {
+            wchar_t* eq = wcschr(q, L'=');
+            if (!eq) continue;
+            *eq = 0;
+            gIB.key[gIB.n] = IbDup(q); gIB.val[gIB.n] = IbDup(eq + 1);
+            if (gIB.key[gIB.n]) gIB.n++;
+            *eq = L'=';
+        }
+        if (gIB.n >= IB_MAX) IbClear();
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+}
+static void IniSet(const wchar_t* k, const wchar_t* v)   // a [settings] value (nullptr removes it)
+{
+    if (!gIB.on) { WritePrivateProfileStringW(L"settings", k, v, gIni); return; }
+    for (int i = 0; i < gIB.n; i++)
+        if (!lstrcmpiW(gIB.key[i], k)) { if (gIB.val[i]) HeapFree(GetProcessHeap(), 0, gIB.val[i]); gIB.val[i] = IbDup(v); return; }
+    if (!v) return;
+    if (gIB.n >= IB_MAX) { WritePrivateProfileStringW(L"settings", k, v, gIni); return; }
+    gIB.key[gIB.n] = IbDup(k); gIB.val[gIB.n] = IbDup(v);
+    if (gIB.key[gIB.n]) gIB.n++;
+}
+static void IniBatchEnd()
+{
+    if (!gIB.on) return;
+    size_t len = 2;
+    for (int i = 0; i < gIB.n; i++) if (gIB.val[i]) len += lstrlenW(gIB.key[i]) + lstrlenW(gIB.val[i]) + 2;
+    wchar_t* buf = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, len * sizeof(wchar_t));
+    if (buf) {
+        size_t o = 0;
+        for (int i = 0; i < gIB.n; i++) {
+            if (!gIB.val[i]) continue;
+            int kl = lstrlenW(gIB.key[i]), vl = lstrlenW(gIB.val[i]);
+            memcpy(buf + o, gIB.key[i], kl * sizeof(wchar_t)); o += kl; buf[o++] = L'=';
+            memcpy(buf + o, gIB.val[i], vl * sizeof(wchar_t)); o += vl; buf[o++] = 0;
+        }
+        buf[o] = 0;
+        WritePrivateProfileSectionW(L"settings", buf, gIni);
+        HeapFree(GetProcessHeap(), 0, buf);
+    } else {                                    // (out of memory: the slow way)
+        for (int i = 0; i < gIB.n; i++) WritePrivateProfileStringW(L"settings", gIB.key[i], gIB.val[i], gIni);
+    }
+    IbClear();
+}
+
 static void LayoutSave(const wchar_t* path);    // (moving things around: defined with the editor)
 static void SaveInt(const wchar_t* k, int v)
 {
     wchar_t b[32]; wsprintfW(b, L"%d", v);
-    WritePrivateProfileStringW(L"settings", k, b, gIni);
+    IniSet(k, b);
 }
 
 // ======================= background picture + pictures on top =======================
@@ -3460,29 +3603,63 @@ static bool GpReady()
     return true;
 }
 
+// Frames are either all kept (cached), or, for GIFs too big for that, streamed: a worker decodes a little
+// ahead into a small ring while the window shows them, so memory stays small however long the GIF is.
+// The background's frames are faded into the theme colour as they're decoded ("baked"), so showing a frame
+// is a plain copy instead of a fade over the whole window every frame.
+#define PIC_CACHE_MAX  (160ll << 20)            // bytes of frames one picture may keep; more = stream it
+#define PIC_RING_BYTES (64ll << 20)             // a streamed picture's ring of frames decoded ahead
+struct PicStream {
+    HANDLE th, wake; volatile LONG stop, head, tail; // head: frames decoded so far, tail: frames shown (ring = head - tail)
+    void* gp; GUID dim; int nAll, nk, rn, w, h; unsigned bake; bool blocky;
+    int* keep; int* kdel;                       // which source frames, and how long each shows
+    DWORD* ring; int* rdel;                     // rn frames of w*h, and their times
+};
 struct PicImg {
     void*  gp;                                  // the file, kept open so it can be decoded again at another size
     int    w0, h0, nAll;                        // its own size and frame count
     GUID   dim;                                 // frame dimension (time, for GIFs)
     int*   delayAll;                            // each frame's delay (ms)
-    int    w, h, n, fps;                        // decoded: size, frame count, the frame-rate limit used
+    int    w, h, n, fps;                        // shown frames: size, count, the frame-rate limit used
     int    rw, rh;                              // the size that was asked for (huge sizes are decoded smaller)
+    unsigned bake;                              // background: the colour + fade its frames were baked with (0 = none)
     int    uid;                                 // finds it again when its background decode finishes
     struct PicJob* job;                         // decoding in the background (owns gp while it runs)
-    int    wantW, wantH;                        // asked for another size while that was running
-    DWORD* px;                                  // n frames of w*h premultiplied BGRA
-    int*   delay;                               // how long each decoded frame shows (ms)
-    int    cur; ULONGLONG due;                  // frame showing and when the next one is due
+    bool   want; int wantW, wantH; unsigned wantBake;   // asked for something else while that was running
+    DWORD* px;                                  // cached: n frames of w*h premultiplied BGRA
+    int*   delay;                               // cached: how long each frame shows (ms)
+    PicStream* st;                              // streamed instead
+    int    cur; ULONGLONG due; bool shown;      // frame showing and when the next one is due
 };
+static void PicStreamStop(PicImg& m)            // (waits at most for the frame being decoded)
+{
+    PicStream* st = m.st;
+    if (!st) return;
+    m.st = nullptr;
+    InterlockedExchange(&st->stop, 1); SetEvent(st->wake);
+    WaitForSingleObject(st->th, INFINITE);
+    CloseHandle(st->th); CloseHandle(st->wake);
+    if (st->ring) HeapFree(GetProcessHeap(), 0, st->ring);
+    if (st->rdel) HeapFree(GetProcessHeap(), 0, st->rdel);
+    if (st->keep) HeapFree(GetProcessHeap(), 0, st->keep);
+    if (st->kdel) HeapFree(GetProcessHeap(), 0, st->kdel);
+    HeapFree(GetProcessHeap(), 0, st);
+}
 static void PicFreeFrames(PicImg& m)
 {
+    PicStreamStop(m);
     if (m.px) HeapFree(GetProcessHeap(), 0, m.px);
     if (m.delay) HeapFree(GetProcessHeap(), 0, m.delay);
-    m.px = nullptr; m.delay = nullptr; m.w = m.h = m.n = 0; m.cur = 0;
+    m.px = nullptr; m.delay = nullptr; m.w = m.h = m.n = 0; m.cur = 0; m.shown = false;
+}
+static const DWORD* PicCurFrame(const PicImg& m)   // the frame to show now (nullptr: none decoded yet)
+{
+    if (m.st) return m.st->head > m.st->tail ? m.st->ring + (size_t)m.st->w * m.st->h * (m.st->tail % m.st->rn) : nullptr;
+    return m.px ? m.px + (size_t)m.w * m.h * m.cur : nullptr;
 }
 struct PicJob {                                 // one background decode: everything it needs is its own copy
     volatile LONG orphan;                       // the picture was closed meanwhile: throw the result (and gp) away
-    void* gp; GUID dim; int nAll; int* delays; int tw, th, askW, askH, fps, uid;
+    void* gp; GUID dim; int nAll; int* delays; int tw, th, askW, askH, fps, uid; unsigned bake;
     DWORD* px; int* delay; int n;
 };
 static void PicJobFree(PicJob* j, bool withGp)
@@ -3495,7 +3672,7 @@ static void PicJobFree(PicJob* j, bool withGp)
 }
 static void PicClose(PicImg& m)
 {
-    PicFreeFrames(m);
+    PicFreeFrames(m);                           // (stops a stream first: it uses gp)
     if (m.delayAll) HeapFree(GetProcessHeap(), 0, m.delayAll);
     if (m.job) { InterlockedExchange(&m.job->orphan, 1); m.gp = nullptr; }   // the job disposes of it when done
     if (m.gp && gGp.ok) gGp.dispose(m.gp);
@@ -3531,58 +3708,69 @@ static bool PicOpen(PicImg& m, const wchar_t* path)
     }
     return true;
 }
-// How many decoded pixels one picture may keep: a share of the memory that's free right now (so big GIFs keep
-// all their frames instead of being merged down to a slideshow), between 64 MB and 1.5 GB.
-static long long PicPxBudget()
+static void PicCapSize(int* tw, int* th)        // never more than ~6 megapixels a frame (drawn bigger if needed)
 {
-    MEMORYSTATUSEX ms = { sizeof(ms) };
-    unsigned long long bytes = GlobalMemoryStatusEx(&ms) ? ms.ullAvailPhys / 4 : 256ull << 20;
-    if (bytes < (64ull << 20)) bytes = 64ull << 20;
-    if (bytes > (1536ull << 20)) bytes = 1536ull << 20;
-    return (long long)(bytes / 4);
+    const double big = (double)*tw * *th;
+    if (big > 6.0e6) { double k = sqrt(6.0e6 / big); *tw = Imax(1, (int)(*tw * k)); *th = Imax(1, (int)(*th * k)); }
 }
-#define PIC_PX_BUDGET PicPxBudget()
+static int PicKeepList(const int* delays, int nAll, int fps, int* keep, int* kdel)   // frames to show at <= fps
+{
+    int nk = 0, t = 0, nextAt = 0; const int minMs = fps > 0 ? 1000 / fps : 0;
+    for (int i = 0; i < nAll; i++) {
+        if (i == 0 || t >= nextAt) { keep[nk] = i; kdel[nk] = 0; nk++; nextAt = t + minMs; }
+        kdel[nk - 1] += delays[i];
+        t += delays[i];
+    }
+    for (int k = 0; k < nk; k++) kdel[k] = Imax(kdel[k], 15);
+    return nk;
+}
+static void PicBake(DWORD* p, size_t n, unsigned key)   // over the theme colour, then faded toward it: opaque
+{
+    const COLORREF bg = key & 0xFFFFFF;
+    const int a = (int)((key >> 24) & 0x7F) * 256 / 100;
+    const int br = GetRValue(bg), bgc = GetGValue(bg), bb = GetBValue(bg);
+    for (size_t i = 0; i < n; i++) {
+        const DWORD v = p[i]; const int A = v >> 24;
+        int r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+        if (A < 255) { r += br * (255 - A) / 255; g += bgc * (255 - A) / 255; b += bb * (255 - A) / 255; }
+        r = (r * (256 - a) + br * a) >> 8; g = (g * (256 - a) + bgc * a) >> 8; b = (b * (256 - a) + bb * a) >> 8;
+        p[i] = 0xFF000000 | (Imin(r, 255) << 16) | (Imin(g, 255) << 8) | Imin(b, 255);
+    }
+}
+static void PicDecodeFrame(void* gp, const GUID& dim, int nAll, int idx, DWORD* out, int tw, int th, bool blocky, unsigned bake)
+{
+    if (nAll > 1) gGp.selFrame(gp, &dim, (UINT)idx);
+    void* bmp = nullptr; void* g = nullptr;
+    if (gGp.fromScan0(tw, th, tw * 4, 0x000E200B /* 32bpp PARGB */, (BYTE*)out, &bmp) == 0 && bmp) {
+        if (gGp.ctx(bmp, &g) == 0 && g) {
+            gGp.clear(g, 0);
+            gGp.interp(g, blocky ? 5 /* nearest */ : 7 /* high-quality bicubic */);
+            gGp.pixOff(g, blocky ? 4 /* half */ : 2 /* high quality */);
+            gGp.draw(g, gp, 0, 0, tw, th);
+            gGp.delG(g);
+        }
+        gGp.dispose(bmp);
+    }
+    if (bake) PicBake(out, (size_t)tw * th, bake);
+}
 static void PicJobRun(PicJob* j)                // (worker thread) all kept frames at tw x th
 {
     int tw = j->tw, th = j->th;
-    const double big = (double)tw * th;         // never more than ~6 megapixels a frame (drawn bigger if needed)
-    if (big > 6.0e6) { double k = sqrt(6.0e6 / big); tw = Imax(1, (int)(tw * k)); th = Imax(1, (int)(th * k)); }
-    // which frames to keep: never faster than the limit, and within the memory budget
-    static thread_local int keep[2000], kdel[2000];
-    int nk = 0;
-    const int maxFrames = (int)Imax(1, (int)Min<long long>(2000, PIC_PX_BUDGET / ((long long)tw * th)));
-    int minMs = j->fps > 0 ? 1000 / j->fps : 0;
-    for (int pass = 0; pass < 12; pass++) {
-        nk = 0; int t = 0, nextAt = 0;
-        for (int i = 0; i < j->nAll; i++) {
-            if (i == 0 || t >= nextAt) { keep[nk] = i; kdel[nk] = 0; nk++; nextAt = t + minMs; }
-            kdel[nk - 1] += j->delays[i];
-            t += j->delays[i];
-        }
-        if (nk <= maxFrames) break;
-        minMs = Imax(minMs * 2, 20);              // too many to fit: fewer, longer frames
-    }
+    PicCapSize(&tw, &th);
+    int* keep = (int*)HeapAlloc(GetProcessHeap(), 0, j->nAll * sizeof(int) * 2);
+    if (!keep) { j->n = 0; return; }
+    int* kdel = keep + j->nAll;
+    const int nk = PicKeepList(j->delays, j->nAll, j->fps, keep, kdel);
     j->px = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)tw * th * 4 * nk);
     j->delay = (int*)HeapAlloc(GetProcessHeap(), 0, nk * sizeof(int));
-    if (!j->px || !j->delay) { j->n = 0; return; }
-    int w0 = 0, h0 = 0; { UINT a = 0, b = 0; gGp.width(j->gp, &a); gGp.height(j->gp, &b); w0 = (int)a; h0 = (int)b; }
-    const bool blocky = tw >= w0 * 2 && th >= h0 * 2;   // big enlargements of small (pixel-art) GIFs stay crisp
-    for (int k = 0; k < nk; k++) {
-        if (j->orphan) break;                   // nobody wants it any more
-        if (j->nAll > 1) gGp.selFrame(j->gp, &j->dim, (UINT)keep[k]);
-        void* bmp = nullptr; void* g = nullptr;
-        if (gGp.fromScan0(tw, th, tw * 4, 0x000E200B /* 32bpp PARGB */, (BYTE*)(j->px + (size_t)tw * th * k), &bmp) == 0 && bmp) {
-            if (gGp.ctx(bmp, &g) == 0 && g) {
-                gGp.clear(g, 0);
-                gGp.interp(g, blocky ? 5 /* nearest */ : 7 /* high-quality bicubic */);
-                gGp.pixOff(g, blocky ? 4 /* half */ : 2 /* high quality */);
-                gGp.draw(g, j->gp, 0, 0, tw, th);
-                gGp.delG(g);
-            }
-            gGp.dispose(bmp);
-        }
-        j->delay[k] = Imax(kdel[k], 15);
+    if (!j->px || !j->delay) { j->n = 0; HeapFree(GetProcessHeap(), 0, keep); return; }
+    UINT a = 0, b = 0; gGp.width(j->gp, &a); gGp.height(j->gp, &b);
+    const bool blocky = tw >= (int)a * 2 && th >= (int)b * 2;   // big enlargements of small (pixel-art) GIFs stay crisp
+    for (int k = 0; k < nk && !j->orphan; k++) {
+        PicDecodeFrame(j->gp, j->dim, j->nAll, keep[k], j->px + (size_t)tw * th * k, tw, th, blocky, j->bake);
+        j->delay[k] = kdel[k];
     }
+    HeapFree(GetProcessHeap(), 0, keep);
     j->tw = tw; j->th = th; j->n = nk;
 }
 static DWORD WINAPI PicJobThread(LPVOID arg)
@@ -3593,20 +3781,68 @@ static DWORD WINAPI PicJobThread(LPVOID arg)
     if (!PostMessageW(gWnd, WM_PIC_DECODED, 0, (LPARAM)j)) PicJobFree(j, j->orphan != 0);
     return 0;
 }
-// Ask for a picture at tw x th: decoded in the background, shown when ready (meanwhile the old frames, stretched).
-static void PicWant(PicImg& m, int tw, int th)
+static DWORD WINAPI PicStreamThread(LPVOID arg)  // decodes ahead into the ring until told to stop
+{
+    PicStream* st = (PicStream*)arg;
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    int next = 0;
+    while (!st->stop) {
+        if (st->head - st->tail >= st->rn - 1) { WaitForSingleObject(st->wake, 30); continue; }   // ring full: wait
+        const int slot = st->head % st->rn;
+        PicDecodeFrame(st->gp, st->dim, st->nAll, st->keep[next], st->ring + (size_t)st->w * st->h * slot, st->w, st->h, st->blocky, st->bake);
+        st->rdel[slot] = st->kdel[next];
+        next = (next + 1) % st->nk;
+        InterlockedIncrement(&st->head);
+    }
+    return 0;
+}
+// Ask for a picture at tw x th (bake: background colour + fade, 0 for pictures on top): decoded in the background,
+// shown when ready (meanwhile the old frames, stretched).
+static void PicWant(PicImg& m, int tw, int th, unsigned bake = 0)
 {
     if (!m.gp || tw < 1 || th < 1) return;
-    if (m.job) { m.wantW = tw; m.wantH = th; return; }          // one at a time: this size next
-    if (m.px && m.rw == tw && m.rh == th && m.fps == gGifFps) return;
+    if (m.job) { m.want = true; m.wantW = tw; m.wantH = th; m.wantBake = bake; return; }   // one at a time: this next
+    if ((m.px || m.st) && m.rw == tw && m.rh == th && m.fps == gGifFps && m.bake == bake) return;
+    int cw = tw, ch = th; PicCapSize(&cw, &ch);
+    int* keep = (int*)HeapAlloc(GetProcessHeap(), 0, m.nAll * sizeof(int) * 2);
+    if (!keep) return;
+    int* kdel = keep + m.nAll;
+    const int nk = PicKeepList(m.delayAll, m.nAll, gGifFps, keep, kdel);
+    const long long frameBytes = (long long)cw * ch * 4;
+    if (nk > 1 && frameBytes * nk > PIC_CACHE_MAX) {      // too big to keep: stream it
+        PicFreeFrames(m);
+        PicStream* st = (PicStream*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PicStream));
+        if (!st) { HeapFree(GetProcessHeap(), 0, keep); return; }
+        st->gp = m.gp; st->dim = m.dim; st->nAll = m.nAll; st->nk = nk; st->w = cw; st->h = ch; st->bake = bake;
+        st->blocky = cw >= m.w0 * 2 && ch >= m.h0 * 2;
+        st->rn = (int)Iclamp((int)(PIC_RING_BYTES / frameBytes), 3, 30);
+        st->keep = keep; st->kdel = (int*)HeapAlloc(GetProcessHeap(), 0, nk * sizeof(int));
+        st->ring = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)frameBytes * st->rn);
+        st->rdel = (int*)HeapAlloc(GetProcessHeap(), 0, st->rn * sizeof(int));
+        st->wake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (st->kdel) memcpy(st->kdel, kdel, nk * sizeof(int));
+        if (!st->kdel || !st->ring || !st->rdel || !st->wake ||
+            !(st->th = CreateThread(nullptr, 0, PicStreamThread, st, 0, nullptr))) {
+            if (st->wake) CloseHandle(st->wake);
+            if (st->ring) HeapFree(GetProcessHeap(), 0, st->ring);
+            if (st->rdel) HeapFree(GetProcessHeap(), 0, st->rdel);
+            if (st->kdel) HeapFree(GetProcessHeap(), 0, st->kdel);
+            HeapFree(GetProcessHeap(), 0, keep); HeapFree(GetProcessHeap(), 0, st);
+            return;
+        }
+        m.st = st; m.w = cw; m.h = ch; m.n = nk; m.rw = tw; m.rh = th; m.fps = gGifFps; m.bake = bake; m.shown = false;
+        return;
+    }
+    HeapFree(GetProcessHeap(), 0, keep);
+    PicStreamStop(m);                           // (it used gp; a cached decode needs it now)
     PicJob* j = (PicJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(PicJob));
     if (!j) return;
     j->gp = m.gp; j->dim = m.dim; j->nAll = m.nAll; j->tw = tw; j->th = th; j->askW = tw; j->askH = th;
-    j->fps = gGifFps; j->uid = m.uid;
+    j->fps = gGifFps; j->uid = m.uid; j->bake = bake;
     j->delays = (int*)HeapAlloc(GetProcessHeap(), 0, m.nAll * sizeof(int));
     if (!j->delays) { HeapFree(GetProcessHeap(), 0, j); return; }
     memcpy(j->delays, m.delayAll, m.nAll * sizeof(int));
-    m.job = j; m.wantW = m.wantH = 0;
+    m.job = j; m.want = false;
     HANDLE t = CreateThread(nullptr, 0, PicJobThread, j, 0, nullptr);
     if (t) CloseHandle(t);
     else { m.job = nullptr; PicJobRun(j); PostMessageW(gWnd, WM_PIC_DECODED, 0, (LPARAM)j); m.job = j; }
@@ -3619,6 +3855,7 @@ static int      gCW = 0, gCH = 0;               // composite size (the window's 
 static DWORD*   gBaseBuf = nullptr;             // theme colour + background picture + fade
 static HBITMAP  gCompBmp = nullptr; static DWORD* gCompBits = nullptr;   // ... + pictures on top
 static bool PicActive() { return gBase.gp != nullptr || gStkN > 0; }
+static unsigned BaseBake() { return 0x80000000u | ((unsigned)Iclamp(gPicDim, 0, 95) << 24) | (BgColor() & 0xFFFFFF); }
 
 static void StkRect(const Sticker& s, RECT* r)  // where a picture on top is drawn (client px)
 {
@@ -3667,6 +3904,19 @@ static void BlitOver(DWORD* dst, int W, int H, const DWORD* src, int sw, int sh,
         }
     }
 }
+static void BlitCopy(DWORD* dst, int W, int H, const DWORD* src, int sw, int sh, int dx, int dy, int dw, int dh, const RECT& clip)
+{
+    int x0 = Imax(Imax(dx, 0), (int)clip.left), y0 = Imax(Imax(dy, 0), (int)clip.top);
+    int x1 = Imin(Imin(dx + dw, W), (int)clip.right), y1 = Imin(Imin(dy + dh, H), (int)clip.bottom);
+    if (x0 >= x1 || y0 >= y1 || dw <= 0 || dh <= 0) return;
+    const bool same = dw == sw && dh == sh;
+    for (int y = y0; y < y1; y++) {
+        DWORD* drow = dst + (size_t)y * W;
+        if (same) { memcpy(drow + x0, src + (size_t)(y - dy) * sw + (x0 - dx), (size_t)(x1 - x0) * 4); continue; }
+        const DWORD* srow = src + (size_t)((long long)(y - dy) * sh / dh) * sw;
+        for (int x = x0; x < x1; x++) drow[x] = srow[(long long)(x - dx) * sw / dw];
+    }
+}
 static void StkEnsureDecoded(Sticker& s)
 {
     RECT r; StkRect(s, &r);
@@ -3678,10 +3928,15 @@ static void PicComposeBase()                    // theme colour, background pict
     const COLORREF bg = BgColor();
     const DWORD bgpx = 0xFF000000 | (GetRValue(bg) << 16) | (GetGValue(bg) << 8) | GetBValue(bg);
     for (int i = 0; i < gCW * gCH; i++) gBaseBuf[i] = bgpx;
-    if (!gBase.gp || !gBase.px) return;
+    const DWORD* f = gBase.gp ? PicCurFrame(gBase) : nullptr;
+    if (!f) return;
     int tw, th, dx, dy; BaseTarget(gCW, gCH, &tw, &th, &dx, &dy);
-    const DWORD* f = gBase.px + (size_t)gBase.w * gBase.h * gBase.cur;
     RECT all = { 0, 0, gCW, gCH };
+    if (gBase.bake) {                           // already faded in when decoded: just copy it in
+        if (gPicFit == 3) { for (int y = 0; y < gCH; y += th) for (int x = 0; x < gCW; x += tw) BlitCopy(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, x, y, tw, th, all); }
+        else BlitCopy(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, dx, dy, tw, th, all);
+        return;
+    }
     if (gPicFit == 3) { for (int y = 0; y < gCH; y += th) for (int x = 0; x < gCW; x += tw) BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, x, y, tw, th, 256, all); }
     else BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, dx, dy, tw, th, 256, all);
     const int a = Iclamp(gPicDim, 0, 95) * 256 / 100;   // fade toward the theme colour so text stays readable
@@ -3701,9 +3956,10 @@ static void PicComposeTop(const RECT& r)        // background + pictures on top,
         memcpy(gCompBits + (size_t)y * gCW + c.left, gBaseBuf + (size_t)y * gCW + c.left, (c.right - c.left) * 4);
     for (int i = 0; i < gStkN; i++) {
         Sticker& s = gStk[i];
-        if (!s.img.px) continue;
+        const DWORD* f = PicCurFrame(s.img);
+        if (!f) continue;
         RECT sr; StkRect(s, &sr);
-        BlitOver(gCompBits, gCW, gCH, s.img.px + (size_t)s.img.w * s.img.h * s.img.cur, s.img.w, s.img.h,
+        BlitOver(gCompBits, gCW, gCH, f, s.img.w, s.img.h,
                  sr.left, sr.top, sr.right - sr.left, sr.bottom - sr.top, Iclamp(s.opacity, 5, 100) * 256 / 100, c);
     }
     GdiFlush();
@@ -3738,7 +3994,7 @@ static void PictureRebuild()                    // everything, at the window's s
         if (!gCompBmp || !gBaseBuf) { PicFreeComposite(); return; }
         gCompBits = (DWORD*)bits; gCW = W; gCH = H;
     }
-    if (gBase.gp) { int tw, th, dx, dy; BaseTarget(W, H, &tw, &th, &dx, &dy); PicWant(gBase, tw, th); }
+    if (gBase.gp) { int tw, th, dx, dy; BaseTarget(W, H, &tw, &th, &dx, &dy); PicWant(gBase, tw, th, BaseBake()); }
     for (int i = 0; i < gStkN; i++) StkEnsureDecoded(gStk[i]);
     PicComposeBase();
     RECT all = { 0, 0, W, H };
@@ -3771,11 +4027,8 @@ static void PicAnimTimer()                      // run the animation timer only 
 {
     bool any = gBase.n > 1;
     for (int i = 0; i < gStkN; i++) if (gStk[i].img.n > 1) any = true;
-    // While a GIF plays, paint the whole window double-buffered: the text over it would flicker otherwise.
-    bool gifs = gBase.nAll > 1;
-    for (int i = 0; i < gStkN; i++) if (gStk[i].img.nAll > 1) gifs = true;
-    LONG ex = GetWindowLongW(gWnd, GWL_EXSTYLE), want = gifs ? (ex | WS_EX_COMPOSITED) : (ex & ~WS_EX_COMPOSITED);
-    if (want != ex) SetWindowLongW(gWnd, GWL_EXSTYLE, want);
+    // (Labels, checkboxes and owner-drawn controls paint off-screen themselves, so the whole window no longer
+    //  needs WS_EX_COMPOSITED while a GIF plays, which made every frame repaint everything.)
     // Frames are shown when they're due, checked every 5 ms with Windows' timer made precise (1 ms) only while
     // something animates: the default ~16 ms steps make GIF timing uneven.
     static bool fine = false;
@@ -3796,6 +4049,15 @@ static ULONGLONG PicNow()                       // ms, precise (GetTickCount64 m
 }
 static bool PicAdvance(PicImg& m, ULONGLONG now)
 {
+    if (PicStream* st = m.st) {                 // streamed: move on when the next frame is decoded and due
+        if (st->head < 1) return false;
+        if (!m.shown) { m.shown = true; m.due = now + st->rdel[st->tail % st->rn]; return true; }
+        if (now < m.due) return false;
+        if (st->head - st->tail < 2) return false;           // the decoder is behind: hold this frame a moment
+        InterlockedIncrement(&st->tail); SetEvent(st->wake);
+        m.due = now - m.due > 250 ? now + st->rdel[st->tail % st->rn] : m.due + st->rdel[st->tail % st->rn];
+        return true;
+    }
     if (m.n <= 1 || now < m.due) return false;
     if (now - m.due > 250) { m.cur = (m.cur + 1) % m.n; m.due = now + m.delay[m.cur]; return true; }   // was paused / hidden
     int steps = 0;
@@ -3831,11 +4093,11 @@ static void OnPicDecoded(PicJob* j)
     if (j->n > 0 && j->px) {                    // swap in the new frames
         PicFreeFrames(*m);
         m->px = j->px; m->delay = j->delay; j->px = nullptr; j->delay = nullptr;
-        m->w = j->tw; m->h = j->th; m->rw = j->askW; m->rh = j->askH; m->n = j->n; m->fps = j->fps;
+        m->w = j->tw; m->h = j->th; m->rw = j->askW; m->rh = j->askH; m->n = j->n; m->fps = j->fps; m->bake = j->bake;
         m->cur = 0; m->due = PicNow() + m->delay[0];
     }
     PicJobFree(j, false);
-    if (m->wantW) { int w = m->wantW, h = m->wantH; m->wantW = m->wantH = 0; PicWant(*m, w, h); }
+    if (m->want) { m->want = false; PicWant(*m, m->wantW, m->wantH, m->wantBake); }
     if (stk >= 0 && gCompBmp) { StkRefresh(nullptr); PicAnimTimer(); }
     else { PictureRebuild(); PicRedraw(nullptr); }
 }
@@ -3884,12 +4146,12 @@ static void StkSaveAll()
     SaveInt(L"pic_count", gStkN);
     for (int i = 0; i < STK_MAX; i++) {
         wchar_t k[32];
-        wsprintfW(k, L"pic_%d_path", i); WritePrivateProfileStringW(L"settings", k, i < gStkN ? gStk[i].path : nullptr, gIni);
+        wsprintfW(k, L"pic_%d_path", i); IniSet(k, i < gStkN ? gStk[i].path : nullptr);
         const wchar_t* names[] = { L"x", L"y", L"size", L"opacity" };
         for (int f = 0; f < 4; f++) {
             wsprintfW(k, L"pic_%d_%s", i, names[f]);
             if (i < gStkN) SaveInt(k, f == 0 ? gStk[i].x : f == 1 ? gStk[i].y : f == 2 ? gStk[i].size : gStk[i].opacity);
-            else WritePrivateProfileStringW(L"settings", k, nullptr, gIni);
+            else IniSet(k, nullptr);
         }
     }
 }
@@ -3897,20 +4159,21 @@ static void StkSaveAll()
 
 static void SaveSettings()
 {
+    IniBatchBegin();                            // everything below is written to the file in one go (IniBatchEnd)
     for (Range& r : gRanges) SaveInt(r.key, *r.var);
     SaveInt(L"hotkey", gHotkeys[0]); SaveInt(L"hotkey2", gHotkeys[1]); SaveInt(L"hotkey3", gHotkeys[2]);
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
-    WritePrivateProfileStringW(L"settings", L"voc_song_app", gSongApp, gIni);
-    WritePrivateProfileStringW(L"settings", L"voc_song_file", gSongFile, gIni);
+    IniSet(L"voc_song_app", gSongApp);
+    IniSet(L"voc_song_file", gSongFile);
     SaveInt(L"voc_song_use_file", gSongUseFile);
     SaveInt(L"voc_synth_other", gVocSynthSaved);
     SaveInt(L"pad_master", gPadMaster);
     for (int i = 0; i < PAD_N; i++) {
         wchar_t key[32];
-        wsprintfW(key, L"pad%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[i], gIni);
+        wsprintfW(key, L"pad%d_file", i + 1);   IniSet(key, gPadFile[i]);
         wsprintfW(key, L"pad%d_volume", i + 1); SaveInt(key, gPads[i].vol);
     }
     SaveInt(L"rec_seconds", gRecSeconds);
@@ -3920,19 +4183,19 @@ static void SaveSettings()
     SaveInt(L"ui_scale", gUiScale); SaveInt(L"compact", gCompact); SaveInt(L"command_line_control", gCmdLine);
     SaveInt(L"settings_subtab", gSetSub);
     for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); SaveInt(k, (int)gUserCol[i]); }
-    WritePrivateProfileStringW(L"settings", L"background_picture", gPicPath, gIni);
+    IniSet(L"background_picture", gPicPath);
     SaveInt(L"background_fit", gPicFit); SaveInt(L"background_dim", gPicDim);
     SaveInt(L"background_x", gPicX); SaveInt(L"background_y", gPicY); SaveInt(L"background_size", gPicSize);
     SaveInt(L"gif_fps_limit", gGifFps); SaveInt(L"gif_pause_in_background", gGifPauseBg);
     StkSaveAll();
     LayoutSave(gIni);
-    WritePrivateProfileStringW(L"settings", L"font", gFontName, gIni);
+    IniSet(L"font", gFontName);
     SaveInt(L"font_px", gFontPx);
     SaveInt(L"window_opacity", gOpacity);
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); SaveInt(k, gFxHold[1 + g]); }
     ProfileKeysSave();
-    WritePrivateProfileStringW(L"settings", L"profile_current", gProfCur >= 0 ? gProfNames[gProfCur] : L"", gIni);
+    IniSet(L"profile_current", gProfCur >= 0 ? gProfNames[gProfCur] : L"");
     SaveInt(L"pads_through_fx", gPadsFx);
     SaveInt(L"clips_through_fx", gClipsFx);
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
@@ -3940,7 +4203,7 @@ static void SaveSettings()
     SaveInt(L"random_lag_every_s", gRandLagSec);
 
     SaveInt(L"repeat_word_times", gRepeatN);
-    WritePrivateProfileStringW(L"settings", L"tts_voice", gTtsVoice, gIni);
+    IniSet(L"tts_voice", gTtsVoice);
     SaveInt(L"tts_accent", gTtsAccent);
     SaveInt(L"fx_echo_style", gEchoStyle);
     SaveInt(L"fx_harm_style", gHarmStyle);
@@ -3964,7 +4227,7 @@ static void SaveSettings()
         wsprintfW(key, L"pad%d_pitch", i + 1);    SaveInt(key, p.pitch);
         wsprintfW(key, L"pad%d_fade_in", i + 1);  SaveInt(key, p.fadeInMs);
         wsprintfW(key, L"pad%d_fade_out", i + 1); SaveInt(key, p.fadeOutMs);
-        wsprintfW(key, L"pad%d_name", i + 1);     WritePrivateProfileStringW(L"settings", key, gPadName[i], gIni);
+        wsprintfW(key, L"pad%d_name", i + 1);     IniSet(key, gPadName[i]);
         wsprintfW(key, L"pad%d_color", i + 1);    SaveInt(key, (int)gPadColor[i]);
     }
     for (int i = 0; i < CLIP_N; i++) {
@@ -3973,7 +4236,7 @@ static void SaveSettings()
         wsprintfW(key, L"clip%d_pinned", i + 1); SaveInt(key, gClipPinned[i]);
         wsprintfW(key, L"clip%d_stamp", i + 1);  SaveInt(key, (int)gClipStamp[i]);
         bool loaded = c.base != nullptr;
-        wsprintfW(key, L"clip%d_file", i + 1);   WritePrivateProfileStringW(L"settings", key, gPadFile[CLIP0 + i], gIni);
+        wsprintfW(key, L"clip%d_file", i + 1);   IniSet(key, gPadFile[CLIP0 + i]);
         wsprintfW(key, L"clip%d_volume", i + 1); SaveInt(key, gPads[CLIP0 + i].vol);
         wsprintfW(key, L"clip%d_start", i + 1);  SaveInt(key, (int)(loaded ? c.ts : c.pendTs));
         wsprintfW(key, L"clip%d_end", i + 1);    SaveInt(key, (int)(loaded ? (c.te >= c.baseLen ? 0 : c.te) : c.pendTe));
@@ -3987,21 +4250,22 @@ static void SaveSettings()
         wchar_t b[64];
         if (!FxKeyIniName(slot)) continue;
         wsprintfW(b, L"%d,%d,%d", gFxKeys[slot][0], gFxKeys[slot][1], gFxKeys[slot][2]);
-        WritePrivateProfileStringW(L"settings", FxKeyIniName(slot), b, gIni);
+        IniSet(FxKeyIniName(slot), b);
     }
     for (FxGroup& g : gFxGroups) SaveInt(g.key, *g.on);
     for (Knob& k : gKnobs) SaveInt(k.key, *k.var);
-    WritePrivateProfileStringW(L"settings", L"update_repo", gUpdateRepo, gIni);
+    IniSet(L"update_repo", gUpdateRepo);
     wchar_t name[512], key[32];
     SelectedName(IDC_MIC, gCapDevs, gCapCount, name, 512);
-    WritePrivateProfileStringW(L"settings", L"mic", name, gIni);
+    IniSet(L"mic", name);
     SaveInt(L"out_count", gRows);
     for (int k = 0; k < gRows; k++) {
         SelectedName(IDC_ROWDEV + k, gPlayDevs, gPlayCount, name, 512);
-        wsprintfW(key, L"out%d_device", k + 1); WritePrivateProfileStringW(L"settings", key, name, gIni);
+        wsprintfW(key, L"out%d_device", k + 1); IniSet(key, name);
         wsprintfW(key, L"out%d_mode", k + 1);   SaveInt(key, gRowMode[k]);
         wsprintfW(key, L"out%d_volume", k + 1); SaveInt(key, gRowVol[k]);
     }
+    IniBatchEnd();
 }
 
 // ======================= audio start/stop =======================
@@ -4256,6 +4520,7 @@ static void PlaceAll()
     for (int i = 0; i < gDesignN; i++) {
         Design& d = gDesign[i];
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
+        if (d.page >= 0 && d.page != gPage) continue;   // other pages are placed when you switch to them
         int x = d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d));
         RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
         int w = d.ud ? r.right - r.left : d.w + d.dw;          // a number box keeps the width its arrows left it
@@ -6163,8 +6428,8 @@ static void ProfileKeysSave()
     for (int i = 0; i < gProfCount; i++) {
         wchar_t key[96], b[64]; ProfileKeyName(gProfNames[i], key);
         const int* k = gFxKeys[SLOT_PROF0 + i];
-        if (k[0] || k[1] || k[2]) { wsprintfW(b, L"%d,%d,%d", k[0], k[1], k[2]); WritePrivateProfileStringW(L"settings", key, b, gIni); }
-        else WritePrivateProfileStringW(L"settings", key, nullptr, gIni);
+        if (k[0] || k[1] || k[2]) { wsprintfW(b, L"%d,%d,%d", k[0], k[1], k[2]); IniSet(key, b); }
+        else IniSet(key, nullptr);
     }
 }
 
@@ -6295,7 +6560,7 @@ static void ProfileDeleteClicked()
     if (MessageBoxW(gWnd, q, L"Lag Effect - Profiles", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     wchar_t path[MAX_PATH], key[96]; ProfilePath(gProfNames[gProfSel], path); ProfileKeyName(gProfNames[gProfSel], key);
     DeleteFileW(path);
-    WritePrivateProfileStringW(L"settings", key, nullptr, gIni);
+    IniSet(key, nullptr);
     gProfCur = -1;
     ProfilesScan();
     ProfilesFill(nullptr);
@@ -6739,7 +7004,7 @@ static void ProfileAutoClicked()
     if (exe[0] && !wcschr(exe, L'.')) lstrcatW(exe, L".exe");
     lstrcpynW(gProfApp[gProfSel], exe, 64);
     wchar_t key[96]; wsprintfW(key, L"profile_app_%s", gProfNames[gProfSel]);
-    WritePrivateProfileStringW(L"settings", key, exe[0] ? exe : nullptr, gIni);
+    IniSet(key, exe[0] ? exe : nullptr);
     ProfileAutoInfo();
 }
 
@@ -7401,10 +7666,11 @@ static int     gTtsLang[TTS_MAX_VOICES];        // each voice's language (Window
 static int     gTtsCount = 0;
 static volatile LONG gTtsBusy = 0;
 
-static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI thread)
+struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][256]; int lang[TTS_MAX_VOICES]; int count; };
+static void TtsEnum(VoiceList& v)               // every installed voice (any thread)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED); // usually already done by the audio library; harmless if so
-    gTtsCount = 0;
+    v.count = 0;
     static const wchar_t* cats[] = { L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Voices",
                                      L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech_OneCore\\Voices" };
     for (const wchar_t* catId : cats) {
@@ -7413,23 +7679,23 @@ static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI
         IEnumSpObjectTokens* en = nullptr;
         if (SUCCEEDED(cat->SetId(catId, FALSE)) && SUCCEEDED(cat->EnumTokens(nullptr, nullptr, &en)) && en) {
             ISpObjectToken* tok = nullptr;
-            while (gTtsCount < TTS_MAX_VOICES && en->Next(1, &tok, nullptr) == S_OK) {
+            while (v.count < TTS_MAX_VOICES && en->Next(1, &tok, nullptr) == S_OK) {
                 LPWSTR id = nullptr, name = nullptr;
                 if (SUCCEEDED(tok->GetId(&id)) && SUCCEEDED(tok->GetStringValue(nullptr, &name)) && name) {
                     bool dup = false;
-                    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsNames[i], name)) dup = true;
+                    for (int i = 0; i < v.count; i++) if (!lstrcmpiW(v.names[i], name)) dup = true;
                     if (!dup) {
-                        lstrcpynW(gTtsNames[gTtsCount], name, 128); lstrcpynW(gTtsIds[gTtsCount], id, 256);
-                        gTtsLang[gTtsCount] = 0;
+                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 256);
+                        v.lang[v.count] = 0;
                         ISpDataKey* attr = nullptr; LPWSTR lang = nullptr;   // "Language" = hex LCID(s), e.g. "409;9"
                         if (SUCCEEDED(tok->OpenKey(L"Attributes", &attr)) && attr) {
                             if (SUCCEEDED(attr->GetStringValue(L"Language", &lang)) && lang) {
-                                gTtsLang[gTtsCount] = (int)wcstol(lang, nullptr, 16);
+                                v.lang[v.count] = (int)wcstol(lang, nullptr, 16);
                                 CoTaskMemFree(lang);
                             }
                             attr->Release();
                         }
-                        gTtsCount++;
+                        v.count++;
                     }
                 }
                 if (id) CoTaskMemFree(id);
@@ -7441,6 +7707,29 @@ static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI
         cat->Release();
     }
 }
+static bool gTtsListed = false;                  // the voice list has been read (it's read in the background at startup)
+static void TtsAdopt(const VoiceList& v)
+{
+    memcpy(gTtsNames, v.names, sizeof(gTtsNames)); memcpy(gTtsIds, v.ids, sizeof(gTtsIds)); memcpy(gTtsLang, v.lang, sizeof(gTtsLang));
+    gTtsCount = v.count; gTtsListed = true;
+}
+static void TtsListVoices()                     // now, on this thread
+{
+    VoiceList* v = (VoiceList*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VoiceList));
+    if (!v) return;
+    TtsEnum(*v); TtsAdopt(*v);
+    HeapFree(GetProcessHeap(), 0, v);
+}
+static DWORD WINAPI TtsListThread(LPVOID)       // at startup, so opening the window doesn't wait for Windows' voice list
+{
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    VoiceList* v = (VoiceList*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VoiceList));
+    if (v) { TtsEnum(*v); if (!PostMessageW(gWnd, WM_VOICES_LISTED, 0, (LPARAM)v)) HeapFree(GetProcessHeap(), 0, v); }
+    CoUninitialize();
+    return 0;
+}
+static void TtsFillVoices();
+static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
 struct TtsJob { wchar_t text[600]; wchar_t voice[256]; int rate; short* data; unsigned len; bool ok; };
 
@@ -7628,6 +7917,7 @@ static DWORD WINAPI TtsThread(LPVOID arg)
 
 static void TtsSpeak()
 {
+    TtsEnsureListed();
     wchar_t text[600];
     GetDlgItemTextW(gWnd, IDC_TTSTEXT, text, 600);
     bool any = false; for (wchar_t* q = text; *q; q++) if (*q > L' ') any = true;
@@ -8795,8 +9085,9 @@ static void HoldPress(int slot);
 static void HoldRelease(int slot);
 static void PollFxKeys()
 {
+    BYTE cache[256] = {};
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
-        bool down = !gCapturingKey && KeysDown(gFxKeys[slot]);
+        bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
         if (slot < FX_KEY_SLOTS && gFxHold[slot]) {   // hold-to-activate effect hotkeys
@@ -10383,14 +10674,10 @@ static void CreateUI()
         SendMessageW(ta, CB_SETDROPPEDWIDTH, SC(180), 0);
         HWND tv = Ctl(L"COMBOBOX", L"", COMBO, 322, 457, 104, 300, IDC_TTSVOICE);
         SendMessageW(tv, CB_SETDROPPEDWIDTH, 280, 0);
-        TtsListVoices();
-        SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
-        int sel = 0;
-        for (int i = 0; i < gTtsCount; i++) {
-            SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsNames[i]);
-            if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1;
-        }
-        SendMessageW(tv, CB_SETCURSEL, sel, 0);
+        SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");   // the rest arrive from the background list
+        if (gTtsVoice[0]) SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsVoice);
+        SendMessageW(tv, CB_SETCURSEL, gTtsVoice[0] ? 1 : 0, 0);
+        { HANDLE t = CreateThread(nullptr, 0, TtsListThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
         Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 455, 98, 28, IDC_TTSSPEAK);
         Ctl(L"STATIC", L"", SS_OWNERDRAW, 30, 486, 500, 6, IDC_VOICEPROG);   // voice install progress (only while installing)
     }
@@ -10564,7 +10851,8 @@ static void CreateUI()
     Ctl(L"STATIC", L"Font:", 0, 30, 147, 44, 20, -1);
     {
         HWND fc = Ctl(L"COMBOBOX", L"", COMBO | CBS_SORT, 76, 143, 160, 300, IDC_FONT);
-        FontsFill(fc);
+        SendMessageW(fc, CB_ADDSTRING, 0, (LPARAM)gFontName);   // every installed font is added when you open the list
+        SendMessageW(fc, CB_SETCURSEL, 0, 0);
         Ctl(L"STATIC", L"Text size:", 0, 246, 147, 64, 20, -1);
         HWND fs = Ctl(L"COMBOBOX", L"", COMBO, 312, 143, 58, 300, IDC_FONTSIZE);
         for (int px = 11; px <= 18; px++) { wchar_t t[8]; wsprintfW(t, L"%d", px); SendMessageW(fs, CB_ADDSTRING, 0, (LPARAM)t); }
@@ -10643,6 +10931,7 @@ static void CreateUI()
         for (int id : follow) { HWND c = GetDlgItem(gWnd, id); for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == c) gDesign[i].shifted = true; }
     }
     AssignSections();
+    EnumChildWindows(gWnd, BufLabelAttach, 0);  // labels paint off-screen (no flicker over pictures)
     LayoutLoad(gIni, false);                    // where you moved things to
     gUiReady = true;
     AddTips();
@@ -10936,6 +11225,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_TTSSPEAK)    { if (code == BN_CLICKED) TtsSpeak(); return; }
     if (id == IDC_TTSACCENT) {
         if (code == CBN_SELCHANGE) {
+            TtsEnsureListed();
             gTtsAccent = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, TTS_ACCENT_N - 1);
             const TtsAccent& a = TTS_ACCENTS[gTtsAccent];
             int v = TtsVoiceFor(gTtsAccent);
@@ -10954,7 +11244,9 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_TTSVOICE) {
+        if (code == CBN_DROPDOWN) TtsEnsureListed();
         if (code == CBN_SELCHANGE) {
+            TtsEnsureListed();
             int sel = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
             lstrcpynW(gTtsVoice, sel > 0 && sel - 1 < gTtsCount ? gTtsNames[sel - 1] : L"", 128);
         }
@@ -10994,6 +11286,11 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_COLRESET) { if (code == BN_CLICKED) { for (int i = 0; i < USERCOL_N; i++) gUserCol[i] = CLR_NONE; ApplyTheme(); } return; }
+    if (id == IDC_FONT && code == CBN_DROPDOWN) {
+        static bool filled = false;
+        if (!filled) { filled = true; HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT)); FontsFill(GetDlgItem(gWnd, id)); SetCursor(old); }
+        return;
+    }
     if (id == IDC_FONT) {
         if (code == CBN_SELCHANGE) {
             int i = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
@@ -11405,6 +11702,30 @@ static void OnCommand(int id, int code)
     }
 }
 
+// Owner-drawn controls are drawn off-screen and copied in one go, so nothing flickers when the picture behind
+// them changes (e.g. a GIF background). The meter buffers itself; dropdown items aren't on the window background.
+static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
+{
+    if ((d)->hwndItem == gStatus) { DrawStatus(d); return true; }
+    if (w == IDC_VOICEPROG) { DrawVoiceProgress(d); return true; }
+    if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
+    if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
+    if (w == IDC_SONGBTN) { DrawSongButton(d); return true; }
+    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB2)) {
+        DrawFxSub(d); return true;
+    }
+    if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch(d); return true; }
+    if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank(d); return true; }
+    if (w >= IDC_CLIPBANK0 && w < IDC_CLIPBANK0 + CLIP_BANKS) { DrawClipBank(d); return true; }
+    if (w >= IDC_ROWLBL && w < IDC_ROWLBL + MAX_OUT) { DrawOutLabel(d); return true; }
+    if ((w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) || (w >= IDC_CLIPPLAY && w < IDC_CLIPPLAY + CLIPS)) {
+        DrawPadButton(d); return true;
+    }
+    if (w == IDC_METER) { DrawMeter(d); return true; }
+    if (w == IDC_COLORTHEME) { DrawColorItem(d); return true; }
+    return false;
+}
+
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -11460,6 +11781,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_PIC_DECODED:
         OnPicDecoded((PicJob*)l);
         return 0;
+    case WM_VOICES_LISTED:
+        if (!gTtsListed) { TtsAdopt(*(VoiceList*)l); TtsFillVoices(); }
+        HeapFree(GetProcessHeap(), 0, (void*)l);
+        return 0;
     case WM_VOICE_INSTALLED:
         OnVoiceInstalled((DWORD)w, (int)l);
         return 0;
@@ -11506,29 +11831,29 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     }
-    case WM_DRAWITEM:
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        const RECT rc = d->rcItem; const int bw = rc.right - rc.left, bh = rc.bottom - rc.top;
+        const bool buffer = w != IDC_METER && d->CtlType != ODT_COMBOBOX && d->CtlType != ODT_LISTBOX && bw > 0 && bh > 0;
+        HDC real = d->hDC, mem = nullptr; HBITMAP bmp = nullptr; HGDIOBJ ob = nullptr;
+        if (buffer && (mem = CreateCompatibleDC(real)) != nullptr) {
+            bmp = CreateCompatibleBitmap(real, bw, bh);
+            if (bmp) { ob = SelectObject(mem, bmp); SetViewportOrgEx(mem, -rc.left, -rc.top, nullptr); d->hDC = mem; }
+            else { DeleteDC(mem); mem = nullptr; }
+        }
         if (gBrPicture) {                       // the picture behind owner-drawn controls lines up with the window
-            POINT pt = { 0, 0 }; MapWindowPoints(((DRAWITEMSTRUCT*)l)->hwndItem, gWnd, &pt, 1);
-            SetBrushOrgEx(((DRAWITEMSTRUCT*)l)->hDC, -pt.x, -pt.y, nullptr);
+            POINT pt = { 0, 0 }; MapWindowPoints(d->hwndItem, gWnd, &pt, 1);
+            SetBrushOrgEx(d->hDC, -pt.x - (mem ? rc.left : 0), -pt.y - (mem ? rc.top : 0), nullptr);
         }
-        if (((DRAWITEMSTRUCT*)l)->hwndItem == gStatus) { DrawStatus((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w == IDC_VOICEPROG) { DrawVoiceProgress((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
-        if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB2)) {
-            DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE;
+        bool done = DrawItemDispatch(w, d);
+        if (mem) {
+            BitBlt(real, rc.left, rc.top, bw, bh, mem, rc.left, rc.top, SRCCOPY);
+            SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
+            d->hDC = real;
         }
-        if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w >= IDC_CLIPBANK0 && w < IDC_CLIPBANK0 + CLIP_BANKS) { DrawClipBank((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w >= IDC_ROWLBL && w < IDC_ROWLBL + MAX_OUT) { DrawOutLabel((DRAWITEMSTRUCT*)l); return TRUE; }
-        if ((w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) || (w >= IDC_CLIPPLAY && w < IDC_CLIPPLAY + CLIPS)) {
-            DrawPadButton((DRAWITEMSTRUCT*)l); return TRUE;
-        }
-        if (w == IDC_METER) { DrawMeter((DRAWITEMSTRUCT*)l); return TRUE; }
-        if (w == IDC_COLORTHEME) { DrawColorItem((DRAWITEMSTRUCT*)l); return TRUE; }
+        if (done) return TRUE;
         break;
+    }
     case WM_LBUTTONDOWN:                        // click on empty space: leave the text/number box you were in
         SetFocus(h);
         return 0;
