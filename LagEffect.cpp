@@ -3437,6 +3437,7 @@ struct PicImg {
     GUID   dim;                                 // frame dimension (time, for GIFs)
     int*   delayAll;                            // each frame's delay (ms)
     int    w, h, n, fps;                        // decoded: size, frame count, the frame-rate limit used
+    int    rw, rh;                              // the size that was asked for (huge sizes are decoded smaller)
     DWORD* px;                                  // n frames of w*h premultiplied BGRA
     int*   delay;                               // how long each decoded frame shows (ms)
     int    cur; ULONGLONG due;                  // frame showing and when the next one is due
@@ -3487,8 +3488,11 @@ static bool PicOpen(PicImg& m, const wchar_t* path)
 static bool PicDecode(PicImg& m, int tw, int th)   // all (kept) frames at tw x th
 {
     if (!m.gp || tw < 1 || th < 1) return false;
-    if (m.px && m.w == tw && m.h == th && m.fps == gGifFps) return true;
+    if (m.px && m.rw == tw && m.rh == th && m.fps == gGifFps) return true;
     PicFreeFrames(m);
+    const int askW = tw, askH = th;
+    const double big = (double)tw * th;         // never more than ~6 megapixels a frame (drawn bigger if needed)
+    if (big > 6.0e6) { double k = sqrt(6.0e6 / big); tw = Imax(1, (int)(tw * k)); th = Imax(1, (int)(th * k)); }
     // which frames to keep: never faster than the limit, and within the memory budget
     int keep[2000], kdel[2000], nk = 0;
     const int maxFrames = Imax(1, Imin(2000, (int)(PIC_PX_BUDGET / ((long long)tw * th))));
@@ -3522,7 +3526,7 @@ static bool PicDecode(PicImg& m, int tw, int th)   // all (kept) frames at tw x 
         }
         m.delay[k] = Imax(kdel[k], 15);
     }
-    m.w = tw; m.h = th; m.n = nk; m.fps = gGifFps; m.cur = 0; m.due = GetTickCount64() + m.delay[0];
+    m.w = tw; m.h = th; m.rw = askW; m.rh = askH; m.n = nk; m.fps = gGifFps; m.cur = 0; m.due = GetTickCount64() + m.delay[0];
     return true;
 }
 
@@ -3555,7 +3559,6 @@ static void BaseTarget(int W, int H, int* tw, int* th, int* dx, int* dy)   // ba
         *dx = (W - *tw) / 2; *dy = (H - *th) / 2;
     }
     }
-    if (gPicFit == 3 && (long long)w0 * h0 > 4000000) { *tw = w0 / 2; *th = h0 / 2; }
 }
 // src (premultiplied BGRA, sw x sh) over dst at dx,dy scaled to dw x dh, faded to op/256, only inside clip
 static void BlitOver(DWORD* dst, int W, int H, const DWORD* src, int sw, int sh, int dx, int dy, int dw, int dh, int op, const RECT& clip)
@@ -3598,7 +3601,7 @@ static void PicComposeBase()                    // theme colour, background pict
     int tw, th, dx, dy; BaseTarget(gCW, gCH, &tw, &th, &dx, &dy);
     const DWORD* f = gBase.px + (size_t)gBase.w * gBase.h * gBase.cur;
     RECT all = { 0, 0, gCW, gCH };
-    if (gPicFit == 3) { for (int y = 0; y < gCH; y += gBase.h) for (int x = 0; x < gCW; x += gBase.w) BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, x, y, gBase.w, gBase.h, 256, all); }
+    if (gPicFit == 3) { for (int y = 0; y < gCH; y += th) for (int x = 0; x < gCW; x += tw) BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, x, y, tw, th, 256, all); }
     else BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, dx, dy, tw, th, 256, all);
     const int a = Iclamp(gPicDim, 0, 95) * 256 / 100;   // fade toward the theme colour so text stays readable
     const DWORD br = GetRValue(bg) * a, bgc = GetGValue(bg) * a, bb = GetBValue(bg) * a;
@@ -7674,7 +7677,7 @@ static LRESULT CALLBACK EdProc(HWND h, UINT m, WPARAM w, LPARAM l)
             int& size = hit == STK_MAX ? gPicSize : gStk[hit].size;
             RECT before; EdItemRect(hit, &before);
             size = Iclamp(size + step * Imax(1, size / 10), 5, 400);
-            if (hit == STK_MAX) { gBase.w = 0; } else gStk[hit].stale = true;   // (sharp again when you stop scrolling)
+            if (hit != STK_MAX) gStk[hit].stale = true;   // drawn stretched now, sharp again when you stop scrolling
             if (hit == STK_MAX) { PictureRebuild(); PicRedraw(nullptr); } else StkRefresh(&before);
             SetTimer(gWnd, TIMER_STKSIZE, 300, nullptr);
             if (hit < gStkN) gStkSel = hit;
