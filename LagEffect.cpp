@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.18.0"
+#define APP_VERSION L"1.19.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -95,6 +95,11 @@ static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / 
 // Random lag: the stutter fires by itself now and then. Rewind / Repeat word: hotkey requests to the audio thread.
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
+// Mic test: 5 s of exactly what Discord hears, recorded by the audio thread, played back on your speakers.
+#define TEST_LEN (RATE * 5)
+static short gTestBuf[TEST_LEN];
+static volatile unsigned gTestPos = 0, gTestLen = 0;
+static volatile bool gTestRec = false;
 
 // ---- Soundboard: 8 pads of short clips, mixed into every output that isn't Off ----
 // Not recorded into the stutter loop, not run through the voice effects, not silenced by Mute mic.
@@ -1828,6 +1833,13 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         }
 
         if (gRecVoiceOn) RecPut(gRecVoice, everything + sb);   // instant replay: what Discord hears
+        if (gTestRec) {                         // mic test
+            float t = everything + sb; t = t > 1 ? 1 : t < -1 ? -1 : t;
+            unsigned tp = gTestPos;
+            gTestBuf[tp] = (short)(t * 32767.0f);
+            if (++tp >= TEST_LEN) { gTestRec = false; gTestLen = TEST_LEN; }
+            gTestPos = tp;
+        }
         float o = Limit(0, (RowSignal(mode[0], effect, everything) + (mode[0] != MODE_OFF ? sb : 0.0f)) * vol[0]);
         out[f * 2] = o;
         out[f * 2 + 1] = o;
@@ -1883,8 +1895,9 @@ enum {
     IDC_RANDLAG, IDC_RANDSEC, IDC_REWINDKEY, IDC_REPEATKEY,
     IDC_PADBANK0, IDC_PADBANK1, IDC_PADBANK2, IDC_PADBANK3, IDC_PADBANKKEY, IDC_PADFX,   // bank buttons: consecutive
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
+    IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
-    IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040,   // + group index (room for 20 effects)
+    IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
     IDC_PADPLAY = 700, IDC_PADVOL = 710, IDC_PADKEY = 720, IDC_PADLOAD = 730, IDC_PADCLR = 740,   // + pad index
     IDC_CLIPPLAY = 750, IDC_CLIPVOL = 760, IDC_CLIPKEY = 770, IDC_CLIPTRIM = 780, IDC_CLIPCLR = 790, // + clip index
@@ -2118,9 +2131,17 @@ static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
 #define SLOT_REWIND  (SLOT_CLIP0 + CLIPS)        // Main tab extras
 #define SLOT_REPEAT  (SLOT_REWIND + 1)
 #define SLOT_PADBANK (SLOT_REPEAT + 1)           // soundboard: next page
-#define KEY_SLOTS    (SLOT_PADBANK + 1)
+#define SLOT_PROFNEXT (SLOT_PADBANK + 1)         // Settings: next profile
+#define PROF_MAX     8                           // profiles (each can have a hotkey)
+#define SLOT_PROF0   (SLOT_PROFNEXT + 1)
+#define KEY_SLOTS    (SLOT_PROF0 + PROF_MAX)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
+static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
+static int  gProfSel = -1;                      // profile selected on the Settings tab (-1 = none)
+static wchar_t gProfNames[PROF_MAX][64];
+static int  gProfCount = 0, gProfCur = -1;      // gProfCur: the profile last loaded
+static void ProfileKeysSave();
 
 // Knob groups: 0..FX_GROUPS-1 are the Voice FX effects; the rest live on the Mic tab.
 enum { KG_PITCH = 0, KG_REVERB, KG_VOCODER, KG_RADIO, KG_FORMANT, KG_ECHO, KG_GHOST, KG_DIST, KG_CHORUS, KG_WOBBLE,
@@ -2503,6 +2524,8 @@ static const wchar_t* FxKeyIniName(int slot)
                                             L"pad5_hotkey", L"pad6_hotkey", L"pad7_hotkey", L"pad8_hotkey" };
     static const wchar_t* clipKeys[CLIPS] = { L"clip1_hotkey", L"clip2_hotkey", L"clip3_hotkey", L"clip4_hotkey",
                                               L"clip5_hotkey", L"clip6_hotkey", L"clip7_hotkey", L"clip8_hotkey" };
+    if (slot >= SLOT_PROF0)    return nullptr;           // saved by profile name (ProfileKeysSave)
+    if (slot == SLOT_PROFNEXT) return L"profile_next_hotkey";
     if (slot == SLOT_REWIND)  return L"rewind_hotkey";
     if (slot == SLOT_REPEAT)  return L"repeat_word_hotkey";
     if (slot == SLOT_PADBANK) return L"pad_page_hotkey";
@@ -2593,6 +2616,7 @@ static void LoadSettings()
     gFxOn = INI_INT(L"fx_on", 0) != 0;
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
+        if (!FxKeyIniName(slot)) continue;
         GetPrivateProfileStringW(L"settings", FxKeyIniName(slot), L"", b, 64, gIni);
         const wchar_t* q = b;
         for (int i = 0; i < MAX_KEYS; i++) {
@@ -2624,6 +2648,8 @@ static void LoadSettings()
     }
     gRecSeconds = Iclamp(INI_INT(L"rec_seconds", 15), 3, REC_MAX_S);
     gPadBank      = Iclamp(INI_INT(L"pad_page", 0), 0, PAD_BANKS - 1);
+    gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
+    for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
     gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
     gClipsFx      = INI_INT(L"clips_through_fx", 0) != 0;
     gClipAutoTrim = INI_INT(L"clip_auto_trim", 1) != 0;
@@ -2724,6 +2750,10 @@ static void SaveSettings()
     }
     SaveInt(L"rec_seconds", gRecSeconds);
     SaveInt(L"pad_page", gPadBank);
+    SaveInt(L"fx_hotkey_hold", gFxHold[0]);
+    for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); SaveInt(k, gFxHold[1 + g]); }
+    ProfileKeysSave();
+    WritePrivateProfileStringW(L"settings", L"profile_current", gProfCur >= 0 ? gProfNames[gProfCur] : L"", gIni);
     SaveInt(L"pads_through_fx", gPadsFx);
     SaveInt(L"clips_through_fx", gClipsFx);
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
@@ -2755,6 +2785,7 @@ static void SaveSettings()
     SaveInt(L"fx_on", gFxOn);
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
+        if (!FxKeyIniName(slot)) continue;
         wsprintfW(b, L"%d,%d,%d", gFxKeys[slot][0], gFxKeys[slot][1], gFxKeys[slot][2]);
         WritePrivateProfileStringW(L"settings", FxKeyIniName(slot), b, gIni);
     }
@@ -3769,6 +3800,7 @@ static void DrawPadButton(DRAWITEMSTRUCT* d)
 }
 
 static void ClipTick();
+static void MicTestTick();
 static void PadTick()                           // every 50 ms: redraw pads that are playing or just stopped
 {
     static bool was[SB_N];
@@ -3784,6 +3816,7 @@ static void PadTick()                           // every 50 ms: redraw pads that
         for (int b = 0; b < PAD_BANKS; b++) InvalidateRect(GetDlgItem(gWnd, IDC_PADBANK0 + b), nullptr, FALSE);
     }
     ClipTick();
+    MicTestTick();
     static int lastRunning = -1;                // hint line: remind to press Start
     if ((int)gRunning != lastRunning) {
         lastRunning = (int)gRunning;
@@ -4190,22 +4223,26 @@ static void PrevStop()
     if (gTrimWnd) { SetDlgItemTextW(gTrimWnd, IDT_PLAY, L"\x25B6  Listen"); InvalidateRect(GetDlgItem(gTrimWnd, IDT_WAVE), nullptr, FALSE); }
 }
 
-static void PrevStart()
+static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain)   // play on your default speakers only
 {
     PrevStop();
-    const Clip& k = gClips[gTrimClip];
-    if (!gCtxOk || !k.base) return;
-    gPrevData = k.base; gPrevPos = k.ts; gPrevEnd = k.te;
-    gPrevGain = gPads[CLIP0 + gTrimClip].vol / 100.0f;
+    if (!gCtxOk || !d || to <= from) return false;
+    gPrevData = d; gPrevPos = from; gPrevEnd = to; gPrevGain = gain;
     ma_device_config cfg = ma_device_config_init(ma_device_type_playback);
     cfg.playback.format   = ma_format_f32;
     cfg.playback.channels = 2;
     cfg.sampleRate        = RATE;
     cfg.dataCallback      = PrevCallback;
-    if (ma_device_init(&gCtx, &cfg, &gPrevDev) != MA_SUCCESS) return;
-    if (ma_device_start(&gPrevDev) != MA_SUCCESS) { ma_device_uninit(&gPrevDev); return; }
+    if (ma_device_init(&gCtx, &cfg, &gPrevDev) != MA_SUCCESS) return false;
+    if (ma_device_start(&gPrevDev) != MA_SUCCESS) { ma_device_uninit(&gPrevDev); return false; }
     gPrevRunning = true;
-    SetDlgItemTextW(gTrimWnd, IDT_PLAY, L"\x25A0  Stop");
+    return true;
+}
+
+static void PrevStart()                         // trim editor: listen to the trimmed part
+{
+    const Clip& k = gClips[gTrimClip];
+    if (PrevPlay(k.base, k.ts, k.te, gPads[CLIP0 + gTrimClip].vol / 100.0f)) SetDlgItemTextW(gTrimWnd, IDT_PLAY, L"\x25A0  Stop");
 }
 
 static void TrimInfo()                          // "Start 1.20 s  ·  End 9.85 s  ·  Length 8.65 s" + button states
@@ -4547,6 +4584,268 @@ static void OpenTrim(int c)
     SetFocus(GetDlgItem(gTrimWnd, IDT_WAVE));
 }
 
+// ======================= profiles =======================
+static void SetGateMode(int m);
+static void FxKeyButtonText(int slot, wchar_t* buf, int cap);
+// A profile is a snapshot of how you sound: the stutter effect, every Voice FX effect and knob, and the
+// Mic tab. Not included: devices / outputs, hotkeys, soundboard, clips, theme and window settings.
+// Saved as %APPDATA%\LagEffect\Profiles\<name>.ini; a profile's hotkey is saved under its name.
+struct ProfVar { const wchar_t* key; volatile int* i; volatile bool* b; int* n; };
+static const ProfVar PROF_VARS[] = {
+    { L"fx_on", nullptr, &gFxOn, nullptr },         { L"voc_style", &gVocStyle, nullptr, nullptr },
+    { L"voc_key", &gVocKey, nullptr, nullptr },     { L"voc_scale", &gVocScale, nullptr, nullptr },
+    { L"voc_range", &gVocRange, nullptr, nullptr }, { L"voc_synth_other", nullptr, nullptr, &gVocSynthSaved },
+    { L"radio_preset", &gRadioPreset, nullptr, nullptr },
+    { L"fx_echo_style", &gEchoStyle, nullptr, nullptr }, { L"fx_dist_style", &gDistStyle, nullptr, nullptr },
+    { L"fx_chorus_style", &gChoStyle, nullptr, nullptr }, { L"fx_muffle_style", &gMufStyle, nullptr, nullptr },
+    { L"gate_mode", &gGateMode, nullptr, nullptr }, { L"ns_on", nullptr, &gNsOn, nullptr },
+    { L"talkover", nullptr, &gTalkOver, nullptr },  { L"toggle", nullptr, &gToggleMode, nullptr },
+    { L"random_lag", nullptr, &gRandLagOn, nullptr }, { L"random_lag_every_s", &gRandLagSec, nullptr, nullptr },
+};
+
+static void ProfileDir(wchar_t* out)
+{
+    lstrcpynW(out, gIni, MAX_PATH);
+    wchar_t* slash = wcsrchr(out, L'\\');
+    if (slash) slash[1] = 0; else out[0] = 0;
+    lstrcatW(out, L"Profiles");
+    CreateDirectoryW(out, nullptr);
+}
+static void ProfilePath(const wchar_t* name, wchar_t* out)
+{
+    wchar_t dir[MAX_PATH]; ProfileDir(dir);
+    wsprintfW(out, L"%s\\%s.ini", dir, name);
+}
+static void ProfileKeyName(const wchar_t* name, wchar_t* out) { wsprintfW(out, L"profile_hotkey_%s", name); }
+
+static void ProfilesScan()                      // list profiles; their hotkeys follow their names
+{
+    int oldKeys[PROF_MAX][MAX_KEYS]; wchar_t oldNames[PROF_MAX][64]; int oldN = gProfCount;
+    for (int i = 0; i < oldN; i++) { lstrcpynW(oldNames[i], gProfNames[i], 64); memcpy(oldKeys[i], gFxKeys[SLOT_PROF0 + i], sizeof(oldKeys[i])); }
+    wchar_t dir[MAX_PATH], pat[MAX_PATH]; ProfileDir(dir);
+    wsprintfW(pat, L"%s\\*.ini", dir);
+    gProfCount = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            wchar_t n[64]; lstrcpynW(n, fd.cFileName, 64);
+            wchar_t* dot = wcsrchr(n, L'.'); if (dot) *dot = 0;
+            if (!n[0] || gProfCount >= PROF_MAX) continue;
+            int at = gProfCount;                // keep the list in alphabetical order
+            while (at > 0 && lstrcmpiW(gProfNames[at - 1], n) > 0) { lstrcpynW(gProfNames[at], gProfNames[at - 1], 64); at--; }
+            lstrcpynW(gProfNames[at], n, 64);
+            gProfCount++;
+        } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    for (int i = 0; i < PROF_MAX; i++) {
+        memset(gFxKeys[SLOT_PROF0 + i], 0, sizeof(gFxKeys[0]));
+        if (i >= gProfCount) continue;
+        bool found = false;
+        for (int k = 0; k < oldN && !found; k++)
+            if (!lstrcmpiW(oldNames[k], gProfNames[i])) { memcpy(gFxKeys[SLOT_PROF0 + i], oldKeys[k], sizeof(oldKeys[k])); found = true; }
+        if (!found) {                           // first time: read it from the settings file
+            wchar_t key[96], b[64]; ProfileKeyName(gProfNames[i], key);
+            GetPrivateProfileStringW(L"settings", key, L"", b, 64, gIni);
+            const wchar_t* q = b;
+            for (int j = 0; j < MAX_KEYS; j++) {
+                gFxKeys[SLOT_PROF0 + i][j] = *q ? Iclamp(_wtoi(q), 0, 255) : 0;
+                while (*q && *q != L',') q++;
+                if (*q == L',') q++;
+            }
+        }
+    }
+}
+
+static void ProfileKeysSave()
+{
+    for (int i = 0; i < gProfCount; i++) {
+        wchar_t key[96], b[64]; ProfileKeyName(gProfNames[i], key);
+        const int* k = gFxKeys[SLOT_PROF0 + i];
+        if (k[0] || k[1] || k[2]) { wsprintfW(b, L"%d,%d,%d", k[0], k[1], k[2]); WritePrivateProfileStringW(L"settings", key, b, gIni); }
+        else WritePrivateProfileStringW(L"settings", key, nullptr, gIni);
+    }
+}
+
+static bool ProfileSave(const wchar_t* name)
+{
+    wchar_t path[MAX_PATH]; ProfilePath(name, path);
+    auto put = [&](const wchar_t* key, int v) { wchar_t b[16]; wsprintfW(b, L"%d", v); WritePrivateProfileStringW(L"profile", key, b, path); };
+    for (const ProfVar& v : PROF_VARS) put(v.key, v.i ? *v.i : v.b ? (int)*v.b : *v.n);
+    for (const Range& r : gRanges) put(r.key, *r.var);
+    for (const FxGroup& g : gFxGroups) put(g.key, *g.on ? 1 : 0);
+    for (const Knob& k : gKnobs) put(k.key, *k.var);
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static void RefreshSoundUI()                    // after a profile changed lots of settings at once
+{
+    for (const Range& r : gRanges) SetDlgItemInt(gWnd, r.id, (UINT)*r.var, FALSE);
+    for (int g = 0; g < FX_GROUPS; g++) CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
+    SendDlgItemMessageW(gWnd, IDC_VOCSTYLE, CB_SETCURSEL, gVocStyle, 0);
+    SendDlgItemMessageW(gWnd, IDC_VOCKEY, CB_SETCURSEL, gVocKey, 0);
+    SendDlgItemMessageW(gWnd, IDC_VOCSCALE, CB_SETCURSEL, gVocScale, 0);
+    SendDlgItemMessageW(gWnd, IDC_VOCRANGE, CB_SETCURSEL, gVocRange, 0);
+    SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, gRadioPreset, 0);
+    SetDlgItemTextW(gWnd, IDC_RADIODESC, RADIO_DESC[Iclamp(gRadioPreset, 0, RADIO_N - 1)]);
+    SendDlgItemMessageW(gWnd, IDC_ECHOSTYLE, CB_SETCURSEL, gEchoStyle, 0);
+    SendDlgItemMessageW(gWnd, IDC_DISTSTYLE, CB_SETCURSEL, gDistStyle, 0);
+    SendDlgItemMessageW(gWnd, IDC_CHOSTYLE, CB_SETCURSEL, gChoStyle, 0);
+    SendDlgItemMessageW(gWnd, IDC_MUFSTYLE, CB_SETCURSEL, gMufStyle, 0);
+    SetGateMode(gGateMode);
+    CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
+    CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
+    CheckDlgButton(gWnd, IDC_RANDLAG, gRandLagOn ? BST_CHECKED : BST_UNCHECKED);
+    SetDlgItemInt(gWnd, IDC_RANDSEC, (UINT)gRandLagSec, FALSE);
+    InvalidateRect(GetDlgItem(gWnd, IDC_FXON), nullptr, FALSE);
+    gFxResetReq = true;                         // start the effects clean
+    SongStyleChanged();                         // Song style shows different controls; also redraws knobs
+    UpdateStatus(true);
+}
+
+static bool ProfileLoad(int idx, bool osd)
+{
+    if (idx < 0 || idx >= gProfCount) return false;
+    wchar_t path[MAX_PATH]; ProfilePath(gProfNames[idx], path);
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return false;
+    auto get = [&](const wchar_t* key, int cur, int lo, int hi) {   // missing = keep what you have
+        wchar_t b[32]; GetPrivateProfileStringW(L"profile", key, L"", b, 32, path);
+        return b[0] ? Iclamp(_wtoi(b), lo, hi) : cur;
+    };
+    for (const ProfVar& v : PROF_VARS) {
+        if (v.i) *v.i = get(v.key, *v.i, -100000, 100000);
+        else if (v.b) *v.b = get(v.key, *v.b, 0, 1) != 0;
+        else *v.n = get(v.key, *v.n, 0, 100);
+    }
+    gVocStyle = Iclamp(gVocStyle, 0, VOC_STYLES - 1); gVocKey = Iclamp(gVocKey, 0, 11);
+    gVocScale = Iclamp(gVocScale, 0, VOC_SCALES - 1); gVocRange = Iclamp(gVocRange, 0, 2);
+    gRadioPreset = Iclamp(gRadioPreset, 0, RADIO_N - 1); gGateMode = Iclamp(gGateMode, 0, 3);
+    gEchoStyle = Iclamp(gEchoStyle, 0, ECHO_N - 1); gDistStyle = Iclamp(gDistStyle, 0, DIST_N - 1);
+    gChoStyle = Iclamp(gChoStyle, 0, CHO_N - 1); gMufStyle = Iclamp(gMufStyle, 0, MUF_N - 1);
+    gRandLagSec = Iclamp(gRandLagSec, 2, 120);
+    for (const Range& r : gRanges) *r.var = get(r.key, *r.var, r.lo, r.hi);
+    for (const FxGroup& g : gFxGroups) *g.on = get(g.key, *g.on, 0, 1) != 0;
+    for (const Knob& k : gKnobs) *k.var = get(k.key, *k.var, k.lo, k.hi);
+    gProfCur = idx;
+    RefreshSoundUI();
+    if (osd) { wchar_t m[96]; wsprintfW(m, L"Profile: %s", gProfNames[idx]); ShowOsd(m, true); }
+    return true;
+}
+
+static void ProfilesFill(const wchar_t* select)   // refresh the Settings dropdown
+{
+    HWND c = GetDlgItem(gWnd, IDC_PROFILE);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    gProfSel = -1;
+    for (int i = 0; i < gProfCount; i++) {
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)gProfNames[i]);
+        if (select && !lstrcmpiW(gProfNames[i], select)) gProfSel = i;
+    }
+    if (gProfSel >= 0) SendMessageW(c, CB_SETCURSEL, gProfSel, 0); else SetWindowTextW(c, select ? select : L"");
+    wchar_t kn[120];
+    if (gProfSel >= 0) FxKeyButtonText(SLOT_PROF0 + gProfSel, kn, 120); else lstrcpynW(kn, L"This profile: (save one first)", 120);
+    SetDlgItemTextW(gWnd, IDC_PROFKEY, kn);
+    EnableWindow(GetDlgItem(gWnd, IDC_PROFKEY), gProfSel >= 0);
+    EnableWindow(GetDlgItem(gWnd, IDC_PROFDEL), gProfSel >= 0);
+}
+
+static void ProfileSaveClicked()
+{
+    wchar_t name[64];
+    GetDlgItemTextW(gWnd, IDC_PROFILE, name, 64);
+    for (wchar_t* q = name; *q; q++) if (wcschr(L"\\/:*?\"<>|.", *q)) *q = L'_';
+    while (name[0] == L' ') memmove(name, name + 1, lstrlenW(name) * sizeof(wchar_t));
+    for (int n = lstrlenW(name); n > 0 && name[n - 1] == L' '; n--) name[n - 1] = 0;
+    if (!name[0]) { MessageBoxW(gWnd, L"Type a name for the profile first (like Gaming or Streaming).", L"Lag Effect - Profiles", MB_ICONINFORMATION); return; }
+    bool exists = false;
+    for (int i = 0; i < gProfCount; i++) if (!lstrcmpiW(gProfNames[i], name)) exists = true;
+    if (!exists && gProfCount >= PROF_MAX) {
+        MessageBoxW(gWnd, L"You can have up to 8 profiles. Delete one to make room.", L"Lag Effect - Profiles", MB_ICONINFORMATION);
+        return;
+    }
+    if (exists) {
+        wchar_t q[160]; wsprintfW(q, L"Replace \"%s\" with how you sound right now?", name);
+        if (MessageBoxW(gWnd, q, L"Lag Effect - Profiles", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    }
+    if (!ProfileSave(name)) { MessageBoxW(gWnd, L"Couldn't save the profile.", L"Lag Effect - Profiles", MB_ICONWARNING); return; }
+    ProfilesScan();
+    for (int i = 0; i < gProfCount; i++) if (!lstrcmpiW(gProfNames[i], name)) gProfCur = i;
+    ProfilesFill(name);
+}
+
+static void ProfileDeleteClicked()
+{
+    if (gProfSel < 0) return;
+    wchar_t q[160]; wsprintfW(q, L"Delete the profile \"%s\"?", gProfNames[gProfSel]);
+    if (MessageBoxW(gWnd, q, L"Lag Effect - Profiles", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    wchar_t path[MAX_PATH], key[96]; ProfilePath(gProfNames[gProfSel], path); ProfileKeyName(gProfNames[gProfSel], key);
+    DeleteFileW(path);
+    WritePrivateProfileStringW(L"settings", key, nullptr, gIni);
+    gProfCur = -1;
+    ProfilesScan();
+    ProfilesFill(nullptr);
+}
+
+// ---- hold-to-activate effect hotkeys ----
+// Holding the key turns the effect (and the Voice effects switch) on; letting go puts both back as they were.
+static bool gHoldActive[1 + FX_GROUPS], gHoldPrevOn[1 + FX_GROUPS];
+static bool gHoldMasterPrev = false;
+static int  gHoldCount = 0;
+
+static void HoldPress(int slot)                 // slot 0 = the Voice effects switch, 1+g = effect g
+{
+    if (gHoldActive[slot]) return;
+    gHoldActive[slot] = true;
+    if (gHoldCount++ == 0) gHoldMasterPrev = gFxOn;
+    if (slot > 0) { gHoldPrevOn[slot] = *gFxGroups[slot - 1].on; SetFxGroupOn(slot - 1, true); }
+    if (!gFxOn) SetFxOn(true);
+    UpdateStatus(true);
+}
+
+static void HoldRelease(int slot)
+{
+    if (!gHoldActive[slot]) return;
+    gHoldActive[slot] = false;
+    if (slot > 0) SetFxGroupOn(slot - 1, gHoldPrevOn[slot]);
+    if (--gHoldCount <= 0) { gHoldCount = 0; if (!gHoldMasterPrev) SetFxOn(false); }
+    UpdateStatus(true);
+}
+
+// ---- mic test ----
+static void MicTestStart()
+{
+    if (!gRunning) {
+        MessageBoxW(gWnd, L"Press Start on the Main tab first, then test.", L"Lag Effect - Mic test", MB_ICONINFORMATION);
+        return;
+    }
+    PrevStop();
+    gTestPos = 0; gTestLen = 0;
+    gTestRec = true;
+}
+
+static void MicTestTick()                       // every 50 ms: countdown, then play it back
+{
+    static bool wasRec = false;
+    static wchar_t last[48];
+    if (gTestRec && !gRunning) {                // audio stopped mid-test: keep what we got
+        gTestRec = false;
+        gTestLen = gTestPos > (unsigned)RATE / 2 ? gTestPos : 0;
+        if (!gTestLen) wasRec = false;
+    }
+    wchar_t t[48];
+    if (gTestRec) wsprintfW(t, L"Recording... %u", (TEST_LEN - gTestPos) / RATE + 1);
+    else if (gPrevRunning && gPrevData == gTestBuf) lstrcpynW(t, L"\x25A0  Stop", 48);
+    else lstrcpynW(t, L"\x25CF  Record 5 s", 48);
+    if (lstrcmpW(t, last)) { lstrcpynW(last, t, 48); SetDlgItemTextW(gWnd, IDC_MICTEST, t); }
+    if (wasRec && !gTestRec && gTestLen) PrevPlay(gTestBuf, 0, gTestLen, 1.0f);   // done: hear it
+    wasRec = gTestRec;
+    EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), gTestLen > 0 && !gTestRec);
+    if (gPrevRunning && !gTrimWnd && gPrevPos >= gPrevEnd) PrevStop();       // finished playing
+}
+
 // ======================= soundboard pages =======================
 static void SetPadBank(int b)
 {
@@ -4864,6 +5163,19 @@ static void AddTips()
         TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
     }
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
+    TipId(IDC_PROFILE,   L"Profiles save how you sound: the stutter effect, every Voice FX effect and knob, and the Mic tab. "
+                         L"Pick one to switch to it. To make one, type a name and click Save (or press Enter). "
+                         L"Devices, hotkeys, soundboard and clips aren't part of profiles.");
+    TipId(IDC_PROFSAVE,  L"Save how you sound right now under the name in the box (replaces it if it already exists).");
+    TipId(IDC_PROFDEL,   L"Delete the selected profile.");
+    TipId(IDC_PROFKEY,   L"A hotkey that switches to this profile from anywhere. Right-click to clear it.");
+    TipId(IDC_PROFNEXTKEY, L"A hotkey that cycles through your profiles in order. Right-click to clear it.");
+    TipId(IDC_FXHOLD,    L"Hold to use: the Voice effects hotkey turns effects on only while you hold it. "
+                         L"Set up a Character, then hold the key to talk as it.");
+    for (int g = 0; g < FX_GROUPS; g++) TipId(IDC_FXGRP_HOLD + g, L"Hold: this effect's hotkey turns it on only while you hold it, "
+                                                                  L"then puts everything back when you let go.");
+    TipId(IDC_MICTEST,   L"Record 5 seconds of what Discord hears (your mic with every effect), then play it back to you.");
+    TipId(IDC_MICPLAY,   L"Play the last mic test again.");
     for (int b = 0; b < PAD_BANKS; b++) TipId(IDC_PADBANK0 + b, L"Soundboard pages: 8 pads each. The dot means the page has sounds. "
                                                                 L"Pad hotkeys play the pad in that spot on whichever page is showing.");
     TipId(IDC_PADBANKKEY, L"A hotkey that flips to the next soundboard page (A > B > C > D > A). Right-click to clear it.");
@@ -5172,13 +5484,22 @@ static void OsdTick()                           // shows ~1.1 s, then fades out 
 
 static void ClipNow();
 static void SetPadBank(int b);
+static bool ProfileLoad(int idx, bool osd);
+static void HoldPress(int slot);
+static void HoldRelease(int slot);
 static void PollFxKeys()
 {
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         bool down = !gCapturingKey && KeysDown(gFxKeys[slot]);
-        bool pressed = down && !gFxKeyWasDown[slot];
+        bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
+        if (slot < FX_KEY_SLOTS && gFxHold[slot]) {   // hold-to-activate effect hotkeys
+            if (pressed) HoldPress(slot); else if (released) HoldRelease(slot);
+            continue;
+        }
         if (!pressed) continue;
+        if (slot >= SLOT_PROF0)    { ProfileLoad(slot - SLOT_PROF0, true); continue; }
+        if (slot == SLOT_PROFNEXT) { if (gProfCount) ProfileLoad((gProfCur + 1) % gProfCount, true); continue; }
         if (slot == SLOT_REWIND)  { if (gRunning) gRewindReq = true; continue; }
         if (slot == SLOT_REPEAT)  { if (gRunning) gRepeatReq = true; continue; }
         if (slot == SLOT_PADBANK) {
@@ -5986,6 +6307,11 @@ static void ShowHelp()
         L"With VB-Cable: add Audio Input Capture = \"CABLE Output\".\n"
         L"Sharing your whole screen in Discord? Tick Settings > Hide from screen share, or people hear you twice.\n"
         L"Without VB-Cable: add Application Audio Capture and pick LagEffect.exe.\n\n"
+        L"PROFILES (Settings tab)\n"
+        L"Save how you sound as a named profile (Gaming, Streaming, Trolling...) and switch by picking it or with its hotkey. "
+        L"Effect hotkeys can be Hold: the effect is on only while you hold the key.\n\n"
+        L"MIC TEST (Mic tab)\n"
+        L"Record 5 s and hear exactly what Discord hears.\n\n"
         L"LAG EXTRAS (Main tab)\n"
         L"Random lag fires the stutter by itself now and then. Rewind plays your last 2 seconds backwards like a tape. "
         L"Repeat word plays the last word you said 3 times. (Change the 2 s / 3 times in the settings file: rewind_ms, repeat_word_times.)\n\n"
@@ -6017,12 +6343,15 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     ComboName(gFxKeys[slot], MAX_KEYS, k, 100);
     if (!k[0]) lstrcpynW(k, L"Set hotkey", 100);
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
-                       : slot == SLOT_PADBANK ? L"Next page: " : L"";
+                       : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
+                       : slot >= SLOT_PROF0 ? L"This profile: " : L"";
     wsprintfW(buf, L"%s%s", pre, k);
 }
 
 static int FxKeyButtonId(int slot)
 {
+    if (slot >= SLOT_PROF0)    return slot - SLOT_PROF0 == gProfSel ? IDC_PROFKEY : 0;   // the selected profile's button
+    if (slot == SLOT_PROFNEXT) return IDC_PROFNEXTKEY;
     if (slot == SLOT_REWIND)  return IDC_REWINDKEY;
     if (slot == SLOT_REPEAT)  return IDC_REPEATKEY;
     if (slot == SLOT_PADBANK) return IDC_PADBANKKEY;
@@ -6368,6 +6697,11 @@ static void CreateUI()
         }
         Ctl(L"STATIC", L"Every output also has a limiter, so loud moments never clip or distort.", 0, 330, y + 30, 196, 54, IDC_HDR);
     }
+    Ctl(L"BUTTON", L"\x25CF  Record 5 s", WS_TABSTOP | WS_GROUP, 14, 556, 128, 30, IDC_MICTEST);
+    Ctl(L"BUTTON", L"\x25B6  Play again", WS_TABSTOP, 148, 556, 110, 30, IDC_MICPLAY);
+    EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), FALSE);
+    Ctl(L"STATIC", L"Mic test: talk for 5 seconds, then hear exactly what Discord hears (with all your effects), "
+                   L"on your speakers or headphones.", 0, 268, 556, 278, 32, IDC_HDR);
 
     // ---------------- Voice FX page ----------------
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
@@ -6377,7 +6711,9 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Vocode to song", BS_OWNERDRAW | WS_TABSTOP, 310, 52, 116, 44, IDC_SONGBTN);
     {
         wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 59, 114, 30, IDC_FXKEY_MASTER);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 52, 114, 28, IDC_FXKEY_MASTER);
+        Ctl(L"BUTTON", L"Hold to use", BS_AUTOCHECKBOX | WS_TABSTOP, 436, 83, 110, 18, IDC_FXHOLD);
+        CheckDlgButton(gWnd, IDC_FXHOLD, gFxHold[0] ? BST_CHECKED : BST_UNCHECKED);
     }
     // sub-tabs (three effects each) and the Characters menu
     for (int t = 0; t < FX_SUBS; t++)
@@ -6459,8 +6795,10 @@ static void CreateUI()
             Ctl(L"LagKnob", L"", WS_TABSTOP | (col == 0 ? WS_GROUP : 0), kx + col * kstep, y + 8, kw, FX_KNOB_H, IDC_KNOB + i);
             col++;
         }
-        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 12, 100, 20, IDC_FXGRP_ON + g);
+        Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 12, 46, 20, IDC_FXGRP_ON + g);
         CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
+        Ctl(L"BUTTON", L"Hold", BS_AUTOCHECKBOX | WS_TABSTOP, 478, y + 12, 56, 20, IDC_FXGRP_HOLD + g);
+        CheckDlgButton(gWnd, IDC_FXGRP_HOLD + g, gFxHold[1 + g] ? BST_CHECKED : BST_UNCHECKED);
         wchar_t kn[120]; FxKeyButtonText(1 + g, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 38, 104, 26, IDC_FXGRP_KEY + g);
         Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
@@ -6566,60 +6904,80 @@ static void CreateUI()
     // ---------------- Settings page ----------------
     gBuildPage = PAGE_SETTINGS;
 
-    AddSection(14, 60, 532, 87, L"Latency");
-    Ctl(L"STATIC", L"Buffer:", 0, 30, 85, 90, 20, -1);
-    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 124, 81, 168, 200, IDC_BUFFER);
+    AddSection(14, 60, 532, 92, L"Profiles");
+    Ctl(L"STATIC", L"Profile:", 0, 30, 86, 56, 20, -1);
+    {
+        HWND pc = Ctl(L"COMBOBOX", L"", CBS_DROPDOWN | CBS_AUTOHSCROLL | WS_VSCROLL | WS_TABSTOP | WS_GROUP, 88, 82, 214, 300, IDC_PROFILE);
+        SendMessageW(pc, CB_LIMITTEXT, 40, 0);
+        COMBOBOXINFO ci = {}; ci.cbSize = sizeof(ci);
+        if (GetComboBoxInfo(pc, &ci) && ci.hwndItem) SendMessageW(ci.hwndItem, EM_SETCUEBANNER, TRUE, (LPARAM)L"Name, e.g. Gaming");
+    }
+    Ctl(L"BUTTON", L"Save", WS_TABSTOP, 310, 81, 106, 26, IDC_PROFSAVE);
+    Ctl(L"BUTTON", L"Delete", WS_TABSTOP, 424, 81, 106, 26, IDC_PROFDEL);
+    Ctl(L"BUTTON", L"", WS_TABSTOP, 30, 114, 248, 28, IDC_PROFKEY);
+    {
+        wchar_t kn[120]; FxKeyButtonText(SLOT_PROFNEXT, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 284, 114, 246, 28, IDC_PROFNEXTKEY);
+    }
+    {
+        wchar_t cur[64]; GetPrivateProfileStringW(L"settings", L"profile_current", L"", cur, 64, gIni);
+        ProfilesScan();
+        for (int i = 0; i < gProfCount; i++) if (!lstrcmpiW(gProfNames[i], cur)) gProfCur = i;
+        ProfilesFill(gProfCur >= 0 ? gProfNames[gProfCur] : nullptr);
+    }
+
+    AddSection(14, 168, 532, 56, L"Latency");
+    Ctl(L"STATIC", L"Buffer:", 0, 30, 192, 90, 20, -1);
+    HWND buf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 124, 188, 168, 200, IDC_BUFFER);
     const wchar_t* bufNames[] = { L"32 (fastest)", L"64", L"128 (default)", L"256", L"512 (safest)" };
     for (const wchar_t* n : bufNames) SendMessageW(buf, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(buf, CB_SETCURSEL, gBufIdx, 0);
-    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 84, 220, 20, IDC_EXCL);
+    Ctl(L"BUTTON", L"Exclusive mode", BS_AUTOCHECKBOX | WS_TABSTOP, 310, 191, 220, 20, IDC_EXCL);
     CheckDlgButton(gWnd, IDC_EXCL, gExclusive ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Smaller buffer = less delay. Pick a bigger one if you hear crackling.", 0, 30, 116, 500, 18, IDC_HDR);
 
-    AddSection(14, 167, 532, 134, L"App");
-    Ctl(L"STATIC", L"Theme:", 0, 30, 196, 60, 20, -1);
-    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 192, 110, 200, IDC_THEME);
+    AddSection(14, 240, 532, 150, L"App");
+    Ctl(L"STATIC", L"Theme:", 0, 30, 266, 60, 20, -1);
+    HWND th = Ctl(L"COMBOBOX", L"", COMBO, 94, 262, 110, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
     for (const wchar_t* n : themeNames) SendMessageW(th, CB_ADDSTRING, 0, (LPARAM)n);
     SendMessageW(th, CB_SETCURSEL, gThemeMode, 0);
-    Ctl(L"STATIC", L"Color:", 0, 222, 196, 50, 20, -1);
-    HWND ct = Ctl(L"COMBOBOX", L"", COMBO | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, 274, 192, 140, 400, IDC_COLORTHEME);
+    Ctl(L"STATIC", L"Color:", 0, 222, 266, 50, 20, -1);
+    HWND ct = Ctl(L"COMBOBOX", L"", COMBO | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS, 274, 262, 140, 400, IDC_COLORTHEME);
     for (int i = 0; i < COLOR_THEME_N; i++) SendMessageW(ct, CB_ADDSTRING, 0, (LPARAM)COLOR_THEMES[i].name);
     SendMessageW(ct, CB_SETCURSEL, gColorTheme, 0);
 
-    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 230, 300, 20, IDC_AUTO);
+    Ctl(L"BUTTON", L"Start audio && hide in tray when opened", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 296, 300, 20, IDC_AUTO);
     CheckDlgButton(gWnd, IDC_AUTO, gAutoStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Updates:", 0, 30, 264, 60, 20, -1);
-    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 261, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
+    Ctl(L"STATIC", L"Updates:", 0, 30, 328, 60, 20, -1);
+    HWND repo = Ctl(L"EDIT", gUpdateRepo, WS_TABSTOP | ES_AUTOHSCROLL, 94, 325, 200, 24, IDC_REPO, WS_EX_CLIENTEDGE);
     SendMessageW(repo, EM_SETCUEBANNER, TRUE, (LPARAM)L"github-user/repo");
     if (gFramedN < MAX_FRAMED) gFramed[gFramedN++] = { repo, nullptr };
-    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 260, 100, 26, IDC_CHECKUPD);
-    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 263, 118, 20, IDC_UPDSTART);
+    Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 324, 100, 26, IDC_CHECKUPD);
+    Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 327, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
 
-    Ctl(L"STATIC", L"Lag Effect " APP_VERSION, 0, 30, 317, 300, 18, IDC_HDR);
-    Ctl(L"STATIC", L"Settings are saved in %APPDATA%\\LagEffect, shared by every copy and version.", 0, 30, 337, 410, 18, IDC_HDR);
-    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 332, 84, 26, IDC_OPENSET);
+    Ctl(L"STATIC", L"Lag Effect " APP_VERSION L"  \x00B7  settings are in %APPDATA%\\LagEffect", 0, 30, 362, 400, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 357, 84, 26, IDC_OPENSET);
 
-    AddSection(14, 488, 532, 88, L"Shortcuts & window");      // painted text: a single & shows as &
-    Ctl(L"STATIC", L"Mute hotkey:", 0, 30, 513, 90, 20, -1);
-    {
-        wchar_t kn[120]; FxKeyButtonText(SLOT_MUTE, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP, 122, 508, 124, 28, IDC_MUTEKEY);
-    }
-    Ctl(L"BUTTON", L"Pop-up when a hotkey switches something", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 512, 270, 20, IDC_OSD);
-    CheckDlgButton(gWnd, IDC_OSD, gShowOsd ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Always on top", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 546, 200, 20, IDC_TOPMOST);
-    CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 546, 270, 20, IDC_STARTWIN);
-    CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
-
-    AddSection(14, 378, 532, 92, L"Screen share");
-    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 402, 300, 20, IDC_HIDESHARE);
+    AddSection(14, 406, 532, 82, L"Screen share");
+    Ctl(L"BUTTON", L"Hide from screen share", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 428, 300, 20, IDC_HIDESHARE);
     CheckDlgButton(gWnd, IDC_HIDESHARE, gHideShare ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"STATIC", L"Stops Discord screen shares from picking up your voice a second time. Locks the VB-Cable "
-                   L"output to Lag Effect; your mic and speakers stay free for other apps.", 0, 30, 426, 500, 36, IDC_HDR);
+                   L"output to Lag Effect; your mic and speakers stay free for other apps.", 0, 30, 450, 500, 34, IDC_HDR);
+
+    AddSection(14, 504, 532, 78, L"Shortcuts & window");      // painted text: a single & shows as &
+    Ctl(L"STATIC", L"Mute hotkey:", 0, 30, 527, 90, 20, -1);
+    {
+        wchar_t kn[120]; FxKeyButtonText(SLOT_MUTE, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 122, 522, 124, 28, IDC_MUTEKEY);
+    }
+    Ctl(L"BUTTON", L"Pop-up when a hotkey switches something", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 526, 270, 20, IDC_OSD);
+    CheckDlgButton(gWnd, IDC_OSD, gShowOsd ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Always on top", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 556, 200, 20, IDC_TOPMOST);
+    CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 556, 270, 20, IDC_STARTWIN);
+    CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
 
     gBuildPage = -1;
     gUiReady = true;
@@ -6838,6 +7196,32 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_PADFX)       { gPadsFx = Checked(id); return; }
+    if (id == IDC_FXHOLD)      { if (gHoldActive[0]) HoldRelease(0); gFxHold[0] = Checked(id); return; }
+    if (id == IDC_MICTEST)     {
+        if (code == BN_CLICKED) { if (gPrevRunning && gPrevData == gTestBuf) PrevStop(); else if (!gTestRec) MicTestStart(); }
+        return;
+    }
+    if (id == IDC_MICPLAY)     { if (code == BN_CLICKED && gTestLen) PrevPlay(gTestBuf, 0, gTestLen, 1.0f); return; }
+    if (id == IDC_PROFSAVE)    { if (code == BN_CLICKED) ProfileSaveClicked(); return; }
+    if (id == IDC_PROFDEL)     { if (code == BN_CLICKED) ProfileDeleteClicked(); return; }
+    if (id == IDC_PROFKEY)     { if (code == BN_CLICKED && gProfSel >= 0) BeginKeyCapture(gFxKeys[SLOT_PROF0 + gProfSel], id); return; }
+    if (id == IDC_PROFNEXTKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PROFNEXT], id); return; }
+    if (id == IDC_PROFILE) {
+        if (code == CBN_SELCHANGE) {            // picking a profile switches to it
+            int i = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+            if (i >= 0 && i < gProfCount) { ProfileLoad(i, false); ProfilesFill(gProfNames[i]); }
+        } else if (code == CBN_EDITCHANGE) {    // typing a new name: nothing selected yet
+            wchar_t t[64]; GetDlgItemTextW(gWnd, id, t, 64);
+            gProfSel = -1;
+            for (int i = 0; i < gProfCount; i++) if (!lstrcmpiW(gProfNames[i], t)) gProfSel = i;
+            wchar_t kn[120];
+            if (gProfSel >= 0) FxKeyButtonText(SLOT_PROF0 + gProfSel, kn, 120); else lstrcpynW(kn, L"This profile: (save it first)", 120);
+            SetDlgItemTextW(gWnd, IDC_PROFKEY, kn);
+            EnableWindow(GetDlgItem(gWnd, IDC_PROFKEY), gProfSel >= 0);
+            EnableWindow(GetDlgItem(gWnd, IDC_PROFDEL), gProfSel >= 0);
+        }
+        return;
+    }
     if (id == IDC_CLIPFX)      { gClipsFx = Checked(id); return; }
     if (id == IDC_CLIPAUTOTRIM){ gClipAutoTrim = Checked(id); return; }
     if (id == IDC_TTSSPEAK)    { if (code == BN_CLICKED) TtsSpeak(); return; }
@@ -6904,6 +7288,12 @@ static void OnCommand(int id, int code)
     }
     if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) {
         if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[1 + id - IDC_FXGRP_KEY], id);
+        return;
+    }
+    if (id >= IDC_FXGRP_HOLD && id < IDC_FXGRP_HOLD + FX_GROUPS) {
+        int g = id - IDC_FXGRP_HOLD;
+        if (gHoldActive[1 + g]) HoldRelease(1 + g);
+        gFxHold[1 + g] = Checked(id);
         return;
     }
     if (id >= IDC_FXGRP_RESET && id < IDC_FXGRP_RESET + FX_GROUPS) {
@@ -7148,6 +7538,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id >= IDC_PADKEY && id < IDC_PADKEY + PADS) { ClearFxKey(SLOT_PAD0 + id - IDC_PADKEY); return 0; }
         if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) { gPads[PadSlot(id - IDC_PADPLAY)].stop = true; return 0; }   // right-click: stop
         if (id == IDC_REWINDKEY)  { ClearFxKey(SLOT_REWIND); return 0; }
+        if (id == IDC_PROFNEXTKEY) { ClearFxKey(SLOT_PROFNEXT); return 0; }
+        if (id == IDC_PROFKEY && gProfSel >= 0) { ClearFxKey(SLOT_PROF0 + gProfSel); return 0; }
         if (id == IDC_REPEATKEY)  { ClearFxKey(SLOT_REPEAT); return 0; }
         if (id == IDC_PADBANKKEY) { ClearFxKey(SLOT_PADBANK); return 0; }
         if (id >= IDC_CLIPKEY && id < IDC_CLIPKEY + CLIPS) { ClearFxKey(SLOT_CLIP0 + id - IDC_CLIPKEY); return 0; }
@@ -7320,6 +7712,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             continue;
         }
         if (TrimKey(&msg)) continue;
+        if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && GetParent(msg.hwnd) == GetDlgItem(h, IDC_PROFILE)) {
+            ProfileSaveClicked();               // Enter in the profile name box saves it
+            continue;
+        }
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_RETURN && msg.hwnd == GetDlgItem(h, IDC_TTSTEXT)) {
             TtsSpeak();                         // Enter in the text-to-speech box speaks it
             continue;
