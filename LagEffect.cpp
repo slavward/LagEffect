@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.25.0"
+#define APP_VERSION L"1.26.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -41,6 +41,7 @@
 #include <tlhelp32.h>                           // process names without opening the process (browsers' audio helpers)
 #include <commdlg.h>                            // "Audio file..." picker
 #include <sapi.h>                               // text to speech (Windows' own voices)
+#include <wctype.h>
 #include <shlobj.h>                             // folder picker (Load a folder of sounds)
 #include <mfapi.h>                              // MP3 export (Windows' own encoder, loaded at run time)
 #include <mfidl.h>
@@ -98,7 +99,8 @@ static float  gateEnv = 0, gateGain = 1;
 static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
 static int gUiScale = 100;                      // Settings > UI size (needs a restart)
 static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;
-static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }   // UI size   // gCmdLine: hidden (right-click the version text)
+static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }
+static inline int UNSC(int v) { return gUiScale == 100 ? v : MulDiv(v, 100, gUiScale); }   // screen px -> design px   // UI size   // gCmdLine: hidden (right-click the version text)
 static int  gOverlayX = INT_MIN, gOverlayY = INT_MIN;
 static volatile int  gPttMode = 0;               // 0 off, 1 push-to-talk (mic only while held), 2 push-to-mute
 static volatile bool gPttHeld = false;
@@ -2305,8 +2307,7 @@ enum {
     IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6,   // Voice FX sub-tabs: consecutive
     IDC_MICSUB0, IDC_MICSUB1,                   // Mic tab sub-tabs: consecutive
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
-    IDC_SETSUB0, IDC_SETSUB1,                   // Settings sub-tabs: consecutive
-    IDC_COLSW0, IDC_COLSW1, IDC_COLSW2, IDC_COLSW3, IDC_COLSW4, IDC_COLSW5,   // colour swatches: consecutive
+    IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2,      // Settings sub-tabs: consecutive
     IDC_COLRESET, IDC_FONT, IDC_OPACITY, IDC_PICCHOOSE, IDC_PICREMOVE, IDC_PICFIT, IDC_PICDIM, IDC_PICINFO, IDC_CORNERS,
     IDC_PTTMODE, IDC_PTTKEY, IDC_OVERLAY, IDC_BEEPS, IDC_UISCALE, IDC_EXPORT, IDC_IMPORT, IDC_COMPACT, IDC_COMPACTFX,
     IDC_COMPACTFULL, IDC_PROFAUTO, IDC_PROFAUTOINFO, IDC_VERSION,
@@ -2318,7 +2319,9 @@ enum {
     IDC_PADBANK0, IDC_PADBANK1, IDC_PADBANK2, IDC_PADBANK3, IDC_PADBANKKEY, IDC_PADFX,   // bank buttons: consecutive
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
-    IDC_HARMMUTE, IDC_HEARLBL, IDC_HEARON,
+    IDC_HARMMUTE, IDC_HEARLBL, IDC_HEARON, IDC_FONTSIZE, IDC_LAYEDIT, IDC_LAYRESET, IDC_STKLIST, IDC_STKADD, IDC_STKDEL,
+    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT,
+    IDC_COLSW0 = 1400,                          // + colour slot (USERCOL_N): its own range
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
@@ -2557,7 +2560,7 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun" };
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone
-static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look
+static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures
 static FxGroup gFxGroups[] = {
     { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
     { L"Reverb",     &gFxRevOn,     L"fx_reverb_on",   true,  L"fx_reverb_hotkey",  3, 0 },
@@ -2767,11 +2770,17 @@ static int gColorTheme = 0;
 // The palette in use (set by ApplyPalette). The old constant names now point at these.
 static COLORREF gDkBg, gDkCtl, gDkBorder, gDkSection, gDkText = RGB(235, 235, 235), gDkDim = RGB(160, 160, 160);
 // Look tab: your own colours (CLR_NONE = the theme's), a background picture, font, opacity.
-#define USERCOL_N 6
-static COLORREF gUserCol[USERCOL_N] = { CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE };   // accent, background, panels, borders, text, dim text
+#define USERCOL_N 12
+// accent, background, panels, borders, text, dim text, box titles, knobs, knob track, meters, tabs, status bar
+static COLORREF gUserCol[USERCOL_N] = { CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE,
+                                        CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE, CLR_NONE };
+static int      gFontPx = 13;                    // text size (px at 100%)
 static COLORREF gLtText = RGB(30, 30, 30), gLtDim = RGB(110, 110, 110);
 static wchar_t  gPicPath[MAX_PATH];
-static int      gPicFit = 0, gPicDim = 60;       // fit: 0 cover, 1 stretch, 2 centre, 3 tile; dim: % of the theme colour on top
+static int      gPicFit = 0, gPicDim = 60;       // fit: 0 cover, 1 stretch, 2 centre, 3 tile, 4 placed by you; dim: % of the theme colour on top
+static int      gPicX = 40, gPicY = 80, gPicSize = 100;   // background in "place it yourself" mode (design px, %)
+static int      gGifFps = 30;                    // GIF frame-rate limit (0 = as fast as the GIF says)
+static bool     gGifPauseBg = false;             // pause GIFs while another window is in front
 static HBRUSH   gBrPicture = nullptr;            // the picture, sized to the window and dimmed (a pattern brush)
 static wchar_t  gFontName[40] = L"Segoe UI";
 static int      gOpacity = 100;
@@ -2820,6 +2829,7 @@ static void ApplyPalette()
     if (gUserCol[3] != CLR_NONE) { gDkSection = gLtBorder = gDkBorder = gUserCol[3]; }
     if (gUserCol[4] != CLR_NONE) { gDkText = gLtText = gUserCol[4]; }
     if (gUserCol[5] != CLR_NONE) { gDkDim = gLtDim = gUserCol[5]; }
+    if (gUserCol[8] != CLR_NONE) { gDkTrack = gLtTrack = gUserCol[8]; }
     if (gBrDarkBg)  DeleteObject(gBrDarkBg);
     if (gBrDarkCtl) DeleteObject(gBrDarkCtl);
     if (gBrLightBg) DeleteObject(gBrLightBg);
@@ -2832,6 +2842,12 @@ static COLORREF BgColor()  { return gDark ? DK_BG : gLtBg; }
 static HBRUSH   BgBrush()  { return gBrPicture ? gBrPicture : gDark ? gBrDarkBg : gBrLightBg; }
 static HBRUSH   BgSolid()  { return gDark ? gBrDarkBg : gBrLightBg; }   // pop-up windows (not lined up with the picture)
 #define TXT_C (gDark ? DK_TEXT : gLtText)
+static COLORREF UC(int i, COLORREF def) { return gUserCol[i] != CLR_NONE ? gUserCol[i] : def; }   // your colour, or the theme's
+#define TITLE_C  UC(6, TXT_C)
+#define KNOB_C   UC(7, gDark ? DK_KNOB : LT_CARD)
+#define METER_C  UC(9, RGB(40, 190, 90))
+#define TAB_C    UC(10, ACCENT)
+#define STATUS_C UC(11, gDark ? DK_CTL : LT_STATUS)
 
 typedef HRESULT (WINAPI* PFN_SetWindowTheme)(HWND, LPCWSTR, LPCWSTR);
 typedef HRESULT (WINAPI* PFN_DwmSetWindowAttribute)(HWND, DWORD, LPCVOID, DWORD);
@@ -2898,77 +2914,9 @@ static BOOL CALLBACK ThemeChild(HWND h, LPARAM)
     return TRUE;
 }
 
-static HBITMAP gPicSrc = nullptr; static int gPicW = 0, gPicH = 0;
-static bool PictureLoad(const wchar_t* path)    // PNG / JPG / BMP / GIF -> a GDI bitmap
-{
-    if (gPicSrc) { DeleteObject(gPicSrc); gPicSrc = nullptr; }
-    if (!path[0]) return false;
-    static HMODULE gp = LoadLibraryW(L"gdiplus.dll");
-    if (!gp) return false;
-    struct StartupInput { UINT32 ver; void* cb; BOOL noThread, noCodecs; };
-    typedef int (WINAPI* PStartup)(ULONG_PTR*, const StartupInput*, void*);
-    typedef int (WINAPI* PFromFile)(const WCHAR*, void**);
-    typedef int (WINAPI* PToHbm)(void*, HBITMAP*, DWORD);
-    typedef int (WINAPI* PDispose)(void*);
-    typedef int (WINAPI* PGetW)(void*, UINT*);
-    static ULONG_PTR token = 0;
-    auto startup = (PStartup)(void*)GetProcAddress(gp, "GdiplusStartup");
-    auto fromFile = (PFromFile)(void*)GetProcAddress(gp, "GdipCreateBitmapFromFile");
-    auto toHbm = (PToHbm)(void*)GetProcAddress(gp, "GdipCreateHBITMAPFromBitmap");
-    auto dispose = (PDispose)(void*)GetProcAddress(gp, "GdipDisposeImage");
-    auto getW = (PGetW)(void*)GetProcAddress(gp, "GdipGetImageWidth");
-    auto getH = (PGetW)(void*)GetProcAddress(gp, "GdipGetImageHeight");
-    if (!startup || !fromFile || !toHbm || !dispose || !getW || !getH) return false;
-    if (!token) { StartupInput si = { 1, nullptr, FALSE, FALSE }; if (startup(&token, &si, nullptr) != 0) { token = 0; return false; } }
-    void* img = nullptr;
-    if (fromFile(path, &img) != 0 || !img) return false;
-    UINT w = 0, h = 0; getW(img, &w); getH(img, &h);
-    HBITMAP hb = nullptr;
-    toHbm(img, &hb, 0xFF000000);
-    dispose(img);
-    if (!hb || !w || !h) return false;
-    gPicSrc = hb; gPicW = (int)w; gPicH = (int)h;
-    return true;
-}
-
-static void PictureRebuild()                    // the picture at the window's size, fitted and dimmed
-{
-    if (gBrPicture) { DeleteObject(gBrPicture); gBrPicture = nullptr; }
-    if (!gPicSrc || !gWnd) return;
-    RECT rc; GetClientRect(gWnd, &rc);
-    int W = rc.right, H = rc.bottom;
-    if (W <= 0 || H <= 0) return;
-    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
-    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
-    void* bits = nullptr;
-    HDC sdc = GetDC(gWnd);
-    HBITMAP comp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HDC dst = CreateCompatibleDC(sdc), src = CreateCompatibleDC(sdc);
-    ReleaseDC(gWnd, sdc);
-    if (!comp) { DeleteDC(dst); DeleteDC(src); return; }
-    HGDIOBJ od = SelectObject(dst, comp), os = SelectObject(src, gPicSrc);
-    HBRUSH bg = CreateSolidBrush(BgColor()); FillRect(dst, &rc, bg); DeleteObject(bg);
-    SetStretchBltMode(dst, HALFTONE); SetBrushOrgEx(dst, 0, 0, nullptr);
-    if (gPicFit == 1) StretchBlt(dst, 0, 0, W, H, src, 0, 0, gPicW, gPicH, SRCCOPY);
-    else if (gPicFit == 2) BitBlt(dst, (W - gPicW) / 2, (H - gPicH) / 2, gPicW, gPicH, src, 0, 0, SRCCOPY);
-    else if (gPicFit == 3) { for (int y = 0; y < H; y += gPicH) for (int x = 0; x < W; x += gPicW) BitBlt(dst, x, y, gPicW, gPicH, src, 0, 0, SRCCOPY); }
-    else {                                      // cover: fill the window, crop what's left over
-        double sc = Max((double)W / gPicW, (double)H / gPicH);
-        int sw = (int)(W / sc), sh = (int)(H / sc);
-        StretchBlt(dst, 0, 0, W, H, src, (gPicW - sw) / 2, (gPicH - sh) / 2, sw, sh, SRCCOPY);
-    }
-    GdiFlush();
-    COLORREF c = BgColor(); int a = Iclamp(gPicDim, 0, 95) * 256 / 100;   // blend the theme colour on top so text stays readable
-    BYTE* px = (BYTE*)bits;
-    for (int i = 0; i < W * H; i++, px += 4) {
-        px[0] = (BYTE)((px[0] * (256 - a) + GetBValue(c) * a) >> 8);
-        px[1] = (BYTE)((px[1] * (256 - a) + GetGValue(c) * a) >> 8);
-        px[2] = (BYTE)((px[2] * (256 - a) + GetRValue(c) * a) >> 8);
-    }
-    SelectObject(dst, od); SelectObject(src, os); DeleteDC(dst); DeleteDC(src);
-    gBrPicture = CreatePatternBrush(comp);
-    DeleteObject(comp);                         // the brush keeps its own copy
-}
+static bool PictureLoad(const wchar_t* path);   // background picture + pictures on top: see "background picture"
+static void PictureRebuild();
+static bool PicActive();
 
 static void ApplyOpacity()
 {
@@ -2980,12 +2928,31 @@ static void ApplyOpacity()
 
 static void FitText();
 static void FitOne(HWND h);
+static int CALLBACK FontEnumProc(const LOGFONTW* lf, const TEXTMETRICW*, DWORD, LPARAM l)
+{
+    HWND c = (HWND)l;
+    if (lf->lfFaceName[0] == L'@') return 1;    // sideways (vertical) copies of East Asian fonts
+    if (SendMessageW(c, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)lf->lfFaceName) == CB_ERR)
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)lf->lfFaceName);
+    return 1;
+}
+static void FontsFill(HWND c)                   // every font installed on this PC
+{
+    LOGFONTW lf = {}; lf.lfCharSet = DEFAULT_CHARSET;
+    HDC dc = GetDC(nullptr);
+    EnumFontFamiliesExW(dc, &lf, (FONTENUMPROCW)FontEnumProc, (LPARAM)c, 0);
+    ReleaseDC(nullptr, dc);
+    LRESULT i = SendMessageW(c, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)gFontName);
+    if (i == CB_ERR) i = SendMessageW(c, CB_FINDSTRINGEXACT, (WPARAM)-1, (LPARAM)L"Segoe UI");
+    SendMessageW(c, CB_SETCURSEL, i == CB_ERR ? 0 : i, 0);
+    SendMessageW(c, CB_SETDROPPEDWIDTH, SC(240), 0);
+}
 static HFONT gFontFit[3];                       // smaller copies of the font for text that would not fit otherwise
 static BOOL CALLBACK SetFontProc(HWND c, LPARAM) { SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return TRUE; }
 static void ApplyFont()                         // re-create the fonts and hand them to every control
 {
-    HFONT f = CreateFontW(-SC(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
-    HFONT b = CreateFontW(-SC(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    HFONT f = CreateFontW(-SC(gFontPx), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    HFONT b = CreateFontW(-SC(gFontPx), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
     if (!f || !b) { if (f) DeleteObject(f); if (b) DeleteObject(b); return; }
     HFONT of = gFont, ob = gFontBold;
     gFont = f; gFontBold = b;
@@ -3152,6 +3119,7 @@ static int     gVocSynthSaved = 100;             // Synth value of the other sid
 static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds (4 pages), then clips
 static bool    gClipAutoTrim = true;             // cut silence off the ends of new clips
 static wchar_t gTtsVoice[128];                   // text-to-speech voice (its name; empty = Windows' default)
+static int     gTtsAccent = 0;                    // text-to-speech accent (TTS_ACCENTS index; 0 = none)
 static int     gRecSeconds = 15;                 // instant replay length
 // What clips keep. The numbers are saved in the settings file, so new ones go at the end.
 enum { REC_BOTH = 0, REC_VOICE = 1, REC_PC = 2, REC_OFF = 3, REC_DISCORD = 4, REC_VOICE_DISCORD = 5, REC_N };
@@ -3272,12 +3240,18 @@ static void LoadSettings()
     gUiScale      = Iclamp(INI_INT(L"ui_scale", 100), 100, 200);
     gCompact      = INI_INT(L"compact", 0) != 0;
     gCmdLine      = INI_INT(L"command_line_control", 0) != 0;
-    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 1);
+    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 2);
     for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); gUserCol[i] = (COLORREF)INI_INT(k, (int)CLR_NONE); }
     GetPrivateProfileStringW(L"settings", L"background_picture", L"", gPicPath, MAX_PATH, gIni);
-    gPicFit       = Iclamp(INI_INT(L"background_fit", 0), 0, 3);
+    gPicFit       = Iclamp(INI_INT(L"background_fit", 0), 0, 4);
+    gPicX         = Iclamp(INI_INT(L"background_x", 40), -2000, 4000);
+    gPicY         = Iclamp(INI_INT(L"background_y", 80), -2000, 4000);
+    gPicSize      = Iclamp(INI_INT(L"background_size", 100), 5, 400);
+    gGifFps       = Iclamp(INI_INT(L"gif_fps_limit", 30), 0, 120);
+    gGifPauseBg   = INI_INT(L"gif_pause_in_background", 0) != 0;
     gPicDim       = Iclamp(INI_INT(L"background_dim", 60), 0, 95);
     GetPrivateProfileStringW(L"settings", L"font", L"Segoe UI", gFontName, 40, gIni);
+    gFontPx = Iclamp(INI_INT(L"font_px", 13), 10, 20);
     gOpacity      = Iclamp(INI_INT(L"window_opacity", 100), 40, 100);
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
@@ -3289,6 +3263,7 @@ static void LoadSettings()
     gRewindMs     = Iclamp(INI_INT(L"rewind_ms", 2000), 300, 3000);
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
+    gTtsAccent = INI_INT(L"tts_accent", 0);
     gEchoStyle = Iclamp(INI_INT(L"fx_echo_style", 0), 0, ECHO_N - 1);
     gHarmStyle = Iclamp(INI_INT(L"fx_harm_style", 0), 0, HARM_N - 1);
     gBeatSync  = INI_INT(L"beat_sync", 0) != 0;
@@ -3388,6 +3363,401 @@ static void SaveInt(const wchar_t* k, int v)
     WritePrivateProfileStringW(L"settings", k, b, gIni);
 }
 
+// ======================= background picture + pictures on top =======================
+#define PICINT(k, d) (int)GetPrivateProfileIntW(L"settings", k, d, gIni)
+// One background picture (fitted, then faded toward the theme colour so text stays readable) and up to
+// STK_MAX pictures on top that you place yourself (not faded). Any of them can be an animated GIF.
+// Loaded with GDI+ (flat API, run-time linked). Frames are decoded once, already at the size they're shown,
+// and GIFs never run faster than the frame-rate limit (frames in between are merged, which also saves memory).
+// The window background is one pattern brush built from all of this; an animated picture on top only
+// redraws its own rectangle, and nothing animates while the window is hidden or minimised.
+typedef int (WINAPI* PGpLoad)(const WCHAR*, void**);
+typedef int (WINAPI* PGpDispose)(void*);
+typedef int (WINAPI* PGpUint)(void*, UINT*);
+typedef int (WINAPI* PGpDimList)(void*, GUID*, UINT);
+typedef int (WINAPI* PGpFrameCount)(void*, const GUID*, UINT*);
+typedef int (WINAPI* PGpSelFrame)(void*, const GUID*, UINT);
+typedef int (WINAPI* PGpPropSize)(void*, ULONG, UINT*);
+typedef int (WINAPI* PGpProp)(void*, ULONG, UINT, void*);
+typedef int (WINAPI* PGpScan0)(INT, INT, INT, INT, BYTE*, void**);
+typedef int (WINAPI* PGpCtx)(void*, void**);
+typedef int (WINAPI* PGpClear)(void*, DWORD);
+typedef int (WINAPI* PGpSetInt)(void*, int);
+typedef int (WINAPI* PGpDrawRectI)(void*, void*, INT, INT, INT, INT);
+typedef int (WINAPI* PGpDelG)(void*);
+static struct GpApi {
+    bool ok, tried;
+    PGpLoad load; PGpDispose dispose; PGpUint width, height, dimCount; PGpDimList dimList; PGpFrameCount frameCount;
+    PGpSelFrame selFrame; PGpPropSize propSize; PGpProp prop; PGpScan0 fromScan0; PGpCtx ctx; PGpClear clear;
+    PGpSetInt interp, pixOff; PGpDrawRectI draw; PGpDelG delG;
+} gGp;
+static bool GpReady()
+{
+    if (gGp.tried) return gGp.ok;
+    gGp.tried = true;
+    HMODULE gp = LoadLibraryW(L"gdiplus.dll");
+    if (!gp) return false;
+    struct StartupInput { UINT32 ver; void* cb; BOOL noThread, noCodecs; };
+    typedef int (WINAPI* PStartup)(ULONG_PTR*, const StartupInput*, void*);
+    auto startup = (PStartup)(void*)GetProcAddress(gp, "GdiplusStartup");
+    #define GPF(field, T, name) gGp.field = (T)(void*)GetProcAddress(gp, name); if (!gGp.field) return false;
+    GPF(load, PGpLoad, "GdipLoadImageFromFile") GPF(dispose, PGpDispose, "GdipDisposeImage")
+    GPF(width, PGpUint, "GdipGetImageWidth") GPF(height, PGpUint, "GdipGetImageHeight")
+    GPF(dimCount, PGpUint, "GdipImageGetFrameDimensionsCount") GPF(dimList, PGpDimList, "GdipImageGetFrameDimensionsList")
+    GPF(frameCount, PGpFrameCount, "GdipImageGetFrameCount") GPF(selFrame, PGpSelFrame, "GdipImageSelectActiveFrame")
+    GPF(propSize, PGpPropSize, "GdipGetPropertyItemSize") GPF(prop, PGpProp, "GdipGetPropertyItem")
+    GPF(fromScan0, PGpScan0, "GdipCreateBitmapFromScan0") GPF(ctx, PGpCtx, "GdipGetImageGraphicsContext")
+    GPF(clear, PGpClear, "GdipGraphicsClear") GPF(interp, PGpSetInt, "GdipSetInterpolationMode")
+    GPF(pixOff, PGpSetInt, "GdipSetPixelOffsetMode") GPF(draw, PGpDrawRectI, "GdipDrawImageRectI")
+    GPF(delG, PGpDelG, "GdipDeleteGraphics")
+    #undef GPF
+    static ULONG_PTR token = 0;
+    StartupInput si = { 1, nullptr, FALSE, FALSE };
+    if (!startup || startup(&token, &si, nullptr) != 0) return false;
+    gGp.ok = true;
+    return true;
+}
+
+struct PicImg {
+    void*  gp;                                  // the file, kept open so it can be decoded again at another size
+    int    w0, h0, nAll;                        // its own size and frame count
+    GUID   dim;                                 // frame dimension (time, for GIFs)
+    int*   delayAll;                            // each frame's delay (ms)
+    int    w, h, n, fps;                        // decoded: size, frame count, the frame-rate limit used
+    DWORD* px;                                  // n frames of w*h premultiplied BGRA
+    int*   delay;                               // how long each decoded frame shows (ms)
+    int    cur; ULONGLONG due;                  // frame showing and when the next one is due
+};
+static void PicFreeFrames(PicImg& m)
+{
+    if (m.px) HeapFree(GetProcessHeap(), 0, m.px);
+    if (m.delay) HeapFree(GetProcessHeap(), 0, m.delay);
+    m.px = nullptr; m.delay = nullptr; m.w = m.h = m.n = 0; m.cur = 0;
+}
+static void PicClose(PicImg& m)
+{
+    PicFreeFrames(m);
+    if (m.delayAll) HeapFree(GetProcessHeap(), 0, m.delayAll);
+    if (m.gp && gGp.ok) gGp.dispose(m.gp);
+    m = {};
+}
+static bool PicOpen(PicImg& m, const wchar_t* path)
+{
+    PicClose(m);
+    if (!path || !path[0] || !GpReady()) return false;
+    if (gGp.load(path, &m.gp) != 0 || !m.gp) { m.gp = nullptr; return false; }
+    UINT w = 0, h = 0, dims = 0, n = 1;
+    gGp.width(m.gp, &w); gGp.height(m.gp, &h);
+    if (!w || !h) { PicClose(m); return false; }
+    m.w0 = (int)w; m.h0 = (int)h;
+    if (gGp.dimCount(m.gp, &dims) == 0 && dims > 0) {
+        GUID list[4]; gGp.dimList(m.gp, list, dims > 4 ? 4 : dims); m.dim = list[0];
+        if (gGp.frameCount(m.gp, &m.dim, &n) != 0 || n < 1) n = 1;
+    }
+    m.nAll = (int)Imin((int)n, 2000);
+    m.delayAll = (int*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, m.nAll * sizeof(int));
+    if (!m.delayAll) { PicClose(m); return false; }
+    for (int i = 0; i < m.nAll; i++) m.delayAll[i] = 100;
+    UINT sz = 0;
+    if (m.nAll > 1 && gGp.propSize(m.gp, 0x5100, &sz) == 0 && sz > 16) {   // PropertyTagFrameDelay: 1/100 s per frame
+        struct PropItem { ULONG id; ULONG len; WORD type; void* value; };
+        PropItem* pi = (PropItem*)HeapAlloc(GetProcessHeap(), 0, sz);
+        if (pi && gGp.prop(m.gp, 0x5100, sz, pi) == 0) {
+            int cnt = Imin((int)(pi->len / 4), m.nAll);
+            for (int i = 0; i < cnt; i++) { int d = ((LONG*)pi->value)[i] * 10; m.delayAll[i] = d <= 10 ? 100 : d; }   // 0 / 10 ms: browsers use 100
+        }
+        if (pi) HeapFree(GetProcessHeap(), 0, pi);
+    }
+    return true;
+}
+#define PIC_PX_BUDGET (12 * 1024 * 1024)        // pixels of decoded frames per picture (48 MB)
+static bool PicDecode(PicImg& m, int tw, int th)   // all (kept) frames at tw x th
+{
+    if (!m.gp || tw < 1 || th < 1) return false;
+    if (m.px && m.w == tw && m.h == th && m.fps == gGifFps) return true;
+    PicFreeFrames(m);
+    // which frames to keep: never faster than the limit, and within the memory budget
+    int keep[2000], kdel[2000], nk = 0;
+    const int maxFrames = Imax(1, Imin(2000, (int)(PIC_PX_BUDGET / ((long long)tw * th))));
+    int minMs = gGifFps > 0 ? 1000 / gGifFps : 0;
+    for (int pass = 0; pass < 12; pass++) {
+        nk = 0; int t = 0, nextAt = 0;
+        for (int i = 0; i < m.nAll; i++) {
+            if (i == 0 || t >= nextAt) { keep[nk] = i; kdel[nk] = 0; nk++; nextAt = t + minMs; }
+            kdel[nk - 1] += m.delayAll[i];
+            t += m.delayAll[i];
+        }
+        if (nk <= maxFrames) break;
+        minMs = Imax(minMs * 2, 20);              // too many to fit: fewer, longer frames
+    }
+    m.px = (DWORD*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (size_t)tw * th * 4 * nk);
+    m.delay = (int*)HeapAlloc(GetProcessHeap(), 0, nk * sizeof(int));
+    if (!m.px || !m.delay) { PicFreeFrames(m); return false; }
+    const bool blocky = tw >= m.w0 * 2 && th >= m.h0 * 2;   // big enlargements of small (pixel-art) GIFs stay crisp
+    for (int k = 0; k < nk; k++) {
+        if (m.nAll > 1) gGp.selFrame(m.gp, &m.dim, (UINT)keep[k]);
+        void* bmp = nullptr; void* g = nullptr;
+        if (gGp.fromScan0(tw, th, tw * 4, 0x000E200B /* 32bpp PARGB */, (BYTE*)(m.px + (size_t)tw * th * k), &bmp) == 0 && bmp) {
+            if (gGp.ctx(bmp, &g) == 0 && g) {
+                gGp.clear(g, 0);
+                gGp.interp(g, blocky ? 5 /* nearest */ : 7 /* high-quality bicubic */);
+                gGp.pixOff(g, blocky ? 4 /* half */ : 2 /* high quality */);
+                gGp.draw(g, m.gp, 0, 0, tw, th);
+                gGp.delG(g);
+            }
+            gGp.dispose(bmp);
+        }
+        m.delay[k] = Imax(kdel[k], 15);
+    }
+    m.w = tw; m.h = th; m.n = nk; m.fps = gGifFps; m.cur = 0; m.due = GetTickCount64() + m.delay[0];
+    return true;
+}
+
+#define STK_MAX 8
+struct Sticker { wchar_t path[MAX_PATH]; int x, y, size, opacity; PicImg img; bool stale; };
+static Sticker  gStk[STK_MAX];  static int gStkN = 0, gStkSel = 0;
+static PicImg   gBase;                          // the background picture
+static int      gCW = 0, gCH = 0;               // composite size (the window's client area)
+static DWORD*   gBaseBuf = nullptr;             // theme colour + background picture + fade
+static HBITMAP  gCompBmp = nullptr; static DWORD* gCompBits = nullptr;   // ... + pictures on top
+static bool PicActive() { return gBase.gp != nullptr || gStkN > 0; }
+
+static void StkRect(const Sticker& s, RECT* r)  // where a picture on top is drawn (client px)
+{
+    int w = Imax(1, SC(s.img.w0) * s.size / 100), h = Imax(1, SC(s.img.h0) * s.size / 100);
+    r->left = SC(s.x); r->top = SC(s.y); r->right = r->left + w; r->bottom = r->top + h;
+}
+static void BaseTarget(int W, int H, int* tw, int* th, int* dx, int* dy)   // background: decoded size and where it goes
+{
+    const int w0 = gBase.w0, h0 = gBase.h0;
+    switch (gPicFit) {
+    case 1:  *tw = W; *th = H; *dx = 0; *dy = 0; break;                                     // stretch
+    case 2:  *tw = w0; *th = h0; *dx = (W - w0) / 2; *dy = (H - h0) / 2; break;              // centre
+    case 3:  *tw = w0; *th = h0; *dx = 0; *dy = 0; break;                                   // tile
+    case 4:  *tw = Imax(1, SC(w0) * gPicSize / 100); *th = Imax(1, SC(h0) * gPicSize / 100);  // placed by you
+             *dx = SC(gPicX); *dy = SC(gPicY); break;
+    default: {                                                                               // fill (crop)
+        double sc = Max((double)W / w0, (double)H / h0);
+        *tw = Imax(W, (int)(w0 * sc + 0.5)); *th = Imax(H, (int)(h0 * sc + 0.5));
+        *dx = (W - *tw) / 2; *dy = (H - *th) / 2;
+    }
+    }
+    if (gPicFit == 3 && (long long)w0 * h0 > 4000000) { *tw = w0 / 2; *th = h0 / 2; }
+}
+// src (premultiplied BGRA, sw x sh) over dst at dx,dy scaled to dw x dh, faded to op/256, only inside clip
+static void BlitOver(DWORD* dst, int W, int H, const DWORD* src, int sw, int sh, int dx, int dy, int dw, int dh, int op, const RECT& clip)
+{
+    int x0 = Imax(Imax(dx, 0), (int)clip.left), y0 = Imax(Imax(dy, 0), (int)clip.top);
+    int x1 = Imin(Imin(dx + dw, W), (int)clip.right), y1 = Imin(Imin(dy + dh, H), (int)clip.bottom);
+    if (x0 >= x1 || y0 >= y1 || dw <= 0 || dh <= 0) return;
+    const bool same = dw == sw && dh == sh;
+    for (int y = y0; y < y1; y++) {
+        const int sy = same ? y - dy : (int)((long long)(y - dy) * sh / dh);
+        const DWORD* srow = src + (size_t)sy * sw;
+        DWORD* drow = dst + (size_t)y * W;
+        for (int x = x0; x < x1; x++) {
+            DWORD s = srow[same ? x - dx : (int)((long long)(x - dx) * sw / dw)];
+            if (op < 256) {
+                s = ((((s & 0x00FF00FF) * op) >> 8) & 0x00FF00FF) | ((((s >> 8) & 0x00FF00FF) * op) & 0xFF00FF00);
+            }
+            const DWORD a = s >> 24;
+            if (a == 0) continue;
+            if (a == 255) { drow[x] = s | 0xFF000000; continue; }
+            const DWORD d = drow[x], ia = 255 - a;
+            const DWORD rb = ((d & 0x00FF00FF) * ia / 255) & 0x00FF00FF;   // (per-channel, no carries: each < 256)
+            const DWORD g  = ((d & 0x0000FF00) * ia / 255) & 0x0000FF00;
+            drow[x] = 0xFF000000 | ((s & 0x00FFFFFF) + rb + g);
+        }
+    }
+}
+static void StkEnsureDecoded(Sticker& s)
+{
+    RECT r; StkRect(s, &r);
+    PicDecode(s.img, r.right - r.left, r.bottom - r.top);
+    s.stale = false;
+}
+static void PicComposeBase()                    // theme colour, background picture, fade
+{
+    const COLORREF bg = BgColor();
+    const DWORD bgpx = 0xFF000000 | (GetRValue(bg) << 16) | (GetGValue(bg) << 8) | GetBValue(bg);
+    for (int i = 0; i < gCW * gCH; i++) gBaseBuf[i] = bgpx;
+    if (!gBase.gp || !gBase.px) return;
+    int tw, th, dx, dy; BaseTarget(gCW, gCH, &tw, &th, &dx, &dy);
+    const DWORD* f = gBase.px + (size_t)gBase.w * gBase.h * gBase.cur;
+    RECT all = { 0, 0, gCW, gCH };
+    if (gPicFit == 3) { for (int y = 0; y < gCH; y += gBase.h) for (int x = 0; x < gCW; x += gBase.w) BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, x, y, gBase.w, gBase.h, 256, all); }
+    else BlitOver(gBaseBuf, gCW, gCH, f, gBase.w, gBase.h, dx, dy, tw, th, 256, all);
+    const int a = Iclamp(gPicDim, 0, 95) * 256 / 100;   // fade toward the theme colour so text stays readable
+    const DWORD br = GetRValue(bg) * a, bgc = GetGValue(bg) * a, bb = GetBValue(bg) * a;
+    BYTE* p = (BYTE*)gBaseBuf;
+    for (int i = 0; i < gCW * gCH; i++, p += 4) {
+        p[0] = (BYTE)((p[0] * (256 - a) + bb) >> 8);
+        p[1] = (BYTE)((p[1] * (256 - a) + bgc) >> 8);
+        p[2] = (BYTE)((p[2] * (256 - a) + br) >> 8);
+    }
+}
+static void PicComposeTop(const RECT& r)        // background + pictures on top, inside r
+{
+    RECT c = { Imax((int)r.left, 0), Imax((int)r.top, 0), Imin((int)r.right, gCW), Imin((int)r.bottom, gCH) };
+    if (c.left >= c.right || c.top >= c.bottom) return;
+    for (int y = c.top; y < c.bottom; y++)
+        memcpy(gCompBits + (size_t)y * gCW + c.left, gBaseBuf + (size_t)y * gCW + c.left, (c.right - c.left) * 4);
+    for (int i = 0; i < gStkN; i++) {
+        Sticker& s = gStk[i];
+        if (!s.img.px) continue;
+        RECT sr; StkRect(s, &sr);
+        BlitOver(gCompBits, gCW, gCH, s.img.px + (size_t)s.img.w * s.img.h * s.img.cur, s.img.w, s.img.h,
+                 sr.left, sr.top, sr.right - sr.left, sr.bottom - sr.top, Iclamp(s.opacity, 5, 100) * 256 / 100, c);
+    }
+    GdiFlush();
+}
+static void PicMakeBrush()
+{
+    if (gBrPicture) { DeleteObject(gBrPicture); gBrPicture = nullptr; }
+    if (gCompBmp) gBrPicture = CreatePatternBrush(gCompBmp);
+}
+static void PicFreeComposite()
+{
+    if (gBrPicture) { DeleteObject(gBrPicture); gBrPicture = nullptr; }
+    if (gCompBmp) { DeleteObject(gCompBmp); gCompBmp = nullptr; gCompBits = nullptr; }
+    if (gBaseBuf) { HeapFree(GetProcessHeap(), 0, gBaseBuf); gBaseBuf = nullptr; }
+    gCW = gCH = 0;
+}
+static void PicAnimTimer();
+static void PictureRebuild()                    // everything, at the window's size
+{
+    if (!gWnd) return;
+    if (!PicActive()) { PicFreeComposite(); PicAnimTimer(); return; }
+    RECT rc; GetClientRect(gWnd, &rc);
+    const int W = rc.right, H = rc.bottom;
+    if (W <= 0 || H <= 0) return;
+    if (W != gCW || H != gCH || !gCompBmp) {
+        PicFreeComposite();
+        BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+        void* bits = nullptr;
+        gCompBmp = CreateDIBSection(nullptr, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        gBaseBuf = (DWORD*)HeapAlloc(GetProcessHeap(), 0, (size_t)W * H * 4);
+        if (!gCompBmp || !gBaseBuf) { PicFreeComposite(); return; }
+        gCompBits = (DWORD*)bits; gCW = W; gCH = H;
+    }
+    if (gBase.gp) { int tw, th, dx, dy; BaseTarget(W, H, &tw, &th, &dx, &dy); PicDecode(gBase, tw, th); }
+    for (int i = 0; i < gStkN; i++) StkEnsureDecoded(gStk[i]);
+    PicComposeBase();
+    RECT all = { 0, 0, W, H };
+    PicComposeTop(all);
+    PicMakeBrush();
+    PicAnimTimer();
+}
+static bool PictureLoad(const wchar_t* path)    // the background picture (empty path = none)
+{
+    PicClose(gBase);
+    return path && path[0] && PicOpen(gBase, path);
+}
+static void PicRedraw(const RECT* r)            // repaint the window (or part of it) and its controls
+{
+    RedrawWindow(gWnd, r, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+}
+static void StkRefresh(const RECT* also)        // pictures on top changed: re-compose and repaint just there
+{
+    if (!gCompBmp) { PictureRebuild(); PicRedraw(nullptr); return; }
+    RECT u = {}; if (also) u = *also;
+    for (int i = 0; i < gStkN; i++) { RECT r; StkRect(gStk[i], &r); UnionRect(&u, &u, &r); }
+    PicComposeTop(u);
+    PicMakeBrush();
+    PicRedraw(&u);
+}
+// ---- animation ----
+#define TIMER_PICANIM  41
+#define TIMER_STKSIZE  42
+static void PicAnimTimer()                      // run the animation timer only while something animates
+{
+    bool any = gBase.n > 1;
+    for (int i = 0; i < gStkN; i++) if (gStk[i].img.n > 1) any = true;
+    if (any) SetTimer(gWnd, TIMER_PICANIM, gGifFps > 0 ? Imax(15, 1000 / gGifFps) : 15, nullptr);
+    else KillTimer(gWnd, TIMER_PICANIM);
+}
+static bool PicAdvance(PicImg& m, ULONGLONG now)
+{
+    if (m.n <= 1 || now < m.due) return false;
+    int steps = 0;
+    while (now >= m.due && steps++ < m.n) { m.cur = (m.cur + 1) % m.n; m.due += m.delay[m.cur]; }
+    if (now >= m.due) m.due = now + m.delay[m.cur];   // fell far behind (e.g. was hidden): carry on from now
+    return true;
+}
+static void PicAnimTick()
+{
+    if (!gWnd || !IsWindowVisible(gWnd) || IsIconic(gWnd) || !gCompBmp) return;   // nobody can see it
+    if (gGifPauseBg && GetForegroundWindow() != gWnd) return;
+    const ULONGLONG now = GetTickCount64();
+    if (PicAdvance(gBase, now)) {               // the background moved: everything changes
+        for (int i = 0; i < gStkN; i++) PicAdvance(gStk[i].img, now);
+        PicComposeBase();
+        RECT all = { 0, 0, gCW, gCH };
+        PicComposeTop(all); PicMakeBrush(); PicRedraw(nullptr);
+        return;
+    }
+    RECT u = {}; bool any = false;
+    for (int i = 0; i < gStkN; i++)
+        if (PicAdvance(gStk[i].img, now)) { RECT r; StkRect(gStk[i], &r); UnionRect(&u, &u, &r); any = true; }
+    if (!any) return;
+    PicComposeTop(u); PicMakeBrush(); PicRedraw(&u);
+}
+// ---- pictures on top: add / remove / save ----
+static bool StkAdd(const wchar_t* path)
+{
+    if (gStkN >= STK_MAX) return false;
+    Sticker& s = gStk[gStkN];
+    s = {};
+    if (!PicOpen(s.img, path)) return false;
+    lstrcpynW(s.path, path, MAX_PATH);
+    int big = Imax(s.img.w0, s.img.h0);
+    s.size = Iclamp(big > 160 ? 16000 / big : 100, 5, 400);   // start about 160 px across
+    s.opacity = 100;
+    s.x = 300 + (gStkN % 4) * 24; s.y = 90 + (gStkN % 4) * 24;
+    gStkN++;
+    return true;
+}
+static void StkRemove(int i)
+{
+    if (i < 0 || i >= gStkN) return;
+    PicClose(gStk[i].img);
+    for (int k = i; k < gStkN - 1; k++) gStk[k] = gStk[k + 1];
+    gStk[gStkN - 1] = {};
+    gStkN--;
+    if (gStkSel >= gStkN) gStkSel = Imax(0, gStkN - 1);
+}
+static void StkLoadAll()                        // from the settings file
+{
+    for (int i = gStkN - 1; i >= 0; i--) StkRemove(i);
+    int n = Iclamp(PICINT(L"pic_count", 0), 0, STK_MAX);
+    for (int i = 0; i < n; i++) {
+        wchar_t k[32], path[MAX_PATH];
+        wsprintfW(k, L"pic_%d_path", i); GetPrivateProfileStringW(L"settings", k, L"", path, MAX_PATH, gIni);
+        if (!StkAdd(path)) continue;
+        Sticker& s = gStk[gStkN - 1];
+        wsprintfW(k, L"pic_%d_x", i);       s.x = Iclamp(PICINT(k, s.x), -2000, 4000);
+        wsprintfW(k, L"pic_%d_y", i);       s.y = Iclamp(PICINT(k, s.y), -2000, 4000);
+        wsprintfW(k, L"pic_%d_size", i);    s.size = Iclamp(PICINT(k, s.size), 5, 400);
+        wsprintfW(k, L"pic_%d_opacity", i); s.opacity = Iclamp(PICINT(k, 100), 5, 100);
+    }
+}
+static void StkSaveAll()
+{
+    SaveInt(L"pic_count", gStkN);
+    for (int i = 0; i < STK_MAX; i++) {
+        wchar_t k[32];
+        wsprintfW(k, L"pic_%d_path", i); WritePrivateProfileStringW(L"settings", k, i < gStkN ? gStk[i].path : nullptr, gIni);
+        const wchar_t* names[] = { L"x", L"y", L"size", L"opacity" };
+        for (int f = 0; f < 4; f++) {
+            wsprintfW(k, L"pic_%d_%s", i, names[f]);
+            if (i < gStkN) SaveInt(k, f == 0 ? gStk[i].x : f == 1 ? gStk[i].y : f == 2 ? gStk[i].size : gStk[i].opacity);
+            else WritePrivateProfileStringW(L"settings", k, nullptr, gIni);
+        }
+    }
+}
+
+
 static void SaveSettings()
 {
     for (Range& r : gRanges) SaveInt(r.key, *r.var);
@@ -3415,7 +3785,12 @@ static void SaveSettings()
     for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); SaveInt(k, (int)gUserCol[i]); }
     WritePrivateProfileStringW(L"settings", L"background_picture", gPicPath, gIni);
     SaveInt(L"background_fit", gPicFit); SaveInt(L"background_dim", gPicDim);
+    SaveInt(L"background_x", gPicX); SaveInt(L"background_y", gPicY); SaveInt(L"background_size", gPicSize);
+    SaveInt(L"gif_fps_limit", gGifFps); SaveInt(L"gif_pause_in_background", gGifPauseBg);
+    StkSaveAll();
+    LayoutSave(gIni);
     WritePrivateProfileStringW(L"settings", L"font", gFontName, gIni);
+    SaveInt(L"font_px", gFontPx);
     SaveInt(L"window_opacity", gOpacity);
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); SaveInt(k, gFxHold[1 + g]); }
@@ -3429,6 +3804,7 @@ static void SaveSettings()
     SaveInt(L"rewind_ms", gRewindMs);
     SaveInt(L"repeat_word_times", gRepeatN);
     WritePrivateProfileStringW(L"settings", L"tts_voice", gTtsVoice, gIni);
+    SaveInt(L"tts_accent", gTtsAccent);
     SaveInt(L"fx_echo_style", gEchoStyle);
     SaveInt(L"fx_harm_style", gHarmStyle);
     SaveInt(L"beat_sync", gBeatSync); SaveInt(L"bpm", gBpm); SaveInt(L"beat_division", gBeatDiv);
@@ -3656,14 +4032,22 @@ static void StopAudio()
 #define TAB_COUNT 6
 enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5 };
 
-struct Shifted { HWND h; int x, y; };
-struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; };
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; };   // ox/oy: moved by you (design px)
 struct Framed  { HWND edit, ud; };
 struct Paged   { HWND h; int page; int sub; };   // sub: Voice FX sub-tab (-1 = every sub-tab)
-static Shifted gShift[96];   static int gShiftN = 0;
-// Every control's position as laid out (already scaled), plus how far FitText has moved / widened it.
-struct Design  { HWND h; int x, y, w, ht, page, sub, dx, dw, adx, adw; };
+// Every control's position as laid out (scaled), how far FitText moved / widened it, and how far you moved it.
+// PlaceAll puts each control at: layout + FitText + (moves with the output list) + your offset + its section's offset.
+struct Design  {
+    HWND h; int x, y, w, ht, page, sub, dx, dw;
+    int  rx, ry;                                // layout position in design px (unscaled): names it in saved layouts
+    bool shifted, combo;                        // moves down as outputs are added / is a dropdown (height = list)
+    HWND ud; int udx, udy;                      // number box: its arrows and where they sit relative to it
+    int  sec, ox, oy;                           // the section it's in (-1 none), your offset (design px)
+};
 #define MAX_DESIGN 1400
+static void LayoutSave(const wchar_t* path);
+static bool LayoutLoad(const wchar_t* path, bool apply);
+static void EdFollow();
 static Design  gDesign[MAX_DESIGN];  static int gDesignN = 0;
 #define MAX_SECTIONS 48
 #define MAX_FRAMED   48
@@ -3687,9 +4071,13 @@ static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int
     HWND c = CreateWindowExW(ex, cls, text, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
                              gWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE);
-    if (gRecordShift && gShiftN < 96) gShift[gShiftN++] = { c, x, y };
     RecordPage(c);
-    if (gDesignN < MAX_DESIGN) gDesign[gDesignN++] = { c, x, y, w, h, gBuildPage, gBuildSub, 0, 0, 0, 0 };
+    if (gDesignN < MAX_DESIGN) {
+        Design& d = gDesign[gDesignN++];
+        d = {};
+        d.h = c; d.x = x; d.y = y; d.w = w; d.ht = h; d.page = gBuildPage; d.sub = gBuildSub;
+        d.rx = UNSC(x); d.ry = UNSC(y); d.shifted = gRecordShift; d.combo = !lstrcmpiW(cls, L"COMBOBOX"); d.sec = -1;
+    }
     return c;
 }
 
@@ -3703,10 +4091,12 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
     SendMessageW(u, UDM_SETRANGE32, lo, hi);
     SendMessageW(u, UDM_SETPOS32, 0, val);
     SetWindowSubclass(u, UpDownProc, 1, 0);
-    if (gRecordShift && gShiftN < 96) {
-        RECT r; GetWindowRect(u, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
-        gShift[gShiftN++] = { u, r.left, r.top };
-    }
+    for (int i = gDesignN - 1; i >= 0; i--)
+        if (gDesign[i].h == e) {                // the arrows follow the box wherever it goes
+            RECT er, ur; GetWindowRect(e, &er); GetWindowRect(u, &ur);
+            gDesign[i].ud = u; gDesign[i].udx = ur.left - er.left; gDesign[i].udy = ur.top - er.top;
+            break;
+        }
     if (gFramedN < MAX_FRAMED) gFramed[gFramedN++] = { e, u };
     RecordPage(u);
     return u;
@@ -3714,9 +4104,47 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub };
+    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub, 0, 0 };
 }
 
+
+// ======================= placing controls =======================
+static int CtlOffX(const Design& d) { return d.ox + (d.sec >= 0 ? gSections[d.sec].ox : 0); }
+static int CtlOffY(const Design& d) { return d.oy + (d.sec >= 0 ? gSections[d.sec].oy : 0); }
+static void PlaceAll()
+{
+    if (!gWnd) return;
+    const int rows = RowsDelta();
+    HWND keep[3] = { GetDlgItem(gWnd, IDC_STATUS), GetDlgItem(gWnd, IDC_START), GetDlgItem(gWnd, IDC_MUTEBTN) };
+    for (int i = 0; i < gDesignN; i++) {
+        Design& d = gDesign[i];
+        if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
+        int x = d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d));
+        RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+        int w = d.ud ? r.right - r.left : d.w + d.dw;          // a number box keeps the width its arrows left it
+        int h = d.combo ? d.ht : r.bottom - r.top;              // a dropdown's height is its list
+        if (r.left != x || r.top != y || r.right - r.left != w)
+            SetWindowPos(d.h, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (d.ud) {
+            RECT u; GetWindowRect(d.ud, &u); MapWindowPoints(nullptr, gWnd, (POINT*)&u, 2);
+            if (u.left != x + d.udx || u.top != y + d.udy)
+                SetWindowPos(d.ud, nullptr, x + d.udx, y + d.udy, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+static void AssignSections()                    // which section each control sits in (it moves with it)
+{
+    for (int i = 0; i < gDesignN; i++) {
+        Design& d = gDesign[i];
+        d.sec = -1;
+        if (d.page < 0) continue;
+        for (int k = 0; k < gSectionN; k++) {
+            const Section& s = gSections[k];
+            if (s.page != d.page || !(s.sub == d.sub || s.sub < 0 || d.sub < 0)) continue;
+            if (d.rx >= s.x && d.rx < s.x + s.w && d.ry >= s.y - 10 && d.ry < s.y + s.h) { d.sec = k; break; }
+        }
+    }
+}
 
 // ======================= fitting text to its space =======================
 // The layout uses fixed sizes that suit Segoe UI. Wider fonts (Verdana, Comic Sans, ...) or different text
@@ -3752,7 +4180,7 @@ static int FitKind(const Design& d)            // 0 = other, 1 = one-line label,
     }
     if (!lstrcmpiW(cls, L"Static")) {
         int id = GetDlgCtrlID(d.h);
-        if ((st & SS_TYPEMASK) != SS_LEFT || !(id == 0xFFFF || id == IDC_HDR || id == IDC_RADIODESC || id == IDC_HEARLBL)) return 0;
+        if ((st & SS_TYPEMASK) != SS_LEFT || !((id & 0xFFFF) == 0xFFFF || id == IDC_HDR || id == IDC_RADIODESC || id == IDC_HEARLBL)) return 0;
         return d.ht <= SC(24) ? 1 : 3;
     }
     return 0;
@@ -3803,7 +4231,7 @@ static HFONT FitFont(int level)                 // level 0 = the normal font, 1-
 {
     if (level <= 0) return gFont;
     HFONT& f = gFontFit[level - 1];
-    if (!f) f = CreateFontW(-SC(13 - level), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    if (!f) f = CreateFontW(-SC(gFontPx - level), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
     return f ? f : gFont;
 }
 static void FitFontOf(int i, int kind)
@@ -3824,6 +4252,7 @@ static void FitText()
     if (!gWnd || !gFont) return;
     int* kinds = gFitKinds;
     for (int i = 0; i < gDesignN; i++) { gDesign[i].dx = 0; gDesign[i].dw = 0; kinds[i] = gDesign[i].page >= 0 ? FitKind(gDesign[i]) : 0; }
+    // (GetDlgCtrlID gives -1 for the many "no id" labels: (id & 0xFFFF) == 0xFFFF catches both spellings)
 
     // 1. widen labels, left to right, pushing the rest of the row along
     for (int pass = 0; pass < 2; pass++)        // twice, so a label pushed by an earlier one is measured at its final place
@@ -3853,28 +4282,23 @@ static void FitText()
                     if (j != k && FitSameGroup(cb, b) && FitSameRow(cb, b) && b.x > cb.x) b.dx -= take;
                 }
             }
-            if (over > 0 && (kinds[i] == 1 || kinds[i] == 3)) c.dw -= Imin(over, c.w + c.dw - SC(20));
+            // still too wide: labels / checkboxes on the row (left of it, or it) give up width; their font shrinks to fit later
+            for (int k = gDesignN - 1; k >= 0 && over > 0; k--) {
+                Design& lb = gDesign[k];
+                if ((kinds[k] != 1 && kinds[k] != 2 && kinds[k] != 3) || !FitSameGroup(c, lb) || !FitSameRow(c, lb) || lb.x > c.x) continue;
+                int slack = lb.w + lb.dw - Imax(SC(30), (lb.w + lb.dw) * 70 / 100);
+                int take = Imin(slack, over);
+                if (take <= 0) continue;
+                lb.dw -= take; over -= take;
+                for (int j = 0; j < gDesignN; j++) {
+                    Design& b = gDesign[j];
+                    if (j != k && FitSameGroup(lb, b) && FitSameRow(lb, b) && b.x > lb.x) b.dx -= take;
+                }
+            }
         }
 
-    // 3. move / resize what changed (number boxes take their arrows along; rows that slide down remember the new x)
-    for (int i = 0; i < gDesignN; i++) {
-        Design& d = gDesign[i];
-        int ddx = d.dx - d.adx, ddw = d.dw - d.adw;
-        if (!ddx && !ddw) continue;
-        RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
-        int hgt = kinds[i] == 4 ? d.ht : r.bottom - r.top;
-        SetWindowPos(d.h, nullptr, r.left + ddx, r.top, r.right - r.left + ddw, hgt,
-                     SWP_NOZORDER | SWP_NOACTIVATE | (ddw ? 0 : SWP_NOSIZE));
-        for (int k = 0; k < gShiftN; k++) if (gShift[k].h == d.h) gShift[k].x += ddx;
-        if (ddx)
-            for (int f = 0; f < gFramedN; f++)
-                if (gFramed[f].edit == d.h && gFramed[f].ud) {
-                    RECT u; GetWindowRect(gFramed[f].ud, &u); MapWindowPoints(nullptr, gWnd, (POINT*)&u, 2);
-                    SetWindowPos(gFramed[f].ud, nullptr, u.left + ddx, u.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-                    for (int k = 0; k < gShiftN; k++) if (gShift[k].h == gFramed[f].ud) gShift[k].x += ddx;
-                }
-        d.adx = d.dx; d.adw = d.dw;
-    }
+    // 3. put everything where it now belongs
+    PlaceAll();
 
     // 4. still too big for its space: a slightly smaller font (down to 3 px smaller)
     for (int i = 0; i < gDesignN; i++) FitFontOf(i, kinds[i]);
@@ -3981,7 +4405,7 @@ static void PaintKnob(HWND h, HDC dc)
         KnobArc(dc, cx, cy, r, 225.0, ang, value, 5);
     }
 
-    HBRUSH body = CreateSolidBrush(gDark ? DK_KNOB : LT_CARD);
+    HBRUSH body = CreateSolidBrush(KNOB_C);
     HPEN   edge = CreatePen(PS_SOLID, 1, focus ? ACCENT : gDark ? RGB(88, 88, 88) : RGB(186, 186, 186));
     HGDIOBJ ob = SelectObject(dc, body), op = SelectObject(dc, edge);
     Ellipse(dc, cx - 18, cy - 18, cx + 19, cy + 19);
@@ -5605,6 +6029,7 @@ static bool ProfileSave(const wchar_t* name)
     for (const Range& r : gRanges) put(r.key, *r.var);
     for (const FxGroup& g : gFxGroups) put(g.key, *g.on ? 1 : 0);
     for (const Knob& k : gKnobs) put(k.key, *k.var);
+    LayoutSave(path);                           // each profile keeps where you moved things to
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
@@ -5665,6 +6090,7 @@ static bool ProfileLoad(int idx, bool osd)
     for (const FxGroup& g : gFxGroups) *g.on = get(g.key, *g.on, 0, 1) != 0;
     for (const Knob& k : gKnobs) *k.var = get(k.key, *k.var, k.lo, k.hi);
     gProfCur = idx;
+    if (LayoutLoad(path, true)) LayoutSave(gIni);   // its layout (older profiles have none: keep the current one)
     RefreshSoundUI();
     if (osd) { wchar_t m[96]; wsprintfW(m, L"Profile: %s", gProfNames[idx]); ShowOsd(m, true); }
     return true;
@@ -6262,12 +6688,37 @@ static void ImportSettings()
     PostMessageW(gWnd, WM_CLOSE, 0, 0);
 }
 
+static bool gPicUiBusy = false;                 // (filling the Pictures page: not a change by you)
+static void PicUiRefresh()
+{
+    if (!gWnd) return;
+    gPicUiBusy = true;
+    HWND c = GetDlgItem(gWnd, IDC_STKLIST);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gStkN; i++) {
+        const wchar_t* b = wcsrchr(gStk[i].path, L'\\');
+        wchar_t t[MAX_PATH + 8]; wsprintfW(t, L"%d. %s%s", i + 1, b ? b + 1 : gStk[i].path, gStk[i].img.nAll > 1 ? L" (GIF)" : L"");
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)t);
+    }
+    if (!gStkN) SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"(none yet)");
+    gStkSel = Iclamp(gStkSel, 0, Imax(0, gStkN - 1));
+    SendMessageW(c, CB_SETCURSEL, gStkSel, 0);
+    const bool has = gStkN > 0;
+    SendDlgItemMessageW(gWnd, SPIN_UD(IDC_STKSIZE), UDM_SETPOS32, 0, has ? gStk[gStkSel].size : 100);
+    SendDlgItemMessageW(gWnd, SPIN_UD(IDC_STKOPAC), UDM_SETPOS32, 0, has ? gStk[gStkSel].opacity : 100);
+    const int ids[] = { IDC_STKLIST, IDC_STKDEL, IDC_STKSIZE, IDC_STKOPAC, SPIN_UD(IDC_STKSIZE), SPIN_UD(IDC_STKOPAC) };
+    for (int id : ids) EnableWindow(GetDlgItem(gWnd, id), has);
+    EnableWindow(GetDlgItem(gWnd, IDC_STKADD), gStkN < STK_MAX);
+    gPicUiBusy = false;
+}
+
 static void PictureInfo()
 {
     const wchar_t* base = wcsrchr(gPicPath, L'\\');
     wchar_t t[MAX_PATH]; wsprintfW(t, gPicPath[0] ? L"%s" : L"No picture", base ? base + 1 : gPicPath);
     SetDlgItemTextW(gWnd, IDC_PICINFO, t);
     EnableWindow(GetDlgItem(gWnd, IDC_PICREMOVE), gPicPath[0] != 0);
+    PicUiRefresh();
 }
 
 static void SetCompact(bool on)
@@ -6704,8 +7155,9 @@ static const GUID kIID_ISpObjectTokenCategory  = { 0x2D3D3845, 0x39AF, 0x4850, {
 static const GUID kCLSID_SpObjectToken = { 0xEF411752, 0x3736, 0x4CB4, { 0x9C, 0x8C, 0x8E, 0xF4, 0xCC, 0xB5, 0x8E, 0xFE } };
 static const GUID kIID_ISpObjectToken  = { 0x14056589, 0xE16C, 0x11D2, { 0xBB, 0x90, 0x00, 0xC0, 0x4F, 0x8E, 0xE6, 0xC0 } };
 
-#define TTS_MAX_VOICES 32
+#define TTS_MAX_VOICES 64
 static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][256];
+static int     gTtsLang[TTS_MAX_VOICES];        // each voice's language (Windows LCID, e.g. 0x080A = Spanish, Mexico)
 static int     gTtsCount = 0;
 static volatile LONG gTtsBusy = 0;
 
@@ -6726,7 +7178,19 @@ static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI
                 if (SUCCEEDED(tok->GetId(&id)) && SUCCEEDED(tok->GetStringValue(nullptr, &name)) && name) {
                     bool dup = false;
                     for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsNames[i], name)) dup = true;
-                    if (!dup) { lstrcpynW(gTtsNames[gTtsCount], name, 128); lstrcpynW(gTtsIds[gTtsCount], id, 256); gTtsCount++; }
+                    if (!dup) {
+                        lstrcpynW(gTtsNames[gTtsCount], name, 128); lstrcpynW(gTtsIds[gTtsCount], id, 256);
+                        gTtsLang[gTtsCount] = 0;
+                        ISpDataKey* attr = nullptr; LPWSTR lang = nullptr;   // "Language" = hex LCID(s), e.g. "409;9"
+                        if (SUCCEEDED(tok->OpenKey(L"Attributes", &attr)) && attr) {
+                            if (SUCCEEDED(attr->GetStringValue(L"Language", &lang)) && lang) {
+                                gTtsLang[gTtsCount] = (int)wcstol(lang, nullptr, 16);
+                                CoTaskMemFree(lang);
+                            }
+                            attr->Release();
+                        }
+                        gTtsCount++;
+                    }
                 }
                 if (id) CoTaskMemFree(id);
                 if (name) CoTaskMemFree(name);
@@ -6739,6 +7203,70 @@ static void TtsListVoices()                     // fills gTtsNames / gTtsIds (UI
 }
 
 struct TtsJob { wchar_t text[600]; wchar_t voice[256]; short* data; unsigned len; bool ok; };
+
+// Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
+// English sounds Mexican, and so on). Windows only has voices for some places; the rest can't be done honestly.
+// American and Canadian also add a little stereotypical phrasing.
+struct TtsAccent { const wchar_t* name; int lang, alt, primary; const wchar_t* voiceName; int phrasing; };
+static const TtsAccent TTS_ACCENTS[] = {
+    { L"No accent",  0,      0,      0,    nullptr,                   0 },
+    { L"American",   0x0409, 0,      0,    L"English (United States)", 1 },
+    { L"Canadian",   0x1009, 0x0409, 0,    L"English (Canada)",        2 },
+    { L"Irish",      0x1809, 0,      0,    L"English (Ireland)",       0 },
+    { L"Indian",     0x4009, 0x0439, 0,    L"English (India)",         0 },
+    { L"Mexican",    0x080A, 0,      0x0A, L"Spanish (Mexico)",        0 },
+    { L"French",     0x040C, 0x0C0C, 0x0C, L"French (France)",         0 },
+    { L"Russian",    0x0419, 0,      0x19, L"Russian",                 0 },
+    { L"Syrian (Arabic voice)", 0x2801, 0x0401, 0x01, L"Arabic",       0 },
+};
+#define TTS_ACCENT_N ((int)(sizeof(TTS_ACCENTS) / sizeof(TTS_ACCENTS[0])))
+static int TtsVoiceFor(int accent)              // index into the voice list, -1 if none installed
+{
+    if (accent <= 0 || accent >= TTS_ACCENT_N) return -1;
+    const TtsAccent& a = TTS_ACCENTS[accent];
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = 0; i < gTtsCount; i++) {
+            int l = gTtsLang[i];
+            if (pass == 0 && l == a.lang) return i;
+            if (pass == 1 && a.alt && l == a.alt) return i;
+            if (pass == 2 && a.primary && (l & 0x3FF) == a.primary) return i;
+        }
+    return -1;
+}
+static bool TtsIsWordChar(wchar_t c) { return iswalnum(c) || c == L'\''; }
+static void TtsSwapWord(wchar_t* t, int cap, const wchar_t* from, const wchar_t* to)   // whole words, any case
+{
+    wchar_t out[1200]; int o = 0; const int fl = lstrlenW(from), tl = lstrlenW(to);
+    for (int i = 0; t[i] && o < 1190;) {
+        bool start = i == 0 || !TtsIsWordChar(t[i - 1]);
+        if (start && !_wcsnicmp(t + i, from, fl) && !TtsIsWordChar(t[i + fl])) {
+            for (int k = 0; k < tl && o < 1190; k++)
+                out[o++] = k == 0 && iswupper(t[i]) ? towupper(to[0]) : to[k];
+            i += fl;
+        } else out[o++] = t[i++];
+    }
+    out[o] = 0;
+    lstrcpynW(t, out, cap);
+}
+static void TtsPhrase(wchar_t* t, int cap, int style)   // 1 = American, 2 = Canadian (light, stereotypical)
+{
+    int n = lstrlenW(t);
+    while (n > 0 && t[n - 1] == L' ') t[--n] = 0;
+    if (!n) return;
+    bool question = t[n - 1] == L'?';
+    if (t[n - 1] == L'.' || t[n - 1] == L'!') t[--n] = 0;
+    if (style == 1) {
+        TtsSwapWord(t, cap, L"very", L"super"); TtsSwapWord(t, cap, L"good", L"awesome");
+        TtsSwapWord(t, cap, L"great", L"awesome"); TtsSwapWord(t, cap, L"hello", L"hey");
+        wchar_t b[1200]; wsprintfW(b, question ? L"Dude, %s" : L"Dude, %s. Like, totally.", t);
+        lstrcpynW(t, b, cap);
+    } else {
+        TtsSwapWord(t, cap, L"about", L"aboot"); TtsSwapWord(t, cap, L"out", L"oot");
+        TtsSwapWord(t, cap, L"sorry", L"soary");
+        wchar_t b[1200]; wsprintfW(b, question ? L"%s" : L"%s, eh?", t);
+        lstrcpynW(t, b, cap);
+    }
+}
 
 static bool TtsRender(TtsJob* j, bool useVoice)
 {
@@ -6798,6 +7326,11 @@ static void TtsSpeak()
     lstrcpynW(j->text, text, 600);
     int sel = (int)SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_GETCURSEL, 0, 0);
     if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 256);
+    if (gTtsAccent > 0 && gTtsAccent < TTS_ACCENT_N) {   // the accent's voice wins (if it's installed)
+        int v = TtsVoiceFor(gTtsAccent);
+        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
+        if (TTS_ACCENTS[gTtsAccent].phrasing) TtsPhrase(j->text, 600, TTS_ACCENTS[gTtsAccent].phrasing);
+    }
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
@@ -6817,6 +7350,366 @@ static void OnTtsDone(TtsJob* j)
     gTtsBusy = 0;
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak");
 }
+
+// ======================= moving things around (layout + pictures) =======================
+// "Move things around" and "Move & resize pictures" put a see-through layer over the window. It catches the mouse
+// (except over the tabs and sub-tabs, so you can still switch pages) and outlines what can be moved.
+// Layout: drag a control, or a box by its title / empty space; right-click one to put it back.
+// Pictures: drag to move, mouse wheel to resize, Delete to remove.
+// Where you moved things is saved in the settings and in the profile you're using (each profile has its own).
+enum { ED_NONE = 0, ED_LAYOUT = 1, ED_PICS = 2 };
+static HWND  gEdWnd = nullptr;
+static int   gEdMode = ED_NONE;
+static int   gEdHot = -1, gEdDrag = -1;         // item: >= 0 control (gDesign index) / picture; <= -2: section -2 - k; -1 none
+static POINT gEdFrom;  static int gEdOx, gEdOy;  // drag start (screen) and the item's offset / position then
+static RECT  gEdDone;                           // the Done button (overlay px)
+
+// ---- saving / loading where things were moved ----
+static void LayoutKeyC(const Design& d, wchar_t* k)  { wsprintfW(k, L"c%d.%d.%d.%d", d.page, d.sub + 1, d.rx, d.ry); }
+static void LayoutKeyS(const Section& s, wchar_t* k) { wsprintfW(k, L"s%d.%d.%d.%d", s.page, s.sub + 1, s.x, s.y); }
+static void LayoutSave(const wchar_t* path)
+{
+    const int cap = 65536;
+    wchar_t* buf = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap * sizeof(wchar_t));
+    if (!buf) return;
+    int n = 0;
+    auto add = [&](const wchar_t* line) { int l = lstrlenW(line); if (n + l + 2 < cap) { lstrcpyW(buf + n, line); n += l + 1; } };
+    add(L"saved=1");
+    wchar_t k[64], line[96];
+    for (int i = 0; i < gDesignN; i++) {
+        const Design& d = gDesign[i];
+        if (d.page < 0 || (!d.ox && !d.oy)) continue;
+        bool dup = false;                       // two controls can share a spot (e.g. Song style swaps): write it once
+        for (int j = 0; j < i && !dup; j++) dup = gDesign[j].page == d.page && gDesign[j].sub == d.sub && gDesign[j].rx == d.rx && gDesign[j].ry == d.ry;
+        if (dup) continue;
+        LayoutKeyC(d, k); wsprintfW(line, L"%s=%d,%d", k, d.ox, d.oy); add(line);
+    }
+    for (int i = 0; i < gSectionN; i++) {
+        const Section& s = gSections[i];
+        if (!s.ox && !s.oy) continue;
+        LayoutKeyS(s, k); wsprintfW(line, L"%s=%d,%d", k, s.ox, s.oy); add(line);
+    }
+    buf[n] = 0;
+    WritePrivateProfileSectionW(L"layout", buf, path);
+    HeapFree(GetProcessHeap(), 0, buf);
+}
+static void LayoutReset()
+{
+    for (int i = 0; i < gDesignN; i++) gDesign[i].ox = gDesign[i].oy = 0;
+    for (int i = 0; i < gSectionN; i++) gSections[i].ox = gSections[i].oy = 0;
+}
+static bool LayoutLoad(const wchar_t* path, bool apply)   // false (and nothing changes) if the file has no layout
+{
+    const int cap = 65536;
+    wchar_t* buf = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, cap * sizeof(wchar_t));
+    if (!buf) return false;
+    DWORD got = GetPrivateProfileSectionW(L"layout", buf, cap, path);
+    bool saved = false;
+    for (wchar_t* p = buf; got && *p; p += lstrlenW(p) + 1) if (!wcsncmp(p, L"saved=", 6)) saved = true;
+    if (saved) {
+        LayoutReset();
+        for (wchar_t* p = buf; *p; p += lstrlenW(p) + 1) {
+            wchar_t* eq = wcschr(p, L'=');
+            if (!eq || (p[0] != L'c' && p[0] != L's')) continue;
+            int page = 0, sub = 0, x = 0, y = 0, dx = 0, dy = 0;
+            if (swscanf_s(p + 1, L"%d.%d.%d.%d=%d,%d", &page, &sub, &x, &y, &dx, &dy) != 6) continue;
+            dx = Iclamp(dx, -3000, 3000); dy = Iclamp(dy, -3000, 3000);
+            if (p[0] == L'c') {
+                for (int i = 0; i < gDesignN; i++) {
+                    Design& d = gDesign[i];
+                    if (d.page == page && d.sub + 1 == sub && d.rx == x && d.ry == y) { d.ox = dx; d.oy = dy; }
+                }
+            } else {
+                for (int i = 0; i < gSectionN; i++) {
+                    Section& s = gSections[i];
+                    if (s.page == page && s.sub + 1 == sub && s.x == x && s.y == y) { s.ox = dx; s.oy = dy; }
+                }
+            }
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+    if (saved && apply && gWnd) { PlaceAll(); RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN); }
+    return saved;
+}
+static void LayoutSaveNow()                     // to the settings and the profile in use
+{
+    LayoutSave(gIni);
+    if (gProfCur >= 0 && gProfCur < gProfCount) { wchar_t path[MAX_PATH]; ProfilePath(gProfNames[gProfCur], path); LayoutSave(path); }
+}
+
+// ---- what can be moved ----
+static bool EdIsSubTab(HWND h)
+{
+    int id = GetDlgCtrlID(h);
+    return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || id == IDC_MICSUB0 || id == IDC_MICSUB1 ||
+           (id >= IDC_SETSUB0 && id <= IDC_SETSUB2);
+}
+static bool SectionShown(const Section& s)
+{
+    if (gCompact || (s.page >= 0 && s.page != gPage)) return false;
+    return s.sub < 0 || s.sub == (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub);
+}
+static RECT SectionRect(const Section& s)
+{
+    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0)), x = SC(s.x + s.ox);
+    RECT r = { x, y - SC(8), x + SC(s.w), y + SC(s.h) };
+    return r;
+}
+static bool EdItemRect(int item, RECT* r)
+{
+    if (gEdMode == ED_PICS) {
+        if (item == STK_MAX) {                  // the background picture, when you place it yourself
+            if (!gBase.gp || gPicFit != 4) return false;
+            int tw, th, dx, dy; BaseTarget(gCW, gCH, &tw, &th, &dx, &dy);
+            SetRect(r, dx, dy, dx + tw, dy + th); return true;
+        }
+        if (item < 0 || item >= gStkN) return false;
+        StkRect(gStk[item], r); return true;
+    }
+    if (item >= 0) {
+        if (item >= gDesignN) return false;
+        const Design& d = gDesign[item];
+        if (d.page < 0 || !IsWindowVisible(d.h) || EdIsSubTab(d.h)) return false;
+        GetWindowRect(d.h, r); MapWindowPoints(nullptr, gWnd, (POINT*)r, 2);
+        if (d.ud) { RECT u; GetWindowRect(d.ud, &u); MapWindowPoints(nullptr, gWnd, (POINT*)&u, 2); UnionRect(r, r, &u); }
+        if (d.combo) r->bottom = r->top + SC(24);
+        return true;
+    }
+    int k = -2 - item;
+    if (k < 0 || k >= gSectionN || !SectionShown(gSections[k])) return false;
+    *r = SectionRect(gSections[k]);
+    return true;
+}
+static int EdHit(POINT p)                       // client px -> item under it (smallest wins)
+{
+    int best = -1; long long bestA = -1;
+    if (gEdMode == ED_PICS) {
+        for (int i = gStkN - 1; i >= 0; i--) { RECT r; if (EdItemRect(i, &r) && PtInRect(&r, p)) return i; }
+        RECT r; if (EdItemRect(STK_MAX, &r) && PtInRect(&r, p)) return STK_MAX;
+        return -1;
+    }
+    for (int i = 0; i < gDesignN; i++) {
+        RECT r; if (!EdItemRect(i, &r) || !PtInRect(&r, p)) continue;
+        long long a = (long long)(r.right - r.left) * (r.bottom - r.top);
+        if (bestA < 0 || a < bestA) { best = i; bestA = a; }
+    }
+    if (best >= 0) return best;
+    for (int k = 0; k < gSectionN; k++) {
+        RECT r; if (!EdItemRect(-2 - k, &r) || !PtInRect(&r, p)) continue;
+        long long a = (long long)(r.right - r.left) * (r.bottom - r.top);
+        if (bestA < 0 || a < bestA) { best = -2 - k; bestA = a; }
+    }
+    return best;
+}
+static void EdGetOffset(int item, int* x, int* y)
+{
+    if (gEdMode == ED_PICS) {
+        if (item == STK_MAX) { *x = gPicX; *y = gPicY; return; }
+        *x = gStk[item].x; *y = gStk[item].y; return;
+    }
+    if (item >= 0) { *x = gDesign[item].ox; *y = gDesign[item].oy; return; }
+    *x = gSections[-2 - item].ox; *y = gSections[-2 - item].oy;
+}
+static void EdSetOffset(int item, int x, int y)
+{
+    if (gEdMode == ED_PICS) {
+        RECT before; EdItemRect(item, &before);
+        if (item == STK_MAX) { gPicX = x; gPicY = y; PicComposeBase(); RECT all = { 0, 0, gCW, gCH }; PicComposeTop(all); PicMakeBrush(); PicRedraw(nullptr); return; }
+        gStk[item].x = x; gStk[item].y = y;
+        StkRefresh(&before);
+        return;
+    }
+    if (item >= 0) {                            // moves every control that shares its spot (e.g. Song-style swaps) too
+        Design& d = gDesign[item];
+        for (int i = 0; i < gDesignN; i++) {
+            Design& o = gDesign[i];
+            if (o.page == d.page && o.sub == d.sub && o.rx == d.rx && o.ry == d.ry) { o.ox = x; o.oy = y; }
+        }
+        PlaceAll();
+        return;
+    }
+    gSections[-2 - item].ox = x; gSections[-2 - item].oy = y;
+    PlaceAll();
+    RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);   // the box frame is painted by the window
+}
+
+// ---- the see-through layer ----
+static void EdPut(DWORD* px, int W, int H, int x, int y, DWORD c) { if (x >= 0 && y >= 0 && x < W && y < H) px[(size_t)y * W + x] = c; }
+static DWORD EdPm(COLORREF c, int a)            // premultiplied ARGB
+{
+    return ((DWORD)a << 24) | ((GetRValue(c) * a / 255) << 16) | ((GetGValue(c) * a / 255) << 8) | (GetBValue(c) * a / 255);
+}
+static void EdFrame(DWORD* px, int W, int H, RECT r, DWORD c, int t, bool dashed)
+{
+    for (int k = 0; k < t; k++) {
+        for (int x = r.left; x < r.right; x++) if (!dashed || ((x / 4) & 1)) { EdPut(px, W, H, x, r.top + k, c); EdPut(px, W, H, x, r.bottom - 1 - k, c); }
+        for (int y = r.top; y < r.bottom; y++) if (!dashed || ((y / 4) & 1)) { EdPut(px, W, H, r.left + k, y, c); EdPut(px, W, H, r.right - 1 - k, y, c); }
+    }
+}
+static void EdFill(DWORD* px, int W, int H, RECT r, DWORD c)
+{
+    for (int y = Imax(0, (int)r.top); y < Imin(H, (int)r.bottom); y++)
+        for (int x = Imax(0, (int)r.left); x < Imin(W, (int)r.right); x++) px[(size_t)y * W + x] = c;
+}
+static void EdRender()
+{
+    if (!gEdWnd) return;
+    RECT rc; GetClientRect(gWnd, &rc);
+    const int W = rc.right, H = rc.bottom;
+    if (W <= 0 || H <= 0) return;
+    BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    void* bits = nullptr;
+    HDC sdc = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(sdc);
+    HBITMAP bmp = CreateDIBSection(sdc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!bmp) { DeleteDC(mem); ReleaseDC(nullptr, sdc); return; }
+    HGDIOBJ ob = SelectObject(mem, bmp);
+    DWORD* px = (DWORD*)bits;
+    for (int i = 0; i < W * H; i++) px[i] = 0x01000000;   // almost invisible, but it catches the mouse
+    // the tabs and sub-tabs stay clickable (fully see-through lets clicks fall through to them)
+    RECT tabs = { 0, 0, W, SC(44) }; EdFill(px, W, H, tabs, 0);
+    for (int i = 0; i < gDesignN; i++)
+        if (EdIsSubTab(gDesign[i].h) && IsWindowVisible(gDesign[i].h)) {
+            RECT r; GetWindowRect(gDesign[i].h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2); EdFill(px, W, H, r, 0);
+        }
+    const DWORD line = EdPm(ACCENT, 200), faint = EdPm(ACCENT, 110), hot = EdPm(ACCENT, 255), tint = EdPm(ACCENT, 40);
+    if (gEdMode == ED_LAYOUT) {
+        for (int k = 0; k < gSectionN; k++) { RECT r; if (EdItemRect(-2 - k, &r)) EdFrame(px, W, H, r, faint, 1, true); }
+        for (int i = 0; i < gDesignN; i++) { RECT r; if (EdItemRect(i, &r)) EdFrame(px, W, H, r, line, 1, false); }
+    } else {
+        for (int i = 0; i < gStkN; i++) { RECT r; if (EdItemRect(i, &r)) EdFrame(px, W, H, r, line, 2, false); }
+        RECT r; if (EdItemRect(STK_MAX, &r)) EdFrame(px, W, H, r, faint, 2, true);
+    }
+    int sel = gEdDrag != -1 ? gEdDrag : gEdHot;
+    if (sel != -1) { RECT r; if (EdItemRect(sel, &r)) { EdFill(px, W, H, r, tint); EdFrame(px, W, H, r, hot, 2, false); } }
+    // the bar at the bottom: what to do, and Done
+    RECT bar = { 0, H - SC(34), W, H };
+    COLORREF barC = gDark ? RGB(24, 24, 24) : RGB(250, 250, 250);
+    HBRUSH bb = CreateSolidBrush(barC); FillRect(mem, &bar, bb); DeleteObject(bb);
+    gEdDone = { W - SC(96), H - SC(30), W - SC(10), H - SC(4) };
+    HBRUSH ab = CreateSolidBrush(ACCENT); FillRect(mem, &gEdDone, ab); DeleteObject(ab);
+    SetBkMode(mem, TRANSPARENT);
+    HGDIOBJ of = SelectObject(mem, gFontBold);
+    SetTextColor(mem, RGB(255, 255, 255));
+    DrawTextW(mem, L"Done", -1, &gEdDone, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(mem, gFont);
+    SetTextColor(mem, gDark ? RGB(235, 235, 235) : RGB(30, 30, 30));
+    RECT tr = { SC(10), bar.top, gEdDone.left - SC(8), bar.bottom };
+    DrawTextW(mem, gEdMode == ED_LAYOUT ? L"Drag anything to move it (a box: drag its title or an empty part). Right-click puts it back. Esc = done."
+                                        : L"Drag a picture to move it, scroll to resize, Delete removes it. Esc = done.",
+              -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
+    SelectObject(mem, of);
+    GdiFlush();
+    for (int y = bar.top; y < H; y++) for (int x = 0; x < W; x++) px[(size_t)y * W + x] |= 0xFF000000;   // GDI leaves alpha 0
+    POINT org = { 0, 0 }; ClientToScreen(gWnd, &org);
+    POINT zero = { 0, 0 }; SIZE sz = { W, H };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(gEdWnd, sdc, &org, &sz, mem, &zero, 0, &bf, ULW_ALPHA);
+    SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(nullptr, sdc);
+}
+static void EdEnd();
+static LRESULT CALLBACK EdProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    auto client = [&](LPARAM lp) { POINT p = { (short)LOWORD(lp), (short)HIWORD(lp) }; return p; };   // overlay px = window client px
+    switch (m) {
+    case WM_MOUSEMOVE: {
+        POINT p = client(l);
+        if (gEdDrag != -1) {
+            POINT s; GetCursorPos(&s);
+            int dx = UNSC(s.x - gEdFrom.x), dy = UNSC(s.y - gEdFrom.y);
+            if (GetKeyState(VK_SHIFT) < 0) { dx = dx / 10 * 10; dy = dy / 10 * 10; }   // Shift: snap to 10
+            EdSetOffset(gEdDrag, gEdOx + dx, gEdOy + dy);
+            EdRender();
+        } else {
+            int hit = EdHit(p);
+            if (hit != gEdHot) { gEdHot = hit; EdRender(); }
+        }
+        return 0;
+    }
+    case WM_SETCURSOR:
+        SetCursor(LoadCursor(nullptr, gEdHot != -1 || gEdDrag != -1 ? IDC_SIZEALL : IDC_ARROW));
+        return TRUE;
+    case WM_LBUTTONDOWN: {
+        POINT p = client(l);
+        if (PtInRect(&gEdDone, p)) { EdEnd(); return 0; }
+        gEdDrag = EdHit(p);
+        if (gEdDrag != -1) {
+            GetCursorPos(&gEdFrom); EdGetOffset(gEdDrag, &gEdOx, &gEdOy); SetCapture(h);
+            if (gEdMode == ED_PICS && gEdDrag < gStkN) gStkSel = gEdDrag;
+        }
+        return 0;
+    }
+    case WM_LBUTTONUP:
+        if (gEdDrag != -1) { gEdDrag = -1; ReleaseCapture(); EdRender(); }
+        return 0;
+    case WM_RBUTTONUP: {
+        int hit = EdHit(client(l));
+        if (gEdMode == ED_LAYOUT && hit != -1) { EdSetOffset(hit, 0, 0); EdRender(); }
+        return 0;
+    }
+    case WM_MOUSEWHEEL:
+        if (gEdMode == ED_PICS) {
+            POINT p = { (short)LOWORD(l), (short)HIWORD(l) }; ScreenToClient(gWnd, &p);
+            int hit = EdHit(p);
+            if (hit == -1) return 0;
+            int step = GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1 : -1;
+            int& size = hit == STK_MAX ? gPicSize : gStk[hit].size;
+            RECT before; EdItemRect(hit, &before);
+            size = Iclamp(size + step * Imax(1, size / 10), 5, 400);
+            if (hit == STK_MAX) { gBase.w = 0; } else gStk[hit].stale = true;   // (sharp again when you stop scrolling)
+            if (hit == STK_MAX) { PictureRebuild(); PicRedraw(nullptr); } else StkRefresh(&before);
+            SetTimer(gWnd, TIMER_STKSIZE, 300, nullptr);
+            if (hit < gStkN) gStkSel = hit;
+            EdRender();
+        }
+        return 0;
+    case WM_KEYDOWN:
+        if (w == VK_ESCAPE || w == VK_RETURN) { EdEnd(); return 0; }
+        if (w == VK_DELETE && gEdMode == ED_PICS && gEdHot >= 0 && gEdHot < gStkN) {
+            RECT before; EdItemRect(gEdHot, &before);
+            StkRemove(gEdHot); gEdHot = -1;
+            PictureRebuild(); PicRedraw(&before); EdRender();
+            return 0;
+        }
+        if ((w == VK_LEFT || w == VK_RIGHT || w == VK_UP || w == VK_DOWN) && gEdHot != -1) {   // nudge
+            int x, y; EdGetOffset(gEdHot, &x, &y);
+            int st = GetKeyState(VK_SHIFT) < 0 ? 10 : 1;
+            x += w == VK_LEFT ? -st : w == VK_RIGHT ? st : 0; y += w == VK_UP ? -st : w == VK_DOWN ? st : 0;
+            EdSetOffset(gEdHot, x, y); EdRender();
+            return 0;
+        }
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void PicUiRefresh();
+static void EdBegin(int mode)
+{
+    if (gEdWnd) EdEnd();
+    static bool reg = false;
+    if (!reg) {
+        WNDCLASSW wc = {}; wc.lpfnWndProc = EdProc; wc.hInstance = gInst; wc.lpszClassName = L"LagEditLayer";
+        wc.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&wc); reg = true;
+    }
+    gEdMode = mode; gEdHot = gEdDrag = -1;
+    gEdWnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW, L"LagEditLayer", L"", WS_POPUP, 0, 0, 10, 10, gWnd, nullptr, gInst, nullptr);
+    if (!gEdWnd) { gEdMode = ED_NONE; return; }
+    EdRender();
+    ShowWindow(gEdWnd, SW_SHOW);                // active, so Esc / Delete / arrow keys reach it
+    SetActiveWindow(gEdWnd); SetFocus(gEdWnd);
+}
+static void EdEnd()
+{
+    if (!gEdWnd) return;
+    HWND w = gEdWnd; gEdWnd = nullptr;
+    if (GetCapture() == w) ReleaseCapture();
+    DestroyWindow(w);
+    if (gEdMode == ED_LAYOUT) LayoutSaveNow();
+    else { StkSaveAll(); SaveInt(L"background_x", gPicX); SaveInt(L"background_y", gPicY); SaveInt(L"background_size", gPicSize); PicUiRefresh(); }
+    gEdMode = ED_NONE;
+}
+static void EdFollow() { if (gEdWnd) EdRender(); }   // the window moved / changed page: redraw the layer over it
 
 // ======================= tooltips =======================
 // Hover help for every setting. Labels get SS_NOTIFY so they can be hovered too
@@ -7015,11 +7908,12 @@ static void AddTips()
     }
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
     TipId(IDC_SETSUB0, L"Profiles, latency, updates, screen share, shortcuts and the window.");
-    TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, opacity and a background picture.");
+    TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
+    TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
     TipId(IDC_FONT,    L"The font for the whole window.");
     TipId(IDC_OPACITY, L"See-through window: 100% = solid. Lower lets what's behind show through.");
     TipId(IDC_COLRESET, L"Go back to the theme's colours.");
-    for (int i = 0; i < USERCOL_N; i++) TipId(IDC_COLSW0 + i, L"Click to pick this colour; right-click to use the theme's again.");
+    for (int i = 0; i < USERCOL_N; i++) TipId(IDC_COLSW0 + i, L"Click to pick this colour; right-click to use the theme's again. Bold = your own colour.");
     TipId(IDC_PICCHOOSE, L"Use a picture as the window's background (PNG, JPG, BMP or GIF).");
     TipId(IDC_PICREMOVE, L"Remove the background picture.");
     TipId(IDC_PICFIT,  L"Fill: covers the window and crops the edges. Stretch: squashes to fit. Centre: actual size. Tile: repeats.");
@@ -7071,6 +7965,19 @@ static void AddTips()
                           L"a robot or demon soundboard. Off: they play clean.");
     TipId(IDC_TTSTEXT,    L"Type a line and press Enter (or Speak): Windows says it into Discord and your outputs.");
     TipId(IDC_TTSVOICE,   L"Which Windows voice speaks. More voices: Windows Settings > Time & language > Speech > Add voices.");
+    TipId(IDC_TTSACCENT,  L"Read your words with an accent, using a Windows voice from that country (installed from Windows' speech settings). "
+                          L"American and Canadian add some stereotypical phrasing too.");
+    TipId(IDC_FONTSIZE,   L"How big the text is, in pixels (at 100% size).");
+    TipId(IDC_LAYEDIT,    L"Drag any control or box to where you want it. Saved for the profile you're using.");
+    TipId(IDC_LAYRESET,   L"Put every control and box back where it started.");
+    TipId(IDC_STKLIST,    L"The pictures / GIFs on top. Pick one to change its size or opacity.");
+    TipId(IDC_STKADD,     L"Add pictures or GIFs (pick several at once). Then drag them where you want them.");
+    TipId(IDC_STKDEL,     L"Remove the picked picture.");
+    TipId(IDC_STKSIZE,    L"Size of the picked picture (100% = its own size).");
+    TipId(IDC_STKOPAC,    L"How see-through the picked picture is (100% = solid).");
+    TipId(IDC_STKMOVE,    L"Drag pictures to move them, scroll over one to resize it, Delete removes it.");
+    TipId(IDC_GIFFPS,     L"The most frames per second GIFs play at. Lower uses less CPU and memory.");
+    TipId(IDC_GIFPAUSE,   L"Stop GIFs while you're in another window (saves CPU while gaming).");
     TipId(IDC_TTSSPEAK,   L"Say the text. It plays like a pad, at the soundboard volume.");
     TipId(IDC_CLIPAUTOTRIM, L"New clips start just before the first sound and end just after the last, so there's no dead air. "
                             L"The whole recording is kept: Reset in Trim brings it back.");
@@ -7230,25 +8137,28 @@ static void DrawOutLabel(DRAWITEMSTRUCT* d)     // "Out 1" with a thin level bar
     RECT track = { rc.left + 2, rc.bottom - 4, rc.right - 4, rc.bottom - 1 };
     HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(dc, &track, tb); DeleteObject(tb);
     RECT lvl = track; lvl.right = track.left + (int)((track.right - track.left) * f);
-    HBRUSH lb = CreateSolidBrush(db > -3.0f ? RGB(220, 70, 60) : ACCENT); FillRect(dc, &lvl, lb); DeleteObject(lb);
+    HBRUSH lb = CreateSolidBrush(db > -3.0f ? RGB(220, 70, 60) : UC(9, ACCENT)); FillRect(dc, &lvl, lb); DeleteObject(lb);
 }
 
-static const wchar_t* USERCOL_NAMES[USERCOL_N] = { L"Accent", L"Background", L"Panels", L"Borders", L"Text", L"Dim text" };
+static const wchar_t* USERCOL_NAMES[USERCOL_N] = { L"Accent", L"Background", L"Panels", L"Borders", L"Text", L"Dim text",
+                                                   L"Box titles", L"Knobs", L"Knob track", L"Meters", L"Tabs", L"Status bar" };
 static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "theme" when not set
 {
     int i = (int)d->CtlID - IDC_COLSW0;
     HDC dc = d->hDC; RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
-    COLORREF now = i == 0 ? ACCENT : i == 1 ? BgColor() : i == 2 ? (gDark ? DK_CTL : LT_CARD) : i == 3 ? (gDark ? DK_SECTION : LT_BORDER)
-                 : i == 4 ? TXT_C : (gDark ? DK_DIM : gLtDim);
+    const COLORREF nows[USERCOL_N] = { ACCENT, BgColor(), gDark ? DK_CTL : LT_CARD, gDark ? DK_SECTION : LT_BORDER, TXT_C,
+                                       gDark ? DK_DIM : gLtDim, TITLE_C, KNOB_C, gDark ? DK_TRACK : LT_TRACK, METER_C, TAB_C, STATUS_C };
+    COLORREF now = nows[Iclamp(i, 0, USERCOL_N - 1)];
     HBRUSH b = CreateSolidBrush(now); HPEN p = CreatePen(PS_SOLID, 1, gDark ? RGB(120, 120, 120) : RGB(150, 150, 150));
     HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
-    RoundRect(dc, rc.left + 2, rc.top + 4, rc.left + 34, rc.bottom - 4, 8, 8);
+    const int bw = (rc.bottom - rc.top) - 6;     // a square-ish swatch; your own colours have their name in bold
+    RoundRect(dc, rc.left + 2, rc.top + 3, rc.left + 2 + bw, rc.bottom - 3, 8, 8);
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
-    wchar_t t[48]; wsprintfW(t, gUserCol[i] == CLR_NONE ? L"%s (theme)" : L"%s", USERCOL_NAMES[i]);
+    const wchar_t* t = USERCOL_NAMES[i];
     SetBkMode(dc, TRANSPARENT); SetTextColor(dc, TXT_C);
-    HGDIOBJ of = SelectObject(dc, gFont);
-    RECT tr = { rc.left + 42, rc.top, rc.right, rc.bottom };
+    HGDIOBJ of = SelectObject(dc, gUserCol[i] == CLR_NONE ? gFont : gFontBold);
+    RECT tr = { rc.left + bw + 8, rc.top, rc.right, rc.bottom };
     DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS);
     SelectObject(dc, of);
     if ((d->itemState & ODS_FOCUS) && !(d->itemState & ODS_NOFOCUSRECT)) { RECT fr = rc; InflateRect(&fr, -1, -1); DrawFocusRect(dc, &fr); }
@@ -7256,10 +8166,10 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
 static const wchar_t* MIC_SUB_NAMES[2] = { L"Cleanup", L"Tone" };
-static const wchar_t* SET_SUB_NAMES[2] = { L"General", L"Look" };
+static const wchar_t* SET_SUB_NAMES[3] = { L"General", L"Look", L"Pictures" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings sub-tabs
 {
-    const bool set = (int)d->CtlID == IDC_SETSUB0 || (int)d->CtlID == IDC_SETSUB1;
+    const bool set = (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB2;
     const bool mic = !set && (int)d->CtlID >= IDC_MICSUB0 && (int)d->CtlID <= IDC_MICSUB1;
     int t = (int)d->CtlID - (set ? IDC_SETSUB0 : mic ? IDC_MICSUB0 : IDC_FXSUB0);
     HDC dc = d->hDC;
@@ -7268,8 +8178,8 @@ static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings su
     bool active = t == (set ? gSetSub : mic ? gMicSub : gFxSub);
     int on = 0;
     if (!mic && !set) for (int g = 0; g < FX_GROUPS; g++) if (gFxGroups[g].sub == t && *gFxGroups[g].on && gFxOn) on++;
-    HBRUSH b = CreateSolidBrush(active ? ACCENT : gDark ? DK_CTL : LT_CARD);
-    HPEN   p = CreatePen(PS_SOLID, 1, active ? ACCENT : gDark ? DK_SECTION : LT_BORDER);
+    HBRUSH b = CreateSolidBrush(active ? TAB_C : gDark ? DK_CTL : LT_CARD);
+    HPEN   p = CreatePen(PS_SOLID, 1, active ? TAB_C : gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
@@ -7538,7 +8448,7 @@ static void DrawMeterTo(HDC dc, RECT rc)
 
     bool gateOn = gGateMode != GATE_OFF, open = !gateOn || gMeterGateOpen;
     COLORREF fillc = !gRunning ? (gDark ? RGB(90, 90, 90) : RGB(180, 180, 180))
-                   : open ? RGB(40, 190, 90) : (gDark ? RGB(110, 110, 110) : RGB(165, 165, 165));
+                   : open ? METER_C : (gDark ? RGB(110, 110, 110) : RGB(165, 165, 165));
     RECT lvl = { x0, by, X(gMeterShowDb), by + bh };
     HBRUSH fb = CreateSolidBrush(fillc); FillRect(dc, &lvl, fb); DeleteObject(fb);
     if (gMeterShowDb > -6.0f) {                 // hot zone
@@ -7905,22 +8815,12 @@ static void Layout()
     }
 
     int by = ROW_Y0 + ROW_H * gRows + 6;
-    SetWindowPos(GetDlgItem(gWnd, IDC_ADDOUT),  nullptr, SC(30),  SC(by), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(GetDlgItem(gWnd, IDC_VBCABLE), nullptr, SC(162), SC(by), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    static const int hearIds[] = { IDC_HEARLBL, IDC_HEARON };
-    for (int id : hearIds) {                        // keep their x: FitText may have moved them along
-        HWND c = GetDlgItem(gWnd, id); RECT rc; GetWindowRect(c, &rc); MapWindowPoints(nullptr, gWnd, (POINT*)&rc, 2);
-        SetWindowPos(c, nullptr, rc.left, SC(by + (id == IDC_HEARLBL ? 5 : 1)), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    }
     FillHearList();
     EnableWindow(GetDlgItem(gWnd, IDC_ADDOUT), gRows < MAX_OUT);
     gSections[gDevSectionIdx].h = by + 28 + 14 - gSections[gDevSectionIdx].y;
 
     int d = RowsDelta();
-    for (int i = 0; i < gShiftN; i++)
-        if (!(gCompact && (gShift[i].h == GetDlgItem(gWnd, IDC_STATUS) || gShift[i].h == GetDlgItem(gWnd, IDC_START) ||
-                           gShift[i].h == GetDlgItem(gWnd, IDC_MUTEBTN))))
-        SetWindowPos(gShift[i].h, nullptr, gShift[i].x, gShift[i].y + SC(d), 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    PlaceAll();                                 // everything below the output list slides down with it
 
     DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
     RECT r = { 0, 0, SC(CLIENT_W), SC(gCompact ? COMPACT_H : BASE_H + d) };   // both pages share the window size, so switching never jumps
@@ -7929,6 +8829,7 @@ static void Layout()
     LayoutCompact(gCompact);
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | (freeze ? RDW_UPDATENOW : 0));
+    EdFollow();
 }
 
 static void SetPage(int page)
@@ -9012,10 +9913,15 @@ static void CreateUI()
         if (gPadFile[i][0]) PadLoad(i, gPadFile[i], true);   // reload last time's sounds (every page), quietly
     AddSection(14, 436, 532, 60, L"Text to speech");
     {
-        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 250, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
+        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 176, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
         SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type something, press Enter");
         SendMessageW(te, EM_LIMITTEXT, 500, 0);
-        HWND tv = Ctl(L"COMBOBOX", L"", COMBO, 286, 457, 140, 300, IDC_TTSVOICE);
+        HWND ta = Ctl(L"COMBOBOX", L"", COMBO, 212, 457, 104, 400, IDC_TTSACCENT);
+        for (int i = 0; i < TTS_ACCENT_N; i++) SendMessageW(ta, CB_ADDSTRING, 0, (LPARAM)TTS_ACCENTS[i].name);
+        gTtsAccent = Iclamp(gTtsAccent, 0, TTS_ACCENT_N - 1);
+        SendMessageW(ta, CB_SETCURSEL, gTtsAccent, 0);
+        SendMessageW(ta, CB_SETDROPPEDWIDTH, SC(180), 0);
+        HWND tv = Ctl(L"COMBOBOX", L"", COMBO, 322, 457, 104, 300, IDC_TTSVOICE);
         SendMessageW(tv, CB_SETDROPPEDWIDTH, 280, 0);
         TtsListVoices();
         SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
@@ -9099,6 +10005,7 @@ static void CreateUI()
 
     Ctl(L"BUTTON", L"General", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 52, 90, 26, IDC_SETSUB0);
     Ctl(L"BUTTON", L"Look", BS_OWNERDRAW | WS_TABSTOP, 108, 52, 90, 26, IDC_SETSUB1);
+    Ctl(L"BUTTON", L"Pictures", BS_OWNERDRAW | WS_TABSTOP, 202, 52, 90, 26, IDC_SETSUB2);
     gBuildSub = 0;
     AddSection(14, 88, 532, 108, L"Profiles");
     Ctl(L"STATIC", L"Profile:", 0, 30, 110, 56, 20, -1);
@@ -9193,39 +10100,75 @@ static void CreateUI()
         for (int i = 0; i < 5; i++) { wchar_t t[16]; wsprintfW(t, L"%d%%", scales[i]); SendMessageW(us, CB_ADDSTRING, 0, (LPARAM)t); if (scales[i] == gUiScale) sel = i; }
         SendMessageW(us, CB_SETCURSEL, sel, 0);
     }
-    Ctl(L"STATIC", L"Font:", 0, 30, 147, 50, 20, -1);
+    Ctl(L"STATIC", L"Font:", 0, 30, 147, 44, 20, -1);
     {
-        HWND fc = Ctl(L"COMBOBOX", L"", COMBO, 82, 143, 170, 300, IDC_FONT);
-        static const wchar_t* fonts[] = { L"Segoe UI", L"Segoe UI Variable Text", L"Bahnschrift", L"Calibri", L"Trebuchet MS", L"Verdana",
-                                          L"Tahoma", L"Consolas", L"Comic Sans MS", L"Georgia" };
-        int sel = 0;
-        for (int i = 0; i < 10; i++) { SendMessageW(fc, CB_ADDSTRING, 0, (LPARAM)fonts[i]); if (!lstrcmpiW(fonts[i], gFontName)) sel = i; }
-        SendMessageW(fc, CB_SETCURSEL, sel, 0);
+        HWND fc = Ctl(L"COMBOBOX", L"", COMBO | CBS_SORT, 76, 143, 160, 300, IDC_FONT);
+        FontsFill(fc);
+        Ctl(L"STATIC", L"Text size:", 0, 246, 147, 64, 20, -1);
+        HWND fs = Ctl(L"COMBOBOX", L"", COMBO, 312, 143, 58, 300, IDC_FONTSIZE);
+        for (int px = 11; px <= 18; px++) { wchar_t t[8]; wsprintfW(t, L"%d", px); SendMessageW(fs, CB_ADDSTRING, 0, (LPARAM)t); }
+        SendMessageW(fs, CB_SETCURSEL, Iclamp(gFontPx, 11, 18) - 11, 0);
     }
-    Ctl(L"STATIC", L"Window opacity:", 0, 270, 147, 104, 20, -1);
-    Spin(IDC_OPACITY, 376, 144, 64, 40, 100, gOpacity);
-    Ctl(L"STATIC", L"%", 0, 446, 147, 16, 20, -1);
+    Ctl(L"STATIC", L"Opacity:", 0, 380, 147, 58, 20, -1);
+    Spin(IDC_OPACITY, 440, 144, 60, 40, 100, gOpacity);
+    Ctl(L"STATIC", L"%", 0, 504, 147, 16, 20, -1);
 
-    AddSection(14, 198, 532, 132, L"Your colours");
+    AddSection(14, 198, 532, 148, L"Your colours");
     for (int i = 0; i < USERCOL_N; i++)
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + (i % 3) * 168, 220 + (i / 3) * 40, 160, 34, IDC_COLSW0 + i);
-    Ctl(L"STATIC", L"Click a colour to change it; right-click it to go back to the theme's.", 0, 30, 302, 360, 18, IDC_HDR);
-    Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 298, 100, 26, IDC_COLRESET);
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + (i % 4) * 126, 218 + (i / 4) * 32, 120, 28, IDC_COLSW0 + i);
+    Ctl(L"STATIC", L"Click a colour to change it; right-click it to go back to the theme's.", 0, 30, 318, 390, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 314, 100, 26, IDC_COLRESET);
 
-    AddSection(14, 344, 532, 116, L"Background picture");
-    Ctl(L"BUTTON", L"Choose a picture...", WS_TABSTOP | WS_GROUP, 30, 366, 150, 28, IDC_PICCHOOSE);
-    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 186, 366, 90, 28, IDC_PICREMOVE);
-    Ctl(L"STATIC", L"", 0, 286, 372, 244, 18, IDC_PICINFO);
-    Ctl(L"STATIC", L"Fit:", 0, 30, 406, 30, 20, -1);
+    AddSection(14, 360, 532, 84, L"Layout");
+    Ctl(L"BUTTON", L"Move things around...", WS_TABSTOP | WS_GROUP, 30, 382, 180, 28, IDC_LAYEDIT);
+    Ctl(L"BUTTON", L"Put everything back", WS_TABSTOP, 218, 382, 160, 28, IDC_LAYRESET);
+    Ctl(L"STATIC", L"Saved for the profile you're using: each profile can have its own layout.", 0, 30, 418, 500, 18, IDC_HDR);
+    gBuildSub = -1;
+
+    // ---- Pictures ----
+    gBuildSub = 2;
+    AddSection(14, 88, 532, 106, L"Background picture");
+    Ctl(L"BUTTON", L"Choose a picture or GIF...", WS_TABSTOP | WS_GROUP, 30, 110, 176, 28, IDC_PICCHOOSE);
+    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 212, 110, 80, 28, IDC_PICREMOVE);
+    Ctl(L"STATIC", L"", 0, 300, 116, 230, 18, IDC_PICINFO);
+    Ctl(L"STATIC", L"Fit:", 0, 30, 150, 30, 20, -1);
     {
-        HWND pf = Ctl(L"COMBOBOX", L"", COMBO, 62, 402, 120, 200, IDC_PICFIT);
-        const wchar_t* fits[] = { L"Fill (crop)", L"Stretch", L"Centre", L"Tile" };
+        HWND pf = Ctl(L"COMBOBOX", L"", COMBO, 62, 146, 150, 200, IDC_PICFIT);
+        const wchar_t* fits[] = { L"Fill (crop)", L"Stretch", L"Centre", L"Tile", L"Place it yourself" };
         for (const wchar_t* n : fits) SendMessageW(pf, CB_ADDSTRING, 0, (LPARAM)n);
         SendMessageW(pf, CB_SETCURSEL, gPicFit, 0);
     }
-    Ctl(L"STATIC", L"Fade it into the theme:", 0, 200, 406, 150, 20, -1);
-    Spin(IDC_PICDIM, 352, 403, 64, 0, 95, gPicDim);
-    Ctl(L"STATIC", L"%  (higher = easier to read)", 0, 422, 406, 110, 34, IDC_HDR);
+    Ctl(L"STATIC", L"Fade:", 0, 226, 150, 40, 20, -1);
+    Spin(IDC_PICDIM, 268, 147, 60, 0, 95, gPicDim);
+    Ctl(L"STATIC", L"%", 0, 332, 150, 16, 20, -1);
+    Ctl(L"STATIC", L"(higher = easier to read)", 0, 352, 150, 178, 18, IDC_HDR);
+
+    AddSection(14, 208, 532, 120, L"Pictures on top");
+    Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 30, 230, 226, 300, IDC_STKLIST);
+    Ctl(L"BUTTON", L"Add pictures or GIFs...", WS_TABSTOP, 264, 229, 170, 28, IDC_STKADD);
+    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 440, 229, 90, 28, IDC_STKDEL);
+    Ctl(L"STATIC", L"Size:", 0, 30, 268, 36, 20, -1);
+    Spin(IDC_STKSIZE, 68, 265, 64, 5, 400, 100);
+    Ctl(L"STATIC", L"%", 0, 136, 268, 16, 20, -1);
+    Ctl(L"STATIC", L"Opacity:", 0, 164, 268, 58, 20, -1);
+    Spin(IDC_STKOPAC, 224, 265, 64, 5, 100, 100);
+    Ctl(L"STATIC", L"%", 0, 292, 268, 16, 20, -1);
+    Ctl(L"BUTTON", L"Move && resize...", WS_TABSTOP, 360, 263, 170, 28, IDC_STKMOVE);
+    Ctl(L"STATIC", L"Up to 8, over every page. They aren't faded, so keep them off text you need.", 0, 30, 302, 500, 18, IDC_HDR);
+
+    AddSection(14, 342, 532, 84, L"GIFs");
+    Ctl(L"STATIC", L"Frame-rate limit:", 0, 30, 364, 110, 20, -1);
+    {
+        HWND gf = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 142, 360, 110, 200, IDC_GIFFPS);
+        const wchar_t* fpsN[] = { L"10 fps", L"15 fps", L"24 fps", L"30 fps", L"60 fps", L"No limit" };
+        static const int fpsV[] = { 10, 15, 24, 30, 60, 0 };
+        int sel = 3;
+        for (int i = 0; i < 6; i++) { SendMessageW(gf, CB_ADDSTRING, 0, (LPARAM)fpsN[i]); if (fpsV[i] == gGifFps) sel = i; }
+        SendMessageW(gf, CB_SETCURSEL, sel, 0);
+    }
+    Ctl(L"BUTTON", L"Pause while another window is in front", BS_AUTOCHECKBOX | WS_TABSTOP, 266, 364, 264, 20, IDC_GIFPAUSE);
+    CheckDlgButton(gWnd, IDC_GIFPAUSE, gGifPauseBg ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Lower = less CPU and memory. Skipped frames are merged, so GIFs still play at their own speed.", 0, 30, 396, 500, 18, IDC_HDR);
     gBuildSub = -1;
 
     // compact mode's own buttons (shown only in compact mode)
@@ -9234,6 +10177,12 @@ static void CreateUI()
     ShowWindow(Ctl(L"BUTTON", L"Full window", WS_TABSTOP, 410, 42, 142, 34, IDC_COMPACTFULL), SW_HIDE);
 
     gBuildPage = -1;
+    {                                           // the "+ Add output" row sits just under the output list
+        static const int follow[] = { IDC_ADDOUT, IDC_VBCABLE, IDC_HEARLBL, IDC_HEARON };
+        for (int id : follow) { HWND c = GetDlgItem(gWnd, id); for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == c) gDesign[i].shifted = true; }
+    }
+    AssignSections();
+    LayoutLoad(gIni, false);                    // where you moved things to
     gUiReady = true;
     AddTips();
     FitText();
@@ -9310,7 +10259,7 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
     if (active) {
-        HBRUSH ab = CreateSolidBrush(ACCENT);
+        HBRUSH ab = CreateSolidBrush(TAB_C);
         RECT bar = { rc.left + 14, rc.bottom - 3, rc.right - 14, rc.bottom };
         FillRect(dc, &bar, ab);
         DeleteObject(ab);
@@ -9343,13 +10292,13 @@ static void PaintWindow(HDC dc)
         if (s.page >= 0 && s.page != gPage) continue;
         if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub)) continue;
         if (gCompact) continue;
-        int y = SC(s.y + (s.shifts ? d : 0)), sx = SC(s.x);
+        int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         RECT tr = { sx + 10, y - sz.cy / 2, sx + 18 + sz.cx, y + sz.cy / 2 + 1 };
         FillRect(dc, &tr, BgBrush());
         SetBkColor(dc, BgColor());
-        SetTextColor(dc, TXT_C);
+        SetTextColor(dc, TITLE_C);
         TextOutW(dc, sx + 14, y - sz.cy / 2, s.title, lstrlenW(s.title));
     }
 
@@ -9377,7 +10326,7 @@ static void DrawStatus(DRAWITEMSTRUCT* d)
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
     bool loop = gLooping || (gRunning && gMicMuted), live = gRunning;   // red while looping or muted
-    COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : (gDark ? DK_CTL : LT_STATUS);
+    COLORREF fill = loop ? (gDark ? RGB(92, 30, 34) : RGB(253, 224, 224)) : STATUS_C;
     COLORREF text = loop ? (gDark ? RGB(255, 125, 125) : RGB(185, 20, 20)) : (TXT_C);
     COLORREF dotc = loop ? RGB(235, 60, 60) : live ? RGB(40, 190, 90) : RGB(150, 150, 150);
 
@@ -9524,6 +10473,26 @@ static void OnCommand(int id, int code)
     if (id == IDC_CLIPFX)      { gClipsFx = Checked(id); return; }
     if (id == IDC_CLIPAUTOTRIM){ gClipAutoTrim = Checked(id); return; }
     if (id == IDC_TTSSPEAK)    { if (code == BN_CLICKED) TtsSpeak(); return; }
+    if (id == IDC_TTSACCENT) {
+        if (code == CBN_SELCHANGE) {
+            gTtsAccent = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, TTS_ACCENT_N - 1);
+            const TtsAccent& a = TTS_ACCENTS[gTtsAccent];
+            int v = TtsVoiceFor(gTtsAccent);
+            if (v >= 0) {                       // show which voice will speak
+                SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_SETCURSEL, v + 1, 0);
+                lstrcpynW(gTtsVoice, gTtsNames[v], 128);
+            } else if (gTtsAccent > 0 && !a.phrasing) {
+                wchar_t m[512];
+                wsprintfW(m, L"The %s accent needs a Windows voice for %s, and none is installed.\n\n"
+                             L"Add one in Windows Settings > Time & language > Speech > Manage voices > Add voices "
+                             L"(pick \"%s\"), then restart Lag Effect.\n\nOpen the speech settings now?", a.name, a.voiceName, a.voiceName);
+                if (MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                    ShellExecuteW(nullptr, L"open", L"ms-settings:speech", nullptr, nullptr, SW_SHOWNORMAL);
+                gTtsAccent = 0; SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, 0, 0);
+            }
+        }
+        return;
+    }
     if (id == IDC_TTSVOICE) {
         if (code == CBN_SELCHANGE) {
             int sel = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
@@ -9546,10 +10515,10 @@ static void OnCommand(int id, int code)
     if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
     if (id == IDC_CLIPHIST)    { if (code == BN_CLICKED) ClipHistory(GetDlgItem(gWnd, id)); return; }
     if (id == IDC_PADFOLDER)   { if (code == BN_CLICKED) PadLoadFolder(); return; }
-    if (id == IDC_SETSUB0 || id == IDC_SETSUB1) {
+    if (id >= IDC_SETSUB0 && id <= IDC_SETSUB2) {
         if (code == BN_CLICKED && gSetSub != id - IDC_SETSUB0) {
             gSetSub = id - IDC_SETSUB0; Layout();
-            InvalidateRect(GetDlgItem(gWnd, IDC_SETSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_SETSUB1), nullptr, FALSE);
+            for (int k = IDC_SETSUB0; k <= IDC_SETSUB2; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
         }
         return;
     }
@@ -9585,22 +10554,106 @@ static void OnCommand(int id, int code)
             wchar_t path[MAX_PATH] = L"";
             OPENFILENAMEW o = {};
             o.lStructSize = sizeof(o); o.hwndOwner = gWnd; o.lpstrFile = path; o.nMaxFile = MAX_PATH;
-            o.lpstrFilter = L"Pictures (PNG, JPG, BMP, GIF)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All files\0*.*\0";
-            o.lpstrTitle = L"Pick a background picture"; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+            o.lpstrFilter = L"Pictures and GIFs (PNG, JPG, BMP, GIF)\0*.png;*.jpg;*.jpeg;*.bmp;*.gif\0All files\0*.*\0";
+            o.lpstrTitle = L"Pick a background picture or GIF"; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
             if (GetOpenFileNameW(&o)) {
+                HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
                 if (PictureLoad(path)) { lstrcpynW(gPicPath, path, MAX_PATH); ApplyTheme(); }
-                else MessageBoxW(gWnd, L"Couldn't open that picture. PNG, JPG, BMP and GIF work.", L"Lag Effect", MB_ICONWARNING);
+                else { PictureLoad(gPicPath); MessageBoxW(gWnd, L"Couldn't open that picture. PNG, JPG, BMP and GIF work.", L"Lag Effect", MB_ICONWARNING); }
+                SetCursor(old);
             }
             PictureInfo();
         }
         return;
     }
     if (id == IDC_PICREMOVE) { if (code == BN_CLICKED) { gPicPath[0] = 0; PictureLoad(gPicPath); ApplyTheme(); PictureInfo(); } return; }
-    if (id == IDC_PICFIT) { if (code == CBN_SELCHANGE) { gPicFit = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3); ApplyTheme(); } return; }
+    if (id == IDC_PICFIT) { if (code == CBN_SELCHANGE) { gPicFit = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 4); ApplyTheme(); } return; }
+    if (id == IDC_FONTSIZE) {
+        if (code == CBN_SELCHANGE) {
+            gFontPx = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) + 11, 11, 18);
+            ApplyFont(); RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+        return;
+    }
+    if (id == IDC_LAYEDIT)  { if (code == BN_CLICKED) EdBegin(ED_LAYOUT); return; }
+    if (id == IDC_LAYRESET) {
+        if (code == BN_CLICKED && MessageBoxW(gWnd, L"Put everything back where it started (for this profile)?", L"Lag Effect - Layout",
+                                              MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            LayoutReset(); PlaceAll(); LayoutSaveNow();
+            RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_INVALIDATE | RDW_ALLCHILDREN);
+        }
+        return;
+    }
+    if (id == IDC_STKMOVE)  {
+        if (code == BN_CLICKED) {
+            if (!gStkN && !(gBase.gp && gPicFit == 4))
+                MessageBoxW(gWnd, L"Add a picture or GIF first (or set the background to \"Place it yourself\").", L"Lag Effect - Pictures", MB_ICONINFORMATION);
+            else EdBegin(ED_PICS);
+        }
+        return;
+    }
+    if (id == IDC_STKLIST)  { if (code == CBN_SELCHANGE) { gStkSel = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0); PicUiRefresh(); } return; }
+    if (id == IDC_STKADD) {
+        if (code == BN_CLICKED) {
+            if (gStkN >= STK_MAX) { MessageBoxW(gWnd, L"That's the most (8). Remove one to add another.", L"Lag Effect - Pictures", MB_ICONINFORMATION); return; }
+            static wchar_t files[16384];
+            files[0] = 0;
+            OPENFILENAMEW o = {};
+            o.lStructSize = sizeof(o); o.hwndOwner = gWnd; o.lpstrFile = files; o.nMaxFile = 16384;
+            o.lpstrFilter = L"Pictures and GIFs (PNG, GIF, JPG, BMP)\0*.png;*.gif;*.jpg;*.jpeg;*.bmp\0All files\0*.*\0";
+            o.lpstrTitle = L"Add pictures or GIFs (you can pick several)";
+            o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
+            if (!GetOpenFileNameW(&o)) return;
+            int added = 0, failed = 0;
+            const wchar_t* dir = files; const wchar_t* f = files + lstrlenW(files) + 1;
+            HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+            if (!*f) { if (StkAdd(files)) added++; else failed++; }   // one file: the full path
+            for (; *f && gStkN < STK_MAX; f += lstrlenW(f) + 1) {
+                wchar_t path[MAX_PATH]; wsprintfW(path, L"%s\\%s", dir, f);
+                if (StkAdd(path)) added++; else failed++;
+            }
+            SetCursor(old);
+            if (added) { gStkSel = gStkN - 1; PictureRebuild(); PicRedraw(nullptr); StkSaveAll(); }
+            PicUiRefresh();
+            if (failed) MessageBoxW(gWnd, L"Some files couldn't be opened (PNG, GIF, JPG and BMP work), or there wasn't room for them.", L"Lag Effect - Pictures", MB_ICONWARNING);
+            else if (added) EdBegin(ED_PICS);    // straight to placing them
+        }
+        return;
+    }
+    if (id == IDC_STKDEL) {
+        if (code == BN_CLICKED && gStkSel >= 0 && gStkSel < gStkN) {
+            RECT r; StkRect(gStk[gStkSel], &r);
+            StkRemove(gStkSel); PictureRebuild(); PicRedraw(nullptr); StkSaveAll(); PicUiRefresh();
+        }
+        return;
+    }
+    if (id == IDC_STKSIZE || id == IDC_STKOPAC) {
+        if (!gUiReady || gPicUiBusy || gStkSel < 0 || gStkSel >= gStkN) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        Sticker& st = gStk[gStkSel];
+        if (code == EN_CHANGE && ok && v >= 5) {
+            RECT before; StkRect(st, &before);
+            if (id == IDC_STKSIZE) { st.size = Iclamp(v, 5, 400); st.stale = true; SetTimer(gWnd, TIMER_STKSIZE, 300, nullptr); }
+            else st.opacity = Iclamp(v, 5, 100);
+            StkRefresh(&before);
+        } else if (code == EN_KILLFOCUS) { SetDlgItemInt(gWnd, id, (UINT)(id == IDC_STKSIZE ? st.size : st.opacity), FALSE); StkSaveAll(); }
+        return;
+    }
+    if (id == IDC_GIFFPS) {
+        if (code == CBN_SELCHANGE) {
+            static const int fpsV[] = { 10, 15, 24, 30, 60, 0 };
+            gGifFps = fpsV[Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 5)];
+            HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
+            PictureRebuild(); PicRedraw(nullptr);  // frames are decoded again for the new limit
+            SetCursor(old);
+        }
+        return;
+    }
+    if (id == IDC_GIFPAUSE) { gGifPauseBg = Checked(id); return; }
     if (id == IDC_PICDIM) {
         if (!gUiReady) return;
         BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
-        if (code == EN_CHANGE && ok) { gPicDim = Iclamp(v, 0, 95); if (gPicSrc) ApplyTheme(); }
+        if (code == EN_CHANGE && ok) { gPicDim = Iclamp(v, 0, 95); if (PicActive()) ApplyTheme(); }
         else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gPicDim, FALSE);
         return;
     }
@@ -9887,7 +10940,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         UpdateUi();
         if (gCompact) Layout();
         ExecCommandLine(GetCommandLineW());     // switches given on the first start (only if allowed)
-        if (PictureLoad(gPicPath)) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
+        PictureLoad(gPicPath);
+        StkLoadAll();
+        if (PicActive()) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
         PictureInfo();
         ApplyOpacity();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
@@ -9900,6 +10955,15 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         else if (w == TIMER_CLEANUP) CleanupOldExe();
         else if (w == TIMER_FXKEYS) PollFxKeys();
         else if (w == TIMER_OSD) OsdTick();
+        else if (w == TIMER_PICANIM) PicAnimTick();
+        else if (w == TIMER_STKSIZE) {          // a picture was resized: decode it again at its new size (sharp, fast)
+            KillTimer(h, TIMER_STKSIZE);
+            bool any = false;
+            for (int i = 0; i < gStkN; i++) if (gStk[i].stale) { StkEnsureDecoded(gStk[i]); any = true; }
+            if (gBase.gp && gPicFit == 4) { PictureRebuild(); PicRedraw(nullptr); }
+            else if (any) StkRefresh(nullptr);
+            PicAnimTimer();
+        }
         else if (w == TIMER_RECONNECT) {
             if (!gWantRunning || gRunning || StartAudio(true)) KillTimer(h, TIMER_RECONNECT);
             UpdateUi();
@@ -9919,7 +10983,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         OnDropFiles((HDROP)w);
         return 0;
     case WM_SIZE:                               // the picture is sized to the window
-        if (gPicSrc && w != SIZE_MINIMIZED) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
+        if (PicActive() && w != SIZE_MINIMIZED) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
+        EdFollow();
+        break;
+    case WM_MOVE:
+        EdFollow();                             // the move-things-around layer stays over the window
         break;
     case WM_COPYDATA: {                         // command-line control from another LagEffect.exe (if allowed)
         const COPYDATASTRUCT* cd = (const COPYDATASTRUCT*)l;
@@ -9963,7 +11031,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_FXON) { DrawFxSwitch((DRAWITEMSTRUCT*)l); return TRUE; }
         if (w == IDC_SONGBTN) { DrawSongButton((DRAWITEMSTRUCT*)l); return TRUE; }
-        if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || w == IDC_SETSUB0 || w == IDC_SETSUB1) {
+        if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB2)) {
             DrawFxSub((DRAWITEMSTRUCT*)l); return TRUE;
         }
         if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch((DRAWITEMSTRUCT*)l); return TRUE; }
@@ -10106,8 +11174,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
     if (gCtxOk) ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
 
-    gFont     = CreateFontW(-SC(13), 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
-    gFontBold = CreateFontW(-SC(13), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    gFont     = CreateFontW(-SC(gFontPx), 0, 0, 0, FW_NORMAL,   0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
+    gFontBold = CreateFontW(-SC(gFontPx), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, gFontName);
     gFontOsd  = CreateFontW(-20, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     gIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));          // custom icon if built with LagEffect.rc
     if (!gIcon) gIcon = LoadIconW(nullptr, IDI_APPLICATION);
