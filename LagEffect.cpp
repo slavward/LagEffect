@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.1"
+#define APP_VERSION L"1.28.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7724,9 +7724,10 @@ static bool gTtsListed = false;                  // the voice list has been read
 static void TtsAdopt(const VoiceList& v)        // (natural-sounding voices first: accents pick them before older ones)
 {
     int o = 0;
-    for (int pass = 0; pass < 2; pass++)
+    for (int pass = 0; pass < 3; pass++)        // natural English voices, other natural ones, then the older ones
         for (int i = 0; i < v.count; i++) {
-            if (TtsIsNatural(v.names[i]) != (pass == 0)) continue;
+            const bool nat = TtsIsNatural(v.names[i]), en = (v.lang[i] & 0x3FF) == 0x09;
+            if ((pass == 0 && !(nat && en)) || (pass == 1 && !(nat && !en)) || (pass == 2 && nat)) continue;
             memcpy(gTtsNames[o], v.names[i], sizeof(gTtsNames[o])); memcpy(gTtsIds[o], v.ids[i], sizeof(gTtsIds[o]));
             gTtsLang[o] = v.lang[i]; o++;
         }
@@ -7746,6 +7747,16 @@ static DWORD WINAPI TtsListThread(LPVOID)       // at startup, so opening the wi
     if (v) { TtsEnum(*v); if (!PostMessageW(gWnd, WM_VOICES_LISTED, 0, (LPARAM)v)) HeapFree(GetProcessHeap(), 0, v); }
     CoUninitialize();
     return 0;
+}
+static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
+{
+    if (!wcsncmp(in, L"Microsoft ", 10)) in += 10;
+    int o = 0;
+    for (const wchar_t* q = in; *q && o < cap - 1; ) {
+        if (!wcsncmp(q, L" Online", 7)) { q += 7; continue; }
+        out[o++] = *q++;
+    }
+    out[o] = 0;
 }
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
@@ -7847,10 +7858,32 @@ static unsigned TtsRand(unsigned n)             // a different pick every line
     s = s * 1664525u + 1013904223u;
     return n ? (s >> 8) % n : 0;
 }
+// Natural voices each accent likes best (first found wins), so it doesn't land on a child's or a novelty voice.
+static const struct { const wchar_t* accent; const wchar_t* names[6]; } TTS_PREFER[] = {
+    { L"American", { L"Andrew", L"Guy", L"Brian", L"Christopher", L"Aria", L"Jenny" } },
+    { L"Memphis",  { L"Roger", L"Guy", L"Steffan", L"Eric", L"Ava", L"Michelle" } },
+    { L"Canadian", { L"Liam", L"Clara" } },
+    { L"Scottish", { L"Ryan", L"Thomas", L"Sonia", L"Libby" } },
+    { L"Irish",    { L"Connor", L"Emily" } },
+    { L"Indian",   { L"Prabhat", L"Neerja" } },
+    { L"Mexican",  { L"Jorge", L"Dalia" } },
+    { L"French",   { L"Henri", L"Remy", L"Denise", L"Vivienne" } },
+    { L"Russian",  { L"Dmitry", L"Svetlana" } },
+    { L"Syrian",   { L"Laith", L"Amany" } },
+    { L"Arabic",   { L"Hamed", L"Zariyah" } },
+};
 static int TtsVoiceFor(int accent)              // index into the voice list, -1 if none installed
 {
     if (accent <= 0 || accent >= TTS_ACCENT_N) return -1;
     const TtsAccent& a = TTS_ACCENTS[accent];
+    for (const auto& pr : TTS_PREFER) {         // 1. a favourite natural voice in exactly that language / region
+        if (lstrcmpiW(pr.accent, a.name)) continue;
+        for (const wchar_t* nm : pr.names) {
+            if (!nm) break;
+            for (int i = 0; i < gTtsCount; i++)
+                if (gTtsLang[i] == a.lang && TtsIsNatural(gTtsNames[i]) && wcsstr(gTtsNames[i], nm)) return i;
+        }
+    }
     for (int pass = 0; pass < 3; pass++)
         for (int i = 0; i < gTtsCount; i++) {
             int l = gTtsLang[i];
@@ -8608,12 +8641,19 @@ static void TtsFillVoices()                     // the voice dropdown, after the
     SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
     int sel = 0;
     bool natural = false;
+    HDC dc = GetDC(tv); HGDIOBJ of = SelectObject(dc, (HFONT)SendMessageW(tv, WM_GETFONT, 0, 0));
+    int widest = 0;
     for (int i = 0; i < gTtsCount; i++) {
-        SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsNames[i]);
+        wchar_t shown[160]; TtsShortName(gTtsNames[i], shown, 160);   // "Microsoft Saleh Online (Natural) - ..." -> "Saleh (Natural) - ..."
+        SIZE sz; GetTextExtentPoint32W(dc, shown, lstrlenW(shown), &sz); if (sz.cx > widest) widest = sz.cx;
+        SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)shown);
         if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1;
         if (TtsIsNatural(gTtsNames[i])) natural = true;
     }
     SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)(natural ? L"More natural voices..." : L"Get natural (realistic) voices..."));
+    SelectObject(dc, of); ReleaseDC(tv, dc);
+    RECT wa; SystemParametersInfoW(SPI_GETWORKAREA, 0, &wa, 0);
+    SendMessageW(tv, CB_SETDROPPEDWIDTH, Imin(widest + GetSystemMetrics(SM_CXVSCROLL) + SC(16), (int)(wa.right - wa.left) / 2), 0);
     SendMessageW(tv, CB_SETCURSEL, sel, 0);
 }
 static void AppRestart()
@@ -12146,6 +12186,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         gNvsaBusy = false;
         SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK));
         TtsListVoices(); TtsFillVoices();
+        if (gTtsAccent > 0) { int v = TtsVoiceFor(gTtsAccent); if (v >= 0) { lstrcpynW(gTtsVoice, gTtsNames[v], 128); TtsFillVoices(); } }
         int nat = 0; for (int i = 0; i < gTtsCount; i++) if (TtsIsNatural(gTtsNames[i])) nat++;
         wchar_t m[400];
         if (nat) wsprintfW(m, L"Found %d natural voice%s. They're at the top of the voice list, and accents use them first.", nat, nat == 1 ? L"" : L"s");
@@ -12155,7 +12196,11 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     case WM_VOICES_LISTED:
-        if (!gTtsListed) { TtsAdopt(*(VoiceList*)l); TtsFillVoices(); }
+        if (!gTtsListed) {
+            TtsAdopt(*(VoiceList*)l);
+            if (gTtsAccent > 0) { int v = TtsVoiceFor(gTtsAccent); if (v >= 0) lstrcpynW(gTtsVoice, gTtsNames[v], 128); }   // show the accent's voice
+            TtsFillVoices();
+        }
         HeapFree(GetProcessHeap(), 0, (void*)l);
         return 0;
     case WM_VOICE_INSTALLED:
