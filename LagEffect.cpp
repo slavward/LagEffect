@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.2"
+#define APP_VERSION L"1.28.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7672,13 +7672,13 @@ static const GUID kIID_ISpObjectTokenCategory  = { 0x2D3D3845, 0x39AF, 0x4850, {
 static const GUID kCLSID_SpObjectToken = { 0xEF411752, 0x3736, 0x4CB4, { 0x9C, 0x8C, 0x8E, 0xF4, 0xCC, 0xB5, 0x8E, 0xFE } };
 static const GUID kIID_ISpObjectToken  = { 0x14056589, 0xE16C, 0x11D2, { 0xBB, 0x90, 0x00, 0xC0, 0x4F, 0x8E, 0xE6, 0xC0 } };
 
-#define TTS_MAX_VOICES 64
-static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][256];
+#define TTS_MAX_VOICES 1000                  // the natural-voices add-on alone brings hundreds (Edge has most languages)
+static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][512];
 static int     gTtsLang[TTS_MAX_VOICES];        // each voice's language (Windows LCID, e.g. 0x080A = Spanish, Mexico)
 static int     gTtsCount = 0;
 static volatile LONG gTtsBusy = 0;
 
-struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][256]; int lang[TTS_MAX_VOICES]; int count; };
+struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][512]; int lang[TTS_MAX_VOICES]; int count; };
 static void TtsEnum(VoiceList& v)               // every installed voice (any thread)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED); // usually already done by the audio library; harmless if so
@@ -7697,7 +7697,7 @@ static void TtsEnum(VoiceList& v)               // every installed voice (any th
                     bool dup = false;
                     for (int i = 0; i < v.count; i++) if (!lstrcmpiW(v.names[i], name)) dup = true;
                     if (!dup) {
-                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 256);
+                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 512);
                         v.lang[v.count] = 0;
                         ISpDataKey* attr = nullptr; LPWSTR lang = nullptr;   // "Language" = hex LCID(s), e.g. "409;9"
                         if (SUCCEEDED(tok->OpenKey(L"Attributes", &attr)) && attr) {
@@ -7761,7 +7761,7 @@ static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[256]; int rate, pitch, room; bool natural; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room; bool natural; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -8162,10 +8162,10 @@ static void TtsSpeakNow(const wchar_t* given)
     if (!j) { gTtsBusy = 0; return; }
     lstrcpynW(j->text, text, 600);
     int sel = (int)SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_GETCURSEL, 0, 0);
-    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 256);
+    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 512);
     if (gTtsAccent > 0 && gTtsAccent < TTS_ACCENT_N) {   // the accent's voice wins (if it's installed)
         int v = TtsVoiceFor(gTtsAccent);
-        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
+        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 512);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
     j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
