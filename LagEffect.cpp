@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.0"
+#define APP_VERSION L"1.28.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -9960,11 +9960,18 @@ static DWORD WINAPI NvsaThread(LPVOID arg)
         char url[1024] = "", pick[1024] = "";
         if (json) {
             const char* p = json;
-            while (JsonString(json, "browser_download_url", &p, url, 1024)) {   // its zip (not an ARM-only one if there's a choice)
+            // The release has NaturalVoiceSAPIAdapter_<ver>_x86_x64.zip (what PCs need), an ARM64 zip, and
+            // debug_symbols.zip (no programs in it). Take the x86_x64 one; failing that any adapter zip that isn't ARM.
+            auto has = [](const char* t, const char* w) {
+                for (; *t; t++) { int k = 0; while (w[k] && t[k] && ((t[k] | 32) == (w[k] | 32))) k++; if (!w[k]) return true; }
+                return false;
+            };
+            int best = -1;
+            while (JsonString(json, "browser_download_url", &p, url, 1024)) {
                 int n = lstrlenA(url);
-                if (n < 5 || lstrcmpiA(url + n - 4, ".zip")) continue;
-                auto arm = [](const char* t) { for (; *t; t++) if ((t[0] | 32) == 'a' && (t[1] | 32) == 'r' && (t[2] | 32) == 'm') return true; return false; };
-                if (!pick[0] || (arm(pick) && !arm(url))) lstrcpynA(pick, url, 1024);
+                if (n < 5 || lstrcmpiA(url + n - 4, ".zip") || has(url, "debug") || !has(url, "NaturalVoiceSAPIAdapter")) continue;
+                int score = has(url, "x86_x64") ? 3 : !has(url, "arm") ? 2 : 1;
+                if (score > best) { best = score; lstrcpynA(pick, url, 1024); }
             }
             MemFree(json);
             if (!pick[0]) lstrcpynW(j->error, L"Its latest release has no .zip to download.", 300);
