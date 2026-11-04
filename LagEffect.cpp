@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.27.2"
+#define APP_VERSION L"1.27.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7794,11 +7794,20 @@ static const TtsSwap SW_SC[] = {
     { L"little", { L"wee" } }, { L"know", { L"ken" } }, { L"very", { L"pure", L"dead" } }, { L"good", { L"braw", L"pure brilliant" } },
     { L"great", { L"braw", L"pure dead brilliant" } }, { L"friend", { L"pal", L"mate" } }, { L"what", { L"whit" } },
     { L"nothing", { L"hee haw", L"nothin'" } }, { L"child", { L"wean", L"bairn" } } };
+static const TtsSwap SW_MEM[] = {
+    { L"thank you very much", { L"thank ya kindly", L"much obliged" } }, { L"thanks", { L"thank ya", L"preciate it" } },
+    { L"you all", { L"y'all" } }, { L"you guys", { L"y'all" } }, { L"everyone", { L"all y'all", L"everybody" } },
+    { L"going to", { L"fixin' to", L"gonna" } }, { L"think", { L"reckon" } }, { L"hello", { L"hey y'all", L"howdy" } },
+    { L"hi", { L"hey", L"howdy" } }, { L"very", { L"mighty", L"real" } }, { L"friend", { L"buddy", L"darlin'" } },
+    { L"yes", { L"yes sir", L"yeah", L"sure enough" } }, { L"isn't", { L"ain't" } }, { L"great", { L"mighty fine" } },
+    { L"good", { L"real good", L"fine" } } };
 #define SWN(a) a, (int)(sizeof(a) / sizeof(a[0]))
 static const TtsAccent TTS_ACCENTS[] = {
     { L"No accent", 0, 0, 0, nullptr, nullptr, 0, nullptr, 0, {}, {} },
     { L"American", 0x0409, 0, 0, L"English (United States)", L"en-US", 1, SWN(SW_US),
       { L"Dude, ", L"Bro, ", L"Okay so, ", L"Oh my gosh, ", L"" }, { L". Like, totally.", L". For real.", L". Let's go!", L". No cap.", L"." } },
+    { L"Memphis", 0x0409, 0, 0, L"English (United States)", L"en-US", -1, SWN(SW_MEM),
+      { L"", L"Well, ", L"Now, ", L"Lord, ", L"" }, { L".", L", y'all.", L", bless your heart.", L", I tell ya.", L"." } },
     { L"Canadian", 0x1009, 0x0409, 0, L"English (Canada)", L"en-CA", 0, SWN(SW_CA),
       { L"", L"Oh, ", L"Sorry, but ", L"Well, ", L"" }, { L", eh?", L", eh.", L", eh buddy?", L", bud.", L"." } },
     { L"Scottish", 0x0809, 0, 0, L"English (United Kingdom)", L"en-GB", 0, SWN(SW_SC),
