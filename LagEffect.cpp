@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.4"
+#define APP_VERSION L"1.28.5"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7761,7 +7761,7 @@ static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room; bool natural; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -8024,6 +8024,41 @@ static void TtsRepitch(short*& d, unsigned& n, int semis)   // the whole line hi
     d = o; n = m;
 }
 
+// Band-limited (windowed-sinc, 32 taps) resampling to 48 kHz, then a peak limit: the speech never clips.
+static void TtsResample(short*& d, unsigned& n, int srcRate)
+{
+    if (!d || !n) return;
+    if (srcRate != RATE && srcRate > 0) {
+        const double step = (double)srcRate / RATE;                 // source samples per output sample
+        const unsigned m = (unsigned)((double)n / step);
+        short* o = (short*)HeapAlloc(GetProcessHeap(), 0, (size_t)m * sizeof(short));
+        if (!o) return;
+        const double fc = srcRate < RATE ? 0.5 * 0.92 : 0.5 / step * 0.92;   // keep just under the lower Nyquist
+        const int T = 16;
+        for (unsigned i = 0; i < m; i++) {
+            const double t = i * step; const int c = (int)t;
+            double acc = 0, wsum = 0;
+            for (int k = c - T + 1; k <= c + T; k++) {
+                const double x = t - k;
+                const double sx = fabs(x) < 1e-9 ? 2 * fc : sin(2 * 3.141592653589793 * fc * x) / (3.141592653589793 * x);
+                const double wpos = (x + T) / (2.0 * T);              // Blackman window over the taps
+                const double w = wpos <= 0 || wpos >= 1 ? 0 : 0.42 - 0.5 * cos(2 * 3.141592653589793 * wpos) + 0.08 * cos(4 * 3.141592653589793 * wpos);
+                const double kk = sx * w; wsum += kk;
+                if (k >= 0 && k < (int)n) acc += d[k] * kk;
+            }
+            const double v = wsum != 0 ? acc / wsum : 0;
+            o[i] = (short)(v > 32767 ? 32767 : v < -32767 ? -32767 : v);
+        }
+        HeapFree(GetProcessHeap(), 0, d);
+        d = o; n = m;
+    }
+    int peak = 0; for (unsigned i = 0; i < n; i++) peak = Imax(peak, d[i] < 0 ? -d[i] : d[i]);
+    if (peak > 23170) {                         // louder than -3 dB: bring it down (room for the volume and your mic)
+        const float g = 23170.0f / peak;
+        for (unsigned i = 0; i < n; i++) d[i] = (short)(d[i] * g);
+    }
+}
+
 static bool TtsRender(TtsJob* j, bool useVoice)
 {
     bool ok = false;
@@ -8036,7 +8071,10 @@ static bool TtsRender(TtsJob* j, bool useVoice)
             tok->Release();
         }
     }
-    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0 };
+    // Taken at (about) the voice's own rate: Windows' converter up to 48 kHz just joins the dots, which sounds
+    // crackly / harsh. TtsResample does it properly afterwards.
+    const DWORD sr = j->srcRate > 0 ? (DWORD)j->srcRate : RATE;
+    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, sr, sr * 2, 2, 16, 0 };
     if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &mem)) &&
         SUCCEEDED(CoCreateInstance(kCLSID_SpStream, nullptr, CLSCTX_ALL, kIID_ISpStream, (void**)&ss)) &&
         SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
@@ -8048,9 +8086,9 @@ static bool TtsRender(TtsJob* j, bool useVoice)
         HGLOBAL hg = nullptr;
         if (SUCCEEDED(mem->Stat(&st, STATFLAG_NONAME)) && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
             unsigned n = (unsigned)(st.cbSize.QuadPart / 2);
-            if (n > (unsigned)RATE * 60) n = RATE * 60;
+            if (n > sr * 60) n = sr * 60;
             const short* src = (const short*)GlobalLock(hg);
-            if (src && n > RATE / 20) {
+            if (src && n > sr / 20) {
                 j->data = (short*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(short));
                 if (j->data) { memcpy(j->data, src, n * sizeof(short)); j->len = n; ok = true; }
             }
@@ -8068,6 +8106,7 @@ static DWORD WINAPI TtsThread(LPVOID arg)
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    if (j->ok) TtsResample(j->data, j->len, j->srcRate);
     if (j->ok) TtsRepitch(j->data, j->len, j->pitch);
     if (j->ok && j->natural) TtsHumanize(j->data, j->len, j->room);
     CoUninitialize();
@@ -8184,6 +8223,7 @@ static void TtsSpeakNow(const wchar_t* given)
     bool realVoice = false;
     for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsIds[i], j->voice)) realVoice = TtsIsNatural(gTtsNames[i]);
     if (realVoice) j->natural = false;
+    j->srcRate = realVoice ? 24000 : 22050;    // what the voices actually make (natural ones 24 kHz, older ones ~22 kHz)
     if (gTtsNatural) TtsProsody(j->text, j->xml, 3000, !realVoice);
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
