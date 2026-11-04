@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.3"
+#define APP_VERSION L"1.28.4"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7941,13 +7941,13 @@ static int TtsPhrase(wchar_t* t, int cap, int accent)   // the accent's words, o
 // ---- sounding less like a robot ----
 // 1. Prosody: every sentence gets a slightly different pace and pitch, with a natural pause after it
 //    (SAPI XML; if a voice won't take it, the plain text is spoken instead).
-static void TtsProsody(const wchar_t* in, wchar_t* out, int cap)
+static void TtsProsody(const wchar_t* in, wchar_t* out, int cap, bool vary = true)
 {
     int o = 0;
     auto put = [&](const wchar_t* t) { while (*t && o < cap - 1) out[o++] = *t++; };
     auto sentence = [&](const wchar_t* a, const wchar_t* b) {
         wchar_t open[96];
-        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", (int)TtsRand(3) - 1, (int)TtsRand(5) - 2);
+        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", vary ? (int)TtsRand(3) - 1 : 0, vary ? (int)TtsRand(5) - 2 : 0);
         put(open);
         for (const wchar_t* q = a; q < b && o < cap - 8; q++) {
             if (*q == L'&') put(L"&amp;"); else if (*q == L'<') put(L"&lt;"); else if (*q == L'>') put(L"&gt;");
@@ -7978,12 +7978,17 @@ static void TtsHumanize(short* d, unsigned n, int room)
     static const int tapMs[4] = { 11, 17, 23, 31 }; static const float tapG[4] = { 0.12f, 0.09f, 0.07f, 0.05f };
     float* x = (float*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(float));
     if (!x) return;
-    float env = 0, peak = 0;
+    // Level: a slow, smooth 2:1 above -18 dB (power follower ~10 ms in / 150 ms out, gain smoothed again),
+    // so the gain never moves within a wave cycle (a fast one distorts: that was the crackle).
+    float pw = 0, g = 1.0f, peak = 0;
+    const float aIn = 1.0f - expf(-1.0f / (0.010f * RATE)), aOut = 1.0f - expf(-1.0f / (0.150f * RATE)), aG = 1.0f - expf(-1.0f / (0.005f * RATE));
     for (unsigned i = 0; i < n; i++) {
         float v = d[i] / 32768.0f;
         v = BqRun(highS, BqRun(pres, BqRun(lowS, BqRun(hp, v))));
-        float a = fabsf(v); env += (a - env) * (a > env ? 0.01f : 0.0005f);   // gentle 2:1 above -18 dB
-        const float thr = 0.126f; float g = env > thr ? powf(env / thr, -0.5f) : 1.0f;
+        float p2 = v * v; pw += (p2 - pw) * (p2 > pw ? aIn : aOut);
+        const float rms = sqrtf(pw) * 1.414f, thr = 0.126f;
+        const float want = rms > thr ? sqrtf(thr / rms) : 1.0f;
+        g += (want - g) * aG;
         x[i] = v * g;
     }
     for (unsigned i = n; i-- > 0;) {            // early reflections (from the dry signal, read backwards so it isn't reused)
@@ -7992,8 +7997,13 @@ static void TtsHumanize(short* d, unsigned n, int room)
         x[i] += r;
         float a = fabsf(x[i]); if (a > peak) peak = a;
     }
-    const float norm = peak > 0.0001f ? 0.89f / peak : 1.0f;   // to about -1 dB
-    for (unsigned i = 0; i < n; i++) { float v = x[i] * norm; d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f); }
+    const float norm = peak > 0.0001f ? 0.708f / peak : 1.0f;  // to -3 dB: room for the volume going up to 200%
+    const unsigned fade = Imin((int)n / 4, RATE / 200);          // 5 ms in / out: no click at the ends
+    for (unsigned i = 0; i < n; i++) {
+        float v = x[i] * norm;
+        if (i < fade) v *= i / (float)fade; else if (n - i <= fade) v *= (n - i) / (float)fade;
+        d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f);
+    }
     HeapFree(GetProcessHeap(), 0, x);
 }
 
@@ -8169,7 +8179,12 @@ static void TtsSpeakNow(const wchar_t* given)
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
     j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
-    if (gTtsNatural) TtsProsody(j->text, j->xml, 3000);
+    // The realistic ("Natural") voices already sound human: they only get the pauses, not the per-sentence
+    // pace / pitch changes or the processing (which only made them worse, and could crackle).
+    bool realVoice = false;
+    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsIds[i], j->voice)) realVoice = TtsIsNatural(gTtsNames[i]);
+    if (realVoice) j->natural = false;
+    if (gTtsNatural) TtsProsody(j->text, j->xml, 3000, !realVoice);
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
