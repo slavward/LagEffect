@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.27.3"
+#define APP_VERSION L"1.28.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -2342,7 +2342,7 @@ enum {
     IDC_TTSTEXT, IDC_TTSVOICE, IDC_TTSSPEAK, IDC_CLIPFX, IDC_CLIPAUTOTRIM,
     IDC_PROFILE, IDC_PROFSAVE, IDC_PROFDEL, IDC_PROFKEY, IDC_PROFNEXTKEY, IDC_FXHOLD, IDC_MICTEST, IDC_MICPLAY, IDC_MICTESTINFO,
     IDC_HARMMUTE, IDC_HEARLBL, IDC_HEARON, IDC_FONTSIZE, IDC_LAYEDIT, IDC_LAYRESET, IDC_STKLIST, IDC_STKADD, IDC_STKDEL,
-    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT, IDC_PICPLACE, IDC_VOICEPROG,
+    IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT, IDC_PICPLACE, IDC_VOICEPROG, IDC_TTSVOL, IDC_TTSMORE,
     IDC_COLSW0 = 1400,                          // + colour slot (USERCOL_N): its own range
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
@@ -2363,6 +2363,8 @@ enum {
 #define WM_PIC_DECODED     (WM_APP + 8)          // a picture / GIF finished decoding in the background
 #define WM_VOICE_INSTALLED (WM_APP + 9)          // Windows finished installing a text-to-speech voice
 #define WM_VOICES_LISTED   (WM_APP + 10)         // the voice list (read in the background) is ready
+#define WM_NVSA_READY      (WM_APP + 11)         // NaturalVoiceSAPIAdapter downloaded + unpacked (or failed)
+#define WM_NVSA_DONE       (WM_APP + 12)         // its installer was closed
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -3056,7 +3058,7 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
     HDC dc = CreateCompatibleDC(real);
     HBITMAP bmpBuf = CreateCompatibleBitmap(real, Imax(1, (int)rc.right), Imax(1, (int)rc.bottom));
     HGDIOBJ oldBuf = SelectObject(dc, bmpBuf);
-    if (gBrPicture) {                           // over a picture: show the picture behind it, not a box
+    if (gBrPicture && GetParent(h) == gWnd) {   // over a picture: show the picture behind it, not a box
         POINT pt = { 0, 0 }; MapWindowPoints(h, gWnd, &pt, 1);
         SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
         FillRect(dc, &rc, gBrPicture);
@@ -3232,6 +3234,10 @@ static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds (4 pages),
 static bool    gClipAutoTrim = true;             // cut silence off the ends of new clips
 static wchar_t gTtsVoice[128];                   // text-to-speech voice (its name; empty = Windows' default)
 static int     gTtsAccent = 0;                    // text-to-speech accent (TTS_ACCENTS index; 0 = none)
+static int     gTtsVol = 100;                     // text-to-speech volume (%)
+static int     gTtsRate = 0, gTtsPitch = 0;       // speed (-10..10, on top of the accent's), pitch (semitones)
+static int     gTtsRoom = 35, gTtsPause = 100;    // room sound (%), pauses between sentences (%)
+static bool    gTtsNatural = true;                // per-sentence pace / pitch, warmth, room, even level
 static bool    gVoiceInstalling = false;          // Windows is installing a voice for an accent
 static int     gVoicePct = -1;                    // how far (from DISM's own progress; -1 = not known yet)
 static DWORD   gVoiceStart = 0;                   // when it started (for the time shown until DISM reports)
@@ -3381,6 +3387,10 @@ static void LoadSettings()
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
     gTtsAccent = INI_INT(L"tts_accent", 0);
+    gTtsVol = Iclamp(INI_INT(L"tts_volume", 100), 0, 200);
+    gTtsRate = Iclamp(INI_INT(L"tts_speed", 0), -10, 10); gTtsPitch = Iclamp(INI_INT(L"tts_pitch", 0), -12, 12);
+    gTtsRoom = Iclamp(INI_INT(L"tts_room", 35), 0, 100); gTtsPause = Iclamp(INI_INT(L"tts_pauses", 100), 0, 300);
+    gTtsNatural = INI_INT(L"tts_natural", 1) != 0;
     gEchoStyle = Iclamp(INI_INT(L"fx_echo_style", 0), 0, ECHO_N - 1);
     gHarmStyle = Iclamp(INI_INT(L"fx_harm_style", 0), 0, HARM_N - 1);
     gBeatSync  = INI_INT(L"beat_sync", 0) != 0;
@@ -4204,7 +4214,9 @@ static void SaveSettings()
 
     SaveInt(L"repeat_word_times", gRepeatN);
     IniSet(L"tts_voice", gTtsVoice);
-    SaveInt(L"tts_accent", gTtsAccent);
+    SaveInt(L"tts_accent", gTtsAccent); SaveInt(L"tts_volume", gTtsVol);
+    SaveInt(L"tts_speed", gTtsRate); SaveInt(L"tts_pitch", gTtsPitch); SaveInt(L"tts_room", gTtsRoom);
+    SaveInt(L"tts_pauses", gTtsPause); SaveInt(L"tts_natural", gTtsNatural);
     SaveInt(L"fx_echo_style", gEchoStyle);
     SaveInt(L"fx_harm_style", gHarmStyle);
     SaveInt(L"beat_sync", gBeatSync); SaveInt(L"bpm", gBpm); SaveInt(L"beat_division", gBeatDiv);
@@ -7738,7 +7750,7 @@ static DWORD WINAPI TtsListThread(LPVOID)       // at startup, so opening the wi
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[256]; int rate; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[256]; int rate, pitch, room; bool natural; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -7917,7 +7929,7 @@ static void TtsProsody(const wchar_t* in, wchar_t* out, int cap)
         const wchar_t* b = *q ? q + 1 : q;
         if (b > a) {
             sentence(a, b);
-            wchar_t sil[40]; wsprintfW(sil, L"<silence msec=\"%d\"/>", 140 + (int)TtsRand(180)); put(sil);
+            wchar_t sil[40]; wsprintfW(sil, L"<silence msec=\"%d\"/>", (140 + (int)TtsRand(180)) * gTtsPause / 100); put(sil);
         }
         if (!*q) break;
         a = q + 1;
@@ -7925,7 +7937,7 @@ static void TtsProsody(const wchar_t* in, wchar_t* out, int cap)
     out[o] = 0;
 }
 // 2. Sound: warmer, less harsh and less "in your skull" (a touch of room), evened out like a voice-over.
-static void TtsHumanize(short* d, unsigned n)
+static void TtsHumanize(short* d, unsigned n, int room)
 {
     Biquad hp, lowS, pres, highS; BqSet(hp, 2, 70, 0.707);
     BqShelf(lowS, false, 180, 2.5); BqPeak(pres, 3200, 1.5, 1.0); BqShelf(highS, true, 9000, -3.0);
@@ -7943,13 +7955,30 @@ static void TtsHumanize(short* d, unsigned n)
     }
     for (unsigned i = n; i-- > 0;) {            // early reflections (from the dry signal, read backwards so it isn't reused)
         float r = 0;
-        for (int t = 0; t < 4; t++) { unsigned k = (unsigned)(tapMs[t] * RATE / 1000); if (i >= k) r += x[i - k] * tapG[t]; }
+        for (int t = 0; t < 4; t++) { unsigned k = (unsigned)(tapMs[t] * RATE / 1000); if (i >= k) r += x[i - k] * tapG[t] * (room / 35.0f); }
         x[i] += r;
         float a = fabsf(x[i]); if (a > peak) peak = a;
     }
     const float norm = peak > 0.0001f ? 0.89f / peak : 1.0f;   // to about -1 dB
     for (unsigned i = 0; i < n; i++) { float v = x[i] * norm; d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f); }
     HeapFree(GetProcessHeap(), 0, x);
+}
+
+static void TtsRepitch(short*& d, unsigned& n, int semis)   // the whole line higher / lower, same speed
+{
+    if (!semis || !d || !n) return;
+    PShift* ps = (PShift*)calloc(1, sizeof(PShift));
+    const unsigned tail = RATE / 10, m = n + tail;
+    short* o = (short*)HeapAlloc(GetProcessHeap(), 0, m * sizeof(short));
+    if (!ps || !o) { free(ps); if (o) HeapFree(GetProcessHeap(), 0, o); return; }
+    const double r = pow(2.0, semis / 12.0);
+    for (unsigned i = 0; i < m; i++) {
+        float v = PitchShift(*ps, i < n ? d[i] / 32768.0f : 0.0f, r, 1440, 1.0f);
+        o[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f);
+    }
+    free(ps);
+    HeapFree(GetProcessHeap(), 0, d);
+    d = o; n = m;
 }
 
 static bool TtsRender(TtsJob* j, bool useVoice)
@@ -7969,7 +7998,7 @@ static bool TtsRender(TtsJob* j, bool useVoice)
         SUCCEEDED(CoCreateInstance(kCLSID_SpStream, nullptr, CLSCTX_ALL, kIID_ISpStream, (void**)&ss)) &&
         SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
         SUCCEEDED(v->SetOutput(ss, TRUE)) &&
-        SUCCEEDED(v->SetRate(j->rate)) &&
+        SUCCEEDED(v->SetRate(Iclamp(j->rate, -10, 10))) &&
         ((j->xml[0] && SUCCEEDED(v->Speak(j->xml, SPF_DEFAULT | SPF_IS_XML, nullptr))) ||
          SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr)))) {
         STATSTG st = {};
@@ -7996,17 +8025,104 @@ static DWORD WINAPI TtsThread(LPVOID arg)
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
-    if (j->ok) TtsHumanize(j->data, j->len);
+    if (j->ok) TtsRepitch(j->data, j->len, j->pitch);
+    if (j->ok && j->natural) TtsHumanize(j->data, j->len, j->room);
     CoUninitialize();
     PostMessageW(gWnd, WM_TTS_DONE, 0, (LPARAM)j);
     return 0;
 }
 
-static void TtsSpeak()
+// ---- text to speech: voice settings window ----
+static HWND gTtsDlg = nullptr;
+static const struct { int id; const wchar_t* label; const wchar_t* unit; int lo, hi; int* var; } TTS_SETS[] = {
+    { 21, L"Volume:", L"%", 0, 200, &gTtsVol }, { 22, L"Speed:", L"(-10 to 10)", -10, 10, &gTtsRate },
+    { 23, L"Pitch:", L"semitones", -12, 12, &gTtsPitch }, { 24, L"Room sound:", L"%", 0, 100, &gTtsRoom },
+    { 25, L"Pauses:", L"% (between sentences)", 0, 300, &gTtsPause } };
+static void TtsSpeakText(const wchar_t* t);
+static LRESULT CALLBACK TtsDlgProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_COMMAND: {
+        int id = LOWORD(w), code = HIWORD(w);
+        for (const auto& st : TTS_SETS)
+            if (id == st.id) {
+                BOOL ok = FALSE; int v = (int)GetDlgItemInt(h, id, &ok, TRUE);
+                if (code == EN_CHANGE && ok) { *st.var = Iclamp(v, st.lo, st.hi); if (st.var == &gTtsVol) { gPads[TTS_SLOT].vol = gTtsVol; SetDlgItemInt(gWnd, IDC_TTSVOL, (UINT)gTtsVol, FALSE); } }
+                else if (code == EN_KILLFOCUS) SetDlgItemInt(h, id, (UINT)*st.var, TRUE);
+                return 0;
+            }
+        if (id == 30) { gTtsNatural = IsDlgButtonChecked(h, 30) == BST_CHECKED; return 0; }
+        if (id == 31) { TtsSpeakText(L"Hello! This is how I sound now. Does that sound better?"); return 0; }
+        if (id == 32) {                         // back to how it started
+            gTtsVol = 100; gTtsRate = 0; gTtsPitch = 0; gTtsRoom = 35; gTtsPause = 100; gTtsNatural = true;
+            for (const auto& st : TTS_SETS) SetDlgItemInt(h, st.id, (UINT)*st.var, TRUE);
+            CheckDlgButton(h, 30, BST_CHECKED); gPads[TTS_SLOT].vol = gTtsVol; SetDlgItemInt(gWnd, IDC_TTSVOL, 100, FALSE);
+            return 0;
+        }
+        if (id == IDOK || id == IDCANCEL) { DestroyWindow(h); return 0; }
+        return 0;
+    }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
+        return CtlColor(h, m, w, l);
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_NOTIFY: {
+        NMHDR* nh = (NMHDR*)l;
+        if (gDark && nh->code == NM_CUSTOMDRAW) {
+            wchar_t cls[16]; GetClassNameW(nh->hwndFrom, cls, 16);
+            if (!lstrcmpiW(cls, L"Button")) return DrawDarkCheck((NMCUSTOMDRAW*)l);
+        }
+        break;
+    }
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: gTtsDlg = nullptr; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void TtsSettingsOpen()
+{
+    if (gTtsDlg) { SetForegroundWindow(gTtsDlg); return; }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = TtsDlgProc; wc.hInstance = gInst; wc.hIcon = gIcon; wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+                wc.lpszClassName = L"LagTtsSettings"; RegisterClassW(&wc); reg = true; }
+    RECT pr; GetWindowRect(gWnd, &pr);
+    RECT r = { 0, 0, SC(330), SC(258) }; DWORD st = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    AdjustWindowRect(&r, st, FALSE);
+    int ww = r.right - r.left, wh = r.bottom - r.top;
+    gTtsDlg = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LagTtsSettings", L"Text to speech - voice", st,
+                              (pr.left + pr.right - ww) / 2, (pr.top + pr.bottom - wh) / 2, ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!gTtsDlg) return;
+    auto mk = [&](const wchar_t* cls, const wchar_t* txt, DWORD sty, int x, int y, int w, int hh, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, txt, WS_CHILD | WS_VISIBLE | sty, SC(x), SC(y), SC(w), SC(hh), gTtsDlg, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    int y = 14;
+    for (const auto& s2 : TTS_SETS) {
+        mk(L"STATIC", s2.label, 0, 14, y + 3, 86, 20, -1);
+        HWND e = mk(L"EDIT", L"", WS_TABSTOP | ES_RIGHT | ES_AUTOHSCROLL, 104, y, 66, 24, s2.id, WS_EX_CLIENTEDGE);
+        HWND u = CreateWindowExW(0, UPDOWN_CLASSW, nullptr, WS_CHILD | WS_VISIBLE | UDS_SETBUDDYINT | UDS_ALIGNRIGHT | UDS_ARROWKEYS | UDS_NOTHOUSANDS,
+                                 0, 0, 0, 0, gTtsDlg, nullptr, gInst, nullptr);
+        SendMessageW(u, UDM_SETBUDDY, (WPARAM)e, 0); SendMessageW(u, UDM_SETRANGE32, s2.lo, s2.hi); SendMessageW(u, UDM_SETPOS32, 0, *s2.var);
+        mk(L"STATIC", s2.unit, 0, 178, y + 3, 150, 20, -1);
+        y += 32;
+    }
+    HWND nat = mk(L"BUTTON", L"Natural sound (pace, warmth, room, even level)", BS_AUTOCHECKBOX | WS_TABSTOP, 14, y + 2, 310, 22, 30);
+    CheckDlgButton(gTtsDlg, 30, gTtsNatural ? BST_CHECKED : BST_UNCHECKED); (void)nat;
+    y += 34;
+    mk(L"BUTTON", L"Test", WS_TABSTOP, 14, y, 90, 28, 31);
+    mk(L"BUTTON", L"Reset", WS_TABSTOP, 110, y, 90, 28, 32);
+    mk(L"BUTTON", L"Close", WS_TABSTOP | BS_DEFPUSHBUTTON, 226, y, 90, 28, IDOK);
+    ThemeTitleBar(gTtsDlg); EnumChildWindows(gTtsDlg, ThemeChild, 0);
+    ShowWindow(gTtsDlg, SW_SHOW);
+}
+
+static void TtsSpeakNow(const wchar_t* given);
+static void TtsSpeak() { TtsSpeakNow(nullptr); }
+static void TtsSpeakText(const wchar_t* t) { TtsSpeakNow(t); }
+static void TtsSpeakNow(const wchar_t* given)
 {
     TtsEnsureListed();
     wchar_t text[600];
-    GetDlgItemTextW(gWnd, IDC_TTSTEXT, text, 600);
+    if (given) lstrcpynW(text, given, 600); else GetDlgItemTextW(gWnd, IDC_TTSTEXT, text, 600);
     bool any = false; for (wchar_t* q = text; *q; q++) if (*q > L' ') any = true;
     if (!any || InterlockedCompareExchange(&gTtsBusy, 1, 0) != 0) return;
     TtsJob* j = (TtsJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TtsJob));
@@ -8019,7 +8135,8 @@ static void TtsSpeak()
         if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
-    TtsProsody(j->text, j->xml, 3000);
+    j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
+    if (gTtsNatural) TtsProsody(j->text, j->xml, 3000);
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
@@ -8029,7 +8146,7 @@ static void OnTtsDone(TtsJob* j)
 {
     if (j->ok) {
         PadSetData(TTS_SLOT, j->data, j->len);
-        gPads[TTS_SLOT].vol = 100;
+        gPads[TTS_SLOT].vol = gTtsVol;
         gPads[TTS_SLOT].trigger = true;
     } else {
         MessageBoxW(gWnd, L"Windows couldn't speak that. Check that a voice is installed "
@@ -8790,6 +8907,8 @@ static void AddTips()
     TipId(IDC_TTSVOICE,   L"Which Windows voice speaks. More voices: Windows Settings > Time & language > Speech > Add voices.");
     TipId(IDC_TTSACCENT,  L"Read your words with an accent: a Windows voice from that country (installed for you if it's missing), "
                           L"its own pace, and some of its own words, mixed up every time. American and Canadian are stereotypical.");
+    TipId(IDC_TTSMORE,    L"Voice settings: speed, pitch, room sound, pauses, natural sound, and a quick test.");
+    TipId(IDC_TTSVOL,     L"Text-to-speech volume, % (100 = normal, up to 200). Also changes a line that's already speaking.");
     TipId(IDC_FONTSIZE,   L"How big the text is, in pixels (at 100% size).");
     TipId(IDC_LAYEDIT,    L"Drag any control or box to where you want it. Saved for the profile you're using.");
     TipId(IDC_LAYRESET,   L"Put every control and box back where it started.");
@@ -9805,6 +9924,125 @@ static bool JsonString(const char* json, const char* key, const char** pos, char
     return true;
 }
 
+// ---- natural voices: NaturalVoiceSAPIAdapter (gexgd0419, MIT licence) ----
+// Windows 11's realistic "Natural" Narrator voices, and Edge's online neural voices, aren't open to other apps.
+// This free add-on makes them normal Windows voices. Lag Effect downloads its latest release from GitHub,
+// unpacks it to %LOCALAPPDATA%\LagEffect\NaturalVoiceSAPIAdapter (it must stay there once installed) and opens
+// its installer; when that's closed, the voice list is read again.
+struct NvsaJob { wchar_t dir[MAX_PATH], installer[MAX_PATH], error[300]; bool ok; };
+static bool gNvsaBusy = false;
+static bool NvsaFind(const wchar_t* dir, wchar_t* out, int depth)   // Installer.exe, up to 3 folders down
+{
+    wchar_t pat[MAX_PATH]; wsprintfW(pat, L"%s\\*", dir);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        wchar_t full[MAX_PATH]; wsprintfW(full, L"%s\\%s", dir, fd.cFileName);
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !lstrcmpiW(fd.cFileName, L"Installer.exe")) { lstrcpynW(out, full, MAX_PATH); found = true; }
+        else if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && depth > 0) found = NvsaFind(full, out, depth - 1);
+    } while (!found && FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+static DWORD WINAPI NvsaThread(LPVOID arg)
+{
+    NvsaJob* j = (NvsaJob*)arg;
+    wchar_t base[MAX_PATH] = L"";
+    GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    wsprintfW(j->dir, L"%s\\LagEffect", base); CreateDirectoryW(j->dir, nullptr);
+    wsprintfW(j->dir, L"%s\\LagEffect\\NaturalVoiceSAPIAdapter", base);
+    if (NvsaFind(j->dir, j->installer, 3)) { j->ok = true; }   // already downloaded: just open its installer
+    else {
+        DWORD len = 0;
+        char* json = HttpGet(L"https://api.github.com/repos/gexgd0419/NaturalVoiceSAPIAdapter/releases/latest", &len, j->error, 300);
+        char url[1024] = "", pick[1024] = "";
+        if (json) {
+            const char* p = json;
+            while (JsonString(json, "browser_download_url", &p, url, 1024)) {   // its zip (not an ARM-only one if there's a choice)
+                int n = lstrlenA(url);
+                if (n < 5 || lstrcmpiA(url + n - 4, ".zip")) continue;
+                auto arm = [](const char* t) { for (; *t; t++) if ((t[0] | 32) == 'a' && (t[1] | 32) == 'r' && (t[2] | 32) == 'm') return true; return false; };
+                if (!pick[0] || (arm(pick) && !arm(url))) lstrcpynA(pick, url, 1024);
+            }
+            MemFree(json);
+            if (!pick[0]) lstrcpynW(j->error, L"Its latest release has no .zip to download.", 300);
+        }
+        char* zip = nullptr; DWORD zlen = 0;
+        if (pick[0]) { wchar_t wu[1024]; Widen(pick, wu, 1024); zip = HttpGet(wu, &zlen, j->error, 300); }
+        if (zip) {
+            wchar_t tmp[MAX_PATH], zpath[MAX_PATH]; GetTempPathW(MAX_PATH, tmp); wsprintfW(zpath, L"%sNaturalVoiceSAPIAdapter.zip", tmp);
+            HANDLE f = CreateFileW(zpath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+            DWORD w = 0; bool wrote = f != INVALID_HANDLE_VALUE && WriteFile(f, zip, zlen, &w, nullptr) && w == zlen;
+            if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+            MemFree(zip);
+            if (!wrote) lstrcpynW(j->error, L"Couldn't save the download.", 300);
+            else {                              // unpack with Windows' own PowerShell
+                CreateDirectoryW(j->dir, nullptr);
+                wchar_t cmd[2048];
+                wsprintfW(cmd, L"powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Expand-Archive -LiteralPath '%s' -DestinationPath '%s' -Force\"", zpath, j->dir);
+                STARTUPINFOW si = { sizeof(si) }; si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
+                PROCESS_INFORMATION pi = {};
+                if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+                    WaitForSingleObject(pi.hProcess, 120000); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+                }
+                DeleteFileW(zpath);
+                if (NvsaFind(j->dir, j->installer, 3)) j->ok = true;
+                else lstrcpynW(j->error, L"Unpacked it, but couldn't find its Installer.exe.", 300);
+            }
+        }
+    }
+    if (!PostMessageW(gWnd, WM_NVSA_READY, 0, (LPARAM)j)) HeapFree(GetProcessHeap(), 0, j);
+    return 0;
+}
+static void NvsaStart()
+{
+    if (gNvsaBusy) return;
+    NvsaJob* j = (NvsaJob*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(NvsaJob));
+    if (!j) return;
+    HANDLE t = CreateThread(nullptr, 0, NvsaThread, j, 0, nullptr);
+    if (!t) { HeapFree(GetProcessHeap(), 0, j); return; }
+    CloseHandle(t);
+    gNvsaBusy = true;
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Downloading..."); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK));
+}
+static DWORD WINAPI NvsaWaitThread(LPVOID arg)
+{
+    HANDLE proc = (HANDLE)arg;
+    WaitForSingleObject(proc, INFINITE); CloseHandle(proc);
+    PostMessageW(gWnd, WM_NVSA_DONE, 0, 0);
+    return 0;
+}
+static void OnNvsaReady(NvsaJob* j)
+{
+    SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK));
+    if (!j->ok) {
+        gNvsaBusy = false;
+        wchar_t m[600]; wsprintfW(m, L"Couldn't get the natural voices add-on: %s\n\nYou can download it yourself from its GitHub page (Releases). Open it?", j->error);
+        if (MessageBoxW(gWnd, m, L"Lag Effect - Natural voices", MB_YESNO | MB_ICONWARNING) == IDYES)
+            ShellExecuteW(nullptr, L"open", L"https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases", nullptr, nullptr, SW_SHOWNORMAL);
+        HeapFree(GetProcessHeap(), 0, j);
+        return;
+    }
+    MessageBoxW(gWnd, L"Its installer opens next. In it:\n\n"
+                      L"1. Click Install for 64-bit (and 32-bit too, if offered). Windows asks for permission.\n"
+                      L"2. Turn on the voices you want: \"Narrator\" (Windows 11's natural voices; add more in Settings > "
+                      L"Accessibility > Narrator > Add natural voices) and/or \"Edge online\" (many more, needs internet).\n"
+                      L"3. Close the installer. Lag Effect then finds the new voices by itself.\n\n"
+                      L"NaturalVoiceSAPIAdapter is a free, open-source project by gexgd0419 (MIT licence).",
+                L"Lag Effect - Natural voices", MB_ICONINFORMATION);
+    SHELLEXECUTEINFOW se = {}; se.cbSize = sizeof(se); se.fMask = SEE_MASK_NOCLOSEPROCESS; se.hwnd = gWnd;
+    se.lpVerb = L"open"; se.lpFile = j->installer; se.nShow = SW_SHOWNORMAL;
+    wchar_t dir[MAX_PATH]; lstrcpynW(dir, j->installer, MAX_PATH); if (wchar_t* sl = wcsrchr(dir, L'\\')) *sl = 0; se.lpDirectory = dir;
+    HeapFree(GetProcessHeap(), 0, j);
+    HANDLE t = nullptr;
+    if (ShellExecuteExW(&se) && se.hProcess && (t = CreateThread(nullptr, 0, NvsaWaitThread, se.hProcess, 0, nullptr)) != nullptr) {
+        CloseHandle(t);
+        SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Setting up..."); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK));
+    } else { if (se.hProcess) CloseHandle(se.hProcess); gNvsaBusy = false; }
+}
+
 static void ParseVersion(const wchar_t* s, int v[3])
 {
     v[0] = v[1] = v[2] = 0;
@@ -10758,7 +10996,8 @@ static void CreateUI()
         if (gPadFile[i][0]) PadLoad(i, gPadFile[i], true);   // reload last time's sounds (every page), quietly
     AddSection(14, 436, 532, 60, L"Text to speech");
     {
-        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 176, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
+        HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 116, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
+        Spin(IDC_TTSVOL, 150, 457, 56, 0, 200, gTtsVol);
         SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type, then Enter");
         SendMessageW(te, EM_LIMITTEXT, 500, 0);
         HWND ta = Ctl(L"COMBOBOX", L"", COMBO, 212, 457, 104, 400, IDC_TTSACCENT);
@@ -10772,7 +11011,8 @@ static void CreateUI()
         if (gTtsVoice[0]) SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsVoice);
         SendMessageW(tv, CB_SETCURSEL, gTtsVoice[0] ? 1 : 0, 0);
         { HANDLE t = CreateThread(nullptr, 0, TtsListThread, nullptr, 0, nullptr); if (t) CloseHandle(t); }
-        Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 455, 98, 28, IDC_TTSSPEAK);
+        Ctl(L"BUTTON", L"Speak", WS_TABSTOP, 432, 455, 68, 28, IDC_TTSSPEAK);
+        Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 504, 455, 26, 28, IDC_TTSMORE);   // voice settings
         Ctl(L"STATIC", L"", SS_OWNERDRAW, 30, 486, 500, 6, IDC_VOICEPROG);   // voice install progress (only while installing)
     }
     AddSection(14, 508, 532, 76, L"Playback");
@@ -11317,6 +11557,14 @@ static void OnCommand(int id, int code)
     if (id == IDC_CLIPFX)      { gClipsFx = Checked(id); return; }
     if (id == IDC_CLIPAUTOTRIM){ gClipAutoTrim = Checked(id); return; }
     if (id == IDC_TTSSPEAK)    { if (code == BN_CLICKED) TtsSpeak(); return; }
+    if (id == IDC_TTSMORE) { if (code == BN_CLICKED) TtsSettingsOpen(); return; }
+    if (id == IDC_TTSVOL) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) { gTtsVol = Iclamp(v, 0, 200); gPads[TTS_SLOT].vol = gTtsVol; }   // (changes what's speaking now too)
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gTtsVol, FALSE);
+        return;
+    }
     if (id == IDC_TTSACCENT) {
         if (code == CBN_SELCHANGE) {
             TtsEnsureListed();
@@ -11341,14 +11589,11 @@ static void OnCommand(int id, int code)
         if (code == CBN_DROPDOWN) TtsEnsureListed();
         if (code == CBN_SELCHANGE && (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) == gTtsCount + 1) {
             TtsFillVoices();                    // (put the selection back)
-            if (MessageBoxW(gWnd, L"Windows 11's most realistic voices (the \"Natural\" ones Narrator uses) aren't open to other apps "
-                                  L"on their own. The free, open-source NaturalVoiceSAPIAdapter makes them (and Edge's online voices) "
-                                  L"show up here.\n\n1. Install it from its GitHub page (Releases).\n"
-                                  L"2. Add natural voices in Windows: Settings > Accessibility > Narrator > Add natural voices.\n"
-                                  L"3. Restart Lag Effect: they'll be at the top of this list, and accents pick them first.\n\n"
-                                  L"It's someone else's project, not part of Lag Effect. Open its page now?",
-                            L"Lag Effect - Natural voices", MB_YESNO | MB_ICONINFORMATION) == IDYES)
-                ShellExecuteW(nullptr, L"open", L"https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases", nullptr, nullptr, SW_SHOWNORMAL);
+            if (gNvsaBusy) return;
+            if (MessageBoxW(gWnd, L"Get realistic voices? Lag Effect downloads the free NaturalVoiceSAPIAdapter from GitHub and opens "
+                                  L"its installer, which makes Windows 11's natural Narrator voices and Edge's online neural voices "
+                                  L"usable here. Download and set it up now?",
+                            L"Lag Effect - Natural voices", MB_YESNO | MB_ICONQUESTION) == IDYES) NvsaStart();
             return;
         }
         if (code == CBN_SELCHANGE) {
@@ -11887,6 +12132,21 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_PIC_DECODED:
         OnPicDecoded((PicJob*)l);
         return 0;
+    case WM_NVSA_READY:
+        OnNvsaReady((NvsaJob*)l);
+        return 0;
+    case WM_NVSA_DONE: {
+        gNvsaBusy = false;
+        SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); FitOne(GetDlgItem(gWnd, IDC_TTSSPEAK));
+        TtsListVoices(); TtsFillVoices();
+        int nat = 0; for (int i = 0; i < gTtsCount; i++) if (TtsIsNatural(gTtsNames[i])) nat++;
+        wchar_t m[400];
+        if (nat) wsprintfW(m, L"Found %d natural voice%s. They're at the top of the voice list, and accents use them first.", nat, nat == 1 ? L"" : L"s");
+        else lstrcpynW(m, L"No natural voices showed up yet. If you installed the add-on and turned voices on, restart Lag Effect. "
+                          L"(Narrator's natural voices also need adding in Settings > Accessibility > Narrator.)", 400);
+        MessageBoxW(gWnd, m, L"Lag Effect - Natural voices", MB_ICONINFORMATION);
+        return 0;
+    }
     case WM_VOICES_LISTED:
         if (!gTtsListed) { TtsAdopt(*(VoiceList*)l); TtsFillVoices(); }
         HeapFree(GetProcessHeap(), 0, (void*)l);
