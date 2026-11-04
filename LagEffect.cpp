@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.27.1"
+#define APP_VERSION L"1.27.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7707,11 +7707,18 @@ static void TtsEnum(VoiceList& v)               // every installed voice (any th
         cat->Release();
     }
 }
+static bool TtsIsNatural(const wchar_t* name) { return wcsstr(name, L"Natural") || wcsstr(name, L"Neural") || wcsstr(name, L"Online"); }
 static bool gTtsListed = false;                  // the voice list has been read (it's read in the background at startup)
-static void TtsAdopt(const VoiceList& v)
+static void TtsAdopt(const VoiceList& v)        // (natural-sounding voices first: accents pick them before older ones)
 {
-    memcpy(gTtsNames, v.names, sizeof(gTtsNames)); memcpy(gTtsIds, v.ids, sizeof(gTtsIds)); memcpy(gTtsLang, v.lang, sizeof(gTtsLang));
-    gTtsCount = v.count; gTtsListed = true;
+    int o = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < v.count; i++) {
+            if (TtsIsNatural(v.names[i]) != (pass == 0)) continue;
+            memcpy(gTtsNames[o], v.names[i], sizeof(gTtsNames[o])); memcpy(gTtsIds[o], v.ids[i], sizeof(gTtsIds[o]));
+            gTtsLang[o] = v.lang[i]; o++;
+        }
+    gTtsCount = o; gTtsListed = true;
 }
 static void TtsListVoices()                     // now, on this thread
 {
@@ -7731,7 +7738,7 @@ static DWORD WINAPI TtsListThread(LPVOID)       // at startup, so opening the wi
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t voice[256]; int rate; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[256]; int rate; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -7779,13 +7786,32 @@ static const TtsSwap SW_AR[] = {
     { L"thank you very much", { L"شكراً جزيلاً", L"ألف شكر" } }, { L"very much", { L"جداً" } }, { L"hello", { L"مرحبا", L"السلام عليكم" } }, { L"hi", { L"مرحبا" } }, { L"thank you", { L"شكراً", L"شكراً جزيلاً" } },
     { L"thanks", { L"شكراً" } }, { L"yes", { L"نعم", L"أيوه" } }, { L"no", { L"لا" } }, { L"friend", { L"صديقي", L"حبيبي" } },
     { L"goodbye", { L"مع السلامة" } }, { L"bye", { L"مع السلامة" } } };
+static const TtsSwap SW_SC[] = {
+    { L"thank you very much", { L"cheers, pal", L"ta very much" } }, { L"thanks", { L"cheers", L"ta" } },
+    { L"hello", { L"awright", L"how's it gaun" } }, { L"hi", { L"awright", L"hiya" } }, { L"yes", { L"aye", L"aye, nae bother" } },
+    { L"no", { L"naw", L"nae chance" } }, { L"don't", { L"dinnae", L"don't" } }, { L"can't", { L"cannae" } }, { L"won't", { L"willnae" } },
+    { L"isn't", { L"isnae" } }, { L"didn't", { L"didnae" } }, { L"going to", { L"gonnae" } }, { L"small", { L"wee" } },
+    { L"little", { L"wee" } }, { L"know", { L"ken" } }, { L"very", { L"pure", L"dead" } }, { L"good", { L"braw", L"pure brilliant" } },
+    { L"great", { L"braw", L"pure dead brilliant" } }, { L"friend", { L"pal", L"mate" } }, { L"what", { L"whit" } },
+    { L"nothing", { L"hee haw", L"nothin'" } }, { L"child", { L"wean", L"bairn" } } };
+static const TtsSwap SW_MEM[] = {
+    { L"thank you very much", { L"thank ya kindly", L"much obliged" } }, { L"thanks", { L"thank ya", L"preciate it" } },
+    { L"you all", { L"y'all" } }, { L"you guys", { L"y'all" } }, { L"everyone", { L"all y'all", L"everybody" } },
+    { L"going to", { L"fixin' to", L"gonna" } }, { L"think", { L"reckon" } }, { L"hello", { L"hey y'all", L"howdy" } },
+    { L"hi", { L"hey", L"howdy" } }, { L"very", { L"mighty", L"real" } }, { L"friend", { L"buddy", L"darlin'" } },
+    { L"yes", { L"yes sir", L"yeah", L"sure enough" } }, { L"isn't", { L"ain't" } }, { L"great", { L"mighty fine" } },
+    { L"good", { L"real good", L"fine" } } };
 #define SWN(a) a, (int)(sizeof(a) / sizeof(a[0]))
 static const TtsAccent TTS_ACCENTS[] = {
     { L"No accent", 0, 0, 0, nullptr, nullptr, 0, nullptr, 0, {}, {} },
     { L"American", 0x0409, 0, 0, L"English (United States)", L"en-US", 1, SWN(SW_US),
       { L"Dude, ", L"Bro, ", L"Okay so, ", L"Oh my gosh, ", L"" }, { L". Like, totally.", L". For real.", L". Let's go!", L". No cap.", L"." } },
+    { L"Memphis", 0x0409, 0, 0, L"English (United States)", L"en-US", -1, SWN(SW_MEM),
+      { L"", L"Well, ", L"Now, ", L"Lord, ", L"" }, { L".", L", y'all.", L", bless your heart.", L", I tell ya.", L"." } },
     { L"Canadian", 0x1009, 0x0409, 0, L"English (Canada)", L"en-CA", 0, SWN(SW_CA),
       { L"", L"Oh, ", L"Sorry, but ", L"Well, ", L"" }, { L", eh?", L", eh.", L", eh buddy?", L", bud.", L"." } },
+    { L"Scottish", 0x0809, 0, 0, L"English (United Kingdom)", L"en-GB", 0, SWN(SW_SC),
+      { L"", L"Och, ", L"Listen, ", L"Aye, ", L"" }, { L".", L", ken?", L", pal.", L", so it is.", L"." } },
     { L"Irish", 0x1809, 0, 0, L"English (Ireland)", L"en-IE", 1, SWN(SW_IE),
       { L"", L"Ah sure, ", L"Ah here, ", L"Well, ", L"" }, { L".", L", so it is.", L", sure look.", L", like.", L"." } },
     { L"Indian", 0x4009, 0x0439, 0, L"English (India)", L"en-IN", 1, SWN(SW_IN),
@@ -7867,6 +7893,65 @@ static int TtsPhrase(wchar_t* t, int cap, int accent)   // the accent's words, o
     return Iclamp(a.rate + (int)TtsRand(3) - 1, -3, 4);   // its own pace, a little different every line
 }
 
+// ---- sounding less like a robot ----
+// 1. Prosody: every sentence gets a slightly different pace and pitch, with a natural pause after it
+//    (SAPI XML; if a voice won't take it, the plain text is spoken instead).
+static void TtsProsody(const wchar_t* in, wchar_t* out, int cap)
+{
+    int o = 0;
+    auto put = [&](const wchar_t* t) { while (*t && o < cap - 1) out[o++] = *t++; };
+    auto sentence = [&](const wchar_t* a, const wchar_t* b) {
+        wchar_t open[96];
+        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", (int)TtsRand(3) - 1, (int)TtsRand(5) - 2);
+        put(open);
+        for (const wchar_t* q = a; q < b && o < cap - 8; q++) {
+            if (*q == L'&') put(L"&amp;"); else if (*q == L'<') put(L"&lt;"); else if (*q == L'>') put(L"&gt;");
+            else out[o++] = *q;
+        }
+        put(L"</pitch></rate>");
+    };
+    const wchar_t* a = in;
+    for (const wchar_t* q = in; ; q++) {
+        bool end = !*q || ((*q == L'.' || *q == L'!' || *q == L'?') && (q[1] == L' ' || !q[1]));
+        if (!end) continue;
+        const wchar_t* b = *q ? q + 1 : q;
+        if (b > a) {
+            sentence(a, b);
+            wchar_t sil[40]; wsprintfW(sil, L"<silence msec=\"%d\"/>", 140 + (int)TtsRand(180)); put(sil);
+        }
+        if (!*q) break;
+        a = q + 1;
+    }
+    out[o] = 0;
+}
+// 2. Sound: warmer, less harsh and less "in your skull" (a touch of room), evened out like a voice-over.
+static void TtsHumanize(short* d, unsigned n)
+{
+    Biquad hp, lowS, pres, highS; BqSet(hp, 2, 70, 0.707);
+    BqShelf(lowS, false, 180, 2.5); BqPeak(pres, 3200, 1.5, 1.0); BqShelf(highS, true, 9000, -3.0);
+    lowS.z1 = lowS.z2 = highS.z1 = highS.z2 = 0;
+    static const int tapMs[4] = { 11, 17, 23, 31 }; static const float tapG[4] = { 0.12f, 0.09f, 0.07f, 0.05f };
+    float* x = (float*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(float));
+    if (!x) return;
+    float env = 0, peak = 0;
+    for (unsigned i = 0; i < n; i++) {
+        float v = d[i] / 32768.0f;
+        v = BqRun(highS, BqRun(pres, BqRun(lowS, BqRun(hp, v))));
+        float a = fabsf(v); env += (a - env) * (a > env ? 0.01f : 0.0005f);   // gentle 2:1 above -18 dB
+        const float thr = 0.126f; float g = env > thr ? powf(env / thr, -0.5f) : 1.0f;
+        x[i] = v * g;
+    }
+    for (unsigned i = n; i-- > 0;) {            // early reflections (from the dry signal, read backwards so it isn't reused)
+        float r = 0;
+        for (int t = 0; t < 4; t++) { unsigned k = (unsigned)(tapMs[t] * RATE / 1000); if (i >= k) r += x[i - k] * tapG[t]; }
+        x[i] += r;
+        float a = fabsf(x[i]); if (a > peak) peak = a;
+    }
+    const float norm = peak > 0.0001f ? 0.89f / peak : 1.0f;   // to about -1 dB
+    for (unsigned i = 0; i < n; i++) { float v = x[i] * norm; d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f); }
+    HeapFree(GetProcessHeap(), 0, x);
+}
+
 static bool TtsRender(TtsJob* j, bool useVoice)
 {
     bool ok = false;
@@ -7885,7 +7970,8 @@ static bool TtsRender(TtsJob* j, bool useVoice)
         SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
         SUCCEEDED(v->SetOutput(ss, TRUE)) &&
         SUCCEEDED(v->SetRate(j->rate)) &&
-        SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
+        ((j->xml[0] && SUCCEEDED(v->Speak(j->xml, SPF_DEFAULT | SPF_IS_XML, nullptr))) ||
+         SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr)))) {
         STATSTG st = {};
         HGLOBAL hg = nullptr;
         if (SUCCEEDED(mem->Stat(&st, STATFLAG_NONAME)) && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
@@ -7910,6 +7996,7 @@ static DWORD WINAPI TtsThread(LPVOID arg)
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    if (j->ok) TtsHumanize(j->data, j->len);
     CoUninitialize();
     PostMessageW(gWnd, WM_TTS_DONE, 0, (LPARAM)j);
     return 0;
@@ -7932,6 +8019,7 @@ static void TtsSpeak()
         if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
+    TtsProsody(j->text, j->xml, 3000);
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
@@ -8402,7 +8490,13 @@ static void TtsFillVoices()                     // the voice dropdown, after the
     SendMessageW(tv, CB_RESETCONTENT, 0, 0);
     SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)L"Default voice");
     int sel = 0;
-    for (int i = 0; i < gTtsCount; i++) { SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsNames[i]); if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1; }
+    bool natural = false;
+    for (int i = 0; i < gTtsCount; i++) {
+        SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)gTtsNames[i]);
+        if (!lstrcmpiW(gTtsNames[i], gTtsVoice)) sel = i + 1;
+        if (TtsIsNatural(gTtsNames[i])) natural = true;
+    }
+    SendMessageW(tv, CB_ADDSTRING, 0, (LPARAM)(natural ? L"More natural voices..." : L"Get natural (realistic) voices..."));
     SendMessageW(tv, CB_SETCURSEL, sel, 0);
 }
 static void AppRestart()
@@ -11245,6 +11339,18 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_TTSVOICE) {
         if (code == CBN_DROPDOWN) TtsEnsureListed();
+        if (code == CBN_SELCHANGE && (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) == gTtsCount + 1) {
+            TtsFillVoices();                    // (put the selection back)
+            if (MessageBoxW(gWnd, L"Windows 11's most realistic voices (the \"Natural\" ones Narrator uses) aren't open to other apps "
+                                  L"on their own. The free, open-source NaturalVoiceSAPIAdapter makes them (and Edge's online voices) "
+                                  L"show up here.\n\n1. Install it from its GitHub page (Releases).\n"
+                                  L"2. Add natural voices in Windows: Settings > Accessibility > Narrator > Add natural voices.\n"
+                                  L"3. Restart Lag Effect: they'll be at the top of this list, and accents pick them first.\n\n"
+                                  L"It's someone else's project, not part of Lag Effect. Open its page now?",
+                            L"Lag Effect - Natural voices", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                ShellExecuteW(nullptr, L"open", L"https://github.com/gexgd0419/NaturalVoiceSAPIAdapter/releases", nullptr, nullptr, SW_SHOWNORMAL);
+            return;
+        }
         if (code == CBN_SELCHANGE) {
             TtsEnsureListed();
             int sel = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
