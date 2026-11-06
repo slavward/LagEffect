@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.29.2"
+#define APP_VERSION L"1.29.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -393,6 +393,7 @@ static inline float Hermite(float xm1, float x0, float x1, float x2, float t)
 // fed through ring buffers.
 static float             ring[MAX_OUT][RING_SIZE];
 static volatile unsigned ringW[MAX_OUT], ringR[MAX_OUT];
+static volatile unsigned gMainFrames = 256;     // the main device's block size (extra outputs size their cushion by it)
 static volatile bool     ringOn[MAX_OUT];
 
 static inline double WrapPos(double p, double len)
@@ -2045,6 +2046,7 @@ static void FxReset()                          // audio thread only
 
 static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32 frames)
 {
+    gMainFrames = frames;
 #ifdef HAVE_SSE_FLAGS
     _mm_setcsr(_mm_getcsr() | 0x8040);         // flush denormals to zero: reverb tails stay cheap
 #endif
@@ -2388,6 +2390,13 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     gMeterGateOpen = gateHold > 0;
 }
 
+// Each extra output (a cable, headphones...) runs on its own clock, a tiny bit faster or slower than
+// ours. Instead of letting the gap grow and then jumping (a tick), it keeps a steady cushion and
+// nudges by one sample at a time: blending two samples into one, or holding one, which can't be heard.
+static float    gExtFill[MAX_OUT];              // how full its buffer usually is (smoothed)
+static float    gExtAcc[MAX_OUT];               // corrections owed (part samples carry over)
+static bool     gExtPrimed[MAX_OUT];
+static float    gExtL[MAX_OUT], gExtR[MAX_OUT]; // the last sample it played
 static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_uint32 frames)
 {
     int k = (int)(INT_PTR)dev->pUserData;
@@ -2396,17 +2405,47 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
     MemoryBarrier();
     unsigned r = ringR[k];
     unsigned avail = w - r;
+    unsigned period = dev->playback.internalPeriodSizeInFrames; if (period < frames) period = frames;
+    const unsigned target = period + gMainFrames + 384;   // (enough that neither side's block size empties it)
+    float L = gExtL[k], R = gExtR[k];
 
-    // Each device runs on its own clock; drop old audio so delay never builds up.
-    unsigned maxLag = dev->playback.internalPeriodSizeInFrames * 3 + 512;
-    if (avail > maxLag) { r = w - dev->playback.internalPeriodSizeInFrames; avail = w - r; }
+    if (!gExtPrimed[k]) {                       // starting (or it ran dry): wait for a full cushion,
+        if (avail < target) {                   // one short gap instead of many little ones
+            for (ma_uint32 f = 0; f < frames; f++) { L *= 0.97f; R *= 0.97f; out[f * 2] = L; out[f * 2 + 1] = R; }
+            gExtL[k] = L; gExtR[k] = R;
+            return;
+        }
+        r = w - target; avail = target; gExtFill[k] = (float)target; gExtAcc[k] = 0; gExtPrimed[k] = true;
+    }
+    if (avail > target + 4096) { r = w - target; avail = target; gExtFill[k] = (float)target; }   // a big hiccup: catch up
+    gExtFill[k] += ((float)avail - gExtFill[k]) * 0.05f;
+    const float off = gExtFill[k] - (float)target;
+    // Too full: use a sample fewer; too empty: one more. Further off = a few per block, spread out.
+    // (A little of the gap each block, carried over: steady clock drift is matched exactly.)
+    if (fabsf(off) > 48.0f) gExtAcc[k] += off * 0.01f; else gExtAcc[k] *= 0.9f;
+    int n = (int)fabsf(gExtAcc[k]); const int nMax = frames >= 96 ? (int)frames / 96 : 1; if (n > nMax) n = nMax;
+    const int adj = n == 0 ? 0 : gExtAcc[k] > 0 ? 1 : -1;
+    gExtAcc[k] -= (float)(adj * n);
+    if (gExtAcc[k] > 4) gExtAcc[k] = 4; else if (gExtAcc[k] < -4) gExtAcc[k] = -4;
+    const ma_uint32 step = n ? frames / (ma_uint32)(n + 1) : frames + 1;
+    ma_uint32 next = step;
 
     for (ma_uint32 f = 0; f < frames; f++) {
-        float L = 0.0f, R = 0.0f;
-        if (avail) { const unsigned i = (r & (RING_FRAMES - 1)) * 2; L = ring[k][i]; R = ring[k][i + 1]; r++; avail--; }
+        const bool fix = adj && f == next; if (fix) next += step;
+        if (fix && adj < 0) {
+            // hold: play the last sample again without using one
+        } else if (avail) {
+            unsigned i = (r & (RING_FRAMES - 1)) * 2; L = ring[k][i]; R = ring[k][i + 1]; r++; avail--;
+            if (fix && adj > 0 && avail) {      // blend this one with the next: one sample fewer
+                i = (r & (RING_FRAMES - 1)) * 2; L = (L + ring[k][i]) * 0.5f; R = (R + ring[k][i + 1]) * 0.5f; r++; avail--;
+            }
+        } else {                                // ran dry: fade out (no click) and re-prime
+            L *= 0.97f; R *= 0.97f; gExtPrimed[k] = false;
+        }
         out[f * 2] = L;
         out[f * 2 + 1] = R;
     }
+    gExtL[k] = L; gExtR[k] = R;
     ringR[k] = r;
 }
 
@@ -4469,6 +4508,7 @@ static bool StartExtraOutput(int k)
     if (i >= 0 && i < (int)gPlayCount) cfg.playback.pDeviceID = &gPlayDevs[i].id;
 
     ringW[k] = ringR[k] = 0;
+    gExtPrimed[k] = false; gExtL[k] = gExtR[k] = 0;
     bool hide = RowHidden(k);
     if (hide) cfg.playback.shareMode = ma_share_mode_exclusive;
     ma_result r = ma_device_init(&gCtx, &cfg, &gExtraDev[k]);
