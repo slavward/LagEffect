@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.30.3"
+#define APP_VERSION L"1.30.4"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -5695,12 +5695,14 @@ static void SetSongMode(bool on)
     UpdateStatus(true);
 }
 
-static bool PidAlive(DWORD pid)
+static bool PidAlive(DWORD pid)                 // (asks about just that process: listing them all took ~120 ms)
 {
-    static ProcInfo procs[2048];
-    int n = SnapProcs(procs, 2048);
-    for (int i = 0; i < n; i++) if (procs[i].pid == pid) return true;
-    return n == 0;                              // couldn't list processes: assume it's still there
+    if (!pid) return false;
+    HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    if (!h) return GetLastError() == ERROR_ACCESS_DENIED;   // gone: "invalid parameter"; not ours to open: still there
+    const bool alive = WaitForSingleObject(h, 0) == WAIT_TIMEOUT;
+    CloseHandle(h);
+    return alive;
 }
 
 static void SongTick()                          // every 50 ms
@@ -13444,18 +13446,17 @@ static void HitchLog(UINT m, WPARAM w, int ms)
     if (gHitchN >= 400) return;
     static wchar_t path[MAX_PATH] = L"";
     HANDLE f = INVALID_HANDLE_VALUE;
-    if (!path[0]) {
+    if (!path[0]) {                             // (only when LagEffect-hitches.txt is next to the exe: put an empty one there)
         GetModuleFileNameW(nullptr, path, MAX_PATH);
         wchar_t* b = wcsrchr(path, L'\\'); if (b) lstrcpyW(b + 1, L"LagEffect-hitches.txt");
-        f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
-        if (f == INVALID_HANDLE_VALUE) {        // (no writing next to the exe: the temp folder)
-            GetTempPathW(MAX_PATH, path); lstrcatW(path, L"LagEffect-hitches.txt");
-        } else {
-            static const char head[] = "---- Lag Effect " "1.30.3" " started ----\r\n"; DWORD wr;
+        f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) { gHitchN = 400; return; }   // not asked for: never log
+        else {
+            static const char head[] = "---- Lag Effect " "1.30.4" " started ----\r\n"; DWORD wr;
             WriteFile(f, head, sizeof(head) - 1, &wr, nullptr);
         }
     }
-    if (f == INVALID_HANDLE_VALUE) f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
     SYSTEMTIME st; GetLocalTime(&st);
     char line[200];
