@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.30.2"
+#define APP_VERSION L"1.30.3"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -3329,8 +3329,16 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
 // ---- text labels, painted off-screen ----
 // Windows' own label paints its background, then its text: over a moving picture that flickers. This draws
 // both into a buffer first, using the same colours / brush the window hands every label (WM_CTLCOLORSTATIC).
+static void HitchLog(UINT m, WPARAM w, int ms);
+struct HitchTimer {                             // (a child control's paint, timed for the hitch log)
+    LARGE_INTEGER a; UINT m; int id;
+    HitchTimer(UINT msg, int ctl) : m(msg), id(ctl) { QueryPerformanceCounter(&a); }
+    ~HitchTimer() { LARGE_INTEGER b, f; QueryPerformanceCounter(&b); QueryPerformanceFrequency(&f);
+                    int ms = (int)((b.QuadPart - a.QuadPart) * 1000 / f.QuadPart); if (ms > 25) HitchLog(0x10000 | m, (WPARAM)id, ms); }
+};
 static LRESULT CALLBACK BufLabelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
 {
+    HitchTimer ht(m, GetDlgCtrlID(h));
     if (m == WM_ERASEBKGND) return 1;
     if (m == WM_PAINT || m == WM_PRINTCLIENT) {
         PAINTSTRUCT ps = {};
@@ -7871,6 +7879,7 @@ static LRESULT CALLBACK FaderProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(h, nullptr, FALSE); return 0;
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
+        HitchTimer ht(m, id);
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
         { OffScreen os(dc, rc.right, rc.bottom); FaderDraw(h, os.dc, rc, id); BitBlt(dc, 0, 0, rc.right, rc.bottom, os.dc, 0, 0, SRCCOPY); }
@@ -13427,7 +13436,51 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     return false;
 }
 
+// ---- hitch log: anything that keeps the window busy for over 25 ms goes in LagEffect-hitches.txt next to the
+// exe (or in %TEMP%), so a stutter can be traced to what caused it. At most 400 lines a run.
+static int gHitchN = 0;
+static void HitchLog(UINT m, WPARAM w, int ms)
+{
+    if (gHitchN >= 400) return;
+    static wchar_t path[MAX_PATH] = L"";
+    HANDLE f = INVALID_HANDLE_VALUE;
+    if (!path[0]) {
+        GetModuleFileNameW(nullptr, path, MAX_PATH);
+        wchar_t* b = wcsrchr(path, L'\\'); if (b) lstrcpyW(b + 1, L"LagEffect-hitches.txt");
+        f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+        if (f == INVALID_HANDLE_VALUE) {        // (no writing next to the exe: the temp folder)
+            GetTempPathW(MAX_PATH, path); lstrcatW(path, L"LagEffect-hitches.txt");
+        } else {
+            static const char head[] = "---- Lag Effect " "1.30.3" " started ----\r\n"; DWORD wr;
+            WriteFile(f, head, sizeof(head) - 1, &wr, nullptr);
+        }
+    }
+    if (f == INVALID_HANDLE_VALUE) f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    SYSTEMTIME st; GetLocalTime(&st);
+    char line[200];
+    wsprintfA(line, "%02d:%02d:%02d.%03d  msg 0x%04X  w %u  %d ms%s  page %d  pic %d  opacity %d\r\n",
+              st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, m, (unsigned)w, ms, gMoving ? "  (while moving)" : "",
+              gPage, PicActive() ? 1 : 0, gOpacity);
+    DWORD wr; WriteFile(f, line, lstrlenA(line), &wr, nullptr);
+    CloseHandle(f);
+    gHitchN++;
+}
+static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l);
 static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    // (menus, message boxes and dragging run their own loops inside these: their length is just you)
+    if (m == WM_SYSCOMMAND || m == WM_NCLBUTTONDOWN || m == WM_NCLBUTTONDBLCLK || m == WM_COMMAND || m == WM_CONTEXTMENU ||
+        m == WM_NCRBUTTONDOWN || m == WM_NCRBUTTONUP || m == WM_TRAY || m == WM_CREATE || m == WM_CLOSE || m == WM_DESTROY)
+        return WndProcInner(h, m, w, l);
+    LARGE_INTEGER a, b, fq; QueryPerformanceCounter(&a);
+    LRESULT r = WndProcInner(h, m, w, l);
+    QueryPerformanceCounter(&b); QueryPerformanceFrequency(&fq);
+    const int ms = (int)((b.QuadPart - a.QuadPart) * 1000 / fq.QuadPart);
+    if (ms > 25) HitchLog(m, w, ms);
+    return r;
+}
+static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_CREATE:
@@ -13451,8 +13504,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_TIMER:
         if (w == TIMER_STATUS) {
-            SongTick(); PadTick();
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
+            SongTick(); PadTick();
             UpdateStatus(); UpdateMeter(); MixerMeterTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
@@ -13469,7 +13522,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
         }
         else if (w == TIMER_KEY) PollKeyCapture();
-        else if (w == TIMER_CLEANUP) { CleanupOldExe(); VoiceProgressTick(); }
+        else if (w == TIMER_CLEANUP) { if (!gMoving) { CleanupOldExe(); VoiceProgressTick(); } }
         else if (w == TIMER_FXKEYS) PollFxKeys();
         else if (w == TIMER_OSD) OsdTick();
         else if (w == TIMER_PICANIM) { if (!gMoving) PicAnimTick(); }   // (a GIF background pauses while you drag)
