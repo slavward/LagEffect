@@ -21,12 +21,14 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.33.1"
+#define APP_VERSION L"1.34.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
 #define _UNICODE
 #define NOMINMAX
+#include <winsock2.h>                           // (before anything pulls in windows.h: remote control's WebSocket server)
+#include <ws2tcpip.h>
 #define MINIAUDIO_IMPLEMENTATION
 #include "miniaudio.h"
 #include "rnnoise/include/rnnoise.h"           // AI noise suppression (BSD licence, see rnnoise/COPYING)
@@ -69,6 +71,7 @@ static inline int FocusRectIfKeys(HDC dc, const RECT* r) { return gKbdNav ? Draw
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "ws2_32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
@@ -126,6 +129,11 @@ static float gOutShow[8] = { -80, -80, -80, -80, -80, -80, -80, -80 };
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 // Settings > Features: each of these is hidden and doesn't run at all while it's off (new installs: all off).
 static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false;
+// Remote control (Streamer.bot & co.): a WebSocket server on this PC only, and only while it's switched on.
+static bool    gWsOn = false;
+static int     gWsPort = 7600;
+static wchar_t gWsPass[64] = L"";
+static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutter until then
 enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8 };
 static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips); }
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
@@ -2100,6 +2108,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (gToggleMode) { if (down && !prevDown) toggled = !toggled; active = toggled; }
     else             { toggled = false; active = down; }
     prevDown = down;
+    if (gFeatLag && (int)(GetTickCount() - gWsLagUntil) < 0) active = true;   // remote control: {"do":"lag","ms":...}
 
     // Random lag: now and then the stutter fires by itself (a short random loop for a random time).
     const bool keyActive = active;
@@ -2526,6 +2535,7 @@ enum {
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
     IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2, IDC_SETSUB3,   // Settings sub-tabs: consecutive
     IDC_FEATLAG, IDC_FEATFX, IDC_FEATSOUND, IDC_FEATCLIPS,
+    IDC_WSON, IDC_WSPORT, IDC_WSPASS, IDC_WSSTATUS, IDC_WSHELP,
     IDC_COLRESET, IDC_FONT, IDC_OPACITY, IDC_PICCHOOSE, IDC_PICREMOVE, IDC_PICFIT, IDC_PICDIM, IDC_PICINFO, IDC_CORNERS,
     IDC_PTTMODE, IDC_PTTKEY, IDC_OVERLAY, IDC_BEEPS, IDC_UISCALE, IDC_EXPORT, IDC_IMPORT, IDC_COMPACT, IDC_COMPACTFX,
     IDC_COMPACTFULL, IDC_PROFAUTO, IDC_PROFAUTOINFO, IDC_VERSION,
@@ -2570,6 +2580,9 @@ enum {
 #define WM_APPS_SCANNED    (WM_APP + 13)         // the list of apps with sound (for the Mixer) is ready
 #define WM_OUTPUT_LOST     (WM_APP + 14)         // an extra output's device stopped (unplugged...): reopen just that one
 #define WM_RENAME_DONE     (WM_APP + 15)         // a Mixer channel's name box closed (wParam 1 = keep the text)
+#define WM_WS_MSG          (WM_APP + 17)         // remote control: a command arrived (wParam: connection, lParam: the text)
+#define WM_WS_CONN         (WM_APP + 18)         // remote control: something connected (lParam 1) / left (0)
+#define WM_WS_STATE        (WM_APP + 19)         // remote control: listening (1) / the port is in use (2)
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -3634,6 +3647,9 @@ static void LoadSettings()
         gFeatSound = INI_INT(L"feat_soundboard", had) != 0;
         gFeatClips = INI_INT(L"feat_clips", had) != 0;
     }
+    gWsOn   = INI_INT(L"remote_on", 0) != 0;     // (off unless you switch it on)
+    gWsPort = Iclamp(INI_INT(L"remote_port", 7600), 1024, 65535);
+    GetPrivateProfileStringW(L"settings", L"remote_password", L"", gWsPass, 64, gIni);
     gRandLagSec   = Iclamp(INI_INT(L"random_lag_every_s", 8), 2, 120);
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
@@ -4484,6 +4500,7 @@ static void SaveSettings()
     SaveInt(L"clips_through_fx", gClipsFx);
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
     SaveInt(L"random_lag", gRandLagOn);
+    SaveInt(L"remote_on", gWsOn); SaveInt(L"remote_port", gWsPort); IniSet(L"remote_password", gWsPass);
     SaveInt(L"feat_lag", gFeatLag); SaveInt(L"feat_voicefx", gFeatFx); SaveInt(L"feat_soundboard", gFeatSound); SaveInt(L"feat_clips", gFeatClips);
     SaveInt(L"random_lag_every_s", gRandLagSec);
 
@@ -12011,6 +12028,540 @@ static void PollKeyCapture()
     EndKeyCapture();
 }
 
+// ======================= remote control (Streamer.bot & co.) =======================
+// A small WebSocket server on 127.0.0.1, only while Settings > Features > Remote control is on. Commands are JSON,
+// e.g. {"do":"lag","ms":2000}; every command gets a reply, and changes (mute, lag, profile...) are sent as events.
+// ---- remote control: the protocol bits (no Windows calls, so they're tested on their own) ----
+static void Sha1(const unsigned char* data, size_t len, unsigned char out[20])   // for the WebSocket handshake
+{
+    unsigned h[5] = { 0x67452301u, 0xEFCDAB89u, 0x98BADCFEu, 0x10325476u, 0xC3D2E1F0u };
+    const unsigned long long bits = (unsigned long long)len * 8;
+    size_t total = ((len + 8) / 64 + 1) * 64;
+    for (size_t off = 0; off < total; off += 64) {
+        unsigned char blk[64];
+        for (int i = 0; i < 64; i++) {
+            size_t k = off + i;
+            unsigned char b = k < len ? data[k] : k == len ? 0x80 : 0;
+            if (k >= total - 8) b = (unsigned char)(bits >> (8 * (total - 1 - k)));
+            blk[i] = b;
+        }
+        unsigned w[80];
+        for (int i = 0; i < 16; i++) w[i] = (unsigned)blk[i * 4] << 24 | (unsigned)blk[i * 4 + 1] << 16 | (unsigned)blk[i * 4 + 2] << 8 | blk[i * 4 + 3];
+        for (int i = 16; i < 80; i++) { unsigned x = w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]; w[i] = x << 1 | x >> 31; }
+        unsigned a = h[0], b = h[1], c = h[2], d = h[3], e = h[4];
+        for (int i = 0; i < 80; i++) {
+            unsigned f, k;
+            if (i < 20)      { f = (b & c) | (~b & d);          k = 0x5A827999u; }
+            else if (i < 40) { f = b ^ c ^ d;                   k = 0x6ED9EBA1u; }
+            else if (i < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDCu; }
+            else             { f = b ^ c ^ d;                   k = 0xCA62C1D6u; }
+            unsigned t = (a << 5 | a >> 27) + f + e + k + w[i];
+            e = d; d = c; c = b << 30 | b >> 2; b = a; a = t;
+        }
+        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e;
+    }
+    for (int i = 0; i < 20; i++) out[i] = (unsigned char)(h[i / 4] >> (24 - 8 * (i % 4)));
+}
+static void Base64(const unsigned char* in, int n, char* out)
+{
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int o = 0;
+    for (int i = 0; i < n; i += 3) {
+        unsigned v = (unsigned)in[i] << 16 | (i + 1 < n ? (unsigned)in[i + 1] << 8 : 0) | (i + 2 < n ? in[i + 2] : 0);
+        out[o++] = T[v >> 18 & 63]; out[o++] = T[v >> 12 & 63];
+        out[o++] = i + 1 < n ? T[v >> 6 & 63] : '=';
+        out[o++] = i + 2 < n ? T[v & 63] : '=';
+    }
+    out[o] = 0;
+}
+static bool WsHeader(const char* req, const char* name, char* out, int cap)   // an HTTP header's value (case ignored)
+{
+    const int nl = (int)strlen(name);
+    for (const char* p = req; *p; ) {
+        const char* eol = strstr(p, "\r\n");
+        if (!eol) break;
+        if (eol - p > nl && _strnicmp(p, name, nl) == 0 && p[nl] == ':') {
+            const char* v = p + nl + 1; while (*v == ' ' || *v == '\t') v++;
+            int n = (int)(eol - v); while (n > 0 && (v[n - 1] == ' ' || v[n - 1] == '\t')) n--;
+            if (n >= cap) n = cap - 1;
+            memcpy(out, v, n); out[n] = 0;
+            return true;
+        }
+        p = eol + 2;
+    }
+    return false;
+}
+// The handshake reply for a request (the whole header, ending "\r\n\r\n"). Returns false: refuse it.
+// Web pages are refused (a browser always says which site it's from), so a website can't control the app.
+static bool WsAccept(const char* req, char* reply, int cap)
+{
+    char key[128], origin[256], up[64];
+    if (!WsHeader(req, "Upgrade", up, 64) || _stricmp(up, "websocket") != 0) return false;
+    if (!WsHeader(req, "Sec-WebSocket-Key", key, 100)) return false;
+    if (WsHeader(req, "Origin", origin, 256) &&
+        (_strnicmp(origin, "http", 4) == 0 || _strnicmp(origin, "null", 4) == 0 || _strnicmp(origin, "file", 4) == 0)) return false;
+    char cat[200]; snprintf(cat, sizeof(cat), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    unsigned char dg[20]; Sha1((const unsigned char*)cat, strlen(cat), dg);
+    char acc[40]; Base64(dg, 20, acc);
+    snprintf(reply, cap, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+    return true;
+}
+// One frame from a client: returns the bytes it used (0: not all here yet, -1: broken / too big).
+// Clients must mask their frames; the payload is unmasked into out (cap bytes at most).
+static int WsParse(const unsigned char* b, int n, int* op, bool* fin, unsigned char* out, int cap, int* plen)
+{
+    if (n < 2) return 0;
+    *fin = (b[0] & 0x80) != 0; *op = b[0] & 0x0F;
+    const bool masked = (b[1] & 0x80) != 0;
+    unsigned long long len = b[1] & 0x7F;
+    int at = 2;
+    if (len == 126) { if (n < 4) return 0; len = (unsigned)b[2] << 8 | b[3]; at = 4; }
+    else if (len == 127) {
+        if (n < 10) return 0;
+        len = 0; for (int i = 0; i < 8; i++) len = len << 8 | b[2 + i];
+        at = 10;
+    }
+    if (!masked || len > (unsigned long long)cap) return -1;
+    if (n < at + 4 + (int)len) return 0;
+    const unsigned char* m = b + at; at += 4;
+    for (int i = 0; i < (int)len; i++) out[i] = b[at + i] ^ m[i & 3];
+    *plen = (int)len;
+    return at + (int)len;
+}
+static int WsFrame(int op, const char* data, int len, unsigned char* out)   // a server frame (not masked); out: len + 10
+{
+    int at = 0;
+    out[at++] = (unsigned char)(0x80 | op);
+    if (len < 126) out[at++] = (unsigned char)len;
+    else if (len < 65536) { out[at++] = 126; out[at++] = (unsigned char)(len >> 8); out[at++] = (unsigned char)len; }
+    else { out[at++] = 127; for (int i = 7; i >= 0; i--) out[at++] = i < 4 ? (unsigned char)(len >> (8 * i)) : 0; }
+    memcpy(out + at, data, len);
+    return at + len;
+}
+// Reading a message: {"do":"lag","ms":2000,"on":true,"name":"Robot"}
+static bool JsonNum(const char* json, const char* key, double* v)
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(json, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':' || *p == '\t') p++;
+    if (*p == '"') p++;                         // ("2000" works too)
+    char* e = nullptr; double d = strtod(p, &e);
+    if (e == p) return false;
+    *v = d; return true;
+}
+static int JsonOnOff(const char* json, const char* key)   // 1 on, 0 off, 2 toggle, -1 not given
+{
+    char pat[64]; snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char* p = strstr(json, pat);
+    if (!p) return -1;
+    p += strlen(pat);
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '"') p++;
+    if (!_strnicmp(p, "true", 4) || !_strnicmp(p, "on", 2) || *p == '1') return 1;
+    if (!_strnicmp(p, "false", 5) || !_strnicmp(p, "off", 3) || *p == '0') return 0;
+    if (!_strnicmp(p, "toggle", 6)) return 2;
+    return -1;
+}
+static void JsonEsc(const char* in, char* out, int cap)   // a string's inside, for a reply
+{
+    int o = 0;
+    for (; *in && o < cap - 7; in++) {
+        unsigned char ch = (unsigned char)*in;
+        if (ch == '"' || ch == '\\') { out[o++] = '\\'; out[o++] = (char)ch; }
+        else if (ch < 0x20) o += snprintf(out + o, cap - o, "\\u%04x", ch);
+        else out[o++] = (char)ch;
+    }
+    out[o] = 0;
+}
+
+// ---- remote control: the server (a background thread, only while it's switched on) ----
+// Off: no thread, no port open, networking not even started. On: listens on 127.0.0.1 (this PC only).
+#define WS_MAX 8
+struct WsConn { SOCKET s; int id; bool ws; int inN; unsigned char in[70000]; char msg[65536]; int msgN; };
+static WsConn*   gWsConn[WS_MAX];
+static HANDLE    gWsThread = nullptr;
+static volatile LONG gWsStopNow = 0;
+static CRITICAL_SECTION gWsLock;
+static bool      gWsLockInit = false, gWsNetUp = false;
+struct WsOut { int id; char* msg; };
+static WsOut     gWsQ[128]; static int gWsQN = 0;  // replies / events waiting to go out (id -1: everyone)
+static int       gWsAuthed[32], gWsAuthedN = 0; // connections that gave the password
+static int       gWsCount = 0;                  // connected now (window thread's count)
+static int       gWsState = 0;                  // 0 off, 1 listening, 2 the port is in use
+
+static void WsQueue(int id, const char* utf8)   // (any thread) send to one connection, or -1: all of them
+{
+    if (!gWsLockInit || !gWsThread) return;
+    const int n = (int)strlen(utf8);
+    char* c = (char*)HeapAlloc(GetProcessHeap(), 0, n + 1);
+    if (!c) return;
+    memcpy(c, utf8, n + 1);
+    EnterCriticalSection(&gWsLock);
+    if (gWsQN < 128) gWsQ[gWsQN++] = { id, c }; else HeapFree(GetProcessHeap(), 0, c);
+    LeaveCriticalSection(&gWsLock);
+}
+static void WsSendAll(SOCKET s, const unsigned char* d, int n)
+{
+    while (n > 0) { int k = send(s, (const char*)d, n, 0); if (k <= 0) return; d += k; n -= k; }
+}
+static void WsClose(int i)
+{
+    if (!gWsConn[i]) return;
+    closesocket(gWsConn[i]->s);
+    PostMessageW(gWnd, WM_WS_CONN, (WPARAM)gWsConn[i]->id, 0);
+    HeapFree(GetProcessHeap(), 0, gWsConn[i]);
+    gWsConn[i] = nullptr;
+}
+static DWORD WINAPI WsThread(LPVOID arg)
+{
+    const int port = (int)(INT_PTR)arg;
+    SOCKET ls = INVALID_SOCKET;
+    int nextId = 1;
+    DWORD lastTry = 0;
+    while (!gWsStopNow) {
+        if (ls == INVALID_SOCKET && GetTickCount() - lastTry > 3000) {   // (the port may be in use: tried again now and then)
+            lastTry = GetTickCount();
+            ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            if (ls != INVALID_SOCKET) {
+                BOOL ex = TRUE; setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&ex, sizeof(ex));
+                sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                if (bind(ls, (sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 4) != 0) { closesocket(ls); ls = INVALID_SOCKET; }
+            }
+            PostMessageW(gWnd, WM_WS_STATE, ls != INVALID_SOCKET ? 1 : 2, 0);
+        }
+        fd_set rd; FD_ZERO(&rd);
+        if (ls != INVALID_SOCKET) FD_SET(ls, &rd);
+        for (int i = 0; i < WS_MAX; i++) if (gWsConn[i]) FD_SET(gWsConn[i]->s, &rd);
+        timeval tv = { 0, 20000 };              // 20 ms: replies go out quickly
+        if (rd.fd_count) select(0, &rd, nullptr, nullptr, &tv); else Sleep(20);
+        if (ls != INVALID_SOCKET && FD_ISSET(ls, &rd)) {
+            SOCKET c = accept(ls, nullptr, nullptr);
+            if (c != INVALID_SOCKET) {
+                int slot = -1; for (int i = 0; i < WS_MAX; i++) if (!gWsConn[i]) { slot = i; break; }
+                WsConn* w = slot >= 0 ? (WsConn*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WsConn)) : nullptr;
+                if (!w) closesocket(c);
+                else { BOOL nd = TRUE; setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd)); w->s = c; w->id = nextId++; gWsConn[slot] = w; }
+            }
+        }
+        for (int i = 0; i < WS_MAX; i++) {
+            WsConn* w = gWsConn[i];
+            if (!w || !FD_ISSET(w->s, &rd)) continue;
+            int k = recv(w->s, (char*)w->in + w->inN, (int)sizeof(w->in) - 1 - w->inN, 0);
+            if (k <= 0) { WsClose(i); continue; }
+            w->inN += k; w->in[w->inN] = 0;
+            if (!w->ws) {                       // the handshake first
+                if (!strstr((char*)w->in, "\r\n\r\n")) { if (w->inN > 8000) WsClose(i); continue; }
+                char reply[400];
+                if (!WsAccept((char*)w->in, reply, 400)) {
+                    const char* no = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    WsSendAll(w->s, (const unsigned char*)no, (int)strlen(no));
+                    WsClose(i); continue;
+                }
+                WsSendAll(w->s, (const unsigned char*)reply, (int)strlen(reply));
+                w->ws = true; w->inN = 0;
+                PostMessageW(gWnd, WM_WS_CONN, (WPARAM)w->id, 1);
+                continue;
+            }
+            bool dead = false;
+            for (;;) {                          // every whole frame that's arrived
+                int op = 0, len = 0; bool fin = false;
+                static unsigned char pay[65536];
+                int used = WsParse(w->in, w->inN, &op, &fin, pay, 65535, &len);
+                if (used == 0) break;
+                if (used < 0) { dead = true; break; }
+                memmove(w->in, w->in + used, w->inN - used); w->inN -= used;
+                if (op == 8) { unsigned char f[16]; WsSendAll(w->s, f, WsFrame(8, "", 0, f)); dead = true; break; }   // close
+                if (op == 9) { static unsigned char f[65546]; WsSendAll(w->s, f, WsFrame(10, (const char*)pay, len, f)); continue; }   // ping
+                if (op != 0 && op != 1) continue;   // (pong, binary: ignored)
+                if (op == 1) w->msgN = 0;
+                if (w->msgN + len >= (int)sizeof(w->msg)) { dead = true; break; }
+                memcpy(w->msg + w->msgN, pay, len); w->msgN += len;
+                if (fin) {                      // a whole message: the window runs it
+                    char* m = (char*)HeapAlloc(GetProcessHeap(), 0, w->msgN + 1);
+                    if (m) { memcpy(m, w->msg, w->msgN); m[w->msgN] = 0; if (!PostMessageW(gWnd, WM_WS_MSG, (WPARAM)w->id, (LPARAM)m)) HeapFree(GetProcessHeap(), 0, m); }
+                    w->msgN = 0;
+                }
+            }
+            if (dead) WsClose(i);
+        }
+        EnterCriticalSection(&gWsLock);         // replies and events
+        WsOut q[128]; const int qn = gWsQN; memcpy(q, gWsQ, sizeof(WsOut) * qn); gWsQN = 0;
+        LeaveCriticalSection(&gWsLock);
+        for (int j = 0; j < qn; j++) {
+            const int n = (int)strlen(q[j].msg);
+            unsigned char* f = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, n + 16);
+            if (f) {
+                const int fl = WsFrame(1, q[j].msg, n, f);
+                for (int i = 0; i < WS_MAX; i++)
+                    if (gWsConn[i] && gWsConn[i]->ws && (q[j].id < 0 || q[j].id == gWsConn[i]->id)) WsSendAll(gWsConn[i]->s, f, fl);
+                HeapFree(GetProcessHeap(), 0, f);
+            }
+            HeapFree(GetProcessHeap(), 0, q[j].msg);
+        }
+    }
+    for (int i = 0; i < WS_MAX; i++) if (gWsConn[i]) { closesocket(gWsConn[i]->s); HeapFree(GetProcessHeap(), 0, gWsConn[i]); gWsConn[i] = nullptr; }
+    if (ls != INVALID_SOCKET) closesocket(ls);
+    return 0;
+}
+static void WsStop()                            // closes the port and every connection, and ends the thread
+{
+    if (gWsThread) {
+        gWsStopNow = 1;
+        WaitForSingleObject(gWsThread, 3000);
+        CloseHandle(gWsThread); gWsThread = nullptr;
+    }
+    if (gWsLockInit) {
+        EnterCriticalSection(&gWsLock);
+        for (int j = 0; j < gWsQN; j++) HeapFree(GetProcessHeap(), 0, gWsQ[j].msg);
+        gWsQN = 0;
+        LeaveCriticalSection(&gWsLock);
+    }
+    if (gWsNetUp) { WSACleanup(); gWsNetUp = false; }
+    gWsAuthedN = 0; gWsCount = 0; gWsState = 0;
+}
+static void WsStart()                           // (only when it's switched on in Settings)
+{
+    WsStop();
+    if (!gWsOn) return;
+    if (!gWsLockInit) { InitializeCriticalSection(&gWsLock); gWsLockInit = true; }
+    WSADATA wd;
+    if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) return;
+    gWsNetUp = true;
+    gWsStopNow = 0;
+    gWsThread = CreateThread(nullptr, 0, WsThread, (LPVOID)(INT_PTR)Iclamp(gWsPort, 1024, 65535), 0, nullptr);
+}
+
+// ---- remote control: running a command (the window's thread) ----
+static bool WsAuthed(int id)
+{
+    if (!gWsPass[0]) return true;
+    for (int i = 0; i < gWsAuthedN; i++) if (gWsAuthed[i] == id) return true;
+    return false;
+}
+static void WsReply(int id, const char* what, const char* err)
+{
+    char r[400];
+    if (err) { char e[300]; JsonEsc(err, e, 300); snprintf(r, sizeof(r), "{\"ok\":false,\"do\":\"%s\",\"error\":\"%s\"}", what, e); }
+    else snprintf(r, sizeof(r), "{\"ok\":true,\"do\":\"%s\"}", what);
+    WsQueue(id, r);
+}
+static void WsStatusJson(char* out, int cap)
+{
+    char prof[200] = "", pe[300];
+    if (gProfCur >= 0 && gProfCur < gProfCount) WideCharToMultiByte(CP_UTF8, 0, gProfNames[gProfCur], -1, prof, 200, nullptr, nullptr);
+    JsonEsc(prof, pe, 300);
+    snprintf(out, cap, "{\"event\":\"status\",\"version\":\"%ls\",\"running\":%s,\"muted\":%s,\"lagging\":%s,\"fx\":%s,\"profile\":\"%s\","
+                       "\"features\":{\"lag\":%s,\"voicefx\":%s,\"soundboard\":%s,\"clips\":%s}}",
+             APP_VERSION, gRunning ? "true" : "false", gMicMuted ? "true" : "false", gLooping ? "true" : "false",
+             gFxOn ? "true" : "false", pe, gFeatLag ? "true" : "false", gFeatFx ? "true" : "false",
+             gFeatSound ? "true" : "false", gFeatClips ? "true" : "false");
+}
+static bool WsBool(const char* m, const char* key, bool now, bool* out)   // on/off/toggle; missing = toggle
+{
+    const int v = JsonOnOff(m, key);
+    *out = v == 1 ? true : v == 0 ? false : !now;
+    return true;
+}
+static int WsFindChannel(const char* m)         // "n": 1-8, or "name": its name on the Mixer (or app / input)
+{
+    double n;
+    if (JsonNum(m, "n", &n)) { int c = (int)n - 1; return c >= 0 && c < CH_MAX && gCh[c].type != CH_NONE ? c : -1; }
+    char nm[200]; const char* p = m;
+    if (!JsonString(m, "name", &p, nm, 200)) return -1;
+    wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200);
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        wchar_t l[64]; ChanLabel(c, l, 64);
+        if (!lstrcmpiW(l, w) || !lstrcmpiW(gCh[c].src, w)) return c;
+    }
+    return -1;
+}
+static int WsFindOutput(const char* m)          // "n": 1-5, or "name": its name ("Out 2" or yours)
+{
+    double n;
+    if (JsonNum(m, "n", &n)) { int k = (int)n - 1; return k >= 0 && k < gRows ? k : -1; }
+    char nm[200]; const char* p = m;
+    if (!JsonString(m, "name", &p, nm, 200)) return -1;
+    wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200);
+    for (int k = 0; k < gRows; k++) { wchar_t l[32]; OutName(k, l, 32); if (!lstrcmpiW(l, w)) return k; }
+    return -1;
+}
+static void WsExec(int id, const char* m)
+{
+    char what[40] = ""; const char* p = m;
+    if (!JsonString(m, "do", &p, what, 40)) { WsReply(id, "", "Send JSON like {\"do\":\"lag\",\"ms\":2000}."); return; }
+    for (char* q = what; *q; q++) *q = (char)tolower((unsigned char)*q);
+    if (!strcmp(what, "auth")) {
+        char pw[100] = ""; const char* pp = m; JsonString(m, "password", &pp, pw, 100);
+        wchar_t w[100]; MultiByteToWideChar(CP_UTF8, 0, pw, -1, w, 100);
+        if (gWsPass[0] && lstrcmpW(w, gWsPass)) { WsReply(id, what, "Wrong password."); return; }
+        if (!WsAuthed(id) && gWsAuthedN < 32) gWsAuthed[gWsAuthedN++] = id;
+        WsReply(id, what, nullptr); return;
+    }
+    if (!WsAuthed(id)) { WsReply(id, what, "Send {\"do\":\"auth\",\"password\":\"...\"} first."); return; }
+    const char* offLag = "The lag effect is off (Settings > Features).";
+    const char* offFx = "Voice FX is off (Settings > Features).";
+    const char* offSb = "The soundboard is off (Settings > Features).";
+    const char* offCl = "Clips are off (Settings > Features).";
+    double v; bool b;
+    if (!strcmp(what, "ping")) { char r[120]; snprintf(r, sizeof(r), "{\"ok\":true,\"do\":\"ping\",\"version\":\"%ls\"}", APP_VERSION); WsQueue(id, r); return; }
+    if (!strcmp(what, "status")) { char r[700]; WsStatusJson(r, 700); WsQueue(id, r); return; }
+    if (!strcmp(what, "start")) { if (!gWantRunning) StartAudio(false); UpdateUi(); WsReply(id, what, nullptr); return; }
+    if (!strcmp(what, "stop"))  { if (gWantRunning) StopAudio(); UpdateUi(); WsReply(id, what, nullptr); return; }
+    if (!strcmp(what, "mute"))  { WsBool(m, "on", gMicMuted, &b); SetMute(b); UpdateUi(); WsReply(id, what, nullptr); return; }
+    if (!strcmp(what, "unmute")) { SetMute(false); UpdateUi(); WsReply(id, what, nullptr); return; }
+    if (!strcmp(what, "lag")) {                 // stutter for "ms" (default 1.5 s); {"on":false} stops it
+        if (!gFeatLag) { WsReply(id, what, offLag); return; }
+        if (JsonOnOff(m, "on") == 0) gWsLagUntil = GetTickCount();
+        else { int ms = JsonNum(m, "ms", &v) ? (int)v : 1500; gWsLagUntil = GetTickCount() + (DWORD)Iclamp(ms, 50, 30000); }
+        WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "rewind") || !strcmp(what, "repeat")) {
+        if (!gFeatLag) { WsReply(id, what, offLag); return; }
+        if (what[1] == 'e' && what[2] == 'w') gRewindReq = true; else gRepeatReq = true;
+        WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "fx")) {
+        if (!gFeatFx) { WsReply(id, what, offFx); return; }
+        WsBool(m, "on", gFxOn, &b); SetFxOn(b); UpdateStatus(true); WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "character") || !strcmp(what, "profile")) {   // by name: reuses the command-line control
+        if (what[0] == 'c' && !gFeatFx) { WsReply(id, what, offFx); return; }
+        char nm[200] = ""; const char* np = m;
+        if (!JsonString(m, "name", &np, nm, 200)) { WsReply(id, what, "Give its \"name\"."); return; }
+        wchar_t cmd[300], w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200);
+        for (wchar_t* q = w; *q; q++) if (*q == L'"') *q = L'\'';
+        swprintf(cmd, 300, L"x /%hs \"%ls\"", what, w);
+        const bool was = gCmdLine; gCmdLine = true; ExecCommandLine(cmd); gCmdLine = was;
+        WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "nextprofile")) {
+        if (gProfCount) { int k = (gProfCur + 1) % gProfCount; ProfileLoad(k, true); ProfilesFill(gProfNames[k]); }
+        WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "tts") || !strcmp(what, "say")) {   // {"do":"tts","text":"hello","accent":"Scottish"}
+        if (!gFeatSound) { WsReply(id, what, offSb); return; }
+        static char txt[1800]; const char* tp = m;
+        if (!JsonString(m, "text", &tp, txt, 1800)) { WsReply(id, what, "Give the \"text\"."); return; }
+        wchar_t w[600]; MultiByteToWideChar(CP_UTF8, 0, txt, -1, w, 600);
+        char ac[64] = ""; const char* ap = m; const int keep = gTtsAccent;
+        if (JsonString(m, "accent", &ap, ac, 64)) {
+            wchar_t wa[64]; MultiByteToWideChar(CP_UTF8, 0, ac, -1, wa, 64);
+            for (int i = 0; i < TTS_ACCENT_N; i++) if (!lstrcmpiW(TTS_ACCENTS[i].name, wa)) gTtsAccent = i;
+        }
+        if (gTtsBusy) { gTtsAccent = keep; WsReply(id, what, "Still speaking the last one."); return; }
+        TtsSpeakText(w);
+        gTtsAccent = keep;
+        WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "pad") || !strcmp(what, "sound")) {
+        if (!gFeatSound) { WsReply(id, what, offSb); return; }
+        int k = JsonNum(m, "n", &v) ? (int)v - 1 : -1;
+        if (k < 0 || k >= PAD_N) { WsReply(id, what, "Give its number \"n\" (1-32)."); return; }
+        PadKey(k, true, false); WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "stopsounds")) { for (int k = 0; k < SB_N; k++) gPads[k].stop = true; WsReply(id, what, nullptr); return; }
+    if (!strcmp(what, "clip")) {                // save the last few seconds
+        if (!gFeatClips) { WsReply(id, what, offCl); return; }
+        ClipNow(); WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "playclip")) {
+        if (!gFeatClips) { WsReply(id, what, offCl); return; }
+        int k = JsonNum(m, "n", &v) ? (int)v - 1 : -1;
+        if (k < 0 || k >= CLIP_N || !gClips[k].base) { WsReply(id, what, "No clip with that number \"n\"."); return; }
+        gPads[CLIP0 + k].trigger = true; WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "channel")) {             // {"do":"channel","name":"Spotify","db":-12,"mute":true,"solo":false,"duck":true}
+        const int c = WsFindChannel(m);
+        if (c < 0) { WsReply(id, what, "No Mixer channel with that \"n\" or \"name\"."); return; }
+        if (JsonNum(m, "db", &v)) FaderSet(IDC_CHVOL0 + c, (int)lround(v * 10));
+        if (JsonOnOff(m, "mute") >= 0) { WsBool(m, "mute", gCh[c].mute, &b); gCh[c].mute = b; }
+        if (JsonOnOff(m, "solo") >= 0) { WsBool(m, "solo", gCh[c].solo, &b); gCh[c].solo = b; }
+        if (JsonOnOff(m, "duck") >= 0) { WsBool(m, "duck", gCh[c].duck, &b); gCh[c].duck = b; }
+        MixerRedraw(); WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "output")) {              // {"do":"output","n":2,"mute":true,"volume":80}
+        const int k = WsFindOutput(m);
+        if (k < 0) { WsReply(id, what, "No output with that \"n\" or \"name\"."); return; }
+        if (JsonNum(m, "volume", &v)) { gRowVol[k] = Iclamp((int)lround(v), 0, 200); SendDlgItemMessageW(gWnd, SPIN_UD(IDC_ROWVOL + k), UDM_SETPOS32, 0, gRowVol[k]); }
+        if (JsonOnOff(m, "mute") >= 0) { WsBool(m, "mute", gOutMute[k], &b); gOutMute[k] = b; }
+        MixerRedraw(); WsReply(id, what, nullptr); return;
+    }
+    WsReply(id, what, "Unknown command. Try ping, status, mute, lag, fx, character, profile, tts, pad, clip, channel or output.");
+}
+static void WsEvents()                          // (50 ms, while anything is connected) tell them what changed
+{
+    if (!gWsThread || !gWsCount) return;
+    static int lastMute = -1, lastLag = -1, lastFx = -1, lastProf = -2, lastRun = -1;
+    char r[300];
+    if ((int)gMicMuted != lastMute) { if (lastMute >= 0) { snprintf(r, sizeof(r), "{\"event\":\"mute\",\"on\":%s}", gMicMuted ? "true" : "false"); WsQueue(-1, r); } lastMute = gMicMuted; }
+    if ((int)gLooping != lastLag)   { if (lastLag >= 0)  { snprintf(r, sizeof(r), "{\"event\":\"lag\",\"on\":%s}", gLooping ? "true" : "false"); WsQueue(-1, r); } lastLag = gLooping; }
+    if ((int)gFxOn != lastFx)       { if (lastFx >= 0)   { snprintf(r, sizeof(r), "{\"event\":\"fx\",\"on\":%s}", gFxOn ? "true" : "false"); WsQueue(-1, r); } lastFx = gFxOn; }
+    if ((int)gRunning != lastRun)   { if (lastRun >= 0)  { snprintf(r, sizeof(r), "{\"event\":\"running\",\"on\":%s}", gRunning ? "true" : "false"); WsQueue(-1, r); } lastRun = gRunning; }
+    if (gProfCur != lastProf) {
+        if (lastProf != -2 && gProfCur >= 0 && gProfCur < gProfCount) {
+            char n[200], e[300]; WideCharToMultiByte(CP_UTF8, 0, gProfNames[gProfCur], -1, n, 200, nullptr, nullptr); JsonEsc(n, e, 300);
+            snprintf(r, sizeof(r), "{\"event\":\"profile\",\"name\":\"%s\"}", e); WsQueue(-1, r);
+        }
+        lastProf = gProfCur;
+    }
+}
+static void WsStatusText()                      // Settings: what it's doing
+{
+    wchar_t t[200];
+    if (!gWsOn) lstrcpynW(t, L"Off: nothing can connect.", 200);
+    else if (gWsState == 2) wsprintfW(t, L"Port %d is in use by another app: pick another one.", gWsPort);
+    else if (gWsState == 1) wsprintfW(t, L"On: ws://127.0.0.1:%d  \x00B7  %d connected", gWsPort, gWsCount);
+    else lstrcpynW(t, L"Starting...", 200);
+    SetDlgItemTextW(gWnd, IDC_WSSTATUS, t);
+}
+static void WsHelp()                            // Settings: how to set up Streamer.bot (and copy the C# to paste)
+{
+    wchar_t code[1200];
+    swprintf(code, 1200,
+        L"// Lag Effect remote control. In Streamer.bot: Servers/Clients > Websocket Clients > Add,\r\n"
+        L"// Endpoint ws://127.0.0.1:%d, then use this in an action's C# (\"Execute C# Code\"):\r\n"
+        L"using System;\r\n"
+        L"public class CPHInline\r\n{\r\n    public bool Execute()\r\n    {\r\n"
+        L"        // the 0 is the connection's number in Websocket Clients (the first one is 0)\r\n"
+        L"%ls"
+        L"        CPH.WebsocketSend(\"{\\\"do\\\":\\\"lag\\\",\\\"ms\\\":2000}\", 0);\r\n"
+        L"        return true;\r\n    }\r\n}\r\n",
+        Iclamp(gWsPort, 1024, 65535),
+        gWsPass[0] ? L"        CPH.WebsocketSend(\"{\\\"do\\\":\\\"auth\\\",\\\"password\\\":\\\"YOUR PASSWORD\\\"}\", 0);   // (once per connection)\r\n" : L"");
+    if (OpenClipboard(gWnd)) {
+        EmptyClipboard();
+        const size_t n = (wcslen(code) + 1) * sizeof(wchar_t);
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
+        if (g) { memcpy(GlobalLock(g), code, n); GlobalUnlock(g); if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g); }
+        CloseClipboard();
+    }
+    MessageBoxW(gWnd,
+        L"The C# code for Streamer.bot is copied: paste it into an action's \"Execute C# Code\".\n\n"
+        L"SET UP (once)\n"
+        L"Streamer.bot > Servers/Clients > Websocket Clients > right-click > Add. Endpoint: the address shown in "
+        L"Settings (ws://127.0.0.1:port). Tick Auto Connect, then Connect.\n\n"
+        L"COMMANDS (send as JSON)\n"
+        L"{\"do\":\"lag\",\"ms\":2000}   stutter for 2 s\n"
+        L"{\"do\":\"mute\",\"on\":true}   or false, or \"toggle\"\n"
+        L"{\"do\":\"fx\",\"on\":\"toggle\"}   Voice FX on / off\n"
+        L"{\"do\":\"character\",\"name\":\"Robot\"}\n"
+        L"{\"do\":\"profile\",\"name\":\"Gaming\"}   or {\"do\":\"nextprofile\"}\n"
+        L"{\"do\":\"tts\",\"text\":\"hello chat\",\"accent\":\"Scottish\"}\n"
+        L"{\"do\":\"pad\",\"n\":3}   play soundboard pad 3;  {\"do\":\"stopsounds\"}\n"
+        L"{\"do\":\"clip\"}   save the last few seconds;  {\"do\":\"playclip\",\"n\":1}\n"
+        L"{\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":false,\"duck\":true}\n"
+        L"{\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}\n"
+        L"{\"do\":\"start\"} / {\"do\":\"stop\"} / {\"do\":\"status\"} / {\"do\":\"ping\"}\n\n"
+        L"EVENTS (Lag Effect sends these: use Streamer.bot's \"Websocket Client Message\" trigger)\n"
+        L"{\"event\":\"mute\",\"on\":true}, {\"event\":\"lag\",\"on\":true}, {\"event\":\"fx\",...}, {\"event\":\"profile\",\"name\":...}, "
+        L"{\"event\":\"running\",...}. Every command gets a reply: {\"ok\":true,...} or {\"ok\":false,\"error\":...}.\n\n"
+        L"With a password set, send {\"do\":\"auth\",\"password\":\"...\"} first after connecting.\n"
+        L"Only apps on this PC can connect, never websites.",
+        L"Lag Effect - remote control", MB_OK | MB_ICONINFORMATION);
+}
+
 // ======================= start with Windows =======================
 // HKCU\...\Run\LagEffect = "this exe". Uses this copy's location (re-tick it after moving the app).
 static const wchar_t* RUN_KEY = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -12693,6 +13244,16 @@ static void CreateUI()
             Ctl(L"STATIC", f[i].what, 0, 50, y + 22, 480, 18, IDC_HDR);
         }
     }
+    AddSection(14, 402, 532, 132, L"Remote control (Streamer.bot)");
+    Ctl(L"BUTTON", L"Let apps on this PC control Lag Effect (like Streamer.bot)", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 424, 420, 20, IDC_WSON);
+    CheckDlgButton(gWnd, IDC_WSON, gWsOn ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Port:", 0, 30, 456, 40, 20, -1);
+    Spin(IDC_WSPORT, 72, 453, 86, 1024, 65535, gWsPort);
+    Ctl(L"STATIC", L"Password (optional):", 0, 176, 456, 130, 20, -1);
+    Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 308, 453, 120, 23, IDC_WSPASS);
+    SendDlgItemMessageW(gWnd, IDC_WSPASS, EM_LIMITTEXT, 60, 0);
+    Ctl(L"STATIC", L"", SS_NOPREFIX, 30, 492, 330, 20, IDC_WSSTATUS);
+    Ctl(L"BUTTON", L"Streamer.bot setup...", WS_TABSTOP, 372, 486, 158, 28, IDC_WSHELP);
 
     // ---- Look ----
     gBuildSub = 1;
@@ -13077,6 +13638,28 @@ static void OnCommand(int id, int code)
     if (id == IDC_REWINDKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REWIND], id); return; }
     if (id == IDC_REPEATKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REPEAT], id); return; }
     if (id == IDC_RANDLAG)    { gRandLagOn = Checked(id); return; }
+    if (id == IDC_WSON) {                       // remote control: on = the server starts; off = it's closed completely
+        if (code != BN_CLICKED) return;
+        gWsOn = Checked(id);
+        if (gWsOn) WsStart(); else WsStop();
+        WsStatusText(); SaveSettings();
+        return;
+    }
+    if (id == IDC_WSPORT) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_KILLFOCUS) {             // (applied when you leave the box, not on every keypress)
+            if (ok && v >= 1024 && v <= 65535 && v != gWsPort) { gWsPort = v; if (gWsOn) WsStart(); WsStatusText(); SaveSettings(); }
+            SetDlgItemInt(gWnd, id, (UINT)gWsPort, FALSE);
+        }
+        return;
+    }
+    if (id == IDC_WSPASS) {
+        if (code == EN_CHANGE && gUiReady) { GetDlgItemTextW(gWnd, id, gWsPass, 64); gWsAuthedN = 0; }   // (everyone signs in again)
+        if (code == EN_KILLFOCUS) SaveSettings();
+        return;
+    }
+    if (id == IDC_WSHELP) { if (code == BN_CLICKED) WsHelp(); return; }
     if (id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
@@ -13809,6 +14392,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         DragAcceptFiles(h, TRUE);                // drop audio files onto soundboard pads
         ApplyTheme();
         StartWithWindowsFollow();
+        if (gWsOn) WsStart();                   // remote control (only if you switched it on)
+        WsStatusText();
         // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
         if ((gAutoStart || gResumeAudio) && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
         UpdateUi();
@@ -13827,7 +14412,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            UpdateStatus(); UpdateMeter(); MixerMeterTick();
+            UpdateStatus(); UpdateMeter(); MixerMeterTick(); WsEvents();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
                 chTick = 0; ChanTick();
@@ -13884,6 +14469,22 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_RENAME_DONE:
         ChanRenameDone(w != 0);
+        return 0;
+    case WM_WS_MSG:                             // remote control: run a command
+        if (gWsThread) WsExec((int)w, (const char*)l);
+        HeapFree(GetProcessHeap(), 0, (void*)l);
+        return 0;
+    case WM_WS_CONN:
+        if (l) gWsCount++;
+        else {
+            gWsCount = Imax(0, gWsCount - 1);
+            for (int i = 0; i < gWsAuthedN; i++) if (gWsAuthed[i] == (int)w) { gWsAuthed[i] = gWsAuthed[--gWsAuthedN]; break; }
+        }
+        if (l && gWsThread) { char r[700]; WsStatusJson(r, 700); WsQueue((int)w, r); }   // (a newcomer gets the state)
+        WsStatusText();
+        return 0;
+    case WM_WS_STATE:
+        if (gWsThread) { gWsState = (int)w; WsStatusText(); }
         return 0;
     case WM_APPS_SCANNED: {                     // the background scan: the apps list, icons, and apps that just opened
         AppScan* sc = (AppScan*)l;
@@ -14122,6 +14723,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             SaveInt(L"win_y", wp.rcNormalPosition.top);
         }
         if (!gNoSaveOnExit) SaveSettings();     // (after Import, the imported file is kept as it is)
+        WsStop();
         StopAudio();
         RemoveTray();
         DestroyWindow(h);
