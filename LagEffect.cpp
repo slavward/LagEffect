@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.31.1"
+#define APP_VERSION L"1.31.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -53,6 +53,12 @@
 #include <xmmintrin.h>
 #define HAVE_SSE_FLAGS 1
 #endif
+
+// Focus boxes (the dotted outline on the control you last used) only show once you move around with the
+// keyboard (Tab / arrows), like most apps; clicking with the mouse hides them again.
+static bool gKbdNav = false;
+static inline int FocusRectIfKeys(HDC dc, const RECT* r) { return gKbdNav ? DrawFocusRect(dc, r) : TRUE; }
+#define DrawFocusRect(dc, r) FocusRectIfKeys(dc, r)
 
 #ifdef _MSC_VER
 #pragma comment(lib, "comctl32.lib")
@@ -373,6 +379,12 @@ static volatile int gDuckDb = 12;               // how much ducked channels drop
 static int  gChW[CH_MAX], gOutW[MAX_OUT];       // Mixer strip widths (design px, 0 = the normal width)
 static ChanSet gCh[CH_MAX];
 static volatile bool gOutMute[MAX_OUT];
+static wchar_t gOutName[MAX_OUT][32];           // your name for an output ("" = "Out 1"...)
+static void OutName(int k, wchar_t* out, int cap)
+{
+    if (k >= 0 && k < MAX_OUT && gOutName[k][0]) lstrcpynW(out, gOutName[k], cap);
+    else { wchar_t t[16]; wsprintfW(t, L"Out %d", k + 1); lstrcpynW(out, t, cap); }
+}
 static void ChanStartAll(); static void ChanStopAll(); static void ChanTick(); static bool ChanStart(int c); static void ChanStop(int c);
 static void ChanPush(int c, const float* in, unsigned frames, int chans)   // (capture thread)
 {
@@ -3630,6 +3642,7 @@ static void LoadSettings()
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  int v = INI_INT(key, 0); gChW[c] = v ? Iclamp(v, 52, 240) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); int v = INI_INT(key, 0); gOutW[k] = v ? Iclamp(v, 84, 320) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_name", k); GetPrivateProfileStringW(L"settings", key, L"", gOutName[k], 32, gIni); }
     gTtsVol = Iclamp(INI_INT(L"tts_volume", 100), 0, 200);
     gTtsRate = Iclamp(INI_INT(L"tts_speed", 0), -10, 10); gTtsPitch = Iclamp(INI_INT(L"tts_pitch", 0), -12, 12);
     gTtsRoom = Iclamp(INI_INT(L"tts_room", 35), 0, 100); gTtsPause = Iclamp(INI_INT(L"tts_pauses", 100), 0, 300);
@@ -4471,6 +4484,7 @@ static void SaveSettings()
     }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); } SaveInt(L"tts_volume", gTtsVol);
     SaveInt(L"mixer_duck_db", gDuckDb);
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_name", k); IniSet(key, gOutName[k]); }
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  SaveInt(key, gChW[c]); }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); SaveInt(key, gOutW[k]); }
     SaveInt(L"tts_speed", gTtsRate); SaveInt(L"tts_pitch", gTtsPitch); SaveInt(L"tts_room", gTtsRoom);
@@ -6041,6 +6055,30 @@ static bool InClipFolder(const wchar_t* path)
     return n > 0 && CompareStringOrdinal(path, Min(n, lstrlenW(path)), gClipDir, n, TRUE) == CSTR_EQUAL && path[n] == L'\\';
 }
 
+static void SetClipBank(int b);
+static void ClipShiftUp(int c)                  // clip c was removed: the ones after it move up (no gaps)
+{
+    int last = -1;
+    for (int j = CLIP_N - 1; j > c; j--) if (gClips[j].base || gPadFile[CLIP0 + j][0]) { last = j; break; }
+    if (last < 0) return;                       // nothing after it
+    for (int j = c; j <= last; j++) { Pad& p = gPads[CLIP0 + j]; p.stop = true; p.len = 0; p.data = nullptr; }
+    Sleep(30);                                  // (the audio thread has let go of them by now)
+    for (int j = c; j < last; j++) {
+        Pad& d = gPads[CLIP0 + j]; const Pad& s2 = gPads[CLIP0 + j + 1];
+        d.vol = s2.vol; d.mode = s2.mode; d.speed = s2.speed; d.pitch = s2.pitch; d.fadeInMs = s2.fadeInMs; d.fadeOutMs = s2.fadeOutMs;
+        gClips[j] = gClips[j + 1];              // (its recording moves with it)
+        lstrcpynW(gPadFile[CLIP0 + j], gPadFile[CLIP0 + j + 1], MAX_PATH);
+        gClipPinned[j] = gClipPinned[j + 1]; gClipStamp[j] = gClipStamp[j + 1];
+    }
+    Clip& e = gClips[last];                     // the last one is empty now
+    e.base = nullptr; e.baseLen = 0; e.ts = e.te = e.pendTs = e.pendTe = 0; e.nUndo = e.nRedo = 0;
+    gPadFile[CLIP0 + last][0] = 0; gClipPinned[last] = false; gClipStamp[last] = 0; gPads[CLIP0 + last].vol = 100;
+    for (int j = c; j < last; j++) {
+        Pad& p = gPads[CLIP0 + j]; const Clip& k = gClips[j];
+        if (k.base) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
+    }
+    SetClipBank(gClipBank);                     // (the rows on screen show their new clips)
+}
 static void ClipClear(int c)                    // remove from the board; our own recordings go to the Recycle Bin
 {
     wchar_t* path = gPadFile[CLIP0 + c];
@@ -7746,6 +7784,8 @@ static void ChanSetSource(int c, int type, const wchar_t* src)
 
 // ---- renaming a channel: a little box over its name (Enter keeps it, Esc doesn't)
 static HWND gRenEdit = nullptr; static int gRenCh = -1;
+static void FillHearList();
+static bool gHearListStale = false;
 static LRESULT CALLBACK RenEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
 {
     if (m == WM_GETDLGCODE) return DLGC_WANTALLKEYS;
@@ -7754,12 +7794,14 @@ static LRESULT CALLBACK RenEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
     if (m == WM_KILLFOCUS) PostMessageW(gWnd, WM_RENAME_DONE, 1, 0);
     return DefSubclassProc(h, m, w, l);
 }
-static void ChanRename(int c)
+static void ChanRename(int c)                   // c < CH_MAX: a channel; CH_MAX + k: output k
 {
     if (gRenEdit) return;
-    HWND b = GetDlgItem(gWnd, IDC_CHSRC0 + c);
+    HWND b = GetDlgItem(gWnd, c < CH_MAX ? IDC_CHSRC0 + c : IDC_OLBL0 + (c - CH_MAX));
     RECT r; GetWindowRect(b, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
-    wchar_t t[64]; ChanLabel(c, t, 32);
+    if (c >= CH_MAX) r.right = Imax((int)r.right, (int)r.left + SC(90));   // (room to type)
+    wchar_t t[64];
+    if (c < CH_MAX) ChanLabel(c, t, 32); else OutName(c - CH_MAX, t, 32);
     gRenCh = c;
     gRenEdit = CreateWindowExW(0, L"EDIT", t, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL, r.left, r.top + (r.bottom - r.top - SC(22)) / 2,
                                r.right - r.left, SC(22), gWnd, (HMENU)(INT_PTR)IDC_CHNAMEED, gInst, nullptr);
@@ -7775,6 +7817,17 @@ static void ChanRenameDone(bool keep)
 {
     if (!gRenEdit) return;
     HWND e = gRenEdit; gRenEdit = nullptr;      // (first: destroying it loses focus, which asks again)
+    if (keep && gRenCh >= CH_MAX && gRenCh < CH_MAX + MAX_OUT) {   // an output
+        const int k = gRenCh - CH_MAX;
+        wchar_t t[64]; GetWindowTextW(e, t, 32);
+        wchar_t* p = t; while (*p == L' ') p++;
+        int n = lstrlenW(p); while (n > 0 && p[n - 1] == L' ') p[--n] = 0;
+        wchar_t def[16]; wsprintfW(def, L"Out %d", k + 1);
+        lstrcpynW(gOutName[k], !lstrcmpW(p, def) ? L"" : p, 32);   // empty or "Out 2": back to the number
+        gHearListStale = true; FillHearList();
+        InvalidateRect(GetDlgItem(gWnd, IDC_OLBL0 + k), nullptr, FALSE);
+        InvalidateRect(GetDlgItem(gWnd, IDC_ROWLBL + k), nullptr, FALSE);
+    }
     if (keep && gRenCh >= 0 && gRenCh < CH_MAX) {
         wchar_t t[64]; GetWindowTextW(e, t, 32);
         wchar_t* p = t; while (*p == L' ') p++;
@@ -8652,7 +8705,7 @@ static void ClipMenu(int c, HWND anchor)
     else if (cmd == 4) ClipRename(c);
     else if (cmd == 5) gClipPinned[c] = !gClipPinned[c];
     else if (cmd == 6) OpenTrim(c);
-    else if (cmd == 7) { ClipClear(c); gClipPinned[c] = false; }
+    else if (cmd == 7) { ClipClear(c); gClipPinned[c] = false; ClipShiftUp(c); }
     InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
 }
 
@@ -10053,6 +10106,7 @@ static void AddTips()
         TipId(IDC_OMETER0 + k, L"How loud this output is right now.");
         TipId(IDC_OLIM0 + k,  L"Lights up when this output is so loud the limiter has to turn peaks down. Often lit? Lower some volumes.");
         TipId(IDC_ODEV0 + k,  L"The device this output plays on (change it on the Main tab).");
+        TipId(IDC_OLBL0 + k,  L"Click to rename this output (e.g. \"Stream\" or \"Headphones\"). The name shows on the Main tab too.");
     }
     for (int c = 0; c < CH_MAX; c++) {
         TipId(IDC_CHSRC0 + c,  L"Click: pick what this channel plays (an app, an input like a second mic, or what an output device plays), rename it or change its colour. Drag the strip's right edge to make it wider.");
@@ -10327,12 +10381,12 @@ static void DrawOutLabel(DRAWITEMSTRUCT* d)     // "Out 1" with a thin level bar
     int k = (int)d->CtlID - IDC_ROWLBL;
     HDC dc = d->hDC; RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
-    wchar_t t[16]; wsprintfW(t, L"Out %d", k + 1);
+    wchar_t t[32]; OutName(k, t, 32);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, TXT_C);
     HGDIOBJ of = SelectObject(dc, gFont);
     RECT tr = { rc.left + 2, rc.top, rc.right, rc.bottom - 5 };
-    DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
     SelectObject(dc, of);
     float db = k < 8 ? gOutShow[k] : -80.0f;
     float f = (db + 60.0f) / 60.0f; if (f < 0) f = 0; if (f > 1) f = 1;
@@ -10991,16 +11045,17 @@ static void LayoutCompact(bool on)              // slim window: status, Start, M
 }
 
 // "Always hear sounds on" choices follow the output rows: Off, Out 1..Out n, Every output.
+// (gHearListStale: an output was renamed or removed: the list is filled again)
 static void FillHearList()
 {
     HWND c = GetDlgItem(gWnd, IDC_HEARON);
     if (!c) return;
     static int shown = -1;
-    if (shown == gRows && SendMessageW(c, CB_GETCOUNT, 0, 0) > 0) return;
-    shown = gRows;
+    if (shown == gRows && !gHearListStale && SendMessageW(c, CB_GETCOUNT, 0, 0) > 0) return;
+    shown = gRows; gHearListStale = false;
     SendMessageW(c, CB_RESETCONTENT, 0, 0);
     SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Off");
-    for (int k = 0; k < gRows; k++) { wchar_t t[16]; wsprintfW(t, L"Out %d", k + 1); SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)t); }
+    for (int k = 0; k < gRows; k++) { wchar_t t[32]; OutName(k, t, 32); SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)t); }
     SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Every output");
     if (gHearOut > gRows && gHearOut <= MAX_OUT) gHearOut = 0;   // that output was removed
     SendMessageW(c, CB_SETCURSEL, gHearOut == MAX_OUT + 1 ? gRows + 1 : gHearOut, 0);
@@ -11139,7 +11194,10 @@ static void RemoveOutput(int k)
         SendDlgItemMessageW(gWnd, IDC_ROWDEV + j, CB_SETCURSEL, sel, 0);
         SetRowMode(j, gRowMode[j + 1]);
         SetRowVol(j, gRowVol[j + 1]);
+        lstrcpynW(gOutName[j], gOutName[j + 1], 32); gOutW[j] = gOutW[j + 1]; gOutMute[j] = gOutMute[j + 1];
     }
+    gOutName[gRows - 1][0] = 0; gOutW[gRows - 1] = 0; gOutMute[gRows - 1] = false;
+    gHearListStale = true;
     gRows--;
     Layout();
     RestartIfRunning();
@@ -12628,7 +12686,7 @@ static void CreateUI()
         wchar_t n[16]; wsprintfW(n, L"Out %d", k + 1);
         Ctl(L"LagFader", L"", WS_TABSTOP | (k == 0 ? WS_GROUP : 0), x + 4, 420, 20, 150, IDC_OVOL0 + k);
         Ctl(L"STATIC", L"", SS_OWNERDRAW, x + 27, 422, 8, 146, IDC_OMETER0 + k);
-        Ctl(L"STATIC", n, SS_NOPREFIX, x + 40, 420, 56, 18, IDC_OLBL0 + k);
+        Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, x + 40, 420, 56, 18, IDC_OLBL0 + k);
         Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, x + 40, 439, 56, 18, IDC_ODEV0 + k);
         Ctl(L"STATIC", L"", SS_NOPREFIX, x + 40, 458, 56, 18, IDC_ODB0 + k);
         Ctl(L"STATIC", L"", SS_OWNERDRAW, x + 40, 522, 56, 16, IDC_OLIM0 + k);
@@ -13005,7 +13063,7 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPTRIM); if (gClips[c].base) OpenTrim(c); else ClipBrowse(c); }
         return;
     }
-    if (id >= IDC_CLIPCLR && id < IDC_CLIPCLR + CLIPS) { if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPCLR); ClipClear(c); gClipPinned[c] = false; } return; }
+    if (id >= IDC_CLIPCLR && id < IDC_CLIPCLR + CLIPS) { if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPCLR); ClipClear(c); gClipPinned[c] = false; ClipShiftUp(c); } return; }
     if (id >= IDC_CLIPMORE && id < IDC_CLIPMORE + CLIPS) { if (code == BN_CLICKED) ClipMenu(ClipSlot(id - IDC_CLIPMORE), GetDlgItem(gWnd, id)); return; }
     if (id >= IDC_PADMORE && id < IDC_PADMORE + PADS)    { if (code == BN_CLICKED) PadMenu(PadSlot(id - IDC_PADMORE), GetDlgItem(gWnd, id)); return; }
     if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
@@ -13230,6 +13288,10 @@ static void OnCommand(int id, int code)
     }
     if (id >= IDC_CHADD0 && id < IDC_CHADD0 + CH_MAX) {
         if (code == BN_CLICKED) ChanMenu(id - IDC_CHADD0, GetDlgItem(gWnd, id));
+        return;
+    }
+    if (id >= IDC_OLBL0 && id < IDC_OLBL0 + MAX_OUT) {   // an output's name: rename it
+        if (code == BN_CLICKED) ChanRename(CH_MAX + id - IDC_OLBL0);
         return;
     }
     if (id >= IDC_CHMUTE0 && id < IDC_CHMUTE0 + CH_MAX) {
@@ -13501,6 +13563,17 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w >= IDC_CHSRC0 && w < IDC_CHSRC0 + CH_MAX)   { DrawChanSrc(d, (int)(w - IDC_CHSRC0)); return true; }
     if (w >= IDC_CHADD0 && w < IDC_CHADD0 + CH_MAX)   { DrawChanAdd(d); return true; }
     if (w >= IDC_OLIM0 && w < IDC_OLIM0 + MAX_OUT)    { DrawLimit(d, gLimShow[w - IDC_OLIM0] > 0); return true; }
+    if (w >= IDC_OLBL0 && w < IDC_OLBL0 + MAX_OUT) {   // an output's name (click: rename it)
+        HDC dc = d->hDC; RECT rc = d->rcItem;
+        FillRect(dc, &rc, BgBrush());
+        wchar_t t[32]; OutName((int)(w - IDC_OLBL0), t, 32);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, TXT_C);
+        HGDIOBJ of = SelectObject(dc, gFontBold);
+        DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, of);
+        if (d->itemState & ODS_FOCUS) { RECT f = rc; DrawFocusRect(dc, &f); }
+        return true;
+    }
     if (w >= IDC_CHRT0 && w < IDC_CHRT0 + CH_MAX * MAX_OUT) {
         int c = (int)(w - IDC_CHRT0) / MAX_OUT, k = (int)(w - IDC_CHRT0) % MAX_OUT;
         DrawToggle(d, (gCh[c].routes >> k) & 1, false); return true;
@@ -13542,7 +13615,7 @@ static void HitchLog(UINT m, WPARAM w, int ms)
         f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (f == INVALID_HANDLE_VALUE) { gHitchN = 400; return; }   // not asked for: never log
         else {
-            static const char head[] = "---- Lag Effect " "1.31.1" " started ----\r\n"; DWORD wr;
+            static const char head[] = "---- Lag Effect " "1.31.2" " started ----\r\n"; DWORD wr;
             WriteFile(f, head, sizeof(head) - 1, &wr, nullptr);
         }
     }
@@ -14018,7 +14091,18 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         StartUpdateCheck(false);
 
     MSG msg;
+    SendMessageW(h, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);   // (no focus boxes until you use the keyboard)
+    auto setKbdNav = [&](bool on) {
+        gKbdNav = on;
+        SendMessageW(h, WM_CHANGEUISTATE, MAKEWPARAM(on ? UIS_CLEAR : UIS_SET, UISF_HIDEFOCUS), 0);
+        RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    };
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (gKbdNav && (msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) && (msg.hwnd == h || IsChild(h, msg.hwnd)))
+            setKbdNav(false);
+        else if (!gKbdNav && msg.message == WM_KEYDOWN && (msg.hwnd == h || IsChild(h, msg.hwnd)) &&
+                 (msg.wParam == VK_TAB || msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT || msg.wParam == VK_UP || msg.wParam == VK_DOWN))
+            setKbdNav(true);
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
             (msg.hwnd == h || IsChild(h, msg.hwnd))) {
             { int slot = 0; for (int i = 0; i < TAB_COUNT; i++) if (TAB_ORDER[i] == gPage) slot = i;   // Ctrl+Tab: next page
