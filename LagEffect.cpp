@@ -98,7 +98,10 @@ static double loopPos = 0, grainStart[2];
 static int    grainAge[2], grainLen = 2;
 static float  gateEnv = 0, gateGain = 1;
 static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
-static int gUiScale = 100;                      // Settings > UI size, or drag the window's edges
+static int gUiScale = 100;                      // Settings > UI size
+static bool gOwnSize = false;                   // (resizing) the window is sizing itself
+static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
+static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
 static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;
 static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }
 static inline int UNSC(int v) { return gUiScale == 100 ? v : MulDiv(v, 100, gUiScale); }   // screen px -> design px   // UI size   // gCmdLine: hidden (right-click the version text)
@@ -365,6 +368,7 @@ struct ChanSet {
 };
 static inline float DbGain10(int db10) { return db10 <= -600 ? 0.0f : powf(10.0f, db10 / 200.0f); }
 static volatile int gDuckDb = 12;               // how much ducked channels drop while you talk
+static int  gChW[CH_MAX], gOutW[MAX_OUT];       // Mixer strip widths (design px, 0 = the normal width)
 static ChanSet gCh[CH_MAX];
 static volatile bool gOutMute[MAX_OUT];
 static void ChanStartAll(); static void ChanStopAll(); static void ChanTick(); static bool ChanStart(int c); static void ChanStop(int c);
@@ -5197,9 +5201,6 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 static void Layout();
-static bool gOwnSize = false;                   // (resizing) the window is sizing itself
-static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
-static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
 static int  MixerNeedW();
 static void MixerPlace();
 static void SetFxGroupOn(int g, bool on);
@@ -7981,7 +7982,6 @@ static void DrawLimit(DRAWITEMSTRUCT* d, bool on)   // a little light: the limit
     SelectObject(dc, of);
 }
 // ---- strip widths: drag a strip's right edge (double-click it: back to normal)
-static int  gChW[CH_MAX], gOutW[MAX_OUT];       // design px, 0 = the normal width
 static RECT gStripRc[CH_MAX + MAX_OUT];         // where each strip is now (px)
 static HWND gMixHint = nullptr, gDuckLbl = nullptr, gDuckDbLbl = nullptr;
 static int ChW(int c)  { return gCh[c].type == CH_NONE ? 50 : (gChW[c] ? gChW[c] : 62); }
