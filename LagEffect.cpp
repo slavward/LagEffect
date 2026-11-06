@@ -12209,7 +12209,7 @@ static void WsClose(int i)
 {
     if (!gWsConn[i]) return;
     closesocket(gWsConn[i]->s);
-    PostMessageW(gWnd, WM_WS_CONN, (WPARAM)gWsConn[i]->id, 0);
+    if (gWsConn[i]->ws) PostMessageW(gWnd, WM_WS_CONN, (WPARAM)gWsConn[i]->id, 0);   // (only ones that had connected)
     HeapFree(GetProcessHeap(), 0, gWsConn[i]);
     gWsConn[i] = nullptr;
 }
