@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.30.1"
+#define APP_VERSION L"1.30.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -100,6 +100,8 @@ static float  gateEnv = 0, gateGain = 1;
 static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / tray
 static int gUiScale = 100;                      // Settings > UI size
 static bool gOwnSize = false;                   // (resizing) the window is sizing itself
+static bool gMoving = false;                    // you're dragging / resizing the window
+static DWORD gOutNextTry[MAX_OUT], gOutWait[MAX_OUT];       // (extra outputs that failed: when to try again)
 static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
 static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
 static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;
@@ -5350,13 +5352,22 @@ static DWORD ChanFindApp(const wchar_t* exe)    // the running app's main proces
         if (!lstrcmpiW(procs[i].exe, exe) && procs[i].pid != GetCurrentProcessId()) return ProcRoot(procs, np, procs[i].pid);
     return 0;
 }
+static bool ChanStartPid(int c, DWORD pid);
 static bool ChanStart(int c)                    // (audio must be running)
+{
+    if (gCh[c].type == CH_APP) {
+        DWORD pid = ChanFindApp(gCh[c].src);
+        if (!pid) { ChanStop(c); return false; } // not running yet: looked for again in the background
+        return ChanStartPid(c, pid);
+    }
+    return ChanStartPid(c, 0);
+}
+static bool ChanStartPid(int c, DWORD pid)
 {
     ChanStop(c);
     const ChanSet& cs = gCh[c];
     if (cs.type == CH_APP) {
-        DWORD pid = ChanFindApp(cs.src);
-        if (!pid) return false;                 // not running yet: the timer tries again
+        if (!pid) return false;
         gChA[c].live = true;                    // (before starting: the first packets mustn't be thrown away)
         gChPL[c].priority = THREAD_PRIORITY_ABOVE_NORMAL;   // (not "highest": it's music, not your voice)
         if (!ProcLoopStart(&gChPL[c], pid, false, CH_PL_CB[c], &gChLost[c])) { gChA[c].live = false; return false; }
@@ -5383,13 +5394,22 @@ static bool ChanStart(int c)                    // (audio must be running)
 }
 static void ChanStartAll() { for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) ChanStart(c); }
 static void ChanStopAll()  { for (int c = 0; c < CH_MAX; c++) ChanStop(c); }
+static void AppScanStart();
+static DWORD gChNextTry[CH_MAX], gChWait[CH_MAX];
 static void ChanTick()                          // (every ~2 s) apps that started / closed, devices that came back
 {
     if (!gRunning) return;
+    bool scan = false;
+    const DWORD now = GetTickCount();
     for (int c = 0; c < CH_MAX; c++) {
         if (gCh[c].type == CH_NONE) continue;
-        if (gChLost[c] || !gChRun[c]) ChanStart(c);
+        if (!gChLost[c] && gChRun[c]) { gChWait[c] = 0; continue; }
+        if (gCh[c].type == CH_APP) { scan = true; continue; }   // apps: looked for in the background (no hitch here)
+        if ((int)(now - gChNextTry[c]) < 0) continue;             // inputs: tried less and less often (2 s .. 30 s)
+        if (ChanStart(c)) gChWait[c] = 0;
+        else { gChWait[c] = gChWait[c] ? Imin((int)gChWait[c] * 2, 30000) : 2000; gChNextTry[c] = now + gChWait[c]; }
     }
+    if (scan) AppScanStart();
 }
 
 static void AppDisplayName(const wchar_t* exe, wchar_t* out, int cap)   // "spotify.exe" -> "Spotify"
@@ -7563,20 +7583,42 @@ static void PicUiRefresh()
 // ======================= mixer page =======================
 // A channel's dropdown shows only its own source until it's opened; opening it lists what's there right now.
 struct ChanOpt { int type; wchar_t src[128]; };
-struct AppScan { AudioApp apps[64]; int n; };
+struct AppScan {
+    AudioApp apps[64]; int n;                   // apps playing sound (the channel menu)
+    wchar_t  want[CH_MAX][128];                 // each app channel's .exe (as asked) ...
+    DWORD    pid[CH_MAX];                       // ... its process (0: not running) ...
+    wchar_t  path[CH_MAX][MAX_PATH];            // ... and where its .exe is (for the icon)
+};
 static AppScan gAppCache; static bool gAppCacheOk = false; static volatile LONG gAppScanBusy = 0;
-static DWORD WINAPI AppScanThread(LPVOID)
+static DWORD WINAPI AppScanThread(LPVOID arg)
 {
-    AppScan* sc = (AppScan*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(AppScan));
-    if (sc) { sc->n = ListAudioApps(sc->apps, 64); if (!PostMessageW(gWnd, WM_APPS_SCANNED, 0, (LPARAM)sc)) HeapFree(GetProcessHeap(), 0, sc); }
+    AppScan* sc = (AppScan*)arg;
+    sc->n = ListAudioApps(sc->apps, 64);
+    ProcInfo* procs = (ProcInfo*)HeapAlloc(GetProcessHeap(), 0, sizeof(ProcInfo) * 2048);
+    if (procs) {
+        const int np = SnapProcs(procs, 2048);  // one snapshot for every channel
+        for (int c = 0; c < CH_MAX; c++) {
+            if (!sc->want[c][0]) continue;
+            for (int i = 0; i < np; i++)
+                if (!lstrcmpiW(procs[i].exe, sc->want[c]) && procs[i].pid != GetCurrentProcessId()) { sc->pid[c] = ProcRoot(procs, np, procs[i].pid); break; }
+            if (!sc->pid[c]) continue;
+            HANDLE ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, sc->pid[c]);
+            if (ph) { DWORD n = MAX_PATH; if (!QueryFullProcessImageNameW(ph, 0, sc->path[c], &n)) sc->path[c][0] = 0; CloseHandle(ph); }
+        }
+        HeapFree(GetProcessHeap(), 0, procs);
+    }
+    if (!PostMessageW(gWnd, WM_APPS_SCANNED, 0, (LPARAM)sc)) HeapFree(GetProcessHeap(), 0, sc);
     InterlockedExchange(&gAppScanBusy, 0);
     return 0;
 }
-static void AppScanStart()                      // (in the background: listing every app's sound sessions takes a while)
+static void AppScanStart()                      // (in the background: listing apps and processes takes a while)
 {
     if (InterlockedCompareExchange(&gAppScanBusy, 1, 0) != 0) return;
-    HANDLE t = CreateThread(nullptr, 0, AppScanThread, nullptr, 0, nullptr);
-    if (t) CloseHandle(t); else InterlockedExchange(&gAppScanBusy, 0);
+    AppScan* sc = (AppScan*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(AppScan));
+    if (!sc) { InterlockedExchange(&gAppScanBusy, 0); return; }
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_APP) lstrcpynW(sc->want[c], gCh[c].src, 128);
+    HANDLE t = CreateThread(nullptr, 0, AppScanThread, sc, 0, nullptr);
+    if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, sc); InterlockedExchange(&gAppScanBusy, 0); }
 }
 static ChanOpt gChOpts[200]; static int gChOptN = 0;
 static const COLORREF CH_COLORS[8] = { RGB(43, 184, 165), RGB(140, 124, 240), RGB(240, 136, 62), RGB(229, 83, 75),
@@ -7594,6 +7636,15 @@ static void ChanLabel(int c, wchar_t* out, int cap)   // what its strip calls it
     else if (gCh[c].type == CH_APP) AppDisplayName(gCh[c].src, out, cap);
     else if (gCh[c].type == CH_DEV) lstrcpynW(out, gCh[c].src, cap);
     else lstrcpynW(out, L"", cap);
+}
+static void ChanIconFromPath(int c, const wchar_t* path)
+{
+    if (gChIcon[c] && !lstrcmpiW(gChIconSrc[c], gCh[c].src)) return;
+    if (gChIcon[c]) { DestroyIcon(gChIcon[c]); gChIcon[c] = nullptr; }
+    HICON sm = nullptr;
+    if (ExtractIconExW(path, 0, nullptr, &sm, 1) > 0 && sm) gChIcon[c] = sm;
+    lstrcpynW(gChIconSrc[c], gCh[c].src, 128);  // (tried: not again for this app, even with no icon)
+    InvalidateRect(GetDlgItem(gWnd, IDC_CHSRC0 + c), nullptr, FALSE);
 }
 static void ChanIconUpdate(int c)               // the app's icon, from its .exe (when it's running)
 {
@@ -8156,7 +8207,8 @@ static void MixerOutNames()                     // each output strip shows its d
 }
 static void MixerRefresh()                      // after a profile / settings change
 {
-    for (int c = 0; c < CH_MAX; c++) { FaderLabel(IDC_CHVOL0 + c); if (gCh[c].type == CH_APP && !gChIcon[c]) ChanIconUpdate(c); }
+    for (int c = 0; c < CH_MAX; c++) FaderLabel(IDC_CHVOL0 + c);
+    AppScanStart();
     for (int k = 0; k < MAX_OUT; k++) FaderLabel(IDC_OVOL0 + k);
     SendDlgItemMessageW(gWnd, SPIN_UD(IDC_DUCKDB), UDM_SETPOS32, 0, gDuckDb);
     MixerOutNames();
@@ -12466,7 +12518,6 @@ static void CreateUI()
             Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, x + 4 + k * 11, 344, 10, 18, IDC_CHRT0 + c * MAX_OUT + k);
         }
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, x + 4, 96, 54, 268, IDC_CHADD0 + c);
-        ChanIconUpdate(c);
     }
 
     gSecOut = gSectionN;
@@ -12483,6 +12534,7 @@ static void CreateUI()
         Ctl(L"BUTTON", L"M", BS_OWNERDRAW | WS_TABSTOP, x + 40, 546, 56, 22, IDC_OMUTE0 + k);
     }
     gBuildPage = -1;
+    AppScanStart();                             // (icons and the apps list arrive from the background)
     for (int i = 0; i < gDesignN; i++)          // the Mixer's strips are placed by MixerPlace, not the layout
         if (gDesign[i].page == PAGE_MIXER) gDesign[i].free = true;
     for (int c = 0; c < CH_MAX; c++) FaderLabel(IDC_CHVOL0 + c);
@@ -13399,20 +13451,28 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_TIMER:
         if (w == TIMER_STATUS) {
-            UpdateStatus(); UpdateMeter(); SongTick(); PadTick(); MixerMeterTick();
+            SongTick(); PadTick();
+            if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
+            UpdateStatus(); UpdateMeter(); MixerMeterTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
                 chTick = 0; ChanTick();
-                if (gPage == PAGE_MIXER) { AppScanStart(); for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_APP && !gChIcon[c]) ChanIconUpdate(c); }
-                if (gRunning && !gStopping)     // outputs that dropped out (unplugged, cable reinstalled...): try again
-                    for (int k = 1; k < gRows; k++) if (!gExtraRunning[k]) StartExtraOutput(k);
+                if (gPage == PAGE_MIXER) AppScanStart();
+                if (gRunning && !gStopping) {   // outputs that dropped out (unplugged, cable reinstalled...): try again,
+                    const DWORD now = GetTickCount();   // less and less often (4 s .. 30 s) while they keep failing
+                    for (int k = 1; k < gRows; k++) {
+                        if (gExtraRunning[k] || (int)(now - gOutNextTry[k]) < 0) continue;
+                        if (StartExtraOutput(k)) gOutWait[k] = 0;
+                        else { gOutWait[k] = gOutWait[k] ? Imin((int)gOutWait[k] * 2, 30000) : 4000; gOutNextTry[k] = now + gOutWait[k]; }
+                    }
+                }
             }
         }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) { CleanupOldExe(); VoiceProgressTick(); }
         else if (w == TIMER_FXKEYS) PollFxKeys();
         else if (w == TIMER_OSD) OsdTick();
-        else if (w == TIMER_PICANIM) PicAnimTick();
+        else if (w == TIMER_PICANIM) { if (!gMoving) PicAnimTick(); }   // (a GIF background pauses while you drag)
         else if (w == TIMER_STKSIZE) {          // a picture was resized: decode it again at its new size (sharp, fast)
             KillTimer(h, TIMER_STKSIZE);
             bool any = false;
@@ -13444,16 +13504,24 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (k > 0 && k < MAX_OUT && gExtraRunning[k]) {
             ringOn[k] = false; gExtraRunning[k] = false;
             ma_device_uninit(&gExtraDev[k]);
+            gOutWait[k] = 0; gOutNextTry[k] = GetTickCount() + 2000;
         }
         return 0;
     }
     case WM_RENAME_DONE:
         ChanRenameDone(w != 0);
         return 0;
-    case WM_APPS_SCANNED:
-        gAppCache = *(AppScan*)l; gAppCacheOk = true;
-        HeapFree(GetProcessHeap(), 0, (void*)l);
+    case WM_APPS_SCANNED: {                     // the background scan: the apps list, icons, and apps that just opened
+        AppScan* sc = (AppScan*)l;
+        gAppCache = *sc; gAppCacheOk = true;
+        for (int c = 0; c < CH_MAX; c++) {
+            if (gCh[c].type != CH_APP || lstrcmpiW(sc->want[c], gCh[c].src)) continue;   // (changed meanwhile)
+            if (sc->path[c][0] && lstrcmpiW(gChIconSrc[c], gCh[c].src)) ChanIconFromPath(c, sc->path[c]);
+            if (gRunning && !gStopping && sc->pid[c] && (gChLost[c] || !gChRun[c])) ChanStartPid(c, sc->pid[c]);
+        }
+        HeapFree(GetProcessHeap(), 0, sc);
         return 0;
+    }
     case WM_NVSA_READY:
         OnNvsaReady((NvsaJob*)l);
         return 0;
@@ -13502,6 +13570,8 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
             }
         }
         break;
+    case WM_ENTERSIZEMOVE: gMoving = true; break;
+    case WM_EXITSIZEMOVE:  gMoving = false; break;
     case WM_GETMINMAXINFO: {                    // never smaller than the layout needs
         MINMAXINFO* mm = (MINMAXINFO*)l;
         RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()), SC(gWnd ? DesignH() : BASE_H) };
