@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.2"
+#define APP_VERSION L"1.29.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -73,7 +73,8 @@ static int Iclamp(int v, int lo, int hi) { return Imax(lo, Imin(hi, v)); }
 // ======================= audio =======================
 #define RATE      48000
 #define HIST      (RATE * 4)                   // loops up to 2 s; Rewind / Repeat word look back further
-#define RING_SIZE 16384                        // per-output ring buffer (power of two)
+#define RING_SIZE 16384                        // per-output ring buffer (power of two), floats
+#define RING_FRAMES (RING_SIZE / 2)             // ... as stereo frames
 #define MAXGRAIN  (RATE * 40 / 1000)           // 40 ms grains for pitch/speed
 #define MAX_OUT   5                            // output rows
 static const int BUFFERS[] = { 32, 64, 128, 256, 512 };
@@ -324,6 +325,54 @@ static inline float Limit(int k, float x)
     float y = x * limGain[k];
     limGain[k] += (1.0f - limGain[k]) * 0.00014f;   // ~150 ms recovery
     return y;
+}
+
+// The same, for a stereo pair: one gain for both sides, so the picture never leans when it limits.
+static inline void LimitStereo(int k, float& l, float& r)
+{
+    const float ceil = 0.891f;
+    float a = Max(fabsf(l), fabsf(r));
+    if (a * limGain[k] > ceil) limGain[k] = ceil / a;
+    l *= limGain[k]; r *= limGain[k];
+    limGain[k] += (1.0f - limGain[k]) * 0.00014f;
+}
+
+// ======================= mixer channels (audio side) =======================
+// Up to CH_MAX extra inputs: an app (its sound, captured on its own), or an input device (another mic, a
+// line-in...). Each capture runs on its own thread and pushes stereo frames into its channel's ring; the main
+// callback takes them out, applies the channel's volume / mute and adds them to the outputs it's sent to.
+#define CH_MAX   8
+#define CH_RING  16384                          // frames (stereo, interleaved), power of two
+enum { CH_NONE = 0, CH_APP = 1, CH_DEV = 2 };
+struct ChanAudio {
+    float buf[CH_RING * 2];
+    volatile unsigned w, r;                     // frames written (capture thread) / read (audio callback)
+    volatile bool live;                         // capturing
+    volatile float peak;                        // loudest since the meter last looked
+    bool primed;                                // (callback) enough buffered to play smoothly
+};
+static ChanAudio gChA[CH_MAX];
+struct ChanSet { int type; wchar_t src[128]; volatile int vol; volatile bool mute; volatile unsigned routes; };
+static ChanSet gCh[CH_MAX];
+static volatile bool gOutMute[MAX_OUT];
+static void ChanStartAll(); static void ChanStopAll(); static void ChanTick(); static bool ChanStart(int c); static void ChanStop(int c);
+static void ChanPush(int c, const float* in, unsigned frames, int chans)   // (capture thread)
+{
+    ChanAudio& a = gChA[c];
+    if (!a.live || !in) return;
+    unsigned w = a.w; const unsigned r = a.r;
+    float pk = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        if (w - r >= CH_RING - 1) break;        // (the callback isn't keeping up: drop, it skips ahead anyway)
+        const float L = in[f * chans], R = chans > 1 ? in[f * chans + 1] : L;
+        const unsigned i = (w & (CH_RING - 1)) * 2;
+        a.buf[i] = L; a.buf[i + 1] = R;
+        const float m = Max(fabsf(L), fabsf(R)); if (m > pk) pk = m;
+        w++;
+    }
+    MemoryBarrier();
+    a.w = w;
+    if (pk > a.peak) a.peak = pk;
 }
 
 // 4-point Hermite interpolation: noticeably cleaner than straight lines when pitch/speed resample.
@@ -2049,6 +2098,26 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (gTapeReq)   { gTapeReq = false;   if (!looping) SpStartTape(); }
     if (looping) spMode = SP_NONE;
 
+    // Mixer channels: how much each has buffered, its gain and where it goes (read once per block).
+    float    chG[CH_MAX]; unsigned chRd[CH_MAX], chAv[CH_MAX], chRt[CH_MAX]; int chAdj[CH_MAX]; bool anyCh = false;
+    for (int c = 0; c < CH_MAX; c++) {
+        ChanAudio& a = gChA[c];
+        chG[c] = 0; chRt[c] = 0; chAv[c] = 0; chRd[c] = a.r;
+        if (!a.live) { a.primed = false; continue; }
+        const unsigned wr = a.w; MemoryBarrier();
+        unsigned rd = a.r, av = wr - rd;
+        const unsigned target = frames + 1024;  // ~20 ms + a block of cushion against the capture's bursts
+        if (av > target + 4096) { rd = wr - target; av = target; }   // fallen behind (clock drift / a hiccup): catch up
+        if (!a.primed) { if (av < target) { chRd[c] = rd; continue; } a.primed = true; }
+        if (av < frames) a.primed = false;      // about to run dry: wait for a cushion again after this block
+        chRd[c] = rd; chAv[c] = av;
+        // Its clock and ours never match exactly: drop / repeat one sample now and then to keep the cushion steady.
+        chAdj[c] = av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
+        chG[c] = gCh[c].mute ? 0.0f : Iclamp(gCh[c].vol, 0, 200) / 100.0f;
+        chRt[c] = gCh[c].routes;
+        anyCh = true;
+    }
+
     int      mode[MAX_OUT];
     const int hearOut = gHearOut;
     float    vol[MAX_OUT];
@@ -2056,7 +2125,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     unsigned w[MAX_OUT], r[MAX_OUT];
     for (int k = 0; k < MAX_OUT; k++) {
         mode[k] = gRowMode[k];
-        vol[k]  = gRowVol[k] / 100.0f;
+        vol[k]  = gOutMute[k] ? 0.0f : gRowVol[k] / 100.0f;
         on[k]   = k > 0 && ringOn[k];
         w[k]    = ringW[k];
         r[k]    = ringR[k];
@@ -2272,19 +2341,37 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             const bool always = hearOut == MAX_OUT + 1 || hearOut == k + 1;
             return (mode[k] != MODE_OFF || always ? sb : 0.0f) + (always && mode[k] != MODE_ALL ? sbFx : 0.0f);
         };
-        float o = Limit(0, (RowSignal(mode[0], effect, everything, clean) + sounds(0)) * vol[0]);
-        { float a = o < 0 ? -o : o; if (a > outPk[0]) outPk[0] = a; }
-        out[f * 2] = o;
-        out[f * 2 + 1] = o;
+        // mixer channels: this frame of each, summed per output (stereo)
+        float cL[MAX_OUT] = {}, cR[MAX_OUT] = {};
+        if (anyCh)
+            for (int c = 0; c < CH_MAX; c++) {
+                if (!chAv[c]) continue;
+                const unsigned i = (chRd[c] & (CH_RING - 1)) * 2;
+                const float L = gChA[c].buf[i] * chG[c], R = gChA[c].buf[i + 1] * chG[c];
+                if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
+                else { chRd[c]++; chAv[c]--; }
+                if (f == frames / 2 && chAdj[c] > 0 && chAv[c] > 1) { chRd[c]++; chAv[c]--; }   // skip one
+                for (int k = 0; k < MAX_OUT; k++) if (chRt[c] & (1u << k)) { cL[k] += L; cR[k] += R; }
+            }
+        float m0 = RowSignal(mode[0], effect, everything, clean) + sounds(0);
+        float oL = (m0 + cL[0]) * vol[0], oR = (m0 + cR[0]) * vol[0];
+        LimitStereo(0, oL, oR);
+        { float a = Max(fabsf(oL), fabsf(oR)); if (a > outPk[0]) outPk[0] = a; }
+        out[f * 2] = oL;
+        out[f * 2 + 1] = oR;
 
         for (int k = 1; k < MAX_OUT; k++) {
-            if (!on[k] || (w[k] - r[k]) >= RING_SIZE) continue;
-            float ov = Limit(k, (RowSignal(mode[k], effect, everything, clean) + sounds(k)) * vol[k]);
-            ring[k][w[k] & (RING_SIZE - 1)] = ov;
-            { float a = ov < 0 ? -ov : ov; if (a > outPk[k]) outPk[k] = a; }
+            if (!on[k] || (w[k] - r[k]) >= RING_FRAMES) continue;
+            const float mk = RowSignal(mode[k], effect, everything, clean) + sounds(k);
+            float kL = (mk + cL[k]) * vol[k], kR = (mk + cR[k]) * vol[k];
+            LimitStereo(k, kL, kR);
+            const unsigned i = (w[k] & (RING_FRAMES - 1)) * 2;
+            ring[k][i] = kL; ring[k][i + 1] = kR;
+            { float a = Max(fabsf(kL), fabsf(kR)); if (a > outPk[k]) outPk[k] = a; }
             w[k]++;
         }
     }
+    for (int c = 0; c < CH_MAX; c++) if (gChA[c].live) gChA[c].r = chRd[c];
     MemoryBarrier();
     for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
@@ -2307,10 +2394,10 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
     if (avail > maxLag) { r = w - dev->playback.internalPeriodSizeInFrames; avail = w - r; }
 
     for (ma_uint32 f = 0; f < frames; f++) {
-        float m = 0.0f;
-        if (avail) { m = ring[k][r & (RING_SIZE - 1)]; r++; avail--; }
-        out[f * 2] = m;
-        out[f * 2 + 1] = m;
+        float L = 0.0f, R = 0.0f;
+        if (avail) { const unsigned i = (r & (RING_FRAMES - 1)) * 2; L = ring[k][i]; R = ring[k][i + 1]; r++; avail--; }
+        out[f * 2] = L;
+        out[f * 2 + 1] = R;
     }
     ringR[k] = r;
 }
@@ -2321,7 +2408,7 @@ enum {
     IDC_LOOP, IDC_SPEED, IDC_PITCH, IDC_FADE, IDC_GATE, IDC_TALKVOL,
     IDC_GATEON, IDC_TALKON, IDC_HOTKEY, IDC_HOLD, IDC_TOGGLE, IDC_BUFFER, IDC_EXCL,
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
-    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3, IDC_TAB4, IDC_TAB5,   // tabs must stay consecutive
+    IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3, IDC_TAB4, IDC_TAB5, IDC_TAB6,   // tabs must stay consecutive
     IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_SONGBTN, IDC_SONGSRC, IDC_SONGSTATUS,
     IDC_MUTEBTN, IDC_MUTEKEY, IDC_OSD, IDC_TOPMOST, IDC_STARTWIN,
     IDC_PADMASTER, IDC_PADSTOP, IDC_PADHINT,
@@ -2345,6 +2432,9 @@ enum {
     IDC_STKSIZE, IDC_STKOPAC, IDC_STKMOVE, IDC_GIFFPS, IDC_GIFPAUSE, IDC_TTSACCENT, IDC_PICPLACE, IDC_VOICEPROG, IDC_TTSVOL, IDC_TTSMORE,
     IDC_COLSW0 = 1400,                          // + colour slot (USERCOL_N): its own range
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
+    // Mixer page: + channel (CH_MAX), routing buttons + channel * MAX_OUT + output, output strips + output
+    IDC_CHSRC0 = 1500, IDC_CHMUTE0 = 1510, IDC_CHVOL0 = 1520, IDC_CHMETER0 = 1530, IDC_CHRT0 = 1540,
+    IDC_OMUTE0 = 1590, IDC_OVOL0 = 1600, IDC_OLBL0 = 1610, IDC_OMETER0 = 1620,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -2522,6 +2612,7 @@ static bool ProcLoopStart(ProcLoop* pl, DWORD pid, bool exclude, ma_device_data_
 static void RecPcCallback(ma_device*, void*, const void* input, ma_uint32 frames);
 static bool gSongPLOn = false, gRecPLOn = false;
 static DWORD gSongPid = 0;                        // the app being recorded (Vocode to song, one app)  // true: running on ProcLoop, false: on a miniaudio device
+
 static void SongDevStop() { if (gSongPLOn) ProcLoopStop(&gSongPL); else ma_device_uninit(&gSongDev); gSongPLOn = false; }
 static void RecDevStop()  { if (gRecPLOn)  ProcLoopStop(&gRecPL);  else ma_device_uninit(&gRecDev);  gRecPLOn = false; }
 static bool      gSongRunning = false;
@@ -3387,6 +3478,16 @@ static void LoadSettings()
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
     gTtsAccent = INI_INT(L"tts_accent", 0);
+    for (int c = 0; c < CH_MAX; c++) {           // mixer channels
+        wchar_t k[32];
+        wsprintfW(k, L"ch_%d_type", c);   gCh[c].type = Iclamp(INI_INT(k, CH_NONE), CH_NONE, CH_DEV);
+        wsprintfW(k, L"ch_%d_src", c);    GetPrivateProfileStringW(L"settings", k, L"", gCh[c].src, 128, gIni);
+        wsprintfW(k, L"ch_%d_vol", c);    gCh[c].vol = Iclamp(INI_INT(k, 100), 0, 200);
+        wsprintfW(k, L"ch_%d_mute", c);   gCh[c].mute = INI_INT(k, 0) != 0;
+        wsprintfW(k, L"ch_%d_routes", c); gCh[c].routes = (unsigned)INI_INT(k, 1) & ((1u << MAX_OUT) - 1);
+        if (!gCh[c].src[0]) gCh[c].type = CH_NONE;
+    }
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
     gTtsVol = Iclamp(INI_INT(L"tts_volume", 100), 0, 200);
     gTtsRate = Iclamp(INI_INT(L"tts_speed", 0), -10, 10); gTtsPitch = Iclamp(INI_INT(L"tts_pitch", 0), -12, 12);
     gTtsRoom = Iclamp(INI_INT(L"tts_room", 35), 0, 100); gTtsPause = Iclamp(INI_INT(L"tts_pauses", 100), 0, 300);
@@ -4214,7 +4315,16 @@ static void SaveSettings()
 
     SaveInt(L"repeat_word_times", gRepeatN);
     IniSet(L"tts_voice", gTtsVoice);
-    SaveInt(L"tts_accent", gTtsAccent); SaveInt(L"tts_volume", gTtsVol);
+    SaveInt(L"tts_accent", gTtsAccent);
+    for (int c = 0; c < CH_MAX; c++) {
+        wchar_t k[32];
+        wsprintfW(k, L"ch_%d_type", c);   SaveInt(k, gCh[c].type);
+        wsprintfW(k, L"ch_%d_src", c);    IniSet(k, gCh[c].src);
+        wsprintfW(k, L"ch_%d_vol", c);    SaveInt(k, gCh[c].vol);
+        wsprintfW(k, L"ch_%d_mute", c);   SaveInt(k, gCh[c].mute);
+        wsprintfW(k, L"ch_%d_routes", c); SaveInt(k, (int)gCh[c].routes);
+    }
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); } SaveInt(L"tts_volume", gTtsVol);
     SaveInt(L"tts_speed", gTtsRate); SaveInt(L"tts_pitch", gTtsPitch); SaveInt(L"tts_room", gTtsRoom);
     SaveInt(L"tts_pauses", gTtsPause); SaveInt(L"tts_natural", gTtsNatural);
     SaveInt(L"fx_echo_style", gEchoStyle);
@@ -4339,6 +4449,7 @@ static bool StartExtraOutput(int k)
 static void StopDevices()
 {
     gStopping = true;
+    ChanStopAll();
     for (int k = 0; k < MAX_OUT; k++) ringOn[k] = false;
     if (gRunning) { ma_device_uninit(&gDev); gRunning = false; }
     for (int k = 0; k < MAX_OUT; k++)
@@ -4411,6 +4522,7 @@ static bool StartAudio(bool quiet)
         return false;
     }
     gRunning = true;
+    ChanStartAll();                             // the mixer's apps / devices
     if (gHideFailed && !quiet) {
         wchar_t list[64] = L"";
         for (int k = 0; k < MAX_OUT; k++)
@@ -4442,8 +4554,9 @@ static void StopAudio()
 #define COMPACT_H 84                           // compact mode: status + a few buttons
 #define ROW_Y0    134
 #define ROW_H     30
-#define TAB_COUNT 6
-enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5 };
+#define TAB_COUNT 7
+static const int TAB_ORDER[TAB_COUNT] = { 0, 6, 1, 2, 3, 4, 5 };   // left to right (Mixer sits after Main)
+enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5, PAGE_MIXER = 6 };
 
 struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; };   // ox/oy: moved by you (design px)
 struct Framed  { HWND edit, ud; };
@@ -5059,6 +5172,74 @@ static int ListAudioApps(AudioApp* out, int cap)
         for (int i = 0; i < np; i++)
             if (!lstrcmpiW(procs[i].exe, b)) { add(procs[i].pid); break; }
     return n;
+}
+
+// ======================= mixer channels (capture) =======================
+static ProcLoop      gChPL[CH_MAX];
+static ma_device     gChDev[CH_MAX];
+static bool          gChRun[CH_MAX], gChOnPL[CH_MAX];
+static volatile bool gChLost[CH_MAX];           // its app closed / its device went away: try again later
+template <int N> static void ChanPLCb(ma_device*, void*, const void* in, ma_uint32 n) { ChanPush(N, (const float*)in, n, 2); }
+static ma_device_data_proc CH_PL_CB[CH_MAX] = { ChanPLCb<0>, ChanPLCb<1>, ChanPLCb<2>, ChanPLCb<3>, ChanPLCb<4>, ChanPLCb<5>, ChanPLCb<6>, ChanPLCb<7> };
+static void ChanDevCb(ma_device* d, void*, const void* in, ma_uint32 n) { ChanPush((int)(INT_PTR)d->pUserData, (const float*)in, n, 2); }
+static void ChanDevNote(const ma_device_notification* n)
+{
+    if (n->type == ma_device_notification_type_stopped) gChLost[(int)(INT_PTR)n->pDevice->pUserData] = true;
+}
+static void ChanStop(int c)
+{
+    gChA[c].live = false;
+    if (gChRun[c]) { if (gChOnPL[c]) ProcLoopStop(&gChPL[c]); else ma_device_uninit(&gChDev[c]); }
+    gChRun[c] = false; gChLost[c] = false;
+    gChA[c].w = gChA[c].r = 0; gChA[c].peak = 0;
+}
+static DWORD ChanFindApp(const wchar_t* exe)    // the running app's main process (0: not running)
+{
+    static ProcInfo procs[2048];
+    int np = SnapProcs(procs, 2048);
+    for (int i = 0; i < np; i++)
+        if (!lstrcmpiW(procs[i].exe, exe) && procs[i].pid != GetCurrentProcessId()) return ProcRoot(procs, np, procs[i].pid);
+    return 0;
+}
+static bool ChanStart(int c)                    // (audio must be running)
+{
+    ChanStop(c);
+    const ChanSet& cs = gCh[c];
+    if (cs.type == CH_APP) {
+        DWORD pid = ChanFindApp(cs.src);
+        if (!pid) return false;                 // not running yet: the timer tries again
+        gChA[c].live = true;                    // (before starting: the first packets mustn't be thrown away)
+        if (!ProcLoopStart(&gChPL[c], pid, false, CH_PL_CB[c], &gChLost[c])) { gChA[c].live = false; return false; }
+        gChOnPL[c] = true;
+    } else if (cs.type == CH_DEV) {
+        int di = -1;
+        for (ma_uint32 i = 0; i < gCapCount; i++) {
+            wchar_t n[256]; MultiByteToWideChar(CP_UTF8, 0, gCapDevs[i].name, -1, n, 256);
+            if (!lstrcmpiW(n, cs.src)) { di = (int)i; break; }
+        }
+        if (di < 0) return false;
+        ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+        cfg.capture.format = ma_format_f32; cfg.capture.channels = 2; cfg.sampleRate = RATE;
+        cfg.capture.pDeviceID = &gCapDevs[di].id;
+        cfg.dataCallback = ChanDevCb; cfg.notificationCallback = ChanDevNote; cfg.pUserData = (void*)(INT_PTR)c;
+        cfg.periodSizeInMilliseconds = 10;
+        gChA[c].live = true;
+        if (ma_device_init(&gCtx, &cfg, &gChDev[c]) != MA_SUCCESS) { gChA[c].live = false; return false; }
+        if (ma_device_start(&gChDev[c]) != MA_SUCCESS) { ma_device_uninit(&gChDev[c]); gChA[c].live = false; return false; }
+        gChOnPL[c] = false;
+    } else return false;
+    gChRun[c] = true;
+    return true;
+}
+static void ChanStartAll() { for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) ChanStart(c); }
+static void ChanStopAll()  { for (int c = 0; c < CH_MAX; c++) ChanStop(c); }
+static void ChanTick()                          // (every ~2 s) apps that started / closed, devices that came back
+{
+    if (!gRunning) return;
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        if (gChLost[c] || !gChRun[c]) ChanStart(c);
+    }
 }
 
 static void AppDisplayName(const wchar_t* exe, wchar_t* out, int cap)   // "spotify.exe" -> "Spotify"
@@ -7228,6 +7409,106 @@ static void PicUiRefresh()
     gPicUiBusy = false;
 }
 
+
+// ======================= mixer page =======================
+// A channel's dropdown shows only its own source until it's opened; opening it lists what's there right now.
+struct ChanOpt { int type; wchar_t src[128]; };
+static ChanOpt gChOpts[200]; static int gChOptN = 0;
+static void ChanSourceName(int type, const wchar_t* src, wchar_t* out, int cap)
+{
+    if (type == CH_APP) { wchar_t nice[96]; AppDisplayName(src, nice, 96); wsprintfW(out, L"App: %s", nice); }
+    else if (type == CH_DEV) wsprintfW(out, L"Input: %s", src);
+    else lstrcpynW(out, L"(empty)", cap);
+}
+static void ChanComboShow(int c, HWND cb)
+{
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    wchar_t t[200]; ChanSourceName(gCh[c].type, gCh[c].src, t, 200);
+    SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)t);
+    SendMessageW(cb, CB_SETCURSEL, 0, 0);
+    SendMessageW(cb, CB_SETDROPPEDWIDTH, SC(300), 0);
+}
+static void ChanComboFill(int c, HWND cb)
+{
+    gChOptN = 0;
+    auto add = [&](int type, const wchar_t* src) {
+        if (gChOptN >= 200) return;
+        for (int i = 0; i < gChOptN; i++) if (gChOpts[i].type == type && !lstrcmpiW(gChOpts[i].src, src)) return;
+        gChOpts[gChOptN].type = type; lstrcpynW(gChOpts[gChOptN].src, src, 128); gChOptN++;
+    };
+    add(CH_NONE, L"");
+    if (gCh[c].type != CH_NONE) add(gCh[c].type, gCh[c].src);   // (its own, even if not running now)
+    static AudioApp apps[64];
+    int na = ListAudioApps(apps, 64);
+    for (int i = 0; i < na; i++) add(CH_APP, apps[i].name);
+    for (ma_uint32 i = 0; i < gCapCount; i++) { wchar_t n[128]; MultiByteToWideChar(CP_UTF8, 0, gCapDevs[i].name, -1, n, 128); add(CH_DEV, n); }
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    int sel = 0;
+    for (int i = 0; i < gChOptN; i++) {
+        wchar_t t[200]; ChanSourceName(gChOpts[i].type, gChOpts[i].src, t, 200);
+        if (i > 0 && gChOpts[i].type == CH_APP && gChOpts[i].type == gCh[c].type && !lstrcmpiW(gChOpts[i].src, gCh[c].src) && !ChanFindApp(gChOpts[i].src))
+            lstrcatW(t, L"  (not running)");
+        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)t);
+        if (gChOpts[i].type == gCh[c].type && !lstrcmpiW(gChOpts[i].src, gCh[c].src)) sel = i;
+    }
+    SendMessageW(cb, CB_SETCURSEL, sel, 0);
+}
+static void DrawToggle(DRAWITEMSTRUCT* d, bool on, bool danger)   // the mixer's Mute / routing buttons
+{
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    COLORREF fill = on ? (danger ? RGB(205, 60, 60) : ACCENT) : (gDark ? DK_CTL : LT_CARD);
+    HBRUSH b = CreateSolidBrush(fill);
+    HPEN p = CreatePen(PS_SOLID, 1, on ? fill : (gDark ? DK_SECTION : LT_BORDER));
+    HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, SC(6), SC(6));
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
+    wchar_t t[16]; GetWindowTextW(d->hwndItem, t, 16);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, on ? RGB(255, 255, 255) : (IsWindowEnabled(d->hwndItem) ? TXT_C : (gDark ? DK_DIM : gLtDim)));
+    HGDIOBJ of = SelectObject(dc, on ? gFontBold : gFont);
+    DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    SelectObject(dc, of);
+    if (d->itemState & ODS_FOCUS) { RECT f = rc; InflateRect(&f, -2, -2); DrawFocusRect(dc, &f); }
+}
+static float gChShown[CH_MAX], gOutShown[MAX_OUT];   // meters (falling slowly)
+static void DrawLevel(DRAWITEMSTRUCT* d, float lvl, bool live)
+{
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    RECT tr = rc; tr.top += 2; tr.bottom -= 2;
+    HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(dc, &tr, tb); DeleteObject(tb);
+    if (!live) return;
+    float db = lvl > 0.00001f ? 20.0f * log10f(lvl) : -100.0f;
+    float pos = ((db + 60.0f) / 60.0f < 0 ? 0.0f : (db + 60.0f) / 60.0f > 1 ? 1.0f : (db + 60.0f) / 60.0f);
+    RECT fr = tr; fr.right = tr.left + (LONG)((tr.right - tr.left) * pos);
+    HBRUSH fb = CreateSolidBrush(db > -3.0f ? RGB(220, 70, 60) : METER_C); FillRect(dc, &fr, fb); DeleteObject(fb);
+}
+static void MixerMeterTick()                    // (50 ms) meters on the Mixer page
+{
+    if (gPage != PAGE_MIXER || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
+    for (int c = 0; c < CH_MAX; c++) {
+        float pk = gChA[c].peak; gChA[c].peak = 0;
+        float v = gCh[c].mute ? 0 : pk * gCh[c].vol / 100.0f;
+        gChShown[c] = v > gChShown[c] ? v : gChShown[c] * 0.82f;
+        InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE);
+    }
+    for (int k = 0; k < MAX_OUT && k < gRows; k++) {
+        float v = gOutPeak[k]; gOutPeak[k] = 0;  // (the Main page's meters aren't showing: this page takes the peaks)
+        gOutShown[k] = v > gOutShown[k] ? v : gOutShown[k] * 0.82f;
+        InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE);
+    }
+}
+static void MixerRefresh()                      // after a profile / settings change
+{
+    for (int c = 0; c < CH_MAX; c++) {
+        ChanComboShow(c, GetDlgItem(gWnd, IDC_CHSRC0 + c));
+        SendDlgItemMessageW(gWnd, SPIN_UD(IDC_CHVOL0 + c), UDM_SETPOS32, 0, gCh[c].vol);
+    }
+    for (int k = 0; k < MAX_OUT; k++) SendDlgItemMessageW(gWnd, SPIN_UD(IDC_OVOL0 + k), UDM_SETPOS32, 0, gRowVol[k]);
+    InvalidateRect(gWnd, nullptr, FALSE);
+}
+
 static void PictureInfo()
 {
     const wchar_t* base = wcsrchr(gPicPath, L'\\');
@@ -7672,13 +7953,13 @@ static const GUID kIID_ISpObjectTokenCategory  = { 0x2D3D3845, 0x39AF, 0x4850, {
 static const GUID kCLSID_SpObjectToken = { 0xEF411752, 0x3736, 0x4CB4, { 0x9C, 0x8C, 0x8E, 0xF4, 0xCC, 0xB5, 0x8E, 0xFE } };
 static const GUID kIID_ISpObjectToken  = { 0x14056589, 0xE16C, 0x11D2, { 0xBB, 0x90, 0x00, 0xC0, 0x4F, 0x8E, 0xE6, 0xC0 } };
 
-#define TTS_MAX_VOICES 64
-static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][256];
+#define TTS_MAX_VOICES 1000                  // the natural-voices add-on alone brings hundreds (Edge has most languages)
+static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][512];
 static int     gTtsLang[TTS_MAX_VOICES];        // each voice's language (Windows LCID, e.g. 0x080A = Spanish, Mexico)
 static int     gTtsCount = 0;
 static volatile LONG gTtsBusy = 0;
 
-struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][256]; int lang[TTS_MAX_VOICES]; int count; };
+struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][512]; int lang[TTS_MAX_VOICES]; int count; };
 static void TtsEnum(VoiceList& v)               // every installed voice (any thread)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED); // usually already done by the audio library; harmless if so
@@ -7697,7 +7978,7 @@ static void TtsEnum(VoiceList& v)               // every installed voice (any th
                     bool dup = false;
                     for (int i = 0; i < v.count; i++) if (!lstrcmpiW(v.names[i], name)) dup = true;
                     if (!dup) {
-                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 256);
+                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 512);
                         v.lang[v.count] = 0;
                         ISpDataKey* attr = nullptr; LPWSTR lang = nullptr;   // "Language" = hex LCID(s), e.g. "409;9"
                         if (SUCCEEDED(tok->OpenKey(L"Attributes", &attr)) && attr) {
@@ -7761,7 +8042,7 @@ static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[256]; int rate, pitch, room; bool natural; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural, split, vary; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -7941,13 +8222,13 @@ static int TtsPhrase(wchar_t* t, int cap, int accent)   // the accent's words, o
 // ---- sounding less like a robot ----
 // 1. Prosody: every sentence gets a slightly different pace and pitch, with a natural pause after it
 //    (SAPI XML; if a voice won't take it, the plain text is spoken instead).
-static void TtsProsody(const wchar_t* in, wchar_t* out, int cap)
+static void TtsProsody(const wchar_t* in, wchar_t* out, int cap, bool vary = true)
 {
     int o = 0;
     auto put = [&](const wchar_t* t) { while (*t && o < cap - 1) out[o++] = *t++; };
     auto sentence = [&](const wchar_t* a, const wchar_t* b) {
         wchar_t open[96];
-        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", (int)TtsRand(3) - 1, (int)TtsRand(5) - 2);
+        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", vary ? (int)TtsRand(3) - 1 : 0, vary ? (int)TtsRand(5) - 2 : 0);
         put(open);
         for (const wchar_t* q = a; q < b && o < cap - 8; q++) {
             if (*q == L'&') put(L"&amp;"); else if (*q == L'<') put(L"&lt;"); else if (*q == L'>') put(L"&gt;");
@@ -7978,12 +8259,17 @@ static void TtsHumanize(short* d, unsigned n, int room)
     static const int tapMs[4] = { 11, 17, 23, 31 }; static const float tapG[4] = { 0.12f, 0.09f, 0.07f, 0.05f };
     float* x = (float*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(float));
     if (!x) return;
-    float env = 0, peak = 0;
+    // Level: a slow, smooth 2:1 above -18 dB (power follower ~10 ms in / 150 ms out, gain smoothed again),
+    // so the gain never moves within a wave cycle (a fast one distorts: that was the crackle).
+    float pw = 0, g = 1.0f, peak = 0;
+    const float aIn = 1.0f - expf(-1.0f / (0.010f * RATE)), aOut = 1.0f - expf(-1.0f / (0.150f * RATE)), aG = 1.0f - expf(-1.0f / (0.005f * RATE));
     for (unsigned i = 0; i < n; i++) {
         float v = d[i] / 32768.0f;
         v = BqRun(highS, BqRun(pres, BqRun(lowS, BqRun(hp, v))));
-        float a = fabsf(v); env += (a - env) * (a > env ? 0.01f : 0.0005f);   // gentle 2:1 above -18 dB
-        const float thr = 0.126f; float g = env > thr ? powf(env / thr, -0.5f) : 1.0f;
+        float p2 = v * v; pw += (p2 - pw) * (p2 > pw ? aIn : aOut);
+        const float rms = sqrtf(pw) * 1.414f, thr = 0.126f;
+        const float want = rms > thr ? sqrtf(thr / rms) : 1.0f;
+        g += (want - g) * aG;
         x[i] = v * g;
     }
     for (unsigned i = n; i-- > 0;) {            // early reflections (from the dry signal, read backwards so it isn't reused)
@@ -7992,8 +8278,13 @@ static void TtsHumanize(short* d, unsigned n, int room)
         x[i] += r;
         float a = fabsf(x[i]); if (a > peak) peak = a;
     }
-    const float norm = peak > 0.0001f ? 0.89f / peak : 1.0f;   // to about -1 dB
-    for (unsigned i = 0; i < n; i++) { float v = x[i] * norm; d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f); }
+    const float norm = peak > 0.0001f ? 0.708f / peak : 1.0f;  // to -3 dB: room for the volume going up to 200%
+    const unsigned fade = Imin((int)n / 4, RATE / 200);          // 5 ms in / out: no click at the ends
+    for (unsigned i = 0; i < n; i++) {
+        float v = x[i] * norm;
+        if (i < fade) v *= i / (float)fade; else if (n - i <= fade) v *= (n - i) / (float)fade;
+        d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f);
+    }
     HeapFree(GetProcessHeap(), 0, x);
 }
 
@@ -8014,6 +8305,41 @@ static void TtsRepitch(short*& d, unsigned& n, int semis)   // the whole line hi
     d = o; n = m;
 }
 
+// Band-limited (windowed-sinc, 32 taps) resampling to 48 kHz, then a peak limit: the speech never clips.
+static void TtsResample(short*& d, unsigned& n, int srcRate)
+{
+    if (!d || !n) return;
+    if (srcRate != RATE && srcRate > 0) {
+        const double step = (double)srcRate / RATE;                 // source samples per output sample
+        const unsigned m = (unsigned)((double)n / step);
+        short* o = (short*)HeapAlloc(GetProcessHeap(), 0, (size_t)m * sizeof(short));
+        if (!o) return;
+        const double fc = srcRate < RATE ? 0.5 * 0.92 : 0.5 / step * 0.92;   // keep just under the lower Nyquist
+        const int T = 16;
+        for (unsigned i = 0; i < m; i++) {
+            const double t = i * step; const int c = (int)t;
+            double acc = 0, wsum = 0;
+            for (int k = c - T + 1; k <= c + T; k++) {
+                const double x = t - k;
+                const double sx = fabs(x) < 1e-9 ? 2 * fc : sin(2 * 3.141592653589793 * fc * x) / (3.141592653589793 * x);
+                const double wpos = (x + T) / (2.0 * T);              // Blackman window over the taps
+                const double w = wpos <= 0 || wpos >= 1 ? 0 : 0.42 - 0.5 * cos(2 * 3.141592653589793 * wpos) + 0.08 * cos(4 * 3.141592653589793 * wpos);
+                const double kk = sx * w; wsum += kk;
+                if (k >= 0 && k < (int)n) acc += d[k] * kk;
+            }
+            const double v = wsum != 0 ? acc / wsum : 0;
+            o[i] = (short)(v > 32767 ? 32767 : v < -32767 ? -32767 : v);
+        }
+        HeapFree(GetProcessHeap(), 0, d);
+        d = o; n = m;
+    }
+    int peak = 0; for (unsigned i = 0; i < n; i++) peak = Imax(peak, d[i] < 0 ? -d[i] : d[i]);
+    if (peak > 23170) {                         // louder than -3 dB: bring it down (room for the volume and your mic)
+        const float g = 23170.0f / peak;
+        for (unsigned i = 0; i < n; i++) d[i] = (short)(d[i] * g);
+    }
+}
+
 static bool TtsRender(TtsJob* j, bool useVoice)
 {
     bool ok = false;
@@ -8026,23 +8352,77 @@ static bool TtsRender(TtsJob* j, bool useVoice)
             tok->Release();
         }
     }
-    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0 };
+    // Taken at (about) the voice's own rate: Windows' converter up to 48 kHz just joins the dots, which sounds
+    // crackly / harsh. TtsResample does it properly afterwards.
+    const DWORD sr = j->srcRate > 0 ? (DWORD)j->srcRate : RATE;
+    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, sr, sr * 2, 2, 16, 0 };
     if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &mem)) &&
         SUCCEEDED(CoCreateInstance(kCLSID_SpStream, nullptr, CLSCTX_ALL, kIID_ISpStream, (void**)&ss)) &&
         SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
         SUCCEEDED(v->SetOutput(ss, TRUE)) &&
-        SUCCEEDED(v->SetRate(Iclamp(j->rate, -10, 10))) &&
-        ((j->xml[0] && SUCCEEDED(v->Speak(j->xml, SPF_DEFAULT | SPF_IS_XML, nullptr))) ||
-         SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr)))) {
-        STATSTG st = {};
+        SUCCEEDED(v->SetRate(Iclamp(j->rate, -10, 10)))) {
+        // Natural sound: each sentence is spoken on its own (its own pace if the voice is an older one), then they're
+        // joined here: trimmed, faded in / out and with a real pause between, so nothing clicks at the joins
+        // (letting the voice make the pauses / pace changes itself split the audio mid-wave, which crackled).
+        const int MAXS = 64;
+        unsigned cut[MAXS + 1]; int ns = 0; cut[0] = 0;
+        bool spoke = false;
+        if (j->split) {
+            const wchar_t* a = j->text;
+            for (const wchar_t* q = j->text; ns < MAXS; q++) {
+                bool end = !*q || ((*q == L'.' || *q == L'!' || *q == L'?') && (q[1] == L' ' || !q[1]));
+                if (!end) continue;
+                const wchar_t* b = *q ? q + 1 : q;
+                wchar_t one[600]; int len = (int)(b - a); if (len > 599) len = 599;
+                memcpy(one, a, len * sizeof(wchar_t)); one[len] = 0;
+                bool any = false; for (int k = 0; k < len; k++) if (one[k] > L' ') any = true;
+                if (any) {
+                    v->SetRate(Iclamp(j->rate + (j->vary ? (int)TtsRand(3) - 1 : 0), -10, 10));
+                    if (SUCCEEDED(v->Speak(one, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
+                        spoke = true;
+                        STATSTG st = {}; mem->Stat(&st, STATFLAG_NONAME);
+                        cut[++ns] = (unsigned)(st.cbSize.QuadPart / 2);
+                    }
+                }
+                if (!*q) break;
+                a = q + 1;
+            }
+        } else if (SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
+            spoke = true;
+            STATSTG st = {}; mem->Stat(&st, STATFLAG_NONAME);
+            cut[++ns] = (unsigned)(st.cbSize.QuadPart / 2);
+        }
         HGLOBAL hg = nullptr;
-        if (SUCCEEDED(mem->Stat(&st, STATFLAG_NONAME)) && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
-            unsigned n = (unsigned)(st.cbSize.QuadPart / 2);
-            if (n > (unsigned)RATE * 60) n = RATE * 60;
+        if (spoke && ns > 0 && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
             const short* src = (const short*)GlobalLock(hg);
-            if (src && n > RATE / 20) {
-                j->data = (short*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(short));
-                if (j->data) { memcpy(j->data, src, n * sizeof(short)); j->len = n; ok = true; }
+            unsigned total = cut[ns];
+            if (src && total > sr / 20) {
+                const unsigned pauseMax = sr * 2;
+                unsigned cap = total + (unsigned)ns * pauseMax;
+                if (cap > sr * 90) cap = sr * 90;
+                short* out = (short*)HeapAlloc(GetProcessHeap(), 0, (size_t)cap * sizeof(short));
+                unsigned o = 0;
+                for (int k = 0; out && k < ns; k++) {
+                    unsigned b = cut[k], e = cut[k + 1];
+                    if (ns > 1) {                   // trim the voice's own silence at both ends (a little kept)
+                        while (b < e && abs(src[b]) < 150) b++;
+                        while (e > b && abs(src[e - 1]) < 150) e--;
+                        b = b > cut[k] + sr / 50 ? b - sr / 50 : cut[k];
+                        e = e + sr / 25 < cut[k + 1] ? e + sr / 25 : cut[k + 1];
+                    }
+                    const unsigned L = e - b, fin = Imin((int)L / 4, (int)sr / 300), fout = Imin((int)L / 4, (int)sr / 100);
+                    for (unsigned i = 0; i < L && o < cap; i++) {
+                        float x = src[b + i];
+                        if (i < fin) x *= i / (float)fin; else if (L - i <= fout) x *= (L - i) / (float)fout;
+                        out[o++] = (short)x;
+                    }
+                    if (k < ns - 1) {               // the pause before the next sentence
+                        unsigned p = (unsigned)((120 + TtsRand(160)) * Iclamp(gTtsPause, 0, 300) / 100) * sr / 1000;
+                        for (unsigned i = 0; i < p && o < cap; i++) out[o++] = 0;
+                    }
+                }
+                if (out && o > sr / 20) { j->data = out; j->len = o; ok = true; }
+                else if (out) HeapFree(GetProcessHeap(), 0, out);
             }
             if (src) GlobalUnlock(hg);
         }
@@ -8058,6 +8438,7 @@ static DWORD WINAPI TtsThread(LPVOID arg)
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    if (j->ok) TtsResample(j->data, j->len, j->srcRate);
     if (j->ok) TtsRepitch(j->data, j->len, j->pitch);
     if (j->ok && j->natural) TtsHumanize(j->data, j->len, j->room);
     CoUninitialize();
@@ -8162,14 +8543,20 @@ static void TtsSpeakNow(const wchar_t* given)
     if (!j) { gTtsBusy = 0; return; }
     lstrcpynW(j->text, text, 600);
     int sel = (int)SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_GETCURSEL, 0, 0);
-    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 256);
+    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 512);
     if (gTtsAccent > 0 && gTtsAccent < TTS_ACCENT_N) {   // the accent's voice wins (if it's installed)
         int v = TtsVoiceFor(gTtsAccent);
-        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
+        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 512);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
     j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
-    if (gTtsNatural) TtsProsody(j->text, j->xml, 3000);
+    // The realistic ("Natural") voices already sound human: they only get the pauses, not the per-sentence
+    // pace / pitch changes or the processing (which only made them worse, and could crackle).
+    bool realVoice = false;
+    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsIds[i], j->voice)) realVoice = TtsIsNatural(gTtsNames[i]);
+    if (realVoice) j->natural = false;
+    j->srcRate = realVoice ? 24000 : 22050;    // what the voices actually make (natural ones 24 kHz, older ones ~22 kHz)
+    j->split = gTtsNatural; j->vary = gTtsNatural && !realVoice;   // sentence by sentence (see TtsRender)
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
@@ -8852,6 +9239,7 @@ static void AddTips()
     TipId(IDC_TAB0 + PAGE_SOUND,    L"Soundboard: 8 pads of short sounds on hotkeys, played to Discord and your outputs.");
     TipId(IDC_TAB0 + PAGE_CLIPS,    L"Instant replay: save the last few seconds as a clip, trim it, and play it back on a hotkey.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
+    TipId(IDC_TAB0 + PAGE_MIXER,    L"Mixer: bring in apps (Spotify, a game, a browser) and other inputs, set their volume and send each to the outputs you want.");
     TipId(IDC_CLIPNOW,    L"Save the last few seconds as a new clip (fills the next empty slot below).");
     TipId(IDC_CLIPNOWKEY, L"A hotkey for Clip it, so you can clip from inside a game. Right-click to clear it.");
     TipId(IDC_RECSECS,    L"How many seconds each clip saves (3 to 60).");
@@ -9798,6 +10186,9 @@ static void Layout()
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
         if (cid == IDC_SONGSRC || cid == IDC_SONGSTATUS) vis = vis && songStyle;
         if (cid == IDC_VOICEPROG) vis = vis && gVoiceInstalling;
+        if (cid >= IDC_CHRT0 && cid < IDC_CHRT0 + CH_MAX * MAX_OUT) vis = vis && (cid - IDC_CHRT0) % MAX_OUT < gRows;
+        for (int k = gRows; k < MAX_OUT; k++)
+            if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == SPIN_UD(IDC_OVOL0 + k) || cid == IDC_OMETER0 + k) vis = false;
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
@@ -9874,7 +10265,7 @@ static void RemoveOutput(int k)
 
 struct UpdateJob {
     bool manual, ok, newer;
-    wchar_t error[300], tag[64], url[1024], notes[700];
+    wchar_t error[300], tag[64], url[1024], notes[1800];
 };
 
 static void* MemAlloc(size_t n)            { return HeapAlloc(GetProcessHeap(), 0, n); }
@@ -10143,11 +10534,11 @@ static DWORD WINAPI CheckThread(LPVOID arg)
         DWORD len = 0;
         char* json = HttpGet(api, &len, job->error, 300);
         if (json) {
-            char tag[64] = "", notes[690] = "", url[1024] = "";
+            char tag[64] = "", notes[1700] = "", url[1024] = "";
             const char* p = json;
             JsonString(json, "tag_name", &p, tag, 64);
             p = json;
-            if (JsonString(json, "body", &p, notes, 690)) {} else notes[0] = 0;
+            if (JsonString(json, "body", &p, notes, 1700)) {} else notes[0] = 0;
             p = json;
             while (JsonString(json, "browser_download_url", &p, url, 1024)) {
                 int n = lstrlenA(url);
@@ -10156,7 +10547,7 @@ static DWORD WINAPI CheckThread(LPVOID arg)
             }
             MemFree(json);
             Widen(tag, job->tag, 64);
-            Widen(notes, job->notes, 700);
+            Widen(notes, job->notes, 1800);
             Widen(url, job->url, 1024);
             if (!tag[0])      lstrcpynW(job->error, L"The latest release has no version tag.", 300);
             else if (!url[0]) lstrcpynW(job->error, L"The latest release has no .exe attached.", 300);
@@ -10231,9 +10622,21 @@ static void OnUpdateChecked(UpdateJob* job)
         MemFree(job);
         return;
     }
-    wchar_t msg[1200];
-    wsprintfW(msg, L"Version %s is available (you have %s).\n\n%s%sUpdate now? Lag Effect will restart.",
-              job->tag, APP_VERSION, job->notes, job->notes[0] ? L"\n\n" : L"");
+    // What's new, made readable: no markdown symbols, bullets as dots. (Built with lstrcat: wsprintf stops at 1024 characters.)
+    wchar_t nice[1800]; int o = 0;
+    for (const wchar_t* q = job->notes; *q && o < 1790; ) {
+        const bool lineStart = q == job->notes || q[-1] == L'\n';
+        if (lineStart && *q == L'#') { while (*q == L'#' || *q == L' ') q++; continue; }
+        if (lineStart && (*q == L'-' || *q == L'*') && q[1] == L' ') { nice[o++] = 0x2022; q++; continue; }
+        if (*q == L'*' && q[1] == L'*') { q += 2; continue; }
+        if (*q == L'\r') { q++; continue; }
+        nice[o++] = *q++;
+    }
+    nice[o] = 0;
+    wchar_t msg[2400];
+    wsprintfW(msg, L"Version %s is available (you have %s).\n\n", job->tag, APP_VERSION);
+    lstrcatW(msg, nice);
+    lstrcatW(msg, nice[0] ? L"\n\nUpdate now? Lag Effect will restart." : L"Update now? Lag Effect will restart.");
     if (MessageBoxW(gWnd, msg, L"Lag Effect - Update available", MB_YESNO | MB_ICONINFORMATION) != IDYES) {
         gUpdateBusy = false;
         MemFree(job);
@@ -10681,9 +11084,11 @@ static void CreateUI()
     // Tabs (always visible). Drawn by DrawTab().
     gBuildPage = -1;
     {
-        const wchar_t* tabNames[TAB_COUNT] = { L"Main", L"Mic", L"Voice FX", L"Soundboard", L"Clips", L"Settings" };
-        for (int t = 0; t < TAB_COUNT; t++)
-            Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + t * 87, 10, 85, 32, IDC_TAB0 + t);
+        const wchar_t* tabNames[TAB_COUNT] = { L"Main", L"Mic", L"Voice FX", L"Soundboard", L"Clips", L"Settings", L"Mixer" };
+        for (int slot = 0; slot < TAB_COUNT; slot++) {
+            const int t = TAB_ORDER[slot];
+            Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + slot * 76, 10, 74, 32, IDC_TAB0 + t);
+        }
     }
 
     // ---------------- Main page ----------------
@@ -11301,6 +11706,40 @@ static void CreateUI()
     Ctl(L"STATIC", L"Lower = less CPU and memory (GIFs keep their speed).", 0, 30, 396, 500, 18, IDC_HDR);
     gBuildSub = -1;
 
+
+    // ---------------- Mixer page ----------------
+    gBuildPage = PAGE_MIXER;
+    AddSection(14, 58, 532, 420, L"Channels");
+    Ctl(L"STATIC", L"Source", 0, 30, 78, 196, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Volume", 0, 290, 78, 64, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Level", 0, 362, 78, 70, 18, IDC_HDR);
+    Ctl(L"STATIC", L"Send to output", 0, 438, 78, 100, 18, IDC_HDR);
+    for (int c = 0; c < CH_MAX; c++) {
+        const int y = 100 + c * 44;
+        HWND src = Ctl(L"COMBOBOX", L"", COMBO | (c == 0 ? WS_GROUP : 0), 30, y, 196, 300, IDC_CHSRC0 + c);
+        ChanComboShow(c, src);
+        Ctl(L"BUTTON", L"Mute", BS_OWNERDRAW | WS_TABSTOP, 232, y - 1, 52, 26, IDC_CHMUTE0 + c);
+        Spin(IDC_CHVOL0 + c, 290, y, 64, 0, 200, gCh[c].vol);
+        Ctl(L"STATIC", L"", SS_OWNERDRAW, 362, y + 5, 70, 14, IDC_CHMETER0 + c);
+        for (int k = 0; k < MAX_OUT; k++) {
+            wchar_t n[4]; wsprintfW(n, L"%d", k + 1);
+            Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, 438 + k * 19, y - 1, 17, 26, IDC_CHRT0 + c * MAX_OUT + k);
+        }
+    }
+    Ctl(L"STATIC", L"Pick an app (it's recorded on its own, even if it isn't playing yet) or an input like a second mic. "
+                   L"Lit numbers = the outputs it goes to.", 0, 30, 450, 500, 22, IDC_HDR);
+
+    AddSection(14, 494, 532, 90, L"Outputs");
+    for (int k = 0; k < MAX_OUT; k++) {
+        const int x = 30 + k * 103;
+        wchar_t n[16]; wsprintfW(n, L"Out %d", k + 1);
+        Ctl(L"STATIC", n, 0, x, 516, 44, 18, IDC_OLBL0 + k);
+        Ctl(L"BUTTON", L"Mute", BS_OWNERDRAW | WS_TABSTOP | (k == 0 ? WS_GROUP : 0), x + 46, 512, 50, 24, IDC_OMUTE0 + k);
+        Spin(IDC_OVOL0 + k, x, 542, 62, 0, 200, gRowVol[k]);
+        Ctl(L"STATIC", L"", SS_OWNERDRAW, x + 66, 548, 30, 12, IDC_OMETER0 + k);
+    }
+    gBuildPage = -1;
+
     // compact mode's own buttons (shown only in compact mode)
     gBuildPage = -1;
     ShowWindow(Ctl(L"BUTTON", L"Voice FX", WS_TABSTOP, 276, 42, 128, 34, IDC_COMPACTFX), SW_HIDE);
@@ -11387,6 +11826,11 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, active ? (TXT_C) : (gDark ? DK_DIM : RGB(105, 105, 105)));
     RECT tr = rc; tr.bottom -= 3;
+    for (int lvl = 1; lvl <= 3; lvl++) {        // (seven tabs are narrower: a long name in a wide font gets a smaller size)
+        SIZE sz; GetTextExtentPoint32W(dc, text, lstrlenW(text), &sz);
+        if (sz.cx <= tr.right - tr.left - 6) break;
+        SelectObject(dc, FitFont(lvl));
+    }
     DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
     if (active) {
@@ -11886,12 +12330,61 @@ static void OnCommand(int id, int code)
         else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gRecSeconds, FALSE);
         return;
     }
+    if (id >= IDC_CHSRC0 && id < IDC_CHSRC0 + CH_MAX) {
+        const int c = id - IDC_CHSRC0;
+        HWND cb = GetDlgItem(gWnd, id);
+        if (code == CBN_DROPDOWN) { HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT)); ChanComboFill(c, cb); SetCursor(old); }
+        else if (code == CBN_SELCHANGE) {
+            int i = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
+            if (i < 0 || i >= gChOptN) return;
+            const bool wasEmpty = gCh[c].type == CH_NONE;
+            if (gRunning) ChanStop(c);
+            gCh[c].type = gChOpts[i].type; lstrcpynW(gCh[c].src, gChOpts[i].src, 128);
+            if (wasEmpty && gCh[c].type != CH_NONE && !gCh[c].routes) gCh[c].routes = (1u << gRows) - 1;   // new: to every output
+            if (gRunning && gCh[c].type != CH_NONE) ChanStart(c);
+            for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), nullptr, FALSE);
+        } else if (code == CBN_CLOSEUP) {
+            ChanComboShow(c, cb);               // back to showing just its source
+        }
+        return;
+    }
+    if (id >= IDC_CHMUTE0 && id < IDC_CHMUTE0 + CH_MAX) {
+        if (code == BN_CLICKED) { gCh[id - IDC_CHMUTE0].mute = !gCh[id - IDC_CHMUTE0].mute; InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE); }
+        return;
+    }
+    if (id >= IDC_CHRT0 && id < IDC_CHRT0 + CH_MAX * MAX_OUT) {
+        if (code == BN_CLICKED) {
+            int c = (id - IDC_CHRT0) / MAX_OUT, k = (id - IDC_CHRT0) % MAX_OUT;
+            gCh[c].routes ^= 1u << k;
+            InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
+        }
+        return;
+    }
+    if (id >= IDC_OMUTE0 && id < IDC_OMUTE0 + MAX_OUT) {
+        if (code == BN_CLICKED) { gOutMute[id - IDC_OMUTE0] = !gOutMute[id - IDC_OMUTE0]; InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE); }
+        return;
+    }
+    if (id >= IDC_CHVOL0 && id < IDC_CHVOL0 + CH_MAX) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) gCh[id - IDC_CHVOL0].vol = Iclamp(v, 0, 200);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gCh[id - IDC_CHVOL0].vol, FALSE);
+        return;
+    }
+    if (id >= IDC_OVOL0 && id < IDC_OVOL0 + MAX_OUT) {   // the same volume as the output's row on the Main page
+        if (!gUiReady) return;
+        const int k = id - IDC_OVOL0;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v != gRowVol[k]) { gRowVol[k] = Iclamp(v, 0, 200); SendDlgItemMessageW(gWnd, SPIN_UD(IDC_ROWVOL + k), UDM_SETPOS32, 0, gRowVol[k]); }
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gRowVol[k], FALSE);
+        return;
+    }
     if (id >= IDC_ROWVOL && id < IDC_ROWVOL + MAX_OUT) {
         if (!gUiReady) return;
         int k = id - IDC_ROWVOL;
         BOOL ok = FALSE;
         int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
-        if (code == EN_CHANGE && ok) gRowVol[k] = Iclamp(v, 0, 200);
+        if (code == EN_CHANGE && ok) { gRowVol[k] = Iclamp(v, 0, 200); if (GetDlgItemInt(gWnd, IDC_OVOL0 + k, nullptr, FALSE) != (UINT)gRowVol[k]) SendDlgItemMessageW(gWnd, SPIN_UD(IDC_OVOL0 + k), UDM_SETPOS32, 0, gRowVol[k]); }
         else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gRowVol[k], FALSE);
         return;
     }
@@ -12104,6 +12597,14 @@ static void OnCommand(int id, int code)
 // them changes (e.g. a GIF background). The meter buffers itself; dropdown items aren't on the window background.
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
 {
+    if (w >= IDC_CHMUTE0 && w < IDC_CHMUTE0 + CH_MAX) { DrawToggle(d, gCh[w - IDC_CHMUTE0].mute, true); return true; }
+    if (w >= IDC_CHRT0 && w < IDC_CHRT0 + CH_MAX * MAX_OUT) {
+        int c = (int)(w - IDC_CHRT0) / MAX_OUT, k = (int)(w - IDC_CHRT0) % MAX_OUT;
+        DrawToggle(d, (gCh[c].routes >> k) & 1, false); return true;
+    }
+    if (w >= IDC_OMUTE0 && w < IDC_OMUTE0 + MAX_OUT) { DrawToggle(d, gOutMute[w - IDC_OMUTE0], true); return true; }
+    if (w >= IDC_CHMETER0 && w < IDC_CHMETER0 + CH_MAX) { int c = (int)(w - IDC_CHMETER0); DrawLevel(d, gChShown[c], gChA[c].live); return true; }
+    if (w >= IDC_OMETER0 && w < IDC_OMETER0 + MAX_OUT) { DrawLevel(d, gOutShown[w - IDC_OMETER0], gRunning); return true; }
     if ((d)->hwndItem == gStatus) { DrawStatus(d); return true; }
     if (w == IDC_VOICEPROG) { DrawVoiceProgress(d); return true; }
     if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
@@ -12147,7 +12648,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
-        if (w == TIMER_STATUS) { UpdateStatus(); UpdateMeter(); SongTick(); PadTick(); }
+        if (w == TIMER_STATUS) {
+            UpdateStatus(); UpdateMeter(); SongTick(); PadTick(); MixerMeterTick();
+            static int chTick = 0; if (++chTick >= 40) { chTick = 0; ChanTick(); }   // every 2 s: apps opened / closed
+        }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) { CleanupOldExe(); VoiceProgressTick(); }
         else if (w == TIMER_FXKEYS) PollFxKeys();
@@ -12474,7 +12978,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
             (msg.hwnd == h || IsChild(h, msg.hwnd))) {
-            SetPage((gPage + 1) % TAB_COUNT);   // Ctrl+Tab: next page
+            { int slot = 0; for (int i = 0; i < TAB_COUNT; i++) if (TAB_ORDER[i] == gPage) slot = i;   // Ctrl+Tab: next page
+              SetPage(TAB_ORDER[(slot + 1) % TAB_COUNT]); }
             continue;
         }
         if (msg.message == WM_KEYDOWN && msg.wParam >= '1' && msg.wParam < '1' + TAB_COUNT &&
