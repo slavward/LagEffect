@@ -1,0 +1,54 @@
+LagEffect.cpp
+D:\a\LagEffect\LagEffect\miniaudio.h(80532): warning C4244: '=': conversion from 'ma_uint64' to 'ma_uint32', possible loss of data
+LagEffect.cpp(1030): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1031): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1032): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1033): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1034): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1035): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1036): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1037): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(3616): error C2065: 'gChW': undeclared identifier
+LagEffect.cpp(3617): error C2065: 'gOutW': undeclared identifier
+LagEffect.cpp(4460): error C2065: 'gChW': undeclared identifier
+LagEffect.cpp(4460): error C2660: 'SaveInt': function does not take 1 arguments
+LagEffect.cpp(3784): note: see declaration of 'SaveInt'
+LagEffect.cpp(4460): note: while trying to match the argument list '(wchar_t [24])'
+LagEffect.cpp(4461): error C2065: 'gOutW': undeclared identifier
+LagEffect.cpp(4461): error C2660: 'SaveInt': function does not take 1 arguments
+LagEffect.cpp(3784): note: see declaration of 'SaveInt'
+LagEffect.cpp(4461): note: while trying to match the argument list '(wchar_t [24])'
+LagEffect.cpp(4786): error C2065: 'gOrgX': undeclared identifier
+LagEffect.cpp(4792): error C2065: 'gOrgX': undeclared identifier
+Generating Code...
+Compiling...
+denoise.c
+rnnoise\src\denoise.c(173): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(177): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(178): warning C4244: '*=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(193): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(343): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(346): warning C4305: '-=': truncation from 'double' to 'float'
+rnnoise\src\denoise.c(347): warning C4305: '-=': truncation from 'double' to 'float'
+rnnoise\src\denoise.c(348): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(352): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(353): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(355): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(397): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(416): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(417): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(434): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(435): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(437): warning C4244: '*=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(449): warning C4244: '=': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\denoise.c(470): warning C4305: 'initializing': truncation from 'double' to 'const float'
+rnnoise\src\denoise.c(470): warning C4305: 'initializing': truncation from 'double' to 'const float'
+rnn.c
+rnnoise\src\rnn.c(71): warning C4244: 'function': conversion from 'double' to 'float', possible loss of data
+rnnoise\src\rnn.c(71): warning C4244: 'return': conversion from 'double' to 'float', possible loss of data
+rnn_data.c
+pitch.c
+rnnoise\src\pitch.c(417): warning C4244: 'return': conversion from 'double' to 'opus_val16', possible loss of data
+kiss_fft.c
+celt_lpc.c
+Generating Code...
