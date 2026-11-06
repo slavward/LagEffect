@@ -26,7 +26,7 @@
 #define APP_VERSION L"1.0.0"
 #else
 #define MIXWARD_ON 0
-#define APP_VERSION L"1.32.1"
+#define APP_VERSION L"1.32.2"
 #endif
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
@@ -11531,26 +11531,51 @@ static DWORD WINAPI CheckThread(LPVOID arg)
     if (!RepoFromText(gUpdateRepo, repo, 200)) {
         lstrcpynW(job->error, L"Type your GitHub user/repo in the Updates box first (for example: yourname/LagEffect).", 300);
     } else {
-        wsprintfW(api, L"https://api.github.com/repos/%s/releases/latest", repo);
+        // Lag Effect and Mixward share one repo: Mixward's releases are tagged "mixward-v1.0.0", Lag Effect's "v1.32.1".
+        // So read the recent releases (newest first) and take the first one that's ours.
+        wsprintfW(api, L"https://api.github.com/repos/%s/releases?per_page=30", repo);
         DWORD len = 0;
         char* json = HttpGet(api, &len, job->error, 300);
         if (json) {
             char tag[64] = "", notes[1700] = "", url[1024] = "";
-            const char* p = json;
-            JsonString(json, "tag_name", &p, tag, 64);
-            p = json;
-            if (JsonString(json, "body", &p, notes, 1700)) {} else notes[0] = 0;
-            p = json;
-            while (JsonString(json, "browser_download_url", &p, url, 1024)) {
-                int n = lstrlenA(url);
-                if (n > 4 && lstrcmpiA(url + n - 4, ".exe") == 0) break;
-                url[0] = 0;
+            bool found = false;
+            char* at = strstr(json, "\"tag_name\"");
+            while (at && !found) {
+                char* next = strstr(at + 10, "\"tag_name\"");   // this release runs up to the next one's tag
+                char keep = 0; if (next) { keep = *next; *next = 0; }
+                const char* p = at;
+                char t[64] = "";
+                JsonString(at, "tag_name", &p, t, 64);
+                const bool mixTag = _strnicmp(t, "mixward-", 8) == 0;
+                if (MIXWARD_ON ? mixTag : (!mixTag && (t[0] == 'v' || t[0] == 'V' || (t[0] >= '0' && t[0] <= '9')))) {
+                    found = true;
+                    lstrcpynA(tag, mixTag ? t + 8 : t, 64);   // (just the version: "v1.0.0")
+                    p = at;
+                    const char* want = "/LagEffect.exe"; const int wl = lstrlenA(want);
+                    while (JsonString(at, "browser_download_url", &p, url, 1024)) {   // our exe (else any .exe)
+                        int n = lstrlenA(url);
+                        if (n > wl && lstrcmpiA(url + n - wl, want) == 0) break;
+                        url[0] = 0;
+                    }
+                    if (!url[0]) {
+                        p = at;
+                        while (JsonString(at, "browser_download_url", &p, url, 1024)) {
+                            int n = lstrlenA(url);
+                            if (n > 4 && lstrcmpiA(url + n - 4, ".exe") == 0) break;
+                            url[0] = 0;
+                        }
+                    }
+                    p = at;
+                    if (!JsonString(at, "body", &p, notes, 1700)) notes[0] = 0;
+                }
+                if (next) *next = keep;
+                at = next;
             }
             MemFree(json);
             Widen(tag, job->tag, 64);
             Widen(notes, job->notes, 1800);
             Widen(url, job->url, 1024);
-            if (!tag[0])      lstrcpynW(job->error, L"The latest release has no version tag.", 300);
+            if (!found)       lstrcpynW(job->error, L"No Lag Effect release found yet.", 300);
             else if (!url[0]) lstrcpynW(job->error, L"The latest release has no .exe attached.", 300);
             else { job->ok = true; job->newer = IsNewer(job->tag); }
         }
