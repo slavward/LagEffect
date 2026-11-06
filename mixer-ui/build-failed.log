@@ -1,25 +1,16 @@
 LagEffect.cpp
 D:\a\LagEffect\LagEffect\miniaudio.h(80532): warning C4244: '=': conversion from 'ma_uint64' to 'ma_uint32', possible loss of data
-LagEffect.cpp(1030): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1031): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1032): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1033): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1034): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1035): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1036): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1037): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(3616): error C2065: 'gChW': undeclared identifier
-LagEffect.cpp(3617): error C2065: 'gOutW': undeclared identifier
-LagEffect.cpp(4460): error C2065: 'gChW': undeclared identifier
-LagEffect.cpp(4460): error C2660: 'SaveInt': function does not take 1 arguments
-LagEffect.cpp(3784): note: see declaration of 'SaveInt'
-LagEffect.cpp(4460): note: while trying to match the argument list '(wchar_t [24])'
-LagEffect.cpp(4461): error C2065: 'gOutW': undeclared identifier
-LagEffect.cpp(4461): error C2660: 'SaveInt': function does not take 1 arguments
-LagEffect.cpp(3784): note: see declaration of 'SaveInt'
-LagEffect.cpp(4461): note: while trying to match the argument list '(wchar_t [24])'
-LagEffect.cpp(4786): error C2065: 'gOrgX': undeclared identifier
-LagEffect.cpp(4792): error C2065: 'gOrgX': undeclared identifier
+LagEffect.cpp(1056): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1057): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1058): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1059): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1060): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1061): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1062): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1063): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(4747): error C2065: 'PAGE_FX': undeclared identifier
+LagEffect.cpp(4747): error C2065: 'PAGE_SOUND': undeclared identifier
+LagEffect.cpp(4747): error C2065: 'PAGE_CLIPS': undeclared identifier
 Generating Code...
 Compiling...
 denoise.c
