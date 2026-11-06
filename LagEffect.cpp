@@ -4742,11 +4742,11 @@ static void StopAudio()
 #define TAB_COUNT 7
 #define TAB_SHOWN TAB_COUNT
 static const int TAB_ORDER[TAB_SHOWN] = { 0, 6, 1, 2, 3, 4, 5 };   // left to right (Mixer sits after Main)
+enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5, PAGE_MIXER = 6 };
 static bool PageOn(int page)                    // Voice FX, Soundboard and Clips only exist while their feature is on
 {
     return page == PAGE_FX ? gFeatFx : page == PAGE_SOUND ? gFeatSound : page == PAGE_CLIPS ? gFeatClips : true;
 }
-enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5, PAGE_MIXER = 6 };
 
 struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; int feat; };   // feat: shown only with that feature on   // ox/oy: moved by you (design px)
 struct Framed  { HWND edit, ud; };
