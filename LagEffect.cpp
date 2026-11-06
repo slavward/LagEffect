@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.28.2"
+#define APP_VERSION L"1.28.6"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -7672,13 +7672,13 @@ static const GUID kIID_ISpObjectTokenCategory  = { 0x2D3D3845, 0x39AF, 0x4850, {
 static const GUID kCLSID_SpObjectToken = { 0xEF411752, 0x3736, 0x4CB4, { 0x9C, 0x8C, 0x8E, 0xF4, 0xCC, 0xB5, 0x8E, 0xFE } };
 static const GUID kIID_ISpObjectToken  = { 0x14056589, 0xE16C, 0x11D2, { 0xBB, 0x90, 0x00, 0xC0, 0x4F, 0x8E, 0xE6, 0xC0 } };
 
-#define TTS_MAX_VOICES 64
-static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][256];
+#define TTS_MAX_VOICES 1000                  // the natural-voices add-on alone brings hundreds (Edge has most languages)
+static wchar_t gTtsNames[TTS_MAX_VOICES][128], gTtsIds[TTS_MAX_VOICES][512];
 static int     gTtsLang[TTS_MAX_VOICES];        // each voice's language (Windows LCID, e.g. 0x080A = Spanish, Mexico)
 static int     gTtsCount = 0;
 static volatile LONG gTtsBusy = 0;
 
-struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][256]; int lang[TTS_MAX_VOICES]; int count; };
+struct VoiceList { wchar_t names[TTS_MAX_VOICES][128], ids[TTS_MAX_VOICES][512]; int lang[TTS_MAX_VOICES]; int count; };
 static void TtsEnum(VoiceList& v)               // every installed voice (any thread)
 {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED); // usually already done by the audio library; harmless if so
@@ -7697,7 +7697,7 @@ static void TtsEnum(VoiceList& v)               // every installed voice (any th
                     bool dup = false;
                     for (int i = 0; i < v.count; i++) if (!lstrcmpiW(v.names[i], name)) dup = true;
                     if (!dup) {
-                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 256);
+                        lstrcpynW(v.names[v.count], name, 128); lstrcpynW(v.ids[v.count], id, 512);
                         v.lang[v.count] = 0;
                         ISpDataKey* attr = nullptr; LPWSTR lang = nullptr;   // "Language" = hex LCID(s), e.g. "409;9"
                         if (SUCCEEDED(tok->OpenKey(L"Attributes", &attr)) && attr) {
@@ -7761,7 +7761,7 @@ static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[256]; int rate, pitch, room; bool natural; short* data; unsigned len; bool ok; };
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural, split, vary; short* data; unsigned len; bool ok; };
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -7941,13 +7941,13 @@ static int TtsPhrase(wchar_t* t, int cap, int accent)   // the accent's words, o
 // ---- sounding less like a robot ----
 // 1. Prosody: every sentence gets a slightly different pace and pitch, with a natural pause after it
 //    (SAPI XML; if a voice won't take it, the plain text is spoken instead).
-static void TtsProsody(const wchar_t* in, wchar_t* out, int cap)
+static void TtsProsody(const wchar_t* in, wchar_t* out, int cap, bool vary = true)
 {
     int o = 0;
     auto put = [&](const wchar_t* t) { while (*t && o < cap - 1) out[o++] = *t++; };
     auto sentence = [&](const wchar_t* a, const wchar_t* b) {
         wchar_t open[96];
-        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", (int)TtsRand(3) - 1, (int)TtsRand(5) - 2);
+        wsprintfW(open, L"<rate speed=\"%d\"><pitch middle=\"%d\">", vary ? (int)TtsRand(3) - 1 : 0, vary ? (int)TtsRand(5) - 2 : 0);
         put(open);
         for (const wchar_t* q = a; q < b && o < cap - 8; q++) {
             if (*q == L'&') put(L"&amp;"); else if (*q == L'<') put(L"&lt;"); else if (*q == L'>') put(L"&gt;");
@@ -7978,12 +7978,17 @@ static void TtsHumanize(short* d, unsigned n, int room)
     static const int tapMs[4] = { 11, 17, 23, 31 }; static const float tapG[4] = { 0.12f, 0.09f, 0.07f, 0.05f };
     float* x = (float*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(float));
     if (!x) return;
-    float env = 0, peak = 0;
+    // Level: a slow, smooth 2:1 above -18 dB (power follower ~10 ms in / 150 ms out, gain smoothed again),
+    // so the gain never moves within a wave cycle (a fast one distorts: that was the crackle).
+    float pw = 0, g = 1.0f, peak = 0;
+    const float aIn = 1.0f - expf(-1.0f / (0.010f * RATE)), aOut = 1.0f - expf(-1.0f / (0.150f * RATE)), aG = 1.0f - expf(-1.0f / (0.005f * RATE));
     for (unsigned i = 0; i < n; i++) {
         float v = d[i] / 32768.0f;
         v = BqRun(highS, BqRun(pres, BqRun(lowS, BqRun(hp, v))));
-        float a = fabsf(v); env += (a - env) * (a > env ? 0.01f : 0.0005f);   // gentle 2:1 above -18 dB
-        const float thr = 0.126f; float g = env > thr ? powf(env / thr, -0.5f) : 1.0f;
+        float p2 = v * v; pw += (p2 - pw) * (p2 > pw ? aIn : aOut);
+        const float rms = sqrtf(pw) * 1.414f, thr = 0.126f;
+        const float want = rms > thr ? sqrtf(thr / rms) : 1.0f;
+        g += (want - g) * aG;
         x[i] = v * g;
     }
     for (unsigned i = n; i-- > 0;) {            // early reflections (from the dry signal, read backwards so it isn't reused)
@@ -7992,8 +7997,13 @@ static void TtsHumanize(short* d, unsigned n, int room)
         x[i] += r;
         float a = fabsf(x[i]); if (a > peak) peak = a;
     }
-    const float norm = peak > 0.0001f ? 0.89f / peak : 1.0f;   // to about -1 dB
-    for (unsigned i = 0; i < n; i++) { float v = x[i] * norm; d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f); }
+    const float norm = peak > 0.0001f ? 0.708f / peak : 1.0f;  // to -3 dB: room for the volume going up to 200%
+    const unsigned fade = Imin((int)n / 4, RATE / 200);          // 5 ms in / out: no click at the ends
+    for (unsigned i = 0; i < n; i++) {
+        float v = x[i] * norm;
+        if (i < fade) v *= i / (float)fade; else if (n - i <= fade) v *= (n - i) / (float)fade;
+        d[i] = (short)(v > 1 ? 32767 : v < -1 ? -32767 : v * 32767.0f);
+    }
     HeapFree(GetProcessHeap(), 0, x);
 }
 
@@ -8014,6 +8024,41 @@ static void TtsRepitch(short*& d, unsigned& n, int semis)   // the whole line hi
     d = o; n = m;
 }
 
+// Band-limited (windowed-sinc, 32 taps) resampling to 48 kHz, then a peak limit: the speech never clips.
+static void TtsResample(short*& d, unsigned& n, int srcRate)
+{
+    if (!d || !n) return;
+    if (srcRate != RATE && srcRate > 0) {
+        const double step = (double)srcRate / RATE;                 // source samples per output sample
+        const unsigned m = (unsigned)((double)n / step);
+        short* o = (short*)HeapAlloc(GetProcessHeap(), 0, (size_t)m * sizeof(short));
+        if (!o) return;
+        const double fc = srcRate < RATE ? 0.5 * 0.92 : 0.5 / step * 0.92;   // keep just under the lower Nyquist
+        const int T = 16;
+        for (unsigned i = 0; i < m; i++) {
+            const double t = i * step; const int c = (int)t;
+            double acc = 0, wsum = 0;
+            for (int k = c - T + 1; k <= c + T; k++) {
+                const double x = t - k;
+                const double sx = fabs(x) < 1e-9 ? 2 * fc : sin(2 * 3.141592653589793 * fc * x) / (3.141592653589793 * x);
+                const double wpos = (x + T) / (2.0 * T);              // Blackman window over the taps
+                const double w = wpos <= 0 || wpos >= 1 ? 0 : 0.42 - 0.5 * cos(2 * 3.141592653589793 * wpos) + 0.08 * cos(4 * 3.141592653589793 * wpos);
+                const double kk = sx * w; wsum += kk;
+                if (k >= 0 && k < (int)n) acc += d[k] * kk;
+            }
+            const double v = wsum != 0 ? acc / wsum : 0;
+            o[i] = (short)(v > 32767 ? 32767 : v < -32767 ? -32767 : v);
+        }
+        HeapFree(GetProcessHeap(), 0, d);
+        d = o; n = m;
+    }
+    int peak = 0; for (unsigned i = 0; i < n; i++) peak = Imax(peak, d[i] < 0 ? -d[i] : d[i]);
+    if (peak > 23170) {                         // louder than -3 dB: bring it down (room for the volume and your mic)
+        const float g = 23170.0f / peak;
+        for (unsigned i = 0; i < n; i++) d[i] = (short)(d[i] * g);
+    }
+}
+
 static bool TtsRender(TtsJob* j, bool useVoice)
 {
     bool ok = false;
@@ -8026,23 +8071,77 @@ static bool TtsRender(TtsJob* j, bool useVoice)
             tok->Release();
         }
     }
-    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, RATE, RATE * 2, 2, 16, 0 };
+    // Taken at (about) the voice's own rate: Windows' converter up to 48 kHz just joins the dots, which sounds
+    // crackly / harsh. TtsResample does it properly afterwards.
+    const DWORD sr = j->srcRate > 0 ? (DWORD)j->srcRate : RATE;
+    WAVEFORMATEX wf = { WAVE_FORMAT_PCM, 1, sr, sr * 2, 2, 16, 0 };
     if (SUCCEEDED(CreateStreamOnHGlobal(nullptr, TRUE, &mem)) &&
         SUCCEEDED(CoCreateInstance(kCLSID_SpStream, nullptr, CLSCTX_ALL, kIID_ISpStream, (void**)&ss)) &&
         SUCCEEDED(ss->SetBaseStream(mem, kSPDFID_WaveFormatEx, &wf)) &&
         SUCCEEDED(v->SetOutput(ss, TRUE)) &&
-        SUCCEEDED(v->SetRate(Iclamp(j->rate, -10, 10))) &&
-        ((j->xml[0] && SUCCEEDED(v->Speak(j->xml, SPF_DEFAULT | SPF_IS_XML, nullptr))) ||
-         SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr)))) {
-        STATSTG st = {};
+        SUCCEEDED(v->SetRate(Iclamp(j->rate, -10, 10)))) {
+        // Natural sound: each sentence is spoken on its own (its own pace if the voice is an older one), then they're
+        // joined here: trimmed, faded in / out and with a real pause between, so nothing clicks at the joins
+        // (letting the voice make the pauses / pace changes itself split the audio mid-wave, which crackled).
+        const int MAXS = 64;
+        unsigned cut[MAXS + 1]; int ns = 0; cut[0] = 0;
+        bool spoke = false;
+        if (j->split) {
+            const wchar_t* a = j->text;
+            for (const wchar_t* q = j->text; ns < MAXS; q++) {
+                bool end = !*q || ((*q == L'.' || *q == L'!' || *q == L'?') && (q[1] == L' ' || !q[1]));
+                if (!end) continue;
+                const wchar_t* b = *q ? q + 1 : q;
+                wchar_t one[600]; int len = (int)(b - a); if (len > 599) len = 599;
+                memcpy(one, a, len * sizeof(wchar_t)); one[len] = 0;
+                bool any = false; for (int k = 0; k < len; k++) if (one[k] > L' ') any = true;
+                if (any) {
+                    v->SetRate(Iclamp(j->rate + (j->vary ? (int)TtsRand(3) - 1 : 0), -10, 10));
+                    if (SUCCEEDED(v->Speak(one, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
+                        spoke = true;
+                        STATSTG st = {}; mem->Stat(&st, STATFLAG_NONAME);
+                        cut[++ns] = (unsigned)(st.cbSize.QuadPart / 2);
+                    }
+                }
+                if (!*q) break;
+                a = q + 1;
+            }
+        } else if (SUCCEEDED(v->Speak(j->text, SPF_DEFAULT | SPF_IS_NOT_XML, nullptr))) {
+            spoke = true;
+            STATSTG st = {}; mem->Stat(&st, STATFLAG_NONAME);
+            cut[++ns] = (unsigned)(st.cbSize.QuadPart / 2);
+        }
         HGLOBAL hg = nullptr;
-        if (SUCCEEDED(mem->Stat(&st, STATFLAG_NONAME)) && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
-            unsigned n = (unsigned)(st.cbSize.QuadPart / 2);
-            if (n > (unsigned)RATE * 60) n = RATE * 60;
+        if (spoke && ns > 0 && SUCCEEDED(GetHGlobalFromStream(mem, &hg))) {
             const short* src = (const short*)GlobalLock(hg);
-            if (src && n > RATE / 20) {
-                j->data = (short*)HeapAlloc(GetProcessHeap(), 0, n * sizeof(short));
-                if (j->data) { memcpy(j->data, src, n * sizeof(short)); j->len = n; ok = true; }
+            unsigned total = cut[ns];
+            if (src && total > sr / 20) {
+                const unsigned pauseMax = sr * 2;
+                unsigned cap = total + (unsigned)ns * pauseMax;
+                if (cap > sr * 90) cap = sr * 90;
+                short* out = (short*)HeapAlloc(GetProcessHeap(), 0, (size_t)cap * sizeof(short));
+                unsigned o = 0;
+                for (int k = 0; out && k < ns; k++) {
+                    unsigned b = cut[k], e = cut[k + 1];
+                    if (ns > 1) {                   // trim the voice's own silence at both ends (a little kept)
+                        while (b < e && abs(src[b]) < 150) b++;
+                        while (e > b && abs(src[e - 1]) < 150) e--;
+                        b = b > cut[k] + sr / 50 ? b - sr / 50 : cut[k];
+                        e = e + sr / 25 < cut[k + 1] ? e + sr / 25 : cut[k + 1];
+                    }
+                    const unsigned L = e - b, fin = Imin((int)L / 4, (int)sr / 300), fout = Imin((int)L / 4, (int)sr / 100);
+                    for (unsigned i = 0; i < L && o < cap; i++) {
+                        float x = src[b + i];
+                        if (i < fin) x *= i / (float)fin; else if (L - i <= fout) x *= (L - i) / (float)fout;
+                        out[o++] = (short)x;
+                    }
+                    if (k < ns - 1) {               // the pause before the next sentence
+                        unsigned p = (unsigned)((120 + TtsRand(160)) * Iclamp(gTtsPause, 0, 300) / 100) * sr / 1000;
+                        for (unsigned i = 0; i < p && o < cap; i++) out[o++] = 0;
+                    }
+                }
+                if (out && o > sr / 20) { j->data = out; j->len = o; ok = true; }
+                else if (out) HeapFree(GetProcessHeap(), 0, out);
             }
             if (src) GlobalUnlock(hg);
         }
@@ -8058,6 +8157,7 @@ static DWORD WINAPI TtsThread(LPVOID arg)
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    if (j->ok) TtsResample(j->data, j->len, j->srcRate);
     if (j->ok) TtsRepitch(j->data, j->len, j->pitch);
     if (j->ok && j->natural) TtsHumanize(j->data, j->len, j->room);
     CoUninitialize();
@@ -8162,14 +8262,20 @@ static void TtsSpeakNow(const wchar_t* given)
     if (!j) { gTtsBusy = 0; return; }
     lstrcpynW(j->text, text, 600);
     int sel = (int)SendDlgItemMessageW(gWnd, IDC_TTSVOICE, CB_GETCURSEL, 0, 0);
-    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 256);
+    if (sel > 0 && sel - 1 < gTtsCount) lstrcpynW(j->voice, gTtsIds[sel - 1], 512);
     if (gTtsAccent > 0 && gTtsAccent < TTS_ACCENT_N) {   // the accent's voice wins (if it's installed)
         int v = TtsVoiceFor(gTtsAccent);
-        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 256);
+        if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 512);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
     }
     j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
-    if (gTtsNatural) TtsProsody(j->text, j->xml, 3000);
+    // The realistic ("Natural") voices already sound human: they only get the pauses, not the per-sentence
+    // pace / pitch changes or the processing (which only made them worse, and could crackle).
+    bool realVoice = false;
+    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsIds[i], j->voice)) realVoice = TtsIsNatural(gTtsNames[i]);
+    if (realVoice) j->natural = false;
+    j->srcRate = realVoice ? 24000 : 22050;    // what the voices actually make (natural ones 24 kHz, older ones ~22 kHz)
+    j->split = gTtsNatural; j->vary = gTtsNatural && !realVoice;   // sentence by sentence (see TtsRender)
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speaking...");
     HANDLE t = CreateThread(nullptr, 0, TtsThread, j, 0, nullptr);
     if (t) CloseHandle(t); else { HeapFree(GetProcessHeap(), 0, j); gTtsBusy = 0; SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak"); }
