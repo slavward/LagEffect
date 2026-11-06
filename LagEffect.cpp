@@ -21,14 +21,8 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#ifdef MIXWARD                                  // Mixward: this app without the voice effects (built from this file, see build.yml)
-#define MIXWARD_ON 1
-#define APP_VERSION L"1.0.0"
-#else
-#define MIXWARD_ON 0
-#define APP_VERSION L"1.32.2"
-#endif
-#define DEFAULT_UPDATE_REPO L"slavward/Lag" L"Effect"   // (split: Mixward is built by renaming "LagEffect", and shares this repo)
+#define APP_VERSION L"1.33.0"
+#define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
 #define _UNICODE
@@ -101,13 +95,8 @@ static volatile int   gTalkVolPct = 100;
 static volatile int   gHotkeys[MAX_KEYS] = { VK_F8, 0, 0 };
 static volatile bool  gToggleMode = false, gTalkOver = false;
 static volatile bool  gCapturingKey = false, gLooping = false;
-#ifdef MIXWARD
-#define DEF_MODE0 MODE_CLEAN
-#define DEF_MODEK MODE_APPS
-#else
 #define DEF_MODE0 MODE_ALL
 #define DEF_MODEK MODE_EFFECT
-#endif
 static volatile int   gRowMode[MAX_OUT] = { DEF_MODE0, DEF_MODEK, DEF_MODEK, DEF_MODEK, DEF_MODEK };
 static volatile int   gRowVol[MAX_OUT]  = { 100, 100, 100, 100, 100 };
 
@@ -135,6 +124,11 @@ static volatile float gOutPeak[8];               // per output, for the little m
 static float gOutShow[8] = { -80, -80, -80, -80, -80, -80, -80, -80 };
 // Random lag: the stutter fires by itself now and then. Rewind / Repeat word: hotkey requests to the audio thread.
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
+// Settings > Features: each of these is hidden and doesn't run at all while it's off (new installs: all off).
+static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false;
+enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8 };
+static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips); }
+static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
 static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
 static volatile int  gRewindTop = 350, gRewindRamp = 30, gRewindPitch = 0;   // Rewind: top speed %, % of it spent speeding up, semitones
 static volatile bool gTapeReq = false, gDiveHeld = false, gBeatSync = false, gFxBypass = false;   // A/B: hear yourself dry
@@ -2101,7 +2095,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     float* out = (float*)output;                // stereo
     const float* in = (const float*)input;      // mono
 
-    bool down = !gCapturingKey && ComboDown();
+    bool down = gFeatLag && !gCapturingKey && ComboDown();
     bool active;
     if (gToggleMode) { if (down && !prevDown) toggled = !toggled; active = toggled; }
     else             { toggled = false; active = down; }
@@ -2110,7 +2104,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     // Random lag: now and then the stutter fires by itself (a short random loop for a random time).
     const bool keyActive = active;
     bool randActive = false;
-    if (gRandLagOn) {
+    if (gRandLagOn && gFeatLag) {
         if (randLeft > 0) { randLeft -= (int)frames; randActive = true; }
         else {
             if (randWait <= 0) {                // next one in a random time, Every on average
@@ -2207,7 +2201,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (fade * 2 > len) fade = len / 2.0;
 
     if (gFxResetReq) { FxReset(); gFxResetReq = false; }
-    const bool fxNow = gFxOn && !gFxBypass;     // A/B button held: you hear yourself without effects
+    const bool fxNow = gFxOn && gFeatFx && !gFxBypass;   // A/B button held: you hear yourself without effects (and off with the feature)
     const bool   fxPitch = fxNow && gFxPitchOn;
     const bool   fxRev   = fxNow && gFxRevOn;
     const bool   fxVoc   = fxNow && gFxVocOn;
@@ -2530,7 +2524,8 @@ enum {
     IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6,   // Voice FX sub-tabs: consecutive
     IDC_MICSUB0, IDC_MICSUB1,                   // Mic tab sub-tabs: consecutive
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
-    IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2,      // Settings sub-tabs: consecutive
+    IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2, IDC_SETSUB3,   // Settings sub-tabs: consecutive
+    IDC_FEATLAG, IDC_FEATFX, IDC_FEATSOUND, IDC_FEATCLIPS,
     IDC_COLRESET, IDC_FONT, IDC_OPACITY, IDC_PICCHOOSE, IDC_PICREMOVE, IDC_PICFIT, IDC_PICDIM, IDC_PICINFO, IDC_CORNERS,
     IDC_PTTMODE, IDC_PTTKEY, IDC_OVERLAY, IDC_BEEPS, IDC_UISCALE, IDC_EXPORT, IDC_IMPORT, IDC_COMPACT, IDC_COMPACTFX,
     IDC_COMPACTFULL, IDC_PROFAUTO, IDC_PROFAUTOINFO, IDC_VERSION,
@@ -2803,7 +2798,7 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun" };
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone
-static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures
+static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features
 static FxGroup gFxGroups[] = {
     { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
     { L"Reverb",     &gFxRevOn,     L"fx_reverb_on",   true,  L"fx_reverb_hotkey",  3, 0 },
@@ -3612,7 +3607,7 @@ static void LoadSettings()
     gUiScale      = Iclamp(INI_INT(L"ui_scale", 100), 80, 250);
     gCompact      = INI_INT(L"compact", 0) != 0;
     gCmdLine      = INI_INT(L"command_line_control", 0) != 0;
-    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 2);
+    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 3);
     for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); gUserCol[i] = (COLORREF)INI_INT(k, (int)CLR_NONE); }
     GetPrivateProfileStringW(L"settings", L"background_picture", L"", gPicPath, MAX_PATH, gIni);
     gPicFit       = Iclamp(INI_INT(L"background_fit", 0), 0, 4);
@@ -3631,6 +3626,14 @@ static void LoadSettings()
     gClipsFx      = INI_INT(L"clips_through_fx", 0) != 0;
     gClipAutoTrim = INI_INT(L"clip_auto_trim", 1) != 0;
     gRandLagOn    = INI_INT(L"random_lag", 0) != 0;
+    {                                           // features: off for a new install; someone upgrading keeps everything they had
+        const int had = GetFileAttributesW(gIni) != INVALID_FILE_ATTRIBUTES && INI_INT(L"feat_lag", -1) == -1 &&
+                        GetPrivateProfileIntW(L"settings", L"loop_ms", -1, gIni) != -1 ? 1 : 0;
+        gFeatLag   = INI_INT(L"feat_lag", had) != 0;
+        gFeatFx    = INI_INT(L"feat_voicefx", had) != 0;
+        gFeatSound = INI_INT(L"feat_soundboard", had) != 0;
+        gFeatClips = INI_INT(L"feat_clips", had) != 0;
+    }
     gRandLagSec   = Iclamp(INI_INT(L"random_lag_every_s", 8), 2, 120);
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
     GetPrivateProfileStringW(L"settings", L"tts_voice", L"", gTtsVoice, 128, gIni);
@@ -3721,7 +3724,6 @@ static void LoadSettings()
 
     GetPrivateProfileStringW(L"settings", L"mic",         L"", gMicName, 512, gIni);
     GetPrivateProfileStringW(L"settings", L"update_repo", DEFAULT_UPDATE_REPO, gUpdateRepo, 200, gIni);
-    if (!lstrcmpiW(gUpdateRepo, L"slavward/Mix" L"ward")) lstrcpynW(gUpdateRepo, DEFAULT_UPDATE_REPO, 200);   // (the first Mixward build pointed at a repo that doesn't exist)
 
     int rows = INI_INT(L"out_count", 0);
     if (rows < 1) {
@@ -3747,15 +3749,6 @@ static void LoadSettings()
         }
     }
     gRows = rows;
-#ifdef MIXWARD
-    for (int k = 0; k < MAX_OUT; k++)           // only Off / Mic + apps / Apps only here
-        if (gRowMode[k] == MODE_ALL || gRowMode[k] == MODE_EFFECT) gRowMode[k] = k == 0 ? MODE_CLEAN : MODE_APPS;
-    for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = 0;   // no stutter
-    for (int sl = 0; sl < KEY_SLOTS; sl++)      // keep: mute, push-to-talk, profiles; the rest belong to effects / sounds
-        if (sl != SLOT_MUTE && sl != SLOT_PTT && sl != SLOT_PROFNEXT && sl < SLOT_PROF0)
-            for (int i = 0; i < MAX_KEYS; i++) gFxKeys[sl][i] = 0;
-    gFxOn = false; gRandLagOn = false; gBeatSync = false; gOverlayOn = false;
-#endif
     #undef INI_INT
 }
 
@@ -4491,6 +4484,7 @@ static void SaveSettings()
     SaveInt(L"clips_through_fx", gClipsFx);
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
     SaveInt(L"random_lag", gRandLagOn);
+    SaveInt(L"feat_lag", gFeatLag); SaveInt(L"feat_voicefx", gFeatFx); SaveInt(L"feat_soundboard", gFeatSound); SaveInt(L"feat_clips", gFeatClips);
     SaveInt(L"random_lag_every_s", gRandLagSec);
 
     SaveInt(L"repeat_word_times", gRepeatN);
@@ -4746,18 +4740,17 @@ static void StopAudio()
 #define ROW_Y0    134
 #define ROW_H     30
 #define TAB_COUNT 7
-#ifdef MIXWARD                                  // Main, Mixer, Mic, Settings
-#define TAB_SHOWN 4
-static const int TAB_ORDER[TAB_SHOWN] = { 0, 6, 1, 5 };
-#else
 #define TAB_SHOWN TAB_COUNT
 static const int TAB_ORDER[TAB_SHOWN] = { 0, 6, 1, 2, 3, 4, 5 };   // left to right (Mixer sits after Main)
-#endif
 enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5, PAGE_MIXER = 6 };
+static bool PageOn(int page)                    // Voice FX, Soundboard and Clips only exist while their feature is on
+{
+    return page == PAGE_FX ? gFeatFx : page == PAGE_SOUND ? gFeatSound : page == PAGE_CLIPS ? gFeatClips : true;
+}
 
-struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; };   // ox/oy: moved by you (design px)
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; int feat; };   // feat: shown only with that feature on   // ox/oy: moved by you (design px)
 struct Framed  { HWND edit, ud; };
-struct Paged   { HWND h; int page; int sub; };   // sub: Voice FX sub-tab (-1 = every sub-tab)
+struct Paged   { HWND h; int page; int sub; int feat; };   // sub: Voice FX sub-tab (-1 = every sub-tab)
 // Every control's position as laid out (scaled), how far FitText moved / widened it, and how far you moved it.
 // PlaceAll puts each control at: layout + FitText + (moves with the output list) + your offset + its section's offset.
 struct Design  {
@@ -4786,7 +4779,7 @@ static int     gBuildPage = -1;                // page new controls go on (-1 = 
 static int     gBuildSub = -1;                 // Voice FX sub-tab new controls go on (-1 = all)
 static int     gPage = 0;                      // page being shown
 
-static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage, gBuildSub }; }
+static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage, gBuildSub, gBuildFeat }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 static int DesignH() { return gCompact ? COMPACT_H : BASE_H + RowsDelta(); }
@@ -4830,7 +4823,7 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub, 0, 0 };
+    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub, 0, 0, gBuildFeat };
 }
 
 
@@ -5654,7 +5647,7 @@ static bool SongStartDevice(DWORD pid, bool exclude)
     return true;
 }
 
-static bool SongModeOn() { return gFxOn && gFxVocOn && gVocStyle == VOC_SONG; }
+static bool SongModeOn() { return gFxOn && gFeatFx && gFxVocOn && gVocStyle == VOC_SONG; }
 
 static void UpdateSongStatusText()
 {
@@ -6155,6 +6148,7 @@ static bool FindSoundEnds(const short* d, unsigned n, unsigned* ts, unsigned* te
 
 static void ClipNow()                           // save the last N seconds as a clip
 {
+    if (!gFeatClips) return;
     if (gRecSource == REC_OFF) { ShowOsd(L"Clip recording is off", false); return; }
     if (!gRunning)             { ShowOsd(L"Press Start to record clips", false); return; }
     const unsigned N = (unsigned)gRecSeconds * RATE;
@@ -6304,8 +6298,8 @@ static void UpdateRecCapture()                  // every 50 ms: keep the PC-soun
     static int fallbackRetries = 0;
     if (gRunning && !wasRunning) RecRestart();
     wasRunning = gRunning;
-    gRecVoiceOn = gRunning && RecHasVoice(gRecSource);
-    const bool want = gRunning && gCtxOk && RecHasOther(gRecSource);
+    gRecVoiceOn = gRunning && gFeatClips && RecHasVoice(gRecSource);
+    const bool want = gRunning && gCtxOk && gFeatClips && RecHasOther(gRecSource);
     const bool discord = RecIsDiscord(gRecSource);
     const DWORD now = GetTickCount();
     if (gRecRunning && discord && now - lastAlive > 3000) {   // Discord closed or restarted? find it again
@@ -8230,6 +8224,21 @@ static void PlaceFree(HWND c, int x, int y, int w, int h)
         if (resized) InvalidateRect(c, nullptr, FALSE);   // (labels only repaint their new part by themselves: all of it)
     }
 }
+static void PlaceTabs()                         // the tabs whose feature is on, side by side (wider when there are fewer)
+{
+    int n = 0; for (int i = 0; i < TAB_SHOWN; i++) if (PageOn(TAB_ORDER[i])) n++;
+    const int tw = Imin(130, (532 - (n - 1) * 2) / Imax(1, n));
+    int slot = 0;
+    for (int i = 0; i < TAB_SHOWN; i++) {
+        const int pg = TAB_ORDER[i];
+        HWND t = GetDlgItem(gWnd, IDC_TAB0 + pg);
+        if (!t) continue;
+        if (!PageOn(pg)) { ShowWindow(t, SW_HIDE); continue; }
+        PlaceFree(t, gOrgX + SC(14 + slot * (tw + 2)), SC(10), SC(tw), SC(32));
+        if (!gCompact) ShowWindow(t, SW_SHOWNA);
+        slot++;
+    }
+}
 static void MixerPlace()                        // the Mixer fills the window: strips side by side, taller faders when there's room
 {
     if (!gWnd || gSecChan < 0 || gSecOut < 0 || gCompact) return;
@@ -9573,7 +9582,7 @@ static bool EdIsSubTab(HWND h)
 {
     int id = GetDlgCtrlID(h);
     return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || id == IDC_MICSUB0 || id == IDC_MICSUB1 ||
-           (id >= IDC_SETSUB0 && id <= IDC_SETSUB2);
+           (id >= IDC_SETSUB0 && id <= IDC_SETSUB3);
 }
 static bool SectionShown(const Section& s)
 {
@@ -10199,6 +10208,7 @@ static void AddTips()
     TipId(IDC_SETSUB0, L"Profiles, latency, updates, screen share, shortcuts and the window.");
     TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
     TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
+    TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard and clips.");
     TipId(IDC_FONT,    L"The font for the whole window.");
     TipId(IDC_OPACITY, L"See-through window: 100% = solid. Lower lets what's behind show through.");
     TipId(IDC_COLRESET, L"Go back to the theme's colours.");
@@ -10468,7 +10478,7 @@ static const wchar_t* MIC_SUB_NAMES[2] = { L"Cleanup", L"Tone" };
 static const wchar_t* SET_SUB_NAMES[3] = { L"General", L"Look", L"Pictures" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings sub-tabs
 {
-    const bool set = (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB2;
+    const bool set = (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB3;
     const bool mic = !set && (int)d->CtlID >= IDC_MICSUB0 && (int)d->CtlID <= IDC_MICSUB1;
     int t = (int)d->CtlID - (set ? IDC_SETSUB0 : mic ? IDC_MICSUB0 : IDC_FXSUB0);
     HDC dc = d->hDC;
@@ -10550,6 +10560,7 @@ static void DrawFxSwitch(DRAWITEMSTRUCT* d)
 
 static void SetFxOn(bool on)
 {
+    if (on && !gFeatFx) return;                 // (Voice FX is switched off in Settings > Features)
     if (on && !gFxOn) gFxResetReq = true;      // start clean, no stale reverb tail
     gFxOn = on;
     InvalidateRect(GetDlgItem(gWnd, IDC_FXON), nullptr, FALSE);
@@ -10652,6 +10663,11 @@ static void PollFxKeys()
 {
     BYTE cache[256] = {};
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
+        const bool off = ((slot < FX_KEY_SLOTS || slot == SLOT_TAPESTOP || slot == SLOT_DIVE) && !gFeatFx) ||
+                         (((slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) || slot == SLOT_PADBANK) && !gFeatSound) ||
+                         ((slot == SLOT_CLIPNOW || (slot >= SLOT_CLIP0 && slot < SLOT_CLIP0 + CLIPS)) && !gFeatClips) ||
+                         ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag);
+        if (off) { gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
@@ -11032,11 +11048,8 @@ static void UpdateStatus(bool force = false)
     }
     else {
         HotkeyName(key, 120);
-#ifdef MIXWARD
-        lstrcpynW(s, L"Live", 160);
-#else
-        wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
-#endif
+        if (gFeatLag) wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
+        else lstrcpynW(s, L"Live", 160);
     }
     if (gRunning && gFxOn && !gMicMuted) {       // which voice effects are on
         wchar_t fx[120] = L"";
@@ -11116,7 +11129,7 @@ static void Layout()
     for (int i = 0; i < gPagedN; i++) {
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
-        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0)))
+        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat))
                 && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gPaged[i].page == PAGE_SETTINGS ? gSetSub : gFxSub));
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
@@ -11158,7 +11171,7 @@ static void Layout()
         SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         gOwnSize = false;
     }
-    PlaceAll(); MixerPlace();                   // (centred for the final width)
+    PlaceAll(); MixerPlace(); PlaceTabs();      // (centred for the final width)
     LayoutCompact(gCompact);
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | (freeze ? RDW_UPDATENOW : 0));
@@ -11201,25 +11214,22 @@ static void Rescale(int ns)
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
+static void SetPage(int page);
+static void PageCheck()                         // (the open page's feature was switched off: back to Main)
+{
+    if (!PageOn(gPage)) { const int was = gPage; gPage = -1; SetPage(PAGE_MAIN); if (gPage < 0) gPage = was; }
+}
 static void SetPage(int page)
 {
-    if (page < 0 || page >= TAB_COUNT || page == gPage) return;
-#ifdef MIXWARD
-    if (page == PAGE_FX || page == PAGE_SOUND || page == PAGE_CLIPS) return;   // (not in Mixward)
-#endif
+    if (page < 0 || page >= TAB_COUNT || page == gPage || !PageOn(page)) return;
     HWND focus = GetFocus();
     gPage = page;
     Layout();
     if (!focus || !IsWindowVisible(focus)) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + page));
 }
 
-#ifdef MIXWARD                                  // the Plays list: Off / Mic + apps (your mic, cleaned up) / Apps only
-static int ModeToSel(int m) { return m == MODE_APPS ? 2 : m == MODE_OFF ? 0 : 1; }
-static int SelToMode(int i) { return i == 2 ? MODE_APPS : i == 0 ? MODE_OFF : MODE_CLEAN; }
-#else
 static int ModeToSel(int m) { return m; }
 static int SelToMode(int i) { return i; }
-#endif
 static void SetRowMode(int k, int mode)
 {
     gRowMode[k] = mode;
@@ -11532,8 +11542,7 @@ static DWORD WINAPI CheckThread(LPVOID arg)
     if (!RepoFromText(gUpdateRepo, repo, 200)) {
         lstrcpynW(job->error, L"Type your GitHub user/repo in the Updates box first (for example: yourname/LagEffect).", 300);
     } else {
-        // Lag Effect and Mixward share one repo: Mixward's releases are tagged "mixward-v1.0.0", Lag Effect's "v1.32.1".
-        // So read the recent releases (newest first) and take the first one that's ours.
+        // Read the recent releases (newest first) and take the first that's a Lag Effect version (v1.2.3).
         wsprintfW(api, L"https://api.github.com/repos/%s/releases?per_page=30", repo);
         DWORD len = 0;
         char* json = HttpGet(api, &len, job->error, 300);
@@ -11548,7 +11557,7 @@ static DWORD WINAPI CheckThread(LPVOID arg)
                 char t[64] = "";
                 JsonString(at, "tag_name", &p, t, 64);
                 const bool mixTag = _strnicmp(t, "mixward-", 8) == 0;
-                if (MIXWARD_ON ? mixTag : (!mixTag && (t[0] == 'v' || t[0] == 'V' || (t[0] >= '0' && t[0] <= '9')))) {
+                if (!mixTag && (t[0] == 'v' || t[0] == 'V' || (t[0] >= '0' && t[0] <= '9'))) {   // (skip any "mixward-" test releases)
                     found = true;
                     lstrcpynA(tag, mixTag ? t + 8 : t, 64);   // (just the version: "v1.0.0")
                     p = at;
@@ -11767,26 +11776,6 @@ static void SetupVbCable()
 
 static void ShowHelp()
 {
-#ifdef MIXWARD
-    MessageBoxW(gWnd,
-        L"MIXWARD\n"
-        L"Puts your mic and your apps' sound wherever you want it, each at its own volume.\n\n"
-        L"MAIN\n"
-        L"Pick your microphone and the outputs. Each output plays: Off, Mic + apps (your mic, cleaned up by the Mic tab, "
-        L"plus any Mixer channels you send to it), or Apps only (just the Mixer channels, untouched). "
-        L"Use VB-Cable to make an output Discord, OBS or a game can use as a mic. Press Start.\n\n"
-        L"MIXER\n"
-        L"\"+ Add channel\" brings in an app (recorded on its own), another input, or what an output device plays. "
-        L"Each channel has a fader (drag, scroll, double-click = 0 dB), Mute, Solo (hear only it on your listening output), "
-        L"Duck (quieter while you talk) and buttons 1-5 for which outputs it goes to. Click a name to rename it or change its colour. "
-        L"Drag a strip's right edge to resize it.\n\n"
-        L"MIC\n"
-        L"Noise suppression, noise gate, push-to-talk, voice quality and an equalizer, plus a 5-second mic test.\n\n"
-        L"SETTINGS\n"
-        L"Profiles, latency, theme, pictures, start with Windows and the mute hotkey. Ctrl+Tab switches tabs.",
-        L"Mixward - help", MB_OK | MB_ICONINFORMATION);
-    return;
-#endif
     MessageBoxW(gWnd,
         L"HOW IT WORKS\n"
         L"Hold (or toggle) your hotkey to repeat the last bit of your mic.\n"
@@ -12115,10 +12104,10 @@ static void TrayMenu()
     AppendMenuW(m, MF_STRING, ID_TRAY_RUN, gWantRunning ? L"Stop audio" : L"Start audio");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (gMicMuted ? MF_CHECKED : 0), ID_TRAY_MUTE, L"Mute mic");
-#ifndef MIXWARD
-    AppendMenuW(m, MF_STRING | (gFxOn ? MF_CHECKED : 0), ID_TRAY_FX, L"Voice effects");
-    AppendMenuW(m, MF_STRING | (SongModeOn() ? MF_CHECKED : 0), ID_TRAY_SONG, L"Vocode to song");
-#endif
+    if (gFeatFx) {
+        AppendMenuW(m, MF_STRING | (gFxOn ? MF_CHECKED : 0), ID_TRAY_FX, L"Voice effects");
+        AppendMenuW(m, MF_STRING | (SongModeOn() ? MF_CHECKED : 0), ID_TRAY_SONG, L"Vocode to song");
+    }
     AppendMenuW(m, MF_STRING | (gNsOn ? MF_CHECKED : 0), ID_TRAY_NS, L"Noise suppression");
     AppendMenuW(m, MF_STRING | (gGateMode != GATE_OFF ? MF_CHECKED : 0), ID_TRAY_GATE, L"Noise gate");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -12128,14 +12117,10 @@ static void TrayMenu()
     for (int i = 1; i < CHAR_N; i++) AppendMenuW(chr, MF_STRING, 1220 + i, CHARACTERS[i]);
     for (int i = 0; i < PAD_BANKS; i++) { wchar_t t[16]; wsprintfW(t, L"Page %c", L'A' + i); AppendMenuW(page, MF_STRING | (i == gPadBank ? MF_CHECKED : 0), 1260 + i, t); }
     AppendMenuW(m, MF_POPUP, (UINT_PTR)prof, L"Profile");
-#ifdef MIXWARD
-    DestroyMenu(chr); DestroyMenu(page);
-#else
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)chr, L"Character");
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)page, L"Soundboard page");
+    if (gFeatFx) AppendMenuW(m, MF_POPUP, (UINT_PTR)chr, L"Character"); else DestroyMenu(chr);
+    if (gFeatSound) AppendMenuW(m, MF_POPUP, (UINT_PTR)page, L"Soundboard page"); else DestroyMenu(page);
     AppendMenuW(m, MF_STRING | (gOverlayOn ? MF_CHECKED : 0), 1270, L"Status overlay");
     AppendMenuW(m, MF_STRING | (gCompact ? MF_CHECKED : 0), 1271, L"Compact window");
-#endif
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"Exit");
     SetForegroundWindow(gWnd);
@@ -12147,20 +12132,16 @@ static void TrayMenu()
 static void CreateUI()
 {
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
-#ifdef MIXWARD
-    const wchar_t* modeNames[] = { L"Off", L"Mic + apps", L"Apps only" };
-#else
     const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything", L"Clean voice", L"Apps only" };
-#endif
 
     // Tabs (always visible). Drawn by DrawTab().
     gBuildPage = -1;
     {
         const wchar_t* tabNames[TAB_COUNT] = { L"Main", L"Mic", L"Voice FX", L"Soundboard", L"Clips", L"Settings", L"Mixer" };
-        const int tw = (532 - (TAB_SHOWN - 1) * 2) / TAB_SHOWN;
-        for (int slot = 0; slot < TAB_SHOWN; slot++) {
+        for (int slot = 0; slot < TAB_SHOWN; slot++) {   // (PlaceTabs sets where: only the ones in use show)
             const int t = TAB_ORDER[slot];
-            Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + slot * (tw + 2), 10, tw, 32, IDC_TAB0 + t);
+            Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + slot * 76, 10, 74, 32, IDC_TAB0 + t);
+            gDesign[gDesignN - 1].free = true;
         }
     }
 
@@ -12192,18 +12173,14 @@ static void CreateUI()
     }
     Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 170, 124, 28, IDC_ADDOUT);
     Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 170, 124, 28, IDC_VBCABLE);
-#ifdef MIXWARD
-    gBuildPage = PAGE_FX;                       // (no soundboard here: kept, never shown)
-#endif
+    gBuildFeat = FEAT_SOUND | FEAT_CLIPS;       // (the soundboard and clips: hearing them yourself)
     Ctl(L"STATIC", L"Always hear sounds on:", SS_NOTIFY, 298, 175, 132, 20, IDC_HEARLBL);
     Ctl(L"COMBOBOX", L"", COMBO, 432, 171, 102, 200, IDC_HEARON);
-    gBuildPage = PAGE_MAIN;
+    gBuildFeat = 0;
     FillDevices();
 
     gRecordShift = true;                        // everything below on this page moves with the output list
-#ifdef MIXWARD
-    gBuildPage = PAGE_FX;                       // (the stutter: kept so nothing else breaks, never shown)
-#endif
+    gBuildFeat = FEAT_LAG;                      // the stutter (Settings > Features > Lag effect)
 
     // Effect
     AddSection(14, 232, 532, 148, L"Effect");
@@ -12257,7 +12234,7 @@ static void CreateUI()
     Ctl(L"STATIC", L"(beat repeat)", 0, 418, 450, 110, 20, IDC_HDR);
 
     // Status + buttons
-    gBuildPage = PAGE_MAIN;
+    gBuildFeat = 0;
     gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 498, 532, 30, IDC_STATUS);
     Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 540, 127, 34, IDC_START);
     Ctl(L"BUTTON", L"Mute mic", WS_TABSTOP, 149, 540, 127, 34, IDC_MUTEBTN);
@@ -12621,6 +12598,7 @@ static void CreateUI()
     Ctl(L"BUTTON", L"General", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 52, 90, 26, IDC_SETSUB0);
     Ctl(L"BUTTON", L"Look", BS_OWNERDRAW | WS_TABSTOP, 108, 52, 90, 26, IDC_SETSUB1);
     Ctl(L"BUTTON", L"Pictures", BS_OWNERDRAW | WS_TABSTOP, 202, 52, 90, 26, IDC_SETSUB2);
+    Ctl(L"BUTTON", L"Features", BS_OWNERDRAW | WS_TABSTOP, 296, 52, 90, 26, IDC_SETSUB3);
     gBuildSub = 0;
     AddSection(14, 88, 532, 108, L"Profiles");
     Ctl(L"STATIC", L"Profile:", 0, 30, 110, 56, 20, -1);
@@ -12691,13 +12669,29 @@ static void CreateUI()
     CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 531, 270, 20, IDC_STARTWIN);
     CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
-#ifdef MIXWARD
-    gBuildPage = PAGE_FX;
-#endif
     Ctl(L"BUTTON", L"Status overlay (over games)", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 557, 220, 20, IDC_OVERLAY);
     CheckDlgButton(gWnd, IDC_OVERLAY, gOverlayOn ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Compact window (Ctrl+M)", WS_TABSTOP, 262, 554, 268, 26, IDC_COMPACT);
-    gBuildPage = PAGE_SETTINGS;
+
+    // ---- Features ----
+    gBuildSub = 3;
+    AddSection(14, 88, 532, 300, L"Features");
+    Ctl(L"STATIC", L"Turn on only what you use. A feature that's off is hidden and doesn't run at all, so it costs nothing.",
+        0, 30, 110, 500, 36, IDC_HDR);
+    {
+        struct { int id; const wchar_t* name; const wchar_t* what; bool on; } f[] = {
+            { IDC_FEATLAG,   L"Lag effect", L"Hold a hotkey to stutter your voice. Its settings are on the Main tab.", gFeatLag },
+            { IDC_FEATFX,    L"Voice FX", L"Effects for your live voice, characters and Vocode to song. Adds the Voice FX tab.", gFeatFx },
+            { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, and text to speech. Adds the Soundboard tab.", gFeatSound },
+            { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds the Clips tab.", gFeatClips },
+        };
+        for (int i = 0; i < 4; i++) {
+            const int y = 156 + i * 56;
+            Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 160, 20, f[i].id);
+            CheckDlgButton(gWnd, f[i].id, f[i].on ? BST_CHECKED : BST_UNCHECKED);
+            Ctl(L"STATIC", f[i].what, 0, 50, y + 22, 480, 18, IDC_HDR);
+        }
+    }
 
     // ---- Look ----
     gBuildSub = 1;
@@ -12969,6 +12963,7 @@ static void PaintWindow(HDC dc)
         if (s.page >= 0 && s.page != gPage) continue;
         if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub)) continue;
         if (gCompact) continue;
+        if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
         int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox) + (i == gSecChan || i == gSecOut ? 0 : gOrgX);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
@@ -13081,6 +13076,19 @@ static void OnCommand(int id, int code)
     if (id == IDC_REWINDKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REWIND], id); return; }
     if (id == IDC_REPEATKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REPEAT], id); return; }
     if (id == IDC_RANDLAG)    { gRandLagOn = Checked(id); return; }
+    if (id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) {   // Settings > Features
+        if (code != BN_CLICKED) return;
+        const bool on = Checked(id);
+        if (id == IDC_FEATLAG)   gFeatLag = on;
+        if (id == IDC_FEATFX)    { gFeatFx = on; if (!on && gFxOn) SetFxOn(false); }   // (off: the effects stop too)
+        if (id == IDC_FEATSOUND) { gFeatSound = on; if (!on) for (int i = 0; i < PADS; i++) gPads[i].stop = true; }
+        if (id == IDC_FEATCLIPS) { gFeatClips = on; if (!on) for (int i = 0; i < CLIP_N; i++) gPads[CLIP0 + i].stop = true; }
+        Layout();
+        RedrawWindow(gWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
+        UpdateStatus();
+        SaveSettings();
+        return;
+    }
     if (id == IDC_RANDSEC) {
         if (!gUiReady) return;
         BOOL ok = FALSE;
@@ -13212,10 +13220,10 @@ static void OnCommand(int id, int code)
     if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
     if (id == IDC_CLIPHIST)    { if (code == BN_CLICKED) ClipHistory(GetDlgItem(gWnd, id)); return; }
     if (id == IDC_PADFOLDER)   { if (code == BN_CLICKED) PadLoadFolder(); return; }
-    if (id >= IDC_SETSUB0 && id <= IDC_SETSUB2) {
+    if (id >= IDC_SETSUB0 && id <= IDC_SETSUB3) {
         if (code == BN_CLICKED && gSetSub != id - IDC_SETSUB0) {
             gSetSub = id - IDC_SETSUB0; Layout();
-            for (int k = IDC_SETSUB0; k <= IDC_SETSUB2; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
+            for (int k = IDC_SETSUB0; k <= IDC_SETSUB3; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
         }
         return;
     }
@@ -13733,7 +13741,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
     if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
     if (w == IDC_SONGBTN) { DrawSongButton(d); return true; }
-    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB2)) {
+    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3)) {
         DrawFxSub(d); return true;
     }
     if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch(d); return true; }
@@ -13929,7 +13937,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
                     gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()));
                     gExtraH = Imax(0, (int)c.bottom - SC(DesignH()));
                 }
-                PlaceAll(); MixerPlace();
+                PlaceAll(); MixerPlace(); PlaceTabs();
                 InvalidateRect(h, nullptr, FALSE);
                 busy = false;
             }
@@ -14261,7 +14269,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
             (msg.hwnd == h || IsChild(h, msg.hwnd))) {
             { int slot = 0; for (int i = 0; i < TAB_SHOWN; i++) if (TAB_ORDER[i] == gPage) slot = i;   // Ctrl+Tab: next page
-              SetPage(TAB_ORDER[(slot + 1) % TAB_SHOWN]); }
+              for (int n = 1; n < TAB_SHOWN; n++) { const int pg = TAB_ORDER[(slot + n) % TAB_SHOWN]; if (PageOn(pg)) { SetPage(pg); break; } } }
             continue;
         }
         if (msg.message == WM_KEYDOWN && msg.wParam >= '1' && msg.wParam < '1' + TAB_COUNT &&
@@ -14270,7 +14278,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             continue;
         }
         if (TrimKey(&msg)) continue;
-        if (!MIXWARD_ON && msg.message == WM_KEYDOWN && msg.wParam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
             SetCompact(!gCompact);              // Ctrl+M: compact window
             continue;
         }
