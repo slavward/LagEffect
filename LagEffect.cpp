@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.29.0"
+#define APP_VERSION L"1.29.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -12519,7 +12519,7 @@ static void OnCommand(int id, int code)
             ShellExecuteW(nullptr, L"open", L"explorer.exe", args, nullptr, SW_SHOWNORMAL);
         }
         break;
-    case IDC_TAB3: case IDC_TAB4: case IDC_TAB5:
+    case IDC_TAB3: case IDC_TAB4: case IDC_TAB5: case IDC_TAB6:
         if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
         break;
     case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
