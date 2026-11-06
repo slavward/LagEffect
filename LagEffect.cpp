@@ -3721,6 +3721,7 @@ static void LoadSettings()
 
     GetPrivateProfileStringW(L"settings", L"mic",         L"", gMicName, 512, gIni);
     GetPrivateProfileStringW(L"settings", L"update_repo", DEFAULT_UPDATE_REPO, gUpdateRepo, 200, gIni);
+    if (!lstrcmpiW(gUpdateRepo, L"slavward/Mix" L"ward")) lstrcpynW(gUpdateRepo, DEFAULT_UPDATE_REPO, 200);   // (the first Mixward build pointed at a repo that doesn't exist)
 
     int rows = INI_INT(L"out_count", 0);
     if (rows < 1) {
