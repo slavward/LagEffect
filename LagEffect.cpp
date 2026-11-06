@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.29.0"
+#define APP_VERSION L"1.29.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -360,6 +360,11 @@ static void ChanPush(int c, const float* in, unsigned frames, int chans)   // (c
 {
     ChanAudio& a = gChA[c];
     if (!a.live || !in) return;
+    if (gCh[c].mute || !gCh[c].routes) {         // can't be heard: only the meter needs it
+        float pk = 0; for (unsigned f = 0; f < frames * (unsigned)chans; f++) { float m = fabsf(in[f]); if (m > pk) pk = m; }
+        if (pk > a.peak) a.peak = pk;
+        return;
+    }
     unsigned w = a.w; const unsigned r = a.r;
     float pk = 0;
     for (unsigned f = 0; f < frames; f++) {
@@ -2099,7 +2104,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (looping) spMode = SP_NONE;
 
     // Mixer channels: how much each has buffered, its gain and where it goes (read once per block).
-    float    chG[CH_MAX]; unsigned chRd[CH_MAX], chAv[CH_MAX], chRt[CH_MAX]; int chAdj[CH_MAX]; bool anyCh = false;
+    float    chG[CH_MAX]; unsigned chRd[CH_MAX], chAv[CH_MAX], chRt[CH_MAX]; int chAdj[CH_MAX], act[CH_MAX], nAct = 0; bool anyCh = false;
     for (int c = 0; c < CH_MAX; c++) {
         ChanAudio& a = gChA[c];
         chG[c] = 0; chRt[c] = 0; chAv[c] = 0; chRd[c] = a.r;
@@ -2110,11 +2115,13 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (av > target + 4096) { rd = wr - target; av = target; }   // fallen behind (clock drift / a hiccup): catch up
         if (!a.primed) { if (av < target) { chRd[c] = rd; continue; } a.primed = true; }
         if (av < frames) a.primed = false;      // about to run dry: wait for a cushion again after this block
+        if (gCh[c].mute || !gCh[c].routes) { chRd[c] = wr; continue; }   // can't be heard: just keep its buffer empty
         chRd[c] = rd; chAv[c] = av;
         // Its clock and ours never match exactly: drop / repeat one sample now and then to keep the cushion steady.
         chAdj[c] = av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
         chG[c] = gCh[c].mute ? 0.0f : Iclamp(gCh[c].vol, 0, 200) / 100.0f;
         chRt[c] = gCh[c].routes;
+        act[nAct++] = c;                        // (the per-sample loop only visits these)
         anyCh = true;
     }
 
@@ -2344,7 +2351,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         // mixer channels: this frame of each, summed per output (stereo)
         float cL[MAX_OUT] = {}, cR[MAX_OUT] = {};
         if (anyCh)
-            for (int c = 0; c < CH_MAX; c++) {
+            for (int ci = 0; ci < nAct; ci++) {
+                const int c = act[ci];
                 if (!chAv[c]) continue;
                 const unsigned i = (chRd[c] & (CH_RING - 1)) * 2;
                 const float L = gChA[c].buf[i] * chG[c], R = gChA[c].buf[i + 1] * chG[c];
@@ -2434,7 +2442,7 @@ enum {
     IDC_ROWLBL = 400, IDC_ROWDEV = 410, IDC_ROWMODE = 420, IDC_ROWVOL = 430, IDC_ROWDEL = 440,
     // Mixer page: + channel (CH_MAX), routing buttons + channel * MAX_OUT + output, output strips + output
     IDC_CHSRC0 = 1500, IDC_CHMUTE0 = 1510, IDC_CHVOL0 = 1520, IDC_CHMETER0 = 1530, IDC_CHRT0 = 1540,
-    IDC_OMUTE0 = 1590, IDC_OVOL0 = 1600, IDC_OLBL0 = 1610, IDC_OMETER0 = 1620,
+    IDC_OMUTE0 = 1590, IDC_OVOL0 = 1600, IDC_OLBL0 = 1610, IDC_OMETER0 = 1620, IDC_OPCT0 = 1630,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -2455,6 +2463,7 @@ enum {
 #define WM_VOICES_LISTED   (WM_APP + 10)         // the voice list (read in the background) is ready
 #define WM_NVSA_READY      (WM_APP + 11)         // NaturalVoiceSAPIAdapter downloaded + unpacked (or failed)
 #define WM_NVSA_DONE       (WM_APP + 12)         // its installer was closed
+#define WM_APPS_SCANNED    (WM_APP + 13)         // the list of apps with sound (for the Mixer) is ready
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -2505,6 +2514,7 @@ struct ProcLoop {
     bool                 pcm16 = false;
     ma_device_data_proc  cb = nullptr;
     volatile bool*       lost = nullptr;
+    int                  priority = THREAD_PRIORITY_HIGHEST;
 };
 static ProcLoop gSongPL, gRecPL;
 
@@ -2512,7 +2522,7 @@ static DWORD WINAPI ProcLoopThread(LPVOID arg)
 {
     ProcLoop* pl = (ProcLoop*)arg;
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    SetThreadPriority(GetCurrentThread(), pl->priority);
     static thread_local float buf[2048 * 2];
     LARGE_INTEGER freq, last, now;
     QueryPerformanceFrequency(&freq);
@@ -3136,6 +3146,38 @@ static void ApplyTheme()
 }
 
 // Dark-mode checkbox / radio button, drawn from scratch (Windows has no dark version of these).
+// ---- one shared off-screen buffer ----
+// Labels, checkboxes and custom-drawn controls draw off-screen and copy in one go (no flicker). Making a fresh
+// buffer for every one of those paints is slow with a GIF behind them, so they share one that only grows.
+// (If it's in use, a control gets its own for that paint.)
+static struct { HDC dc; HBITMAP bmp; HGDIOBJ old; int w, h; bool busy; } gBuf;
+struct OffScreen {
+    HDC dc = nullptr; HBITMAP own = nullptr; HGDIOBJ ownOld = nullptr; bool shared = false;
+    OffScreen(HDC like, int w, int h)
+    {
+        w = Imax(1, w); h = Imax(1, h);
+        if (!gBuf.busy) {
+            if (!gBuf.dc) gBuf.dc = CreateCompatibleDC(like);
+            if (gBuf.dc && (w > gBuf.w || h > gBuf.h)) {
+                const int nw = Imax(w, gBuf.w), nh = Imax(h, gBuf.h);
+                if (HBITMAP b = CreateCompatibleBitmap(like, nw, nh)) {
+                    HGDIOBJ prev = SelectObject(gBuf.dc, b);
+                    if (gBuf.bmp) DeleteObject(gBuf.bmp); else gBuf.old = prev;
+                    gBuf.bmp = b; gBuf.w = nw; gBuf.h = nh;
+                }
+            }
+            if (gBuf.bmp && gBuf.w >= w && gBuf.h >= h) {
+                gBuf.busy = true; shared = true; dc = gBuf.dc;
+                SetViewportOrgEx(dc, 0, 0, nullptr); SetBrushOrgEx(dc, 0, 0, nullptr); SelectClipRgn(dc, nullptr);
+                SetBkMode(dc, OPAQUE); SetTextColor(dc, RGB(0, 0, 0)); SetBkColor(dc, RGB(255, 255, 255));
+                return;
+            }
+        }
+        dc = CreateCompatibleDC(like); own = CreateCompatibleBitmap(like, w, h); ownOld = SelectObject(dc, own);
+    }
+    ~OffScreen() { if (shared) gBuf.busy = false; else if (dc) { SelectObject(dc, ownOld); DeleteObject(own); DeleteDC(dc); } }
+};
+
 static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
 {
     if (cd->dwDrawStage != CDDS_PREPAINT) return CDRF_DODEFAULT;
@@ -3146,9 +3188,8 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
 
     HDC real = cd->hdc;                         // drawn off-screen, then copied in one go (no flicker over a GIF)
     RECT rc = cd->rc;
-    HDC dc = CreateCompatibleDC(real);
-    HBITMAP bmpBuf = CreateCompatibleBitmap(real, Imax(1, (int)rc.right), Imax(1, (int)rc.bottom));
-    HGDIOBJ oldBuf = SelectObject(dc, bmpBuf);
+    OffScreen os(real, (int)rc.right, (int)rc.bottom);
+    HDC dc = os.dc;
     if (gBrPicture && GetParent(h) == gWnd) {   // over a picture: show the picture behind it, not a box
         POINT pt = { 0, 0 }; MapWindowPoints(h, gWnd, &pt, 1);
         SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
@@ -3198,7 +3239,6 @@ static LRESULT DrawDarkCheck(NMCUSTOMDRAW* cd)
     }
     SelectObject(dc, oldFont);
     BitBlt(real, rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top, dc, rc.left, rc.top, SRCCOPY);
-    SelectObject(dc, oldBuf); DeleteObject(bmpBuf); DeleteDC(dc);
     return CDRF_SKIPDEFAULT;
 }
 
@@ -3213,9 +3253,8 @@ static LRESULT CALLBACK BufLabelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PT
         HDC dc = m == WM_PAINT ? BeginPaint(h, &ps) : (HDC)w;
         RECT rc; GetClientRect(h, &rc);
         if (rc.right > 0 && rc.bottom > 0) {
-            HDC mem = CreateCompatibleDC(dc);
-            HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-            HGDIOBJ ob = SelectObject(mem, bmp);
+            OffScreen os(dc, rc.right, rc.bottom);
+            HDC mem = os.dc;
             HBRUSH br = (HBRUSH)SendMessageW(GetParent(h), WM_CTLCOLORSTATIC, (WPARAM)mem, (LPARAM)h);   // colours + lined-up brush
             FillRect(mem, &rc, br ? br : GetSysColorBrush(COLOR_BTNFACE));
             wchar_t text[1024]; GetWindowTextW(h, text, 1024);
@@ -3231,7 +3270,6 @@ static LRESULT CALLBACK BufLabelProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PT
             DrawTextW(mem, text, -1, &rc, fl);
             SelectObject(mem, of);
             BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-            SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
         }
         if (m == WM_PAINT) EndPaint(h, &ps);
         return 0;
@@ -5209,6 +5247,7 @@ static bool ChanStart(int c)                    // (audio must be running)
         DWORD pid = ChanFindApp(cs.src);
         if (!pid) return false;                 // not running yet: the timer tries again
         gChA[c].live = true;                    // (before starting: the first packets mustn't be thrown away)
+        gChPL[c].priority = THREAD_PRIORITY_ABOVE_NORMAL;   // (not "highest": it's music, not your voice)
         if (!ProcLoopStart(&gChPL[c], pid, false, CH_PL_CB[c], &gChLost[c])) { gChA[c].live = false; return false; }
         gChOnPL[c] = true;
     } else if (cs.type == CH_DEV) {
@@ -7413,6 +7452,21 @@ static void PicUiRefresh()
 // ======================= mixer page =======================
 // A channel's dropdown shows only its own source until it's opened; opening it lists what's there right now.
 struct ChanOpt { int type; wchar_t src[128]; };
+struct AppScan { AudioApp apps[64]; int n; };
+static AppScan gAppCache; static bool gAppCacheOk = false; static volatile LONG gAppScanBusy = 0;
+static DWORD WINAPI AppScanThread(LPVOID)
+{
+    AppScan* sc = (AppScan*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(AppScan));
+    if (sc) { sc->n = ListAudioApps(sc->apps, 64); if (!PostMessageW(gWnd, WM_APPS_SCANNED, 0, (LPARAM)sc)) HeapFree(GetProcessHeap(), 0, sc); }
+    InterlockedExchange(&gAppScanBusy, 0);
+    return 0;
+}
+static void AppScanStart()                      // (in the background: listing every app's sound sessions takes a while)
+{
+    if (InterlockedCompareExchange(&gAppScanBusy, 1, 0) != 0) return;
+    HANDLE t = CreateThread(nullptr, 0, AppScanThread, nullptr, 0, nullptr);
+    if (t) CloseHandle(t); else InterlockedExchange(&gAppScanBusy, 0);
+}
 static ChanOpt gChOpts[200]; static int gChOptN = 0;
 static void ChanSourceName(int type, const wchar_t* src, wchar_t* out, int cap)
 {
@@ -7438,9 +7492,9 @@ static void ChanComboFill(int c, HWND cb)
     };
     add(CH_NONE, L"");
     if (gCh[c].type != CH_NONE) add(gCh[c].type, gCh[c].src);   // (its own, even if not running now)
-    static AudioApp apps[64];
-    int na = ListAudioApps(apps, 64);
-    for (int i = 0; i < na; i++) add(CH_APP, apps[i].name);
+    if (!gAppCacheOk) { gAppCache.n = ListAudioApps(gAppCache.apps, 64); gAppCacheOk = true; }   // (only the very first time)
+    for (int i = 0; i < gAppCache.n; i++) add(CH_APP, gAppCache.apps[i].name);
+    AppScanStart();                             // fresh for next time
     for (ma_uint32 i = 0; i < gCapCount; i++) { wchar_t n[128]; MultiByteToWideChar(CP_UTF8, 0, gCapDevs[i].name, -1, n, 128); add(CH_DEV, n); }
     SendMessageW(cb, CB_RESETCONTENT, 0, 0);
     int sel = 0;
@@ -7476,12 +7530,15 @@ static void DrawLevel(DRAWITEMSTRUCT* d, float lvl, bool live)
 {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
-    RECT tr = rc; tr.top += 2; tr.bottom -= 2;
+    RECT tr = rc; if (rc.right - rc.left > rc.bottom - rc.top) { tr.top += 2; tr.bottom -= 2; }
     HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(dc, &tr, tb); DeleteObject(tb);
+    HBRUSH ob = CreateSolidBrush(gDark ? DK_SECTION : LT_BORDER); FrameRect(dc, &tr, ob); DeleteObject(ob);   // (an outline: it's a meter, even when empty)
     if (!live) return;
     float db = lvl > 0.00001f ? 20.0f * log10f(lvl) : -100.0f;
     float pos = ((db + 60.0f) / 60.0f < 0 ? 0.0f : (db + 60.0f) / 60.0f > 1 ? 1.0f : (db + 60.0f) / 60.0f);
-    RECT fr = tr; fr.right = tr.left + (LONG)((tr.right - tr.left) * pos);
+    RECT fr = tr; InflateRect(&fr, -1, -1);
+    if (rc.right - rc.left > rc.bottom - rc.top) fr.right = fr.left + (LONG)((fr.right - fr.left) * pos);   // across
+    else fr.top = fr.bottom - (LONG)((fr.bottom - fr.top) * pos);                                          // or up
     HBRUSH fb = CreateSolidBrush(db > -3.0f ? RGB(220, 70, 60) : METER_C); FillRect(dc, &fr, fb); DeleteObject(fb);
 }
 static void MixerMeterTick()                    // (50 ms) meters on the Mixer page
@@ -7491,12 +7548,16 @@ static void MixerMeterTick()                    // (50 ms) meters on the Mixer p
         float pk = gChA[c].peak; gChA[c].peak = 0;
         float v = gCh[c].mute ? 0 : pk * gCh[c].vol / 100.0f;
         gChShown[c] = v > gChShown[c] ? v : gChShown[c] * 0.82f;
-        InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE);
+        static int last[CH_MAX] = { -999, -999, -999, -999, -999, -999, -999, -999 };
+        const int now = gChShown[c] > 0.001f ? (int)(20.0f * log10f(gChShown[c])) : -60;   // whole dB: what a 70 px bar can show
+        if (now != last[c]) { last[c] = now; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
         float v = gOutPeak[k]; gOutPeak[k] = 0;  // (the Main page's meters aren't showing: this page takes the peaks)
         gOutShown[k] = v > gOutShown[k] ? v : gOutShown[k] * 0.82f;
-        InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE);
+        static int lastO[MAX_OUT] = { -999, -999, -999, -999, -999 };
+        const int now = gOutShown[k] > 0.001f ? (int)(20.0f * log10f(gOutShown[k]) / 2) : -30;
+        if (now != lastO[k]) { lastO[k] = now; InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE); }
     }
 }
 static void MixerRefresh()                      // after a profile / settings change
@@ -9239,6 +9300,18 @@ static void AddTips()
     TipId(IDC_TAB0 + PAGE_SOUND,    L"Soundboard: 8 pads of short sounds on hotkeys, played to Discord and your outputs.");
     TipId(IDC_TAB0 + PAGE_CLIPS,    L"Instant replay: save the last few seconds as a clip, trim it, and play it back on a hotkey.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
+    for (int k = 0; k < MAX_OUT; k++) {
+        TipId(IDC_OVOL0 + k,  L"This output's volume (%): the same as its volume on the Main tab.");
+        TipId(IDC_OMUTE0 + k, L"Silence this output (everything going to it).");
+        TipId(IDC_OMETER0 + k, L"How loud this output is right now.");
+    }
+    for (int c = 0; c < CH_MAX; c++) {
+        TipId(IDC_CHSRC0 + c,  L"What this channel plays: an app (recorded on its own, picked up when it starts) or an input like a second mic.");
+        TipId(IDC_CHMUTE0 + c, L"Silence this channel.");
+        TipId(IDC_CHVOL0 + c,  L"This channel's volume (%).");
+        TipId(IDC_CHMETER0 + c, L"How loud this channel is right now.");
+        for (int k = 0; k < MAX_OUT; k++) TipId(IDC_CHRT0 + c * MAX_OUT + k, L"Send this channel to that output (lit = on).");
+    }
     TipId(IDC_TAB0 + PAGE_MIXER,    L"Mixer: bring in apps (Spotify, a game, a browser) and other inputs, set their volume and send each to the outputs you want.");
     TipId(IDC_CLIPNOW,    L"Save the last few seconds as a new clip (fills the next empty slot below).");
     TipId(IDC_CLIPNOWKEY, L"A hotkey for Clip it, so you can clip from inside a game. Right-click to clear it.");
@@ -9787,14 +9860,22 @@ static void UpdateMeter()                       // every 50 ms: fast rise, smoot
         float pk = gOutPeak[k]; gOutPeak[k] = 0;
         float db = pk > 0.0001f ? 20.0f * log10f(pk) : -80.0f;
         float v = db > gOutShow[k] ? db : gOutShow[k] - 2.0f;
-        if (v != gOutShow[k]) { gOutShow[k] = v; if (gPage == PAGE_MAIN && !gCompact) InvalidateRect(GetDlgItem(gWnd, IDC_ROWLBL + k), nullptr, FALSE); }
+        if (v < -80.0f) v = -80.0f;
+        const bool moved = (int)v != (int)gOutShow[k];   // (only redraw when it would look different)
+        gOutShow[k] = v;
+        if (moved && gPage == PAGE_MAIN && !gCompact) InvalidateRect(GetDlgItem(gWnd, IDC_ROWLBL + k), nullptr, FALSE);
     }
     float peak = gMeterPeak; gMeterPeak = 0;
     float db = peak > 0.0000316f ? 20.0f * log10f(peak) : -90.0f;
     gMeterShowDb = db > gMeterShowDb ? db : (gMeterShowDb - 2.5f > db ? gMeterShowDb - 2.5f : db);
     float v = gMeterVad;
     gMeterVadShow = v < 0 ? -1.0f : (v > gMeterVadShow ? v : gMeterVadShow * 0.8f + v * 0.2f);
-    if (gPage == PAGE_MIC) InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+    static int lastDb = -999, lastVad = -999, lastGate = -1;
+    const int nowDb = (int)(gMeterShowDb * 2), nowVad = (int)(gMeterVadShow * 50), nowGate = gMeterGateOpen ? 1 : 0;
+    if (gPage == PAGE_MIC && (nowDb != lastDb || nowVad != lastVad || nowGate != lastGate)) {
+        lastDb = nowDb; lastVad = nowVad; lastGate = nowGate;
+        InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+    }
 }
 
 static void DrawMeterTo(HDC dc, RECT rc)
@@ -10188,7 +10269,7 @@ static void Layout()
         if (cid == IDC_VOICEPROG) vis = vis && gVoiceInstalling;
         if (cid >= IDC_CHRT0 && cid < IDC_CHRT0 + CH_MAX * MAX_OUT) vis = vis && (cid - IDC_CHRT0) % MAX_OUT < gRows;
         for (int k = gRows; k < MAX_OUT; k++)
-            if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == SPIN_UD(IDC_OVOL0 + k) || cid == IDC_OMETER0 + k) vis = false;
+            if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == SPIN_UD(IDC_OVOL0 + k) || cid == IDC_OMETER0 + k || cid == IDC_OPCT0 + k) vis = false;
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
@@ -11726,8 +11807,7 @@ static void CreateUI()
             Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, 438 + k * 19, y - 1, 17, 26, IDC_CHRT0 + c * MAX_OUT + k);
         }
     }
-    Ctl(L"STATIC", L"Pick an app (it's recorded on its own, even if it isn't playing yet) or an input like a second mic. "
-                   L"Lit numbers = the outputs it goes to.", 0, 30, 450, 500, 22, IDC_HDR);
+    Ctl(L"STATIC", L"Pick an app or an input. Lit numbers = the outputs it goes to.", 0, 30, 452, 500, 18, IDC_HDR);
 
     AddSection(14, 494, 532, 90, L"Outputs");
     for (int k = 0; k < MAX_OUT; k++) {
@@ -11735,8 +11815,9 @@ static void CreateUI()
         wchar_t n[16]; wsprintfW(n, L"Out %d", k + 1);
         Ctl(L"STATIC", n, 0, x, 516, 44, 18, IDC_OLBL0 + k);
         Ctl(L"BUTTON", L"Mute", BS_OWNERDRAW | WS_TABSTOP | (k == 0 ? WS_GROUP : 0), x + 46, 512, 50, 24, IDC_OMUTE0 + k);
-        Spin(IDC_OVOL0 + k, x, 542, 62, 0, 200, gRowVol[k]);
-        Ctl(L"STATIC", L"", SS_OWNERDRAW, x + 66, 548, 30, 12, IDC_OMETER0 + k);
+        Spin(IDC_OVOL0 + k, x, 542, 56, 0, 200, gRowVol[k]);
+        Ctl(L"STATIC", L"%", 0, x + 58, 545, 14, 18, IDC_OPCT0 + k);
+        Ctl(L"STATIC", L"", SS_OWNERDRAW, x + 74, 544, 22, 20, IDC_OMETER0 + k);
     }
     gBuildPage = -1;
 
@@ -12343,8 +12424,6 @@ static void OnCommand(int id, int code)
             if (wasEmpty && gCh[c].type != CH_NONE && !gCh[c].routes) gCh[c].routes = (1u << gRows) - 1;   // new: to every output
             if (gRunning && gCh[c].type != CH_NONE) ChanStart(c);
             for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), nullptr, FALSE);
-        } else if (code == CBN_CLOSEUP) {
-            ChanComboShow(c, cb);               // back to showing just its source
         }
         return;
     }
@@ -12519,7 +12598,7 @@ static void OnCommand(int id, int code)
             ShellExecuteW(nullptr, L"open", L"explorer.exe", args, nullptr, SW_SHOWNORMAL);
         }
         break;
-    case IDC_TAB3: case IDC_TAB4: case IDC_TAB5:
+    case IDC_TAB3: case IDC_TAB4: case IDC_TAB5: case IDC_TAB6:
         if (code == BN_CLICKED) SetPage(id - IDC_TAB0);
         break;
     case IDC_TALKON:   gTalkOver = Checked(IDC_TALKON); break;
@@ -12650,7 +12729,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_TIMER:
         if (w == TIMER_STATUS) {
             UpdateStatus(); UpdateMeter(); SongTick(); PadTick(); MixerMeterTick();
-            static int chTick = 0; if (++chTick >= 40) { chTick = 0; ChanTick(); }   // every 2 s: apps opened / closed
+            static int chTick = 0; if (++chTick >= 40) { chTick = 0; ChanTick(); if (gPage == PAGE_MIXER) AppScanStart(); }   // every 2 s
         }
         else if (w == TIMER_KEY) PollKeyCapture();
         else if (w == TIMER_CLEANUP) { CleanupOldExe(); VoiceProgressTick(); }
@@ -12682,6 +12761,10 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     case WM_PIC_DECODED:
         OnPicDecoded((PicJob*)l);
+        return 0;
+    case WM_APPS_SCANNED:
+        gAppCache = *(AppScan*)l; gAppCacheOk = true;
+        HeapFree(GetProcessHeap(), 0, (void*)l);
         return 0;
     case WM_NVSA_READY:
         OnNvsaReady((NvsaJob*)l);
@@ -12757,12 +12840,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
         const RECT rc = d->rcItem; const int bw = rc.right - rc.left, bh = rc.bottom - rc.top;
         const bool buffer = w != IDC_METER && d->CtlType != ODT_COMBOBOX && d->CtlType != ODT_LISTBOX && bw > 0 && bh > 0;
-        HDC real = d->hDC, mem = nullptr; HBITMAP bmp = nullptr; HGDIOBJ ob = nullptr;
-        if (buffer && (mem = CreateCompatibleDC(real)) != nullptr) {
-            bmp = CreateCompatibleBitmap(real, bw, bh);
-            if (bmp) { ob = SelectObject(mem, bmp); SetViewportOrgEx(mem, -rc.left, -rc.top, nullptr); d->hDC = mem; }
-            else { DeleteDC(mem); mem = nullptr; }
-        }
+        HDC real = d->hDC, mem = nullptr;
+        OffScreen* os = buffer ? new OffScreen(real, bw, bh) : nullptr;
+        if (os && os->dc) { mem = os->dc; SetViewportOrgEx(mem, -rc.left, -rc.top, nullptr); d->hDC = mem; }
         if (gBrPicture) {                       // the picture behind owner-drawn controls lines up with the window
             POINT pt = { 0, 0 }; MapWindowPoints(d->hwndItem, gWnd, &pt, 1);
             SetBrushOrgEx(d->hDC, -pt.x - (mem ? rc.left : 0), -pt.y - (mem ? rc.top : 0), nullptr);
@@ -12770,9 +12850,9 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         bool done = DrawItemDispatch(w, d);
         if (mem) {
             BitBlt(real, rc.left, rc.top, bw, bh, mem, rc.left, rc.top, SRCCOPY);
-            SelectObject(mem, ob); DeleteObject(bmp); DeleteDC(mem);
             d->hDC = real;
         }
+        delete os;
         if (done) return TRUE;
         break;
     }
