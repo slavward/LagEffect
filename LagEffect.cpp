@@ -2535,7 +2535,7 @@ enum {
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
     IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2, IDC_SETSUB3,   // Settings sub-tabs: consecutive
     IDC_FEATLAG, IDC_FEATFX, IDC_FEATSOUND, IDC_FEATCLIPS,
-    IDC_WSON, IDC_WSPORT, IDC_WSPASS, IDC_WSSTATUS, IDC_WSHELP,
+    IDC_WSON, IDC_WSPORT, IDC_WSPASS, IDC_WSSTATUS, IDC_WSHELP, IDC_WSGUIDE,
     IDC_COLRESET, IDC_FONT, IDC_OPACITY, IDC_PICCHOOSE, IDC_PICREMOVE, IDC_PICFIT, IDC_PICDIM, IDC_PICINFO, IDC_CORNERS,
     IDC_PTTMODE, IDC_PTTKEY, IDC_OVERLAY, IDC_BEEPS, IDC_UISCALE, IDC_EXPORT, IDC_IMPORT, IDC_COMPACT, IDC_COMPACTFX,
     IDC_COMPACTFULL, IDC_PROFAUTO, IDC_PROFAUTOINFO, IDC_VERSION,
@@ -10225,7 +10225,12 @@ static void AddTips()
     TipId(IDC_SETSUB0, L"Profiles, latency, updates, screen share, shortcuts and the window.");
     TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
     TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
-    TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard and clips.");
+    TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard and clips. And remote control (Streamer.bot).");
+    TipId(IDC_WSON,    L"Off: nothing can connect (no port is open). On: apps on this PC, like Streamer.bot, can send Lag Effect commands. Never websites.");
+    TipId(IDC_WSPORT,  L"The port it listens on (ws://127.0.0.1:port). Change it only if another app already uses this one.");
+    TipId(IDC_WSPASS,  L"Optional. If set, an app has to send {\"do\":\"auth\",\"password\":\"...\"} before anything else.");
+    TipId(IDC_WSGUIDE, L"Step by step: setting up Streamer.bot, and every command you can send.");
+    TipId(IDC_WSHELP,  L"Copies C# code to paste into a Streamer.bot action (Execute C# Code).");
     TipId(IDC_FONT,    L"The font for the whole window.");
     TipId(IDC_OPACITY, L"See-through window: 100% = solid. Lower lets what's behind show through.");
     TipId(IDC_COLRESET, L"Go back to the theme's colours.");
@@ -12537,29 +12542,49 @@ static void WsHelp()                            // Settings: how to set up Strea
         if (g) { memcpy(GlobalLock(g), code, n); GlobalUnlock(g); if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g); }
         CloseClipboard();
     }
-    MessageBoxW(gWnd,
-        L"The C# code for Streamer.bot is copied: paste it into an action's \"Execute C# Code\".\n\n"
-        L"SET UP (once)\n"
-        L"Streamer.bot > Servers/Clients > Websocket Clients > right-click > Add. Endpoint: the address shown in "
-        L"Settings (ws://127.0.0.1:port). Tick Auto Connect, then Connect.\n\n"
-        L"COMMANDS (send as JSON)\n"
-        L"{\"do\":\"lag\",\"ms\":2000}   stutter for 2 s\n"
-        L"{\"do\":\"mute\",\"on\":true}   or false, or \"toggle\"\n"
-        L"{\"do\":\"fx\",\"on\":\"toggle\"}   Voice FX on / off\n"
-        L"{\"do\":\"character\",\"name\":\"Robot\"}\n"
-        L"{\"do\":\"profile\",\"name\":\"Gaming\"}   or {\"do\":\"nextprofile\"}\n"
-        L"{\"do\":\"tts\",\"text\":\"hello chat\",\"accent\":\"Scottish\"}\n"
-        L"{\"do\":\"pad\",\"n\":3}   play soundboard pad 3;  {\"do\":\"stopsounds\"}\n"
-        L"{\"do\":\"clip\"}   save the last few seconds;  {\"do\":\"playclip\",\"n\":1}\n"
-        L"{\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":false,\"duck\":true}\n"
-        L"{\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}\n"
-        L"{\"do\":\"start\"} / {\"do\":\"stop\"} / {\"do\":\"status\"} / {\"do\":\"ping\"}\n\n"
-        L"EVENTS (Lag Effect sends these: use Streamer.bot's \"Websocket Client Message\" trigger)\n"
-        L"{\"event\":\"mute\",\"on\":true}, {\"event\":\"lag\",\"on\":true}, {\"event\":\"fx\",...}, {\"event\":\"profile\",\"name\":...}, "
-        L"{\"event\":\"running\",...}. Every command gets a reply: {\"ok\":true,...} or {\"ok\":false,\"error\":...}.\n\n"
-        L"With a password set, send {\"do\":\"auth\",\"password\":\"...\"} first after connecting.\n"
-        L"Only apps on this PC can connect, never websites.",
-        L"Lag Effect - remote control", MB_OK | MB_ICONINFORMATION);
+    MessageBoxW(gWnd, L"Copied. In Streamer.bot, paste it into an action's \"Execute C# Code\" sub-action, change the message "
+                      L"between the quotes to the command you want, then Compile and Save.\n\n\"How to use...\" has every step and command.",
+                L"Lag Effect - remote control", MB_OK | MB_ICONINFORMATION);
+}
+static void WsGuide()                           // Settings: the walkthrough, and how messages are written
+{
+    wchar_t t[4500];
+    swprintf(t, 4500,
+        L"USING LAG EFFECT WITH STREAMER.BOT\n\n"
+        L"1. Here: tick \"Let apps on this PC control Lag Effect\". The line under it says ws://127.0.0.1:%d.\n\n"
+        L"2. In Streamer.bot: Servers/Clients > Websocket Clients > right-click > Add.\n"
+        L"    Name: Lag Effect.   Endpoint: ws://127.0.0.1:%d.   Tick Auto Connect and Auto Reconnect.\n"
+        L"    OK, then right-click it > Connect. Here it now says \"1 connected\".\n\n"
+        L"3. Actions tab > right-click > Add an action (e.g. \"Lag chat\"), and give it a trigger,\n"
+        L"    like a channel point reward or a chat command.\n\n"
+        L"4. In the action: right-click Sub-Actions > Core > C# > Execute C# Code. Here press \"Copy C# code\"\n"
+        L"    and paste it in. Change the message to the command you want (below), then Compile and Save.\n"
+        L"    The 0 in WebsocketSend is the connection's number in Websocket Clients (the first is 0).\n\n"
+        L"5. Run the action (right-click > Test Trigger). Lag Effect does it.\n\n"
+        L"MESSAGES\n"
+        L"Each one is JSON: {\"do\":\"command\", then any options}. Inside C#, put a \\ before every \" in the message, e.g.\n"
+        L"    CPH.WebsocketSend(\"{\\\"do\\\":\\\"lag\\\",\\\"ms\\\":2000}\", 0);\n\n"
+        L"    {\"do\":\"lag\",\"ms\":2000}   stutter for 2 seconds  (needs the Lag effect on)\n"
+        L"    {\"do\":\"mute\",\"on\":true}   mute; false = unmute, \"toggle\" = switch\n"
+        L"    {\"do\":\"fx\",\"on\":\"toggle\"}   Voice FX on / off  (needs Voice FX on)\n"
+        L"    {\"do\":\"character\",\"name\":\"Robot\"}   a Voice FX character\n"
+        L"    {\"do\":\"profile\",\"name\":\"Gaming\"}   or {\"do\":\"nextprofile\"}\n"
+        L"    {\"do\":\"tts\",\"text\":\"hello chat\",\"accent\":\"Scottish\"}   speak  (needs the Soundboard on)\n"
+        L"    {\"do\":\"pad\",\"n\":3}   play soundboard pad 3;  {\"do\":\"stopsounds\"}\n"
+        L"    {\"do\":\"clip\"}   save the last few seconds;  {\"do\":\"playclip\",\"n\":1}  (needs Clips on)\n"
+        L"    {\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":false,\"solo\":false,\"duck\":true}   a Mixer channel\n"
+        L"    {\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}   an output (or \"name\": what you called it)\n"
+        L"    {\"do\":\"start\"}  {\"do\":\"stop\"}  {\"do\":\"status\"}  {\"do\":\"ping\"}\n\n"
+        L"REPLIES AND EVENTS\n"
+        L"Every message gets a reply: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}. Lag Effect also tells Streamer.bot\n"
+        L"when things change: {\"event\":\"mute\",\"on\":true}, {\"event\":\"lag\",...}, {\"event\":\"fx\",...},\n"
+        L"{\"event\":\"profile\",\"name\":...}, {\"event\":\"running\",...}. Use them with the trigger\n"
+        L"Core > Websocket > Client > Websocket Client Message (the text is in %%message%%).\n\n"
+        L"PASSWORD\n"
+        L"If you set one, send {\"do\":\"auth\",\"password\":\"...\"} first after connecting (\"Copy C# code\" includes it).\n\n"
+        L"Only apps on this PC can connect, never websites. Untick the box above to switch it all off.",
+        Iclamp(gWsPort, 1024, 65535), Iclamp(gWsPort, 1024, 65535));
+    MessageBoxW(gWnd, t, L"Lag Effect - Streamer.bot", MB_OK | MB_ICONINFORMATION);
 }
 
 // ======================= start with Windows =======================
@@ -13252,8 +13277,9 @@ static void CreateUI()
     Ctl(L"STATIC", L"Password (optional):", 0, 176, 456, 130, 20, -1);
     Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 308, 453, 120, 23, IDC_WSPASS);
     SendDlgItemMessageW(gWnd, IDC_WSPASS, EM_LIMITTEXT, 60, 0);
-    Ctl(L"STATIC", L"", SS_NOPREFIX, 30, 492, 330, 20, IDC_WSSTATUS);
-    Ctl(L"BUTTON", L"Streamer.bot setup...", WS_TABSTOP, 372, 486, 158, 28, IDC_WSHELP);
+    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 492, 250, 20, IDC_WSSTATUS);
+    Ctl(L"BUTTON", L"How to use...", WS_TABSTOP, 288, 486, 118, 28, IDC_WSGUIDE);
+    Ctl(L"BUTTON", L"Copy C# code", WS_TABSTOP, 412, 486, 118, 28, IDC_WSHELP);
 
     // ---- Look ----
     gBuildSub = 1;
@@ -13659,7 +13685,8 @@ static void OnCommand(int id, int code)
         if (code == EN_KILLFOCUS) SaveSettings();
         return;
     }
-    if (id == IDC_WSHELP) { if (code == BN_CLICKED) WsHelp(); return; }
+    if (id == IDC_WSHELP)  { if (code == BN_CLICKED) WsHelp(); return; }
+    if (id == IDC_WSGUIDE) { if (code == BN_CLICKED) WsGuide(); return; }
     if (id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
