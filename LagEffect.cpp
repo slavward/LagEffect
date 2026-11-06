@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.31.0"
+#define APP_VERSION L"1.31.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -8137,8 +8137,11 @@ static void PlaceFree(HWND c, int x, int y, int w, int h)
 {
     if (!c) return;
     RECT r; GetWindowRect(c, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
-    if (r.left != x || r.top != y || r.right - r.left != w || r.bottom - r.top != h)
-        SetWindowPos(c, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+    const bool resized = r.right - r.left != w || r.bottom - r.top != h;
+    if (r.left != x || r.top != y || resized) {
+        SetWindowPos(c, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        if (resized) InvalidateRect(c, nullptr, FALSE);   // (labels only repaint their new part by themselves: all of it)
+    }
 }
 static void MixerPlace()                        // the Mixer fills the window: strips side by side, taller faders when there's room
 {
@@ -8243,7 +8246,7 @@ static void MixerEdgeSet(int i, int w)          // design px; 0 = normal
     RECT c; GetClientRect(gWnd, &c);
     if (need > c.right && !IsZoomed(gWnd)) Layout();
     MixerPlace();
-    UpdateWindow(gWnd);
+    RedrawWindow(gWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW);   // (shows straight away while you drag)
 }
 static void MixerPaintStrips(HDC dc)            // (from the window's paint) the strips' outlines and colours
 {
@@ -13539,7 +13542,7 @@ static void HitchLog(UINT m, WPARAM w, int ms)
         f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (f == INVALID_HANDLE_VALUE) { gHitchN = 400; return; }   // not asked for: never log
         else {
-            static const char head[] = "---- Lag Effect " "1.31.0" " started ----\r\n"; DWORD wr;
+            static const char head[] = "---- Lag Effect " "1.31.1" " started ----\r\n"; DWORD wr;
             WriteFile(f, head, sizeof(head) - 1, &wr, nullptr);
         }
     }
@@ -13983,7 +13986,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     RegisterClassW(&tc);
     {                                           // the Mixer's faders
         WNDCLASSW fc = {};
-        fc.style = CS_DBLCLKS; fc.lpfnWndProc = FaderProc; fc.hInstance = hi;
+        fc.style = CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW; fc.lpfnWndProc = FaderProc; fc.hInstance = hi;
         fc.hCursor = LoadCursorW(nullptr, IDC_HAND); fc.lpszClassName = L"LagFader";
         RegisterClassW(&fc);
     }
