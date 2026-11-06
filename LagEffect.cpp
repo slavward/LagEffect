@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.33.0"
+#define APP_VERSION L"1.33.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -10475,7 +10475,7 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
 static const wchar_t* MIC_SUB_NAMES[2] = { L"Cleanup", L"Tone" };
-static const wchar_t* SET_SUB_NAMES[3] = { L"General", L"Look", L"Pictures" };
+static const wchar_t* SET_SUB_NAMES[4] = { L"General", L"Look", L"Pictures", L"Features" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings sub-tabs
 {
     const bool set = (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB3;
@@ -11093,14 +11093,15 @@ static void LayoutCompact(bool on)              // slim window: status, Start, M
     const RECT pos[] = { { 8, 8, 544, 28 }, { 8, 42, 128, 34 }, { 142, 42, 128, 34 }, { 276, 42, 128, 34 }, { 410, 42, 142, 34 } };
     for (int i = 0; i < 5; i++) {
         HWND c = GetDlgItem(gWnd, ids[i]);
-        if (on) { SetWindowPos(c, nullptr, SC(pos[i].left), SC(pos[i].top), SC(pos[i].right), SC(pos[i].bottom), SWP_NOZORDER | SWP_NOACTIVATE); ShowWindow(c, SW_SHOWNA); }
+        if (on) { SetWindowPos(c, nullptr, SC(pos[i].left), SC(pos[i].top), SC(pos[i].right), SC(pos[i].bottom), SWP_NOZORDER | SWP_NOACTIVATE);
+                  ShowWindow(c, ids[i] == IDC_COMPACTFX && !gFeatFx ? SW_HIDE : SW_SHOWNA); }   // (no Voice FX button with it off)
     }
     if (!on) {                                  // back to normal sizes (positions come from Layout)
         SetWindowPos(GetDlgItem(gWnd, IDC_STATUS), nullptr, 0, 0, SC(532), SC(30), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         for (int i = 1; i < 3; i++) SetWindowPos(GetDlgItem(gWnd, ids[i]), nullptr, 0, 0, SC(127), SC(34), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         ShowWindow(GetDlgItem(gWnd, IDC_COMPACTFX), SW_HIDE); ShowWindow(GetDlgItem(gWnd, IDC_COMPACTFULL), SW_HIDE);
     }
-    for (int t = 0; t < TAB_COUNT; t++) ShowWindow(GetDlgItem(gWnd, IDC_TAB0 + t), on ? SW_HIDE : SW_SHOWNA);
+    for (int t = 0; t < TAB_COUNT; t++) ShowWindow(GetDlgItem(gWnd, IDC_TAB0 + t), on || !PageOn(t) ? SW_HIDE : SW_SHOWNA);   // (not a feature that's off)
     SetDlgItemTextW(gWnd, IDC_COMPACTFX, gFxOn ? L"Voice FX: on" : L"Voice FX: off");
 }
 
@@ -12681,9 +12682,9 @@ static void CreateUI()
     {
         struct { int id; const wchar_t* name; const wchar_t* what; bool on; } f[] = {
             { IDC_FEATLAG,   L"Lag effect", L"Hold a hotkey to stutter your voice. Its settings are on the Main tab.", gFeatLag },
-            { IDC_FEATFX,    L"Voice FX", L"Effects for your live voice, characters and Vocode to song. Adds the Voice FX tab.", gFeatFx },
-            { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, and text to speech. Adds the Soundboard tab.", gFeatSound },
-            { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds the Clips tab.", gFeatClips },
+            { IDC_FEATFX,    L"Voice FX", L"Effects for your live voice, characters and Vocode to song. Adds a tab.", gFeatFx },
+            { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, and text to speech. Adds a tab.", gFeatSound },
+            { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
         };
         for (int i = 0; i < 4; i++) {
             const int y = 156 + i * 56;
