@@ -11826,6 +11826,11 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, active ? (TXT_C) : (gDark ? DK_DIM : RGB(105, 105, 105)));
     RECT tr = rc; tr.bottom -= 3;
+    for (int lvl = 1; lvl <= 3; lvl++) {        // (seven tabs are narrower: a long name in a wide font gets a smaller size)
+        SIZE sz; GetTextExtentPoint32W(dc, text, lstrlenW(text), &sz);
+        if (sz.cx <= tr.right - tr.left - 6) break;
+        SelectObject(dc, FitFont(lvl));
+    }
     DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
     SelectObject(dc, of);
     if (active) {
