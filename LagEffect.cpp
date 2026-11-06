@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.30.0"
+#define APP_VERSION L"1.30.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -2542,7 +2542,6 @@ enum {
 #define WM_APPS_SCANNED    (WM_APP + 13)         // the list of apps with sound (for the Mixer) is ready
 #define WM_OUTPUT_LOST     (WM_APP + 14)         // an extra output's device stopped (unplugged...): reopen just that one
 #define WM_RENAME_DONE     (WM_APP + 15)         // a Mixer channel's name box closed (wParam 1 = keep the text)
-#define WM_FIT_SIZE        (WM_APP + 16)         // the window was resized: scale everything to fit
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -3614,6 +3613,8 @@ static void LoadSettings()
         if (!gCh[c].src[0]) gCh[c].type = CH_NONE;
     }
     gDuckDb = Iclamp(INI_INT(L"mixer_duck_db", 12), 3, 30);
+    for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  int v = INI_INT(key, 0); gChW[c] = v ? Iclamp(v, 52, 240) : 0; }
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); int v = INI_INT(key, 0); gOutW[k] = v ? Iclamp(v, 84, 320) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
     gTtsVol = Iclamp(INI_INT(L"tts_volume", 100), 0, 200);
     gTtsRate = Iclamp(INI_INT(L"tts_speed", 0), -10, 10); gTtsPitch = Iclamp(INI_INT(L"tts_pitch", 0), -12, 12);
@@ -4456,6 +4457,8 @@ static void SaveSettings()
     }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); } SaveInt(L"tts_volume", gTtsVol);
     SaveInt(L"mixer_duck_db", gDuckDb);
+    for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  SaveInt(key, gChW[c]); }
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); SaveInt(key, gOutW[k]); }
     SaveInt(L"tts_speed", gTtsRate); SaveInt(L"tts_pitch", gTtsPitch); SaveInt(L"tts_room", gTtsRoom);
     SaveInt(L"tts_pauses", gTtsPause); SaveInt(L"tts_natural", gTtsNatural);
     SaveInt(L"fx_echo_style", gEchoStyle);
@@ -4705,6 +4708,7 @@ struct Design  {
     HWND ud; int udx, udy;                      // number box: its arrows and where they sit relative to it
     int  sec, ox, oy;                           // the section it's in (-1 none), your offset (design px)
     int  s0, x0, y0, w0, ht0, hh0, ww0, udx0, udy0, udw0, udh0;   // (resizing) its size at the UI size s0, kept so sizes never drift
+    bool free;                                  // placed by its own code (the Mixer's strips), not from the layout
 };
 #define MAX_DESIGN 1400
 static void LayoutSave(const wchar_t* path);
@@ -4726,6 +4730,7 @@ static int     gPage = 0;                      // page being shown
 static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage, gBuildSub }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
+static int DesignH() { return gCompact ? COMPACT_H : BASE_H + RowsDelta(); }
 
 static HWND Ctl(const wchar_t* cls, const wchar_t* text, DWORD style, int x, int y, int w, int h, int id, DWORD ex = 0)
 {
@@ -4778,11 +4783,13 @@ static void PlaceAll()
     if (!gWnd) return;
     const int rows = RowsDelta();
     HWND keep[3] = { GetDlgItem(gWnd, IDC_STATUS), GetDlgItem(gWnd, IDC_START), GetDlgItem(gWnd, IDC_MUTEBTN) };
+    { RECT c; GetClientRect(gWnd, &c); gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - SC(CLIENT_W)) / 2); }
     for (int i = 0; i < gDesignN; i++) {
         Design& d = gDesign[i];
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
         if (d.page >= 0 && d.page != gPage) continue;   // other pages are placed when you switch to them
-        int x = d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d));
+        if (d.free) continue;
+        int x = gOrgX + d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d));
         RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
         int w = d.ud ? r.right - r.left : d.w + d.dw;          // a number box keeps the width its arrows left it
         int h = d.combo ? d.ht : r.bottom - r.top;              // a dropdown's height is its list
@@ -5190,7 +5197,11 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
 }
 
 static void Layout();
-static bool gOwnSize = false, gInSizeMove = false;   // (resizing) the window sizing itself / you dragging an edge
+static bool gOwnSize = false;                   // (resizing) the window is sizing itself
+static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
+static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
+static int  MixerNeedW();
+static void MixerPlace();
 static void SetFxGroupOn(int g, bool on);
 static void SetFxOn(bool on);
 static void UpdateStatus(bool force);
@@ -7969,17 +7980,121 @@ static void DrawLimit(DRAWITEMSTRUCT* d, bool on)   // a little light: the limit
     DrawTextW(dc, L"Limit", -1, &tr, DT_SINGLELINE | DT_VCENTER);
     SelectObject(dc, of);
 }
+// ---- strip widths: drag a strip's right edge (double-click it: back to normal)
+static int  gChW[CH_MAX], gOutW[MAX_OUT];       // design px, 0 = the normal width
+static RECT gStripRc[CH_MAX + MAX_OUT];         // where each strip is now (px)
+static HWND gMixHint = nullptr, gDuckLbl = nullptr, gDuckDbLbl = nullptr;
+static int ChW(int c)  { return gCh[c].type == CH_NONE ? 50 : (gChW[c] ? gChW[c] : 62); }
+static int OutW(int k) { return gOutW[k] ? gOutW[k] : 100; }
+static int MixerNeedW()                         // px: how wide the window must be for the strips
+{
+    int a = SC(42), b = SC(42);
+    for (int c = 0; c < CH_MAX; c++) a += SC(ChW(c)) + (c ? SC(3) : 0);
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) b += SC(OutW(k)) + (k ? SC(5) : 0);
+    return Imax(a, b);
+}
+static void PlaceFree(HWND c, int x, int y, int w, int h)
+{
+    if (!c) return;
+    RECT r; GetWindowRect(c, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+    if (r.left != x || r.top != y || r.right - r.left != w || r.bottom - r.top != h)
+        SetWindowPos(c, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+static void MixerPlace()                        // the Mixer fills the window: strips side by side, taller faders when there's room
+{
+    if (!gWnd || gSecChan < 0 || gSecOut < 0 || gCompact) return;
+    RECT cr; GetClientRect(gWnd, &cr);
+    const int W = Imax((int)cr.right, MixerNeedW()), H = cr.bottom;
+    const int extraH = Imax(0, H - SC(DesignH()));
+    const int cx0 = SC(14), cw = W - SC(28);
+    const int chTop = SC(54), chH = SC(330) + extraH * 2 / 3;
+    const int oTop = chTop + chH + SC(16), oH = SC(184) + (extraH - extraH * 2 / 3);
+    Section& sc = gSections[gSecChan]; sc.x = UNSC(cx0); sc.y = UNSC(chTop); sc.w = UNSC(cw); sc.h = UNSC(chH); sc.ox = sc.oy = 0;
+    Section& so = gSections[gSecOut];  so.x = UNSC(cx0); so.y = UNSC(oTop);  so.w = UNSC(cw); so.h = UNSC(oH);  so.ox = so.oy = 0;
+
+    // the top row: hint on the left; Duck by [ ] dB and Restart audio on the right
+    const int rx = cx0 + cw - SC(12) - SC(104);
+    PlaceFree(GetDlgItem(gWnd, IDC_RESTARTAUD), rx, chTop + SC(8), SC(104), SC(26));
+    const int dbx = rx - SC(10) - SC(22);
+    PlaceFree(gDuckDbLbl, dbx, chTop + SC(13), SC(22), SC(18));
+    {
+        HWND e = GetDlgItem(gWnd, IDC_DUCKDB), u = GetDlgItem(gWnd, SPIN_UD(IDC_DUCKDB));
+        RECT ur = {}; if (u) GetWindowRect(u, &ur);
+        const int uw = ur.right - ur.left, sw = SC(52), sx = dbx - SC(4) - sw;
+        PlaceFree(e, sx, chTop + SC(10), sw - uw, SC(23));
+        if (u) PlaceFree(u, sx + sw - uw, chTop + SC(10), uw, SC(23));
+        PlaceFree(gDuckLbl, sx - SC(4) - SC(50), chTop + SC(13), SC(50), SC(18));
+    }
+    PlaceFree(gMixHint, cx0 + SC(16), chTop + SC(13), Imax(SC(60), rx - SC(160) - (cx0 + SC(16))), SC(18));
+
+    // channel strips
+    const int sy = chTop + SC(36), sh = chH - SC(52);
+    int x = SC(21);
+    const int n = Imax(1, Imin(gRows, MAX_OUT));
+    for (int c = 0; c < CH_MAX; c++) {
+        const int w = SC(ChW(c));
+        gStripRc[c] = { x, sy, x + w, sy + sh };
+        PlaceFree(GetDlgItem(gWnd, IDC_CHSRC0 + c), x + SC(3), sy + SC(6), w - SC(6), SC(26));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHDB0 + c), x + SC(2), sy + SC(33), w - SC(4), SC(16));
+        const int gx = x + (w - SC(38)) / 2, ft = sy + SC(51), fb = sy + sh - SC(77);
+        PlaceFree(GetDlgItem(gWnd, IDC_CHVOL0 + c), gx, ft, SC(22), fb - ft);
+        PlaceFree(GetDlgItem(gWnd, IDC_CHMETER0 + c), gx + SC(26), ft + SC(2), SC(12), fb - ft - SC(4));
+        const int bw = (w - SC(8) - SC(3)) / 2;
+        PlaceFree(GetDlgItem(gWnd, IDC_CHMUTE0 + c), x + SC(4), sy + sh - SC(71), bw, SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHSOLO0 + c), x + SC(4) + bw + SC(3), sy + sh - SC(71), bw, SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHDUCK0 + c), x + SC(4), sy + sh - SC(48), w - SC(8), SC(20));
+        const int rg = SC(2), rw = (w - SC(8) - rg * (n - 1)) / n;
+        for (int k = 0; k < MAX_OUT; k++)
+            PlaceFree(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), x + SC(4) + Imin(k, n - 1) * (rw + rg), sy + sh - SC(24), rw, SC(18));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHADD0 + c), x + SC(4), sy + SC(6), w - SC(8), sh - SC(12));
+        x += w + SC(3);
+    }
+    // output strips
+    const int oy = oTop + SC(14), oh = oH - SC(22);
+    x = SC(21);
+    for (int k = 0; k < MAX_OUT; k++) {
+        const int w = SC(OutW(k));
+        gStripRc[CH_MAX + k] = { x, oy, x + w, oy + oh };
+        PlaceFree(GetDlgItem(gWnd, IDC_OVOL0 + k), x + SC(4), oy + SC(6), SC(20), oh - SC(12));
+        PlaceFree(GetDlgItem(gWnd, IDC_OMETER0 + k), x + SC(27), oy + SC(8), SC(8), oh - SC(16));
+        const int tx = x + SC(40), tw = w - SC(44);
+        PlaceFree(GetDlgItem(gWnd, IDC_OLBL0 + k), tx, oy + SC(6), tw, SC(18));
+        PlaceFree(GetDlgItem(gWnd, IDC_ODEV0 + k), tx, oy + SC(25), tw, SC(18));
+        PlaceFree(GetDlgItem(gWnd, IDC_ODB0 + k),  tx, oy + SC(44), tw, SC(18));
+        PlaceFree(GetDlgItem(gWnd, IDC_OLIM0 + k), tx, oy + oh - SC(54), tw, SC(16));
+        PlaceFree(GetDlgItem(gWnd, IDC_OMUTE0 + k), tx, oy + oh - SC(30), tw, SC(22));
+        if (k < gRows) x += w + SC(5);
+    }
+    if (gPage == PAGE_MIXER) InvalidateRect(gWnd, nullptr, FALSE);
+}
 static bool MixerStripRect(int i, RECT* r)      // i < CH_MAX: a channel's strip; CH_MAX + k: output k's
 {
-    const bool out = i >= CH_MAX;
-    const int si = out ? gSecOut : gSecChan;
-    if (si < 0) return false;
-    const Section& s = gSections[si];
-    int x, y, w, hh;
-    if (!out) { x = s.x + s.ox + 7 + i * 65; y = s.y + s.oy + 36; w = 62; hh = 278; }
-    else      { x = s.x + s.ox + 7 + (i - CH_MAX) * 105; y = s.y + s.oy + 14; w = 100; hh = 162; }
-    *r = { SC(x), SC(y), SC(x + w), SC(y + hh) };
+    if (i < 0 || i >= CH_MAX + MAX_OUT || gStripRc[i].right <= gStripRc[i].left) return false;
+    *r = gStripRc[i];
     return true;
+}
+static int  gEdgeDrag = -1, gEdgeX0 = 0, gEdgeW0 = 0;   // dragging a strip's edge
+static int  gEdgeLast = -1; static DWORD gEdgeLastT = 0;
+static int MixerEdgeAt(int x, int y)            // the strip whose right edge is under the mouse (-1: none)
+{
+    if (gCompact || gPage != PAGE_MIXER) return -1;
+    for (int i = 0; i < CH_MAX + gRows && i < CH_MAX + MAX_OUT; i++) {
+        if (i < CH_MAX && gCh[i].type == CH_NONE) continue;   // (empty ones stay small)
+        const RECT& r = gStripRc[i];
+        if (r.right <= r.left) continue;
+        if (y >= r.top && y < r.bottom && x >= r.right - SC(4) && x <= r.right + SC(5)) return i;
+    }
+    return -1;
+}
+static void MixerEdgeSet(int i, int w)          // design px; 0 = normal
+{
+    if (i < CH_MAX) gChW[i] = w ? Iclamp(w, 52, 240) : 0;
+    else gOutW[i - CH_MAX] = w ? Iclamp(w, 84, 320) : 0;
+    const int need = MixerNeedW();              // wider than the window: the window grows
+    RECT c; GetClientRect(gWnd, &c);
+    if (need > c.right && !IsZoomed(gWnd)) Layout();
+    MixerPlace();
+    UpdateWindow(gWnd);
 }
 static void MixerPaintStrips(HDC dc)            // (from the window's paint) the strips' outlines and colours
 {
@@ -9221,7 +9336,7 @@ static bool SectionShown(const Section& s)
 }
 static RECT SectionRect(const Section& s)
 {
-    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0)), x = SC(s.x + s.ox);
+    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0)), x = SC(s.x + s.ox) + ((gSecChan >= 0 && &s == &gSections[gSecChan]) || (gSecOut >= 0 && &s == &gSections[gSecOut]) ? 0 : gOrgX);
     RECT r = { x, y - SC(8), x + SC(s.w), y + SC(s.h) };
     return r;
 }
@@ -10778,21 +10893,23 @@ static void Layout()
     PlaceAll();                                 // everything below the output list slides down with it
 
     DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
-    RECT r = { 0, 0, SC(CLIENT_W), SC(gCompact ? COMPACT_H : BASE_H + d) };   // both pages share the window size, so switching never jumps
+    // every page shares the window size, so switching never jumps; plus however much bigger you made it
+    RECT r = gCompact ? RECT{ 0, 0, SC(CLIENT_W), SC(COMPACT_H) }
+                      : RECT{ 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + gExtraW, SC(BASE_H + d) + gExtraH };
     AdjustWindowRect(&r, style, FALSE);
-    gOwnSize = true;
-    SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-    gOwnSize = false;
+    if (!IsZoomed(gWnd)) {
+        gOwnSize = true;
+        SetWindowPos(gWnd, nullptr, 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        gOwnSize = false;
+    }
+    PlaceAll(); MixerPlace();                   // (centred for the final width)
     LayoutCompact(gCompact);
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | (freeze ? RDW_UPDATENOW : 0));
     EdFollow();
 }
 
-// ---- resizing: everything scales together, keeping the window's shape (nothing gets cut off or stretched)
-static int  gMaxPrevScale = 0;                  // "maximised": the size to go back to
-static RECT gMaxPrevRect;
-static int  DesignH() { return gCompact ? COMPACT_H : BASE_H + RowsDelta(); }
+// ---- resizing: the UI size (Settings) scales everything; the window itself sizes freely
 static void Rescale(int ns)
 {
     ns = Iclamp(ns, 80, 250);
@@ -10818,51 +10935,14 @@ static void Rescale(int ns)
         }
     }
     gUiScale = ns;
+    gExtraW = gExtraH = 0;                      // (a new size: the window fits it snugly again)
     ApplyFont();                                // the fonts at the new size; every label re-measured
     SendDlgItemMessageW(gWnd, IDC_COLORTHEME, CB_SETITEMHEIGHT, (WPARAM)-1, SC(20));
     SendDlgItemMessageW(gWnd, IDC_COLORTHEME, CB_SETITEMHEIGHT, 0, SC(20));
-    {                                           // Settings > UI size shows the nearest
-        static const int scales[] = { 100, 125, 150, 175, 200 };
-        int best = 0; for (int i = 1; i < 5; i++) if (abs(scales[i] - ns) < abs(scales[best] - ns)) best = i;
-        SendDlgItemMessageW(gWnd, IDC_UISCALE, CB_SETCURSEL, best, 0);
-    }
     SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
     Layout();                                   // places everything and sizes the window to match
     if (PicActive()) PictureRebuild();
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN);
-}
-static void FitToWindow()                       // after you resize it: the UI size that fits
-{
-    if (!gWnd || !gUiReady || IsIconic(gWnd) || IsZoomed(gWnd)) return;
-    RECT c; GetClientRect(gWnd, &c);
-    if (c.right == SC(CLIENT_W) && c.bottom == SC(DesignH())) return;   // (already exact)
-    const int ns = Iclamp(Imin(MulDiv(c.right, 100, CLIENT_W), MulDiv(c.bottom, 100, DesignH())), 80, 250);
-    if (ns != gUiScale) { gMaxPrevScale = 0; Rescale(ns); }
-    else Layout();                              // (snaps back to the exact size)
-}
-static void FitMaximize()                       // "maximise": as big as fits the screen, keeping its shape; again = back
-{
-    if (gMaxPrevScale) {
-        const int ps = gMaxPrevScale; const RECT pr = gMaxPrevRect;
-        gMaxPrevScale = 0;
-        Rescale(ps);
-        SetWindowPos(gWnd, nullptr, pr.left, pr.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-        return;
-    }
-    MONITORINFO mi = { sizeof(mi) };
-    if (!GetMonitorInfoW(MonitorFromWindow(gWnd, MONITOR_DEFAULTTONEAREST), &mi)) return;
-    RECT nc = { 0, 0, 0, 0 }; AdjustWindowRect(&nc, (DWORD)GetWindowLongW(gWnd, GWL_STYLE), FALSE);
-    const int aw = (mi.rcWork.right - mi.rcWork.left) - (nc.right - nc.left), ah = (mi.rcWork.bottom - mi.rcWork.top) - (nc.bottom - nc.top);
-    const int ns = Iclamp(Imin(MulDiv(aw, 100, CLIENT_W), MulDiv(ah, 100, DesignH())), 80, 250);
-    if (ns == gUiScale) return;
-    GetWindowRect(gWnd, &gMaxPrevRect);
-    const int prev = gUiScale;
-    Rescale(ns);
-    gMaxPrevScale = prev;
-    RECT wr; GetWindowRect(gWnd, &wr);
-    SetWindowPos(gWnd, nullptr, mi.rcWork.left + ((mi.rcWork.right - mi.rcWork.left) - (wr.right - wr.left)) / 2,
-                 Imax((int)mi.rcWork.top, (int)mi.rcWork.top + ((mi.rcWork.bottom - mi.rcWork.top) - (wr.bottom - wr.top)) / 2),
-                 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
 static void SetPage(int page)
@@ -12366,10 +12446,10 @@ static void CreateUI()
     gBuildPage = PAGE_MIXER;
     gSecChan = gSectionN;
     AddSection(14, 54, 532, 330, L"Channels");
-    Ctl(L"STATIC", L"Click a name to pick what it plays.", 0, 30, 67, 230, 18, IDC_HDR);
-    Ctl(L"STATIC", L"Duck by", 0, 292, 67, 50, 18, IDC_HDR);
+    gMixHint   = Ctl(L"STATIC", L"Click a name to pick what it plays. Drag a strip's right edge to resize it.", SS_ENDELLIPSIS, 30, 67, 230, 18, 0);
+    gDuckLbl   = Ctl(L"STATIC", L"Duck by", SS_RIGHT, 292, 67, 50, 18, 0);
     Spin(IDC_DUCKDB, 344, 64, 52, 3, 30, gDuckDb);
-    Ctl(L"STATIC", L"dB", 0, 400, 67, 22, 18, IDC_HDR);
+    gDuckDbLbl = Ctl(L"STATIC", L"dB", 0, 400, 67, 22, 18, 0);
     Ctl(L"BUTTON", L"Restart audio", WS_TABSTOP, 434, 62, 104, 26, IDC_RESTARTAUD);
     for (int c = 0; c < CH_MAX; c++) {
         const int x = 21 + c * 65;
@@ -12403,6 +12483,8 @@ static void CreateUI()
         Ctl(L"BUTTON", L"M", BS_OWNERDRAW | WS_TABSTOP, x + 40, 546, 56, 22, IDC_OMUTE0 + k);
     }
     gBuildPage = -1;
+    for (int i = 0; i < gDesignN; i++)          // the Mixer's strips are placed by MixerPlace, not the layout
+        if (gDesign[i].page == PAGE_MIXER) gDesign[i].free = true;
     for (int c = 0; c < CH_MAX; c++) FaderLabel(IDC_CHVOL0 + c);
     for (int k = 0; k < MAX_OUT; k++) FaderLabel(IDC_OVOL0 + k);
 
@@ -12523,7 +12605,7 @@ static void PaintWindow(HDC dc)
     {                                           // line under the tabs
         HPEN sep = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
         HGDIOBJ op = SelectObject(dc, sep);
-        if (!gCompact) { MoveToEx(dc, SC(14), SC(42), nullptr); LineTo(dc, SC(CLIENT_W - 14), SC(42)); }
+        if (!gCompact) { MoveToEx(dc, gOrgX + SC(14), SC(42), nullptr); LineTo(dc, gOrgX + SC(CLIENT_W - 14), SC(42)); }
         SelectObject(dc, op);
         DeleteObject(sep);
     }
@@ -12533,7 +12615,7 @@ static void PaintWindow(HDC dc)
         if (s.page >= 0 && s.page != gPage) continue;
         if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub)) continue;
         if (gCompact) continue;
-        int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox);
+        int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox) + (i == gSecChan || i == gSecOut ? 0 : gOrgX);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         RECT tr = { sx + 10, y - sz.cy / 2, sx + 18 + sz.cx, y + sz.cy / 2 + 1 };
@@ -12947,7 +13029,7 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) {
             static const int scales[] = { 100, 125, 150, 175, 200 };
             int v = scales[Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 4)];
-            if (v != gUiScale) { gMaxPrevScale = 0; Rescale(v); }   // (straight away: no restart needed now)
+            if (v != gUiScale) Rescale(v);   // (straight away: no restart needed now)
         }
         return;
     }
@@ -13405,33 +13487,27 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_SIZE:                               // the picture is sized to the window
         if (PicActive() && w != SIZE_MINIMIZED) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
         EdFollow();
-        if (w == SIZE_MAXIMIZED) PostMessageW(h, WM_FIT_SIZE, 1, 0);           // (Win+Up, snapped to the top...)
-        else if (w == SIZE_RESTORED && !gOwnSize && !gInSizeMove) PostMessageW(h, WM_FIT_SIZE, 0, 0);   // (snapped to a side...)
+        if (w != SIZE_MINIMIZED && gUiReady) {  // free sizing: centre the page, the Mixer fills the width / height
+            static bool busy = false;
+            if (!busy) {
+                busy = true;
+                if (!gOwnSize && !IsZoomed(h) && !gCompact) {   // remember how much bigger than needed you made it
+                    RECT c; GetClientRect(h, &c);
+                    gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()));
+                    gExtraH = Imax(0, (int)c.bottom - SC(DesignH()));
+                }
+                PlaceAll(); MixerPlace();
+                InvalidateRect(h, nullptr, FALSE);
+                busy = false;
+            }
+        }
         break;
-    case WM_FIT_SIZE:
-        if (w == 1) { if (IsZoomed(h)) ShowWindow(h, SW_RESTORE); if (!gMaxPrevScale) FitMaximize(); }
-        else FitToWindow();
-        return 0;
-    case WM_ENTERSIZEMOVE: gInSizeMove = true; break;
-    case WM_EXITSIZEMOVE:  gInSizeMove = false; PostMessageW(h, WM_FIT_SIZE, 0, 0); break;
-    case WM_GETMINMAXINFO: {                    // no smaller than 80%
+    case WM_GETMINMAXINFO: {                    // never smaller than the layout needs
         MINMAXINFO* mm = (MINMAXINFO*)l;
-        RECT r = { 0, 0, MulDiv(CLIENT_W, 80, 100), MulDiv(gWnd ? DesignH() : BASE_H, 80, 100) };
+        RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()), SC(gWnd ? DesignH() : BASE_H) };
         AdjustWindowRect(&r, (DWORD)GetWindowLongW(h, GWL_STYLE), FALSE);
         mm->ptMinTrackSize.x = r.right - r.left; mm->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
-    }
-    case WM_SIZING: {                           // keep its shape while you drag an edge or corner
-        RECT* r = (RECT*)l;
-        RECT nc = { 0, 0, 0, 0 }; AdjustWindowRect(&nc, (DWORD)GetWindowLongW(h, GWL_STYLE), FALSE);
-        const int ncw = nc.right - nc.left, nch = nc.bottom - nc.top, H0 = DesignH();
-        int cw = r->right - r->left - ncw, ch = r->bottom - r->top - nch;
-        int sc = (w == WMSZ_TOP || w == WMSZ_BOTTOM) ? MulDiv(ch, 100, H0) : MulDiv(cw, 100, CLIENT_W);
-        sc = Iclamp(sc, 80, 250);
-        cw = MulDiv(CLIENT_W, sc, 100); ch = MulDiv(H0, sc, 100);
-        if (w == WMSZ_LEFT || w == WMSZ_TOPLEFT || w == WMSZ_BOTTOMLEFT) r->left = r->right - cw - ncw; else r->right = r->left + cw + ncw;
-        if (w == WMSZ_TOP || w == WMSZ_TOPLEFT || w == WMSZ_TOPRIGHT) r->top = r->bottom - ch - nch; else r->bottom = r->top + ch + nch;
-        return TRUE;
     }
     case WM_MOUSEWHEEL: {                       // the wheel goes to the fader under the mouse
         POINT pt = { (short)LOWORD(l), (short)HIWORD(l) };
@@ -13498,9 +13574,34 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (done) return TRUE;
         break;
     }
-    case WM_LBUTTONDOWN:                        // click on empty space: leave the text/number box you were in
+    case WM_SETCURSOR:                          // a strip's right edge: the resize arrows
+        if ((HWND)w == h && LOWORD(l) == HTCLIENT) {
+            POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
+            if (gEdgeDrag >= 0 || MixerEdgeAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE; }
+        }
+        break;
+    case WM_LBUTTONDOWN: {                      // click on empty space: leave the text/number box you were in
         SetFocus(h);
+        const int x = (short)LOWORD(l), y = (short)HIWORD(l), e = MixerEdgeAt(x, y);
+        if (e >= 0) {
+            if (e == gEdgeLast && GetTickCount() - gEdgeLastT < GetDoubleClickTime()) {   // double-click: normal width
+                gEdgeLast = -1; MixerEdgeSet(e, 0); return 0;
+            }
+            gEdgeLast = e; gEdgeLastT = GetTickCount();
+            gEdgeDrag = e; gEdgeX0 = x; gEdgeW0 = e < CH_MAX ? ChW(e) : OutW(e - CH_MAX);
+            SetCapture(h);
+        }
         return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (gEdgeDrag >= 0 && GetCapture() == h) MixerEdgeSet(gEdgeDrag, gEdgeW0 + UNSC((short)LOWORD(l) - gEdgeX0));
+        break;
+    case WM_LBUTTONUP:
+        if (gEdgeDrag >= 0) { gEdgeDrag = -1; ReleaseCapture(); }
+        break;
+    case WM_CAPTURECHANGED:
+        gEdgeDrag = -1;
+        break;
     case WM_CONTEXTMENU: {                      // right-click a Voice FX hotkey button to clear it
         int id = GetDlgCtrlID((HWND)w);
         if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
@@ -13543,7 +13644,6 @@ static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     case WM_SYSCOMMAND:
         if ((w & 0xFFF0) == SC_MINIMIZE) { ToTray(); return 0; }   // minimize goes to the tray
-        if ((w & 0xFFF0) == SC_MAXIMIZE) { FitMaximize(); return 0; }   // as big as fits, keeping its shape
         break;
     case WM_TRAY:
         if (l == WM_LBUTTONUP || l == WM_LBUTTONDBLCLK) FromTray();
