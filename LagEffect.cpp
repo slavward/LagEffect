@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.31.2"
+#define APP_VERSION L"1.32.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -85,7 +85,8 @@ static int Iclamp(int v, int lo, int hi) { return Imax(lo, Imin(hi, v)); }
 #define MAX_OUT   5                            // output rows
 static const int BUFFERS[] = { 32, 64, 128, 256, 512 };
 
-enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2, MODE_CLEAN = 3 };   // Clean: your voice without Voice FX or the stutter
+enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2, MODE_CLEAN = 3, MODE_APPS = 4 };   // Clean: your voice without Voice FX or the stutter
+                                                // Apps only: just the Mixer channels sent to it (no mic, no effects, no soundboard)
 
 // Settings shared with the audio threads (plain ints/floats are safe to read on x86/x64).
 static volatile int   gLoopMs = 500, gSpeedPct = 100, gPitchPct = 100, gFadeMs = 3;
@@ -2400,7 +2401,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         // going through the voice effects even when its signal doesn't carry your (effected) voice
         auto sounds = [&](int k) {
             const bool always = hearOut == MAX_OUT + 1 || hearOut == k + 1;
-            return (mode[k] != MODE_OFF || always ? sb : 0.0f) + (always && mode[k] != MODE_ALL ? sbFx : 0.0f);
+            return (mode[k] != MODE_OFF && mode[k] != MODE_APPS) || always ? sb + (always && mode[k] != MODE_ALL ? sbFx : 0.0f) : 0.0f;
         };
         // mixer channels: this frame of each, summed per output (stereo)
         float cL[MAX_OUT] = {}, cR[MAX_OUT] = {};
@@ -2537,6 +2538,7 @@ enum {
     IDC_OMUTE0 = 1590, IDC_OVOL0 = 1600, IDC_OLBL0 = 1610, IDC_OMETER0 = 1620,
     IDC_CHSOLO0 = 1640, IDC_CHDUCK0 = 1650, IDC_CHDB0 = 1660, IDC_CHADD0 = 1670,
     IDC_ODEV0 = 1680, IDC_ODB0 = 1690, IDC_OLIM0 = 1700, IDC_DUCKDB = 1710, IDC_RESTARTAUD = 1711, IDC_CHNAMEED = 1712,
+    IDC_CHADDBTN = 1713, IDC_MIXHINT = 1714,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -3726,7 +3728,7 @@ static void LoadSettings()
         for (int k = 0; k < rows; k++) {
             wchar_t key[32];
             wsprintfW(key, L"out%d_device", k + 1); GetPrivateProfileStringW(L"settings", key, L"", gRowName[k], 512, gIni);
-            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? MODE_ALL : MODE_EFFECT), 0, 3);
+            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? MODE_ALL : MODE_EFFECT), 0, MODE_APPS);
             wsprintfW(key, L"out%d_volume", k + 1); gRowVol[k]  = Iclamp(INI_INT(key, 100), 0, 200);
         }
     }
@@ -7784,6 +7786,7 @@ static void ChanSetSource(int c, int type, const wchar_t* src)
 
 // ---- renaming a channel: a little box over its name (Enter keeps it, Esc doesn't)
 static HWND gRenEdit = nullptr; static int gRenCh = -1;
+static void SaveSettings();
 static void FillHearList();
 static bool gHearListStale = false;
 static LRESULT CALLBACK RenEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
@@ -7827,6 +7830,7 @@ static void ChanRenameDone(bool keep)
         gHearListStale = true; FillHearList();
         InvalidateRect(GetDlgItem(gWnd, IDC_OLBL0 + k), nullptr, FALSE);
         InvalidateRect(GetDlgItem(gWnd, IDC_ROWLBL + k), nullptr, FALSE);
+        SaveSettings();
     }
     if (keep && gRenCh >= 0 && gRenCh < CH_MAX) {
         wchar_t t[64]; GetWindowTextW(e, t, 32);
@@ -7837,6 +7841,7 @@ static void ChanRenameDone(bool keep)
         lstrcpynW(gCh[gRenCh].name, !lstrcmpW(p, own) ? L"" : p, 32);   // empty or its own name: back to automatic
         (void)keepName;
         InvalidateRect(GetDlgItem(gWnd, IDC_CHSRC0 + gRenCh), nullptr, FALSE);
+        SaveSettings();
     }
     DestroyWindow(e);
 }
@@ -8182,7 +8187,7 @@ static int OutW(int k) { return gOutW[k] ? gOutW[k] : 100; }
 static int MixerNeedW()                         // px: how wide the window must be for the strips
 {
     int a = SC(42), b = SC(42);
-    for (int c = 0; c < CH_MAX; c++) a += SC(ChW(c)) + (c ? SC(3) : 0);
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) a += SC(ChW(c)) + SC(3);
     for (int k = 0; k < gRows && k < MAX_OUT; k++) b += SC(OutW(k)) + (k ? SC(5) : 0);
     return Imax(a, b);
 }
@@ -8221,13 +8226,19 @@ static void MixerPlace()                        // the Mixer fills the window: s
         if (u) PlaceFree(u, sx + sw - uw, chTop + SC(10), uw, SC(23));
         PlaceFree(gDuckLbl, sx - SC(4) - SC(50), chTop + SC(13), SC(50), SC(18));
     }
-    PlaceFree(gMixHint, cx0 + SC(16), chTop + SC(13), Imax(SC(60), rx - SC(160) - (cx0 + SC(16))), SC(18));
+    PlaceFree(GetDlgItem(gWnd, IDC_CHADDBTN), cx0 + SC(12), chTop + SC(8), SC(116), SC(26));
+    {
+        bool full = true; for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_NONE) full = false;
+        EnableWindow(GetDlgItem(gWnd, IDC_CHADDBTN), !full);
+    }
+    PlaceFree(gMixHint, cx0 + SC(40), chTop + chH / 2 - SC(20), cw - SC(80), SC(40));
 
     // channel strips
     const int sy = chTop + SC(36), sh = chH - SC(52);
     int x = SC(21);
     const int n = Imax(1, Imin(gRows, MAX_OUT));
     for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) { gStripRc[c] = { 0, 0, 0, 0 }; continue; }   // (empty: no strip; "+ Add channel" fills it)
         const int w = SC(ChW(c));
         gStripRc[c] = { x, sy, x + w, sy + sh };
         PlaceFree(GetDlgItem(gWnd, IDC_CHSRC0 + c), x + SC(3), sy + SC(6), w - SC(6), SC(40));
@@ -10119,6 +10130,7 @@ static void AddTips()
         for (int k = 0; k < MAX_OUT; k++) TipId(IDC_CHRT0 + c * MAX_OUT + k, L"Send this channel to that output (lit = on).");
     }
     TipId(IDC_DUCKDB,      L"How much quieter Duck channels get while you talk.");
+    TipId(IDC_CHADDBTN,    L"Add a channel: an app (Spotify, a game, a browser...), another input, or what an output device plays. Up to 8.");
     TipId(IDC_RESTARTAUD,  L"Close and reopen every sound device. Handy after plugging something in. (Outputs that drop out also come back by themselves.)");
     TipId(IDC_TAB0 + PAGE_MIXER,    L"Mixer: bring in apps (Spotify, a game, a browser) and other inputs, set their volume and send each to the outputs you want.");
     TipId(IDC_CLIPNOW,    L"Save the last few seconds as a new clip (fills the next empty slot below).");
@@ -10184,7 +10196,8 @@ static void AddTips()
                          L"outputs so screen shares can't record them. Discord still hears you through CABLE Output.");
     for (int k = 0; k < MAX_OUT; k++) TipId(IDC_ROWMODE + k, L"What this output plays. Effect only: just the stutter. Everything: your voice with "
                                                               L"every effect. Clean voice: your voice without Voice FX or the stutter, e.g. for "
-                                                              L"OBS while Discord gets the effects. The soundboard plays on all but Off.");
+                                                              L"OBS while Discord gets the effects. Apps only: just the Mixer channels you send to it, untouched (no mic, no effects). "
+                                                              L"The soundboard plays on all but Off and Apps only.");
     TipId(IDC_LAGPRESET, L"Ready-made settings for the stutter: Bad Wi-Fi, Frozen call, Robot glitch, Buffering, Slow-mo...");
     TipId(IDC_BEATSYNC,  L"Beat repeat: the stutter's loop length follows a tempo instead of Loop length, so it sounds musical.");
     TipId(IDC_BPM,       L"Tempo in beats per minute.");
@@ -10250,7 +10263,8 @@ static void AddTips()
     for (int k = 0; k < MAX_OUT; k++) {
         TipId(IDC_ROWLBL + k,  L"An output: a device Lag Effect plays to.");
         TipId(IDC_ROWDEV + k,  L"Where this output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers.");
-        TipId(IDC_ROWMODE + k, L"Off = nothing. Effect only = just the stutter. Everything = your voice plus the stutter (what others should hear).");
+        TipId(IDC_ROWMODE + k, L"Off = nothing. Effect only = just the stutter. Everything = your voice plus the stutter (what others should hear). "
+                               L"Apps only = just the Mixer channels you send to it, untouched (no mic, no effects).");
         TipId(IDC_ROWVOL + k,  L"Volume of this output. 100% = unchanged, up to 200%.");
         TipId(IDC_ROWDEL + k,  L"Remove this output.");
     }
@@ -11081,7 +11095,8 @@ static void Layout()
         {                                       // a Mixer channel: its strip when it plays something, else its Add box
             static const int chIds[] = { IDC_CHSRC0, IDC_CHDB0, IDC_CHVOL0, IDC_CHMETER0, IDC_CHMUTE0, IDC_CHSOLO0, IDC_CHDUCK0 };
             for (int base : chIds) if (cid >= base && cid < base + CH_MAX) vis = vis && gCh[cid - base].type != CH_NONE;
-            if (cid >= IDC_CHADD0 && cid < IDC_CHADD0 + CH_MAX) vis = vis && gCh[cid - IDC_CHADD0].type == CH_NONE;
+            if (cid >= IDC_CHADD0 && cid < IDC_CHADD0 + CH_MAX) vis = false;   // (one "+ Add channel" button instead)
+            if (cid == IDC_MIXHINT) { bool any = false; for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) any = true; vis = vis && !any; }
         }
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
@@ -11941,6 +11956,21 @@ static void SetStartWithWindows(bool on)
     RegCloseKey(k);
 }
 
+static void StartWithWindowsFollow()            // (on start) it pointed at an older copy of Lag Effect: point it at this one
+{
+    wchar_t v[MAX_PATH + 8]; DWORD sz = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, RUN_KEY, L"LagEffect", RRF_RT_REG_SZ, nullptr, v, &sz) != ERROR_SUCCESS) return;
+    wchar_t* p = v; if (*p == L'"') p++;
+    wchar_t* q = wcschr(p, L'"'); if (q) *q = 0;
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    if (!lstrcmpiW(p, exe)) return;
+    WIN32_FILE_ATTRIBUTE_DATA a = {}, b = {};
+    const bool otherThere = GetFileAttributesExW(p, GetFileExInfoStandard, &a) != 0;
+    if (!GetFileAttributesExW(exe, GetFileExInfoStandard, &b)) return;
+    // the other one is gone, or older than this one: start this one with Windows instead (a newer one is left alone)
+    if (!otherThere || CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) < 0) SetStartWithWindows(true);
+}
+
 // ======================= tray =======================
 static void ToTray()
 {
@@ -12023,7 +12053,7 @@ static void TrayMenu()
 static void CreateUI()
 {
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
-    const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything", L"Clean voice" };
+    const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything", L"Clean voice", L"Apps only" };
 
     // Tabs (always visible). Drawn by DrawTab().
     gBuildPage = -1;
@@ -12657,7 +12687,9 @@ static void CreateUI()
     gBuildPage = PAGE_MIXER;
     gSecChan = gSectionN;
     AddSection(14, 54, 532, 330, L"Channels");
-    gMixHint   = Ctl(L"STATIC", L"Click a name to change it.", SS_ENDELLIPSIS, 30, 67, 230, 18, 0);
+    Ctl(L"BUTTON", L"+ Add channel", WS_TABSTOP, 30, 62, 116, 26, IDC_CHADDBTN);
+    gMixHint   = Ctl(L"STATIC", L"No channels yet. Click \"+ Add channel\" to bring in an app (Spotify, a game, a browser...), "
+                                L"another input, or what an output device plays.", SS_CENTER, 30, 160, 500, 40, IDC_MIXHINT);
     gDuckLbl   = Ctl(L"STATIC", L"Duck by", SS_RIGHT, 292, 67, 50, 18, 0);
     Spin(IDC_DUCKDB, 344, 64, 52, 3, 30, gDuckDb);
     gDuckDbLbl = Ctl(L"STATIC", L"dB", 0, 400, 67, 22, 18, 0);
@@ -13290,6 +13322,10 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) ChanMenu(id - IDC_CHADD0, GetDlgItem(gWnd, id));
         return;
     }
+    if (id == IDC_CHADDBTN) {                   // a new channel: the first free one, then pick what it plays
+        if (code == BN_CLICKED) for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_NONE) { ChanMenu(c, GetDlgItem(gWnd, id)); break; }
+        return;
+    }
     if (id >= IDC_OLBL0 && id < IDC_OLBL0 + MAX_OUT) {   // an output's name: rename it
         if (code == BN_CLICKED) ChanRename(CH_MAX + id - IDC_OLBL0);
         return;
@@ -13615,7 +13651,7 @@ static void HitchLog(UINT m, WPARAM w, int ms)
         f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (f == INVALID_HANDLE_VALUE) { gHitchN = 400; return; }   // not asked for: never log
         else {
-            static const char head[] = "---- Lag Effect " "1.31.2" " started ----\r\n"; DWORD wr;
+            static const char head[] = "---- Lag Effect " "1.32.0" " started ----\r\n"; DWORD wr;
             WriteFile(f, head, sizeof(head) - 1, &wr, nullptr);
         }
     }
@@ -13652,6 +13688,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         CreateUI();
         DragAcceptFiles(h, TRUE);                // drop audio files onto soundboard pads
         ApplyTheme();
+        StartWithWindowsFollow();
         // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
         if ((gAutoStart || gResumeAudio) && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
         UpdateUi();
@@ -13970,6 +14007,13 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         DestroyWindow(h);
         return 0;
     }
+    case WM_QUERYENDSESSION:                    // Windows is restarting / shutting down: save now (no WM_CLOSE comes)
+        if (!gNoSaveOnExit) {
+            WINDOWPLACEMENT wp = {}; wp.length = sizeof(wp);
+            if (GetWindowPlacement(h, &wp)) { SaveInt(L"win_x", wp.rcNormalPosition.left); SaveInt(L"win_y", wp.rcNormalPosition.top); }
+            SaveSettings();
+        }
+        return TRUE;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
