@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.32.0"
+#define APP_VERSION L"1.32.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -8347,8 +8347,8 @@ static void MixerMeterTick()                    // (50 ms) meters and limit ligh
         if (now != last[c]) { last[c] = now; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
-        float v = gOutPeak[k]; gOutPeak[k] = 0;  // (the Main page's meters aren't showing: this page takes the peaks)
-        gOutShown[k] = v > gOutShown[k] ? v : gOutShown[k] * 0.82f;
+        // (UpdateMeter, just before this, already took this tick's peak into gOutShow: use that, in dB)
+        gOutShown[k] = gOutShow[k] > -79.0f ? powf(10.0f, gOutShow[k] / 20.0f) : 0.0f;
         static int lastO[MAX_OUT] = { -999, -999, -999, -999, -999 };
         const int now = gOutShown[k] > 0.001f ? (int)(20.0f * log10f(gOutShown[k])) : -60;
         if (now != lastO[k]) { lastO[k] = now; InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE); }
@@ -13651,7 +13651,7 @@ static void HitchLog(UINT m, WPARAM w, int ms)
         f = CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
         if (f == INVALID_HANDLE_VALUE) { gHitchN = 400; return; }   // not asked for: never log
         else {
-            static const char head[] = "---- Lag Effect " "1.32.0" " started ----\r\n"; DWORD wr;
+            static const char head[] = "---- Lag Effect " "1.32.1" " started ----\r\n"; DWORD wr;
             WriteFile(f, head, sizeof(head) - 1, &wr, nullptr);
         }
     }
