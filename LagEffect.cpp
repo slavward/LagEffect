@@ -21,8 +21,14 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.32.1"
-#define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
+#ifdef MIXWARD                                  // Mixward: this app without the voice effects (built from this file, see build.yml)
+#define MIXWARD_ON 1
+#define APP_VERSION L"1.0.0"
+#else
+#define MIXWARD_ON 0
+#define APP_VERSION L"1.32.2"
+#endif
+#define DEFAULT_UPDATE_REPO L"slavward/Lag" L"Effect"   // (split: Mixward is built by renaming "LagEffect", and shares this repo)
 
 #define UNICODE
 #define _UNICODE
@@ -95,7 +101,14 @@ static volatile int   gTalkVolPct = 100;
 static volatile int   gHotkeys[MAX_KEYS] = { VK_F8, 0, 0 };
 static volatile bool  gToggleMode = false, gTalkOver = false;
 static volatile bool  gCapturingKey = false, gLooping = false;
-static volatile int   gRowMode[MAX_OUT] = { MODE_ALL, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT, MODE_EFFECT };
+#ifdef MIXWARD
+#define DEF_MODE0 MODE_CLEAN
+#define DEF_MODEK MODE_APPS
+#else
+#define DEF_MODE0 MODE_ALL
+#define DEF_MODEK MODE_EFFECT
+#endif
+static volatile int   gRowMode[MAX_OUT] = { DEF_MODE0, DEF_MODEK, DEF_MODEK, DEF_MODEK, DEF_MODEK };
 static volatile int   gRowVol[MAX_OUT]  = { 100, 100, 100, 100, 100 };
 
 static float  hist[HIST], frozen[HIST], hann[MAXGRAIN];
@@ -3708,6 +3721,7 @@ static void LoadSettings()
 
     GetPrivateProfileStringW(L"settings", L"mic",         L"", gMicName, 512, gIni);
     GetPrivateProfileStringW(L"settings", L"update_repo", DEFAULT_UPDATE_REPO, gUpdateRepo, 200, gIni);
+    if (!lstrcmpiW(gUpdateRepo, L"slavward/Mix" L"ward")) lstrcpynW(gUpdateRepo, DEFAULT_UPDATE_REPO, 200);   // (the first Mixward build pointed at a repo that doesn't exist)
 
     int rows = INI_INT(L"out_count", 0);
     if (rows < 1) {
@@ -3728,11 +3742,20 @@ static void LoadSettings()
         for (int k = 0; k < rows; k++) {
             wchar_t key[32];
             wsprintfW(key, L"out%d_device", k + 1); GetPrivateProfileStringW(L"settings", key, L"", gRowName[k], 512, gIni);
-            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? MODE_ALL : MODE_EFFECT), 0, MODE_APPS);
+            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? DEF_MODE0 : DEF_MODEK), 0, MODE_APPS);
             wsprintfW(key, L"out%d_volume", k + 1); gRowVol[k]  = Iclamp(INI_INT(key, 100), 0, 200);
         }
     }
     gRows = rows;
+#ifdef MIXWARD
+    for (int k = 0; k < MAX_OUT; k++)           // only Off / Mic + apps / Apps only here
+        if (gRowMode[k] == MODE_ALL || gRowMode[k] == MODE_EFFECT) gRowMode[k] = k == 0 ? MODE_CLEAN : MODE_APPS;
+    for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = 0;   // no stutter
+    for (int sl = 0; sl < KEY_SLOTS; sl++)      // keep: mute, push-to-talk, profiles; the rest belong to effects / sounds
+        if (sl != SLOT_MUTE && sl != SLOT_PTT && sl != SLOT_PROFNEXT && sl < SLOT_PROF0)
+            for (int i = 0; i < MAX_KEYS; i++) gFxKeys[sl][i] = 0;
+    gFxOn = false; gRandLagOn = false; gBeatSync = false; gOverlayOn = false;
+#endif
     #undef INI_INT
 }
 
@@ -4723,7 +4746,13 @@ static void StopAudio()
 #define ROW_Y0    134
 #define ROW_H     30
 #define TAB_COUNT 7
-static const int TAB_ORDER[TAB_COUNT] = { 0, 6, 1, 2, 3, 4, 5 };   // left to right (Mixer sits after Main)
+#ifdef MIXWARD                                  // Main, Mixer, Mic, Settings
+#define TAB_SHOWN 4
+static const int TAB_ORDER[TAB_SHOWN] = { 0, 6, 1, 5 };
+#else
+#define TAB_SHOWN TAB_COUNT
+static const int TAB_ORDER[TAB_SHOWN] = { 0, 6, 1, 2, 3, 4, 5 };   // left to right (Mixer sits after Main)
+#endif
 enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5, PAGE_MIXER = 6 };
 
 struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; };   // ox/oy: moved by you (design px)
@@ -11003,7 +11032,11 @@ static void UpdateStatus(bool force = false)
     }
     else {
         HotkeyName(key, 120);
+#ifdef MIXWARD
+        lstrcpynW(s, L"Live", 160);
+#else
         wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
+#endif
     }
     if (gRunning && gFxOn && !gMicMuted) {       // which voice effects are on
         wchar_t fx[120] = L"";
@@ -11171,16 +11204,26 @@ static void Rescale(int ns)
 static void SetPage(int page)
 {
     if (page < 0 || page >= TAB_COUNT || page == gPage) return;
+#ifdef MIXWARD
+    if (page == PAGE_FX || page == PAGE_SOUND || page == PAGE_CLIPS) return;   // (not in Mixward)
+#endif
     HWND focus = GetFocus();
     gPage = page;
     Layout();
     if (!focus || !IsWindowVisible(focus)) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + page));
 }
 
+#ifdef MIXWARD                                  // the Plays list: Off / Mic + apps (your mic, cleaned up) / Apps only
+static int ModeToSel(int m) { return m == MODE_APPS ? 2 : m == MODE_OFF ? 0 : 1; }
+static int SelToMode(int i) { return i == 2 ? MODE_APPS : i == 0 ? MODE_OFF : MODE_CLEAN; }
+#else
+static int ModeToSel(int m) { return m; }
+static int SelToMode(int i) { return i; }
+#endif
 static void SetRowMode(int k, int mode)
 {
     gRowMode[k] = mode;
-    SendDlgItemMessageW(gWnd, IDC_ROWMODE + k, CB_SETCURSEL, mode, 0);
+    SendDlgItemMessageW(gWnd, IDC_ROWMODE + k, CB_SETCURSEL, ModeToSel(mode), 0);
 }
 
 static void SetRowVol(int k, int vol)
@@ -11489,26 +11532,51 @@ static DWORD WINAPI CheckThread(LPVOID arg)
     if (!RepoFromText(gUpdateRepo, repo, 200)) {
         lstrcpynW(job->error, L"Type your GitHub user/repo in the Updates box first (for example: yourname/LagEffect).", 300);
     } else {
-        wsprintfW(api, L"https://api.github.com/repos/%s/releases/latest", repo);
+        // Lag Effect and Mixward share one repo: Mixward's releases are tagged "mixward-v1.0.0", Lag Effect's "v1.32.1".
+        // So read the recent releases (newest first) and take the first one that's ours.
+        wsprintfW(api, L"https://api.github.com/repos/%s/releases?per_page=30", repo);
         DWORD len = 0;
         char* json = HttpGet(api, &len, job->error, 300);
         if (json) {
             char tag[64] = "", notes[1700] = "", url[1024] = "";
-            const char* p = json;
-            JsonString(json, "tag_name", &p, tag, 64);
-            p = json;
-            if (JsonString(json, "body", &p, notes, 1700)) {} else notes[0] = 0;
-            p = json;
-            while (JsonString(json, "browser_download_url", &p, url, 1024)) {
-                int n = lstrlenA(url);
-                if (n > 4 && lstrcmpiA(url + n - 4, ".exe") == 0) break;
-                url[0] = 0;
+            bool found = false;
+            char* at = strstr(json, "\"tag_name\"");
+            while (at && !found) {
+                char* next = strstr(at + 10, "\"tag_name\"");   // this release runs up to the next one's tag
+                char keep = 0; if (next) { keep = *next; *next = 0; }
+                const char* p = at;
+                char t[64] = "";
+                JsonString(at, "tag_name", &p, t, 64);
+                const bool mixTag = _strnicmp(t, "mixward-", 8) == 0;
+                if (MIXWARD_ON ? mixTag : (!mixTag && (t[0] == 'v' || t[0] == 'V' || (t[0] >= '0' && t[0] <= '9')))) {
+                    found = true;
+                    lstrcpynA(tag, mixTag ? t + 8 : t, 64);   // (just the version: "v1.0.0")
+                    p = at;
+                    const char* want = "/LagEffect.exe"; const int wl = lstrlenA(want);
+                    while (JsonString(at, "browser_download_url", &p, url, 1024)) {   // our exe (else any .exe)
+                        int n = lstrlenA(url);
+                        if (n > wl && lstrcmpiA(url + n - wl, want) == 0) break;
+                        url[0] = 0;
+                    }
+                    if (!url[0]) {
+                        p = at;
+                        while (JsonString(at, "browser_download_url", &p, url, 1024)) {
+                            int n = lstrlenA(url);
+                            if (n > 4 && lstrcmpiA(url + n - 4, ".exe") == 0) break;
+                            url[0] = 0;
+                        }
+                    }
+                    p = at;
+                    if (!JsonString(at, "body", &p, notes, 1700)) notes[0] = 0;
+                }
+                if (next) *next = keep;
+                at = next;
             }
             MemFree(json);
             Widen(tag, job->tag, 64);
             Widen(notes, job->notes, 1800);
             Widen(url, job->url, 1024);
-            if (!tag[0])      lstrcpynW(job->error, L"The latest release has no version tag.", 300);
+            if (!found)       lstrcpynW(job->error, L"No Lag Effect release found yet.", 300);
             else if (!url[0]) lstrcpynW(job->error, L"The latest release has no .exe attached.", 300);
             else { job->ok = true; job->newer = IsNewer(job->tag); }
         }
@@ -11699,6 +11767,26 @@ static void SetupVbCable()
 
 static void ShowHelp()
 {
+#ifdef MIXWARD
+    MessageBoxW(gWnd,
+        L"MIXWARD\n"
+        L"Puts your mic and your apps' sound wherever you want it, each at its own volume.\n\n"
+        L"MAIN\n"
+        L"Pick your microphone and the outputs. Each output plays: Off, Mic + apps (your mic, cleaned up by the Mic tab, "
+        L"plus any Mixer channels you send to it), or Apps only (just the Mixer channels, untouched). "
+        L"Use VB-Cable to make an output Discord, OBS or a game can use as a mic. Press Start.\n\n"
+        L"MIXER\n"
+        L"\"+ Add channel\" brings in an app (recorded on its own), another input, or what an output device plays. "
+        L"Each channel has a fader (drag, scroll, double-click = 0 dB), Mute, Solo (hear only it on your listening output), "
+        L"Duck (quieter while you talk) and buttons 1-5 for which outputs it goes to. Click a name to rename it or change its colour. "
+        L"Drag a strip's right edge to resize it.\n\n"
+        L"MIC\n"
+        L"Noise suppression, noise gate, push-to-talk, voice quality and an equalizer, plus a 5-second mic test.\n\n"
+        L"SETTINGS\n"
+        L"Profiles, latency, theme, pictures, start with Windows and the mute hotkey. Ctrl+Tab switches tabs.",
+        L"Mixward - help", MB_OK | MB_ICONINFORMATION);
+    return;
+#endif
     MessageBoxW(gWnd,
         L"HOW IT WORKS\n"
         L"Hold (or toggle) your hotkey to repeat the last bit of your mic.\n"
@@ -12027,8 +12115,10 @@ static void TrayMenu()
     AppendMenuW(m, MF_STRING, ID_TRAY_RUN, gWantRunning ? L"Stop audio" : L"Start audio");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING | (gMicMuted ? MF_CHECKED : 0), ID_TRAY_MUTE, L"Mute mic");
+#ifndef MIXWARD
     AppendMenuW(m, MF_STRING | (gFxOn ? MF_CHECKED : 0), ID_TRAY_FX, L"Voice effects");
     AppendMenuW(m, MF_STRING | (SongModeOn() ? MF_CHECKED : 0), ID_TRAY_SONG, L"Vocode to song");
+#endif
     AppendMenuW(m, MF_STRING | (gNsOn ? MF_CHECKED : 0), ID_TRAY_NS, L"Noise suppression");
     AppendMenuW(m, MF_STRING | (gGateMode != GATE_OFF ? MF_CHECKED : 0), ID_TRAY_GATE, L"Noise gate");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -12038,10 +12128,14 @@ static void TrayMenu()
     for (int i = 1; i < CHAR_N; i++) AppendMenuW(chr, MF_STRING, 1220 + i, CHARACTERS[i]);
     for (int i = 0; i < PAD_BANKS; i++) { wchar_t t[16]; wsprintfW(t, L"Page %c", L'A' + i); AppendMenuW(page, MF_STRING | (i == gPadBank ? MF_CHECKED : 0), 1260 + i, t); }
     AppendMenuW(m, MF_POPUP, (UINT_PTR)prof, L"Profile");
+#ifdef MIXWARD
+    DestroyMenu(chr); DestroyMenu(page);
+#else
     AppendMenuW(m, MF_POPUP, (UINT_PTR)chr, L"Character");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)page, L"Soundboard page");
     AppendMenuW(m, MF_STRING | (gOverlayOn ? MF_CHECKED : 0), 1270, L"Status overlay");
     AppendMenuW(m, MF_STRING | (gCompact ? MF_CHECKED : 0), 1271, L"Compact window");
+#endif
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"Exit");
     SetForegroundWindow(gWnd);
@@ -12053,15 +12147,20 @@ static void TrayMenu()
 static void CreateUI()
 {
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
+#ifdef MIXWARD
+    const wchar_t* modeNames[] = { L"Off", L"Mic + apps", L"Apps only" };
+#else
     const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything", L"Clean voice", L"Apps only" };
+#endif
 
     // Tabs (always visible). Drawn by DrawTab().
     gBuildPage = -1;
     {
         const wchar_t* tabNames[TAB_COUNT] = { L"Main", L"Mic", L"Voice FX", L"Soundboard", L"Clips", L"Settings", L"Mixer" };
-        for (int slot = 0; slot < TAB_COUNT; slot++) {
+        const int tw = (532 - (TAB_SHOWN - 1) * 2) / TAB_SHOWN;
+        for (int slot = 0; slot < TAB_SHOWN; slot++) {
             const int t = TAB_ORDER[slot];
-            Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + slot * 76, 10, 74, 32, IDC_TAB0 + t);
+            Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + slot * (tw + 2), 10, tw, 32, IDC_TAB0 + t);
         }
     }
 
@@ -12087,17 +12186,24 @@ static void CreateUI()
         SendMessageW(dev, CB_SETDROPPEDWIDTH, 420, 0);       // the open list shows full device names
         HWND mc = Ctl(L"COMBOBOX", L"", COMBO, 320, y, 106, 200, IDC_ROWMODE + k);
         for (const wchar_t* n : modeNames) SendMessageW(mc, CB_ADDSTRING, 0, (LPARAM)n);
-        SendMessageW(mc, CB_SETCURSEL, gRowMode[k], 0);
+        SendMessageW(mc, CB_SETCURSEL, ModeToSel(gRowMode[k]), 0);
         Spin(IDC_ROWVOL + k, 432, y, 68, 0, 200, gRowVol[k]);
         Ctl(L"BUTTON", L"×", WS_TABSTOP, 506, y, 24, 23, IDC_ROWDEL + k);
     }
     Ctl(L"BUTTON", L"+ Add output", WS_TABSTOP, 30, 170, 124, 28, IDC_ADDOUT);
     Ctl(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 162, 170, 124, 28, IDC_VBCABLE);
+#ifdef MIXWARD
+    gBuildPage = PAGE_FX;                       // (no soundboard here: kept, never shown)
+#endif
     Ctl(L"STATIC", L"Always hear sounds on:", SS_NOTIFY, 298, 175, 132, 20, IDC_HEARLBL);
     Ctl(L"COMBOBOX", L"", COMBO, 432, 171, 102, 200, IDC_HEARON);
+    gBuildPage = PAGE_MAIN;
     FillDevices();
 
     gRecordShift = true;                        // everything below on this page moves with the output list
+#ifdef MIXWARD
+    gBuildPage = PAGE_FX;                       // (the stutter: kept so nothing else breaks, never shown)
+#endif
 
     // Effect
     AddSection(14, 232, 532, 148, L"Effect");
@@ -12151,6 +12257,7 @@ static void CreateUI()
     Ctl(L"STATIC", L"(beat repeat)", 0, 418, 450, 110, 20, IDC_HDR);
 
     // Status + buttons
+    gBuildPage = PAGE_MAIN;
     gStatus = Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY | WS_GROUP, 14, 498, 532, 30, IDC_STATUS);
     Ctl(L"BUTTON", L"Start", WS_TABSTOP, 14, 540, 127, 34, IDC_START);
     Ctl(L"BUTTON", L"Mute mic", WS_TABSTOP, 149, 540, 127, 34, IDC_MUTEBTN);
@@ -12584,9 +12691,13 @@ static void CreateUI()
     CheckDlgButton(gWnd, IDC_TOPMOST, gTopMost ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Start with Windows", BS_AUTOCHECKBOX | WS_TABSTOP, 262, 531, 270, 20, IDC_STARTWIN);
     CheckDlgButton(gWnd, IDC_STARTWIN, StartWithWindows() ? BST_CHECKED : BST_UNCHECKED);
+#ifdef MIXWARD
+    gBuildPage = PAGE_FX;
+#endif
     Ctl(L"BUTTON", L"Status overlay (over games)", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 557, 220, 20, IDC_OVERLAY);
     CheckDlgButton(gWnd, IDC_OVERLAY, gOverlayOn ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Compact window (Ctrl+M)", WS_TABSTOP, 262, 554, 268, 26, IDC_COMPACT);
+    gBuildPage = PAGE_SETTINGS;
 
     // ---- Look ----
     gBuildSub = 1;
@@ -12937,7 +13048,7 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_ROWMODE && id < IDC_ROWMODE + MAX_OUT) {
-        if (code == CBN_SELCHANGE) gRowMode[id - IDC_ROWMODE] = (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0);
+        if (code == CBN_SELCHANGE) gRowMode[id - IDC_ROWMODE] = SelToMode((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0));
         return;
     }
     if (id >= IDC_PADPLAY && id < IDC_PADPLAY + PADS) {
@@ -14149,8 +14260,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             setKbdNav(true);
         if (msg.message == WM_KEYDOWN && msg.wParam == VK_TAB && (GetKeyState(VK_CONTROL) & 0x8000) &&
             (msg.hwnd == h || IsChild(h, msg.hwnd))) {
-            { int slot = 0; for (int i = 0; i < TAB_COUNT; i++) if (TAB_ORDER[i] == gPage) slot = i;   // Ctrl+Tab: next page
-              SetPage(TAB_ORDER[(slot + 1) % TAB_COUNT]); }
+            { int slot = 0; for (int i = 0; i < TAB_SHOWN; i++) if (TAB_ORDER[i] == gPage) slot = i;   // Ctrl+Tab: next page
+              SetPage(TAB_ORDER[(slot + 1) % TAB_SHOWN]); }
             continue;
         }
         if (msg.message == WM_KEYDOWN && msg.wParam >= '1' && msg.wParam < '1' + TAB_COUNT &&
@@ -14159,7 +14270,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             continue;
         }
         if (TrimKey(&msg)) continue;
-        if (msg.message == WM_KEYDOWN && msg.wParam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
+        if (!MIXWARD_ON && msg.message == WM_KEYDOWN && msg.wParam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
             SetCompact(!gCompact);              // Ctrl+M: compact window
             continue;
         }
