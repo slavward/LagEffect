@@ -28,7 +28,7 @@
 #define MIXWARD_ON 0
 #define APP_VERSION L"1.32.2"
 #endif
-#define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
+#define DEFAULT_UPDATE_REPO L"slavward/Lag" L"Effect"   // (split: Mixward is built by renaming "LagEffect", and shares this repo)
 
 #define UNICODE
 #define _UNICODE
