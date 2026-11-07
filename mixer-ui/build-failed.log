@@ -1,16 +1,22 @@
 LagEffect.cpp
 D:\a\LagEffect\LagEffect\miniaudio.h(80532): warning C4244: '=': conversion from 'ma_uint64' to 'ma_uint32', possible loss of data
-LagEffect.cpp(1056): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1057): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1058): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1059): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1060): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1061): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1062): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(1063): warning C4305: 'initializing': truncation from 'double' to 'float'
-LagEffect.cpp(4747): error C2065: 'PAGE_FX': undeclared identifier
-LagEffect.cpp(4747): error C2065: 'PAGE_SOUND': undeclared identifier
-LagEffect.cpp(4747): error C2065: 'PAGE_CLIPS': undeclared identifier
+LagEffect.cpp(1069): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1070): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1071): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1072): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1073): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1074): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1075): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(1076): warning C4305: 'initializing': truncation from 'double' to 'float'
+LagEffect.cpp(8154): error C3312: no callable 'begin' function found for type 'initializer list'
+LagEffect.cpp(8154): error C3312: no callable 'end' function found for type 'initializer list'
+LagEffect.cpp(8154): error C2143: syntax error: missing ';' before ':'
+LagEffect.cpp(8154): error C2143: syntax error: missing ';' before '{'
+LagEffect.cpp(8154): error C2143: syntax error: missing ')' before '{'
+LagEffect.cpp(8154): error C2143: syntax error: missing ';' before '}'
+LagEffect.cpp(8154): error C2059: syntax error: ')'
+LagEffect.cpp(8155): error C2065: 'db': undeclared identifier
+LagEffect.cpp(10890): warning C4996: '_snwprintf': This function or variable may be unsafe. Consider using _snwprintf_s instead. To disable deprecation, use _CRT_SECURE_NO_WARNINGS. See online help for details.
 Generating Code...
 Compiling...
 denoise.c
