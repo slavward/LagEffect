@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.38.0"
+#define APP_VERSION L"1.39.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -404,7 +404,16 @@ struct ChanSet {
     volatile int pan;                           // -100 (left) .. 0 .. +100 (right)
     volatile bool mono;                         // left and right mixed together
     volatile bool ducker;                       // while it plays, the Duck channels get quieter (like when you talk)
+    volatile int eqLo, eqMid, eqHi;             // 3-band EQ, tenths of a dB (-120..+120): 100 Hz shelf, 1 kHz, 8 kHz shelf
+    volatile int comp;                          // compressor / leveler: 0 = off .. 100 = strong
+    volatile int send[MAX_OUT];                 // its level on each output, on top of the fader (tenths of a dB, -400..+60)
 };
+enum { CFX_LO = 101, CFX_MID, CFX_HI, CFX_COMP, CFX_SEND0 = 110, CFX_VAL = 200, CFX_GR = 300, CFX_FLAT = 301, CFX_HDR = 302 };
+static HWND gCfxWnd = nullptr; static int gCfxCh = -1;
+static volatile float gChGr[8];                 // (each channel's compressor: how many dB it's turning down now)
+static volatile float gOutPeakMix[MAX_OUT];     // (each output's peak, for the Mixer's meters)
+static volatile int   gSongCh = -1;             // Vocode to song from a Mixer channel: which one (-1 = not)
+static volatile float gSongLevel = 1.0f;        // Vocode to song: the music's level (x1 = as it is)
 static volatile int gTestTone[5];               // (an output's test sound: samples still to play)
 static volatile int   gChatMix = 0;             // ChatMix: -100 (only game) .. 0 (both) .. +100 (only chat)
 static volatile DWORD gFadeSlowUntil = 0;       // (a scene switch: volumes glide over ~0.4 s instead of ~25 ms)
@@ -895,6 +904,7 @@ static inline float PolyBlep(double t, double dt)   // removes the aliasing a pl
 static float             songRing[SONG_RING];
 static volatile unsigned songW = 0, songR = 0;
 static volatile float    gSongPeak = 0;         // loudest music sample lately (UI shows "hearing music")
+static volatile float    gSongPeakM = 0;        // ... for the music level meter
 
 static void SongCallback(ma_device*, void*, const void* input, ma_uint32 frames)
 {
@@ -925,10 +935,11 @@ static inline float SongRead()                  // audio thread
         if (!d || !n) return 0;
         if (gFileRestart) { gFilePos = 0; gFileRestart = false; }
         if (gFilePos >= n) gFilePos = 0;
-        float x = d[gFilePos] * (1.0f / 32768.0f);
+        float x = d[gFilePos] * (1.0f / 32768.0f) * gSongLevel;
         if (++gFilePos >= n) gFilePos = 0;     // loops
         float a = x < 0 ? -x : x;
         if (a > gSongPeak) gSongPeak = a;
+        if (a > gSongPeakM) gSongPeakM = a;
         return x;
     }
     unsigned w = songW;
@@ -936,8 +947,9 @@ static inline float SongRead()                  // audio thread
     unsigned r = songR, avail = w - r;
     if (avail > RATE / 10) { r = w - RATE / 50; avail = RATE / 50; }   // fell behind: jump to 20 ms ago
     float x = 0;
-    if (avail) { x = songRing[r & (SONG_RING - 1)]; r++; }
+    if (avail) { x = songRing[r & (SONG_RING - 1)] * gSongLevel; r++; }
     songR = r;
+    { const float a = x < 0 ? -x : x; if (a > gSongPeakM) gSongPeakM = a; }
     return x;
 }
 
@@ -2197,6 +2209,13 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
 
     // Mixer channels: how much each has buffered, its gain and where it goes (read once per block).
     unsigned chRd[CH_MAX], chAv[CH_MAX]; int chAdj[CH_MAX], act[CH_MAX], nAct = 0; bool anyCh = false;
+    struct ChFx { Biquad lo[2], mid[2], hi[2]; int pl, pm, ph; bool eq; float env, gain, tgt, thr, ratio, makeup; int comp; };
+    static ChFx chFx[CH_MAX];
+    static bool chFxInit = false;
+    if (!chFxInit) { for (int c = 0; c < CH_MAX; c++) { chFx[c].pl = chFx[c].pm = chFx[c].ph = 9999; chFx[c].gain = chFx[c].tgt = 1; chFx[c].comp = -1; } chFxInit = true; }
+    bool     chEq[CH_MAX], chComp[CH_MAX];
+    const int songCh = gSongCh;
+    unsigned songWr = songW;                    // (a Mixer channel as Vocode to song's music: written here)
     bool     chDk[CH_MAX], chMono[CH_MAX], chDucker[CH_MAX];
     float    chPanL[CH_MAX], chPanR[CH_MAX];
     static float chTrig[CH_MAX];                // a "ducks others" channel's level (fast up, slow down)
@@ -2229,9 +2248,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         const float g = gCh[c].mute || gCh[c].held ? 0.0f : DbGain10(gCh[c].db10) * ChatGain(gCh[c].chatRole);
         bool need = false;
         for (int k = 0; k < MAX_OUT; k++) {
-            chTgt[c][k] = rt & (1u << k) ? g : 0.0f;
+            chTgt[c][k] = rt & (1u << k) ? g * DbGain10(Iclamp(gCh[c].send[k], -400, 60)) : 0.0f;   // (and its level there)
             if (chTgt[c][k] > 0.0f || chCur[c][k] > 0.0001f) need = true;
         }
+        if (c == songCh) need = true;           // (Vocode to song listens to it, even when it plays nowhere)
         gChAudible[c] = need;
         if (!need) { for (int k = 0; k < MAX_OUT; k++) chCur[c][k] = 0; chRd[c] = wr; continue; }   // silent: keep its buffer empty
         chRd[c] = rd; chAv[c] = av;
@@ -2239,6 +2259,23 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         chAdj[c] = av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
         chDk[c] = gCh[c].duck;
         chMono[c] = gCh[c].mono; chDucker[c] = gCh[c].ducker;
+        {                                       // EQ and compressor: refiltered only when changed (keeps the state: no clicks)
+            ChFx& x = chFx[c];
+            const int lo = Iclamp(gCh[c].eqLo, -120, 120), mi = Iclamp(gCh[c].eqMid, -120, 120), hi = Iclamp(gCh[c].eqHi, -120, 120);
+            if (lo != x.pl) { x.pl = lo; for (int s2 = 0; s2 < 2; s2++) BqShelf(x.lo[s2], false, 100, lo / 10.0); }
+            if (mi != x.pm) { x.pm = mi; for (int s2 = 0; s2 < 2; s2++) BqPeakKeep(x.mid[s2], 1000, mi / 10.0, 0.8); }
+            if (hi != x.ph) { x.ph = hi; for (int s2 = 0; s2 < 2; s2++) BqShelf(x.hi[s2], true, 8000, hi / 10.0); }
+            const bool eqNow = lo || mi || hi;
+            if (eqNow && !x.eq) for (int s2 = 0; s2 < 2; s2++) { x.lo[s2].z1 = x.lo[s2].z2 = x.mid[s2].z1 = x.mid[s2].z2 = x.hi[s2].z1 = x.hi[s2].z2 = 0; }
+            x.eq = eqNow; chEq[c] = eqNow;
+            const int cp = Iclamp(gCh[c].comp, 0, 100);
+            if (cp != x.comp) {                 // one knob: lower threshold, higher ratio, and make-up gain to match
+                x.comp = cp; const float a = cp / 100.0f;
+                x.thr = -6.0f - 24.0f * a; x.ratio = 1.0f + 5.0f * a; x.makeup = -x.thr * (1.0f - 1.0f / x.ratio) * 0.5f;
+            }
+            chComp[c] = cp > 0;
+            if (!cp) { x.gain = x.tgt = 1; x.env = 0; gChGr[c] = 0; }
+        }
         { const int pn = Iclamp(gCh[c].pan, -100, 100); chPanL[c] = pn > 0 ? 1.0f - pn / 100.0f : 1.0f; chPanR[c] = pn < 0 ? 1.0f + pn / 100.0f : 1.0f; }
         act[nAct++] = c;                        // (the per-sample loop only visits these)
         anyCh = true;
@@ -2490,7 +2527,29 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 // a ducker isn't ducked by itself (only by your mic)
                 const float dk = chDk[c] ? (chDucker[c] ? chDuck : chDuckAll) : 1.0f;
                 float L = gChA[c].buf[i], R = gChA[c].buf[i + 1];
+                if (c == songCh) {               // (before its fader: muting it here doesn't stop the vocoder hearing it)
+                    songRing[songWr & (SONG_RING - 1)] = (L + R) * 0.5f; songWr++;
+                    const float a = Max(fabsf(L), fabsf(R)); if (a > gSongPeak) gSongPeak = a;
+                }
                 if (chDucker[c]) { const float e = Max(fabsf(L), fabsf(R)); chTrig[c] = e > chTrig[c] ? e : chTrig[c] * 0.9995f; }
+                if (chEq[c]) {
+                    ChFx& x = chFx[c];
+                    L = BqRun(x.hi[0], BqRun(x.mid[0], BqRun(x.lo[0], L)));
+                    R = BqRun(x.hi[1], BqRun(x.mid[1], BqRun(x.lo[1], R)));
+                }
+                if (chComp[c]) {                 // compressor: 5 ms attack, 150 ms release, gain worked out every 16 samples
+                    ChFx& x = chFx[c];
+                    const float e = Max(fabsf(L), fabsf(R));
+                    x.env += (e - x.env) * (e > x.env ? 0.0042f : 0.00014f);
+                    if ((f & 15) == 0) {
+                        const float lv = x.env > 1e-6f ? 20.0f * log10f(x.env) : -120.0f, over = lv - x.thr;
+                        const float gr = over > 0 ? over * (1.0f - 1.0f / x.ratio) : 0.0f;
+                        x.tgt = powf(10.0f, (x.makeup - gr) / 20.0f);
+                        gChGr[c] = gr;
+                    }
+                    x.gain += (x.tgt - x.gain) * 0.01f;
+                    L *= x.gain; R *= x.gain;
+                }
                 if (chMono[c]) { L = R = (L + R) * 0.5f; }
                 L *= dk * chPanL[c]; R *= dk * chPanR[c];
                 if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
@@ -2531,6 +2590,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     for (int k = 0; k < MAX_OUT; k++) if (gTestTone[k] > 0) gTestTone[k] = testLeft[k] > 0 ? testLeft[k] : 0;
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
     for (int k = 0; k < MAX_OUT && k < 8; k++) if (outPk[k] > gOutPeak[k]) gOutPeak[k] = outPk[k];
+    for (int k = 0; k < MAX_OUT; k++) if (outPk[k] > gOutPeakMix[k]) gOutPeakMix[k] = outPk[k];
+    if (songCh >= 0) { MemoryBarrier(); songW = songWr; }
     gMeterVad = nsStage ? nsVad : -1.0f;
     gMeterGateOpen = gateHold > 0;
 }
@@ -2602,10 +2663,11 @@ enum {
     IDC_STATUS, IDC_START, IDC_TRAY, IDC_HELPBTN, IDC_AUTO,
     IDC_THEME, IDC_REPO, IDC_CHECKUPD, IDC_UPDSTART, IDC_HDR, IDC_TAB0, IDC_TAB1, IDC_TAB2, IDC_TAB3, IDC_TAB4, IDC_TAB5, IDC_TAB6,   // tabs must stay consecutive
     IDC_FXON, IDC_FXKEY_MASTER, IDC_METER, IDC_GATEMODE, IDC_NSON, IDC_OPENSET, IDC_VOCSTYLE, IDC_VOCKEY, IDC_VOCSCALE, IDC_VOCRANGE, IDC_HIDESHARE, IDC_COLORTHEME, IDC_SONGBTN, IDC_SONGSRC, IDC_SONGSTATUS,
+    IDC_SONGLVL, IDC_SONGMETER, IDC_SONGHINT, IDC_SONGRESTART, IDC_SONGNOTE,
     IDC_MUTEBTN, IDC_MUTEKEY, IDC_OSD, IDC_TOPMOST, IDC_STARTWIN,
     IDC_PADMASTER, IDC_PADSTOP, IDC_PADHINT,
     IDC_CLIPNOW, IDC_CLIPNOWKEY, IDC_RECSECS, IDC_RECSRC, IDC_CLIPMASTER, IDC_CLIPFOLDER, IDC_CLIPSTOP, IDC_RECSTATUS, IDC_RADIOPRESET, IDC_RADIODESC,
-    IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6,   // Voice FX sub-tabs: consecutive
+    IDC_FXSUB0, IDC_FXSUB1, IDC_FXSUB2, IDC_FXSUB3, IDC_FXSUB4, IDC_FXSUB5, IDC_FXSUB6, IDC_FXSUB7,   // Voice FX sub-tabs: consecutive
     IDC_MICSUB0, IDC_MICSUB1,                   // Mic tab sub-tabs: consecutive
     IDC_HARMSTYLE, IDC_BROADCAST, IDC_EQRESET,
     IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2, IDC_SETSUB3,   // Settings sub-tabs: consecutive
@@ -2891,9 +2953,9 @@ static const LagPreset LAG_PRESETS[] = {
 // The page has four sub-tabs (sub) of three effects each (slot = row on the sub-tab).
 // New effects start off (def = false), so updating never changes how you sound.
 struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bool def; const wchar_t* hotkeyKey; int sub, slot; };
-#define FX_SUBS 7
+#define FX_SUBS 8
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
-static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun" };
+static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun", L"Whisper" };
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone
 static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features
 static FxGroup gFxGroups[] = {
@@ -2911,9 +2973,9 @@ static FxGroup gFxGroups[] = {
     { L"Glitch",     &gFxGlitchOn,  L"fx_glitch_on",   false, L"fx_glitch_hotkey",  6, 0 },
     { L"Ring mod",   &gFxRingOn,    L"fx_ring_on",     false, L"fx_ring_hotkey",    2, 1 },
     { L"Wah",        &gFxWahOn,     L"fx_wah_on",      false, L"fx_wah_hotkey",     5, 0 },
-    { L"Whisper",    &gFxWhisperOn, L"fx_whisper_on",  false, L"fx_whisper_hotkey", 1, 2 },
+    { L"Whisper",    &gFxWhisperOn, L"fx_whisper_on",  false, L"fx_whisper_hotkey", 7, 0 },   // (its own sub-tab from 1.39: Vocode to song took its place)
     { L"Growl",      &gFxGrowlOn,   L"fx_growl_on",    false, L"fx_growl_hotkey",   2, 0 },
-    { L"Harmonizer", &gFxHarmOn,    L"fx_harm_on",     false, L"fx_harm_hotkey",    1, 1 },
+    { L"Harmonizer", &gFxHarmOn,    L"fx_harm_on",     false, L"fx_harm_hotkey",    1, 2 },
     { L"Shimmer",    &gFxShimOn,    L"fx_shimmer_on",  false, L"fx_shimmer_hotkey", 3, 1 },
     { L"Gender",     &gFxGenderOn,  L"fx_gender_on",   false, L"fx_gender_hotkey",  0, 2 },
 };
@@ -3597,6 +3659,14 @@ static wchar_t gUpdateRepo[200];
 static wchar_t gSongApp[64] = L"";               // Vocode to song: app to take music from ("" = all PC sound)
 static wchar_t gSongFile[MAX_PATH] = L"";        // ...or an audio file (used when gUseFile)
 static bool    gSongUseFile = false;
+// ...or (from 1.39) a Mixer channel, a playback device (what it plays) or a recording device (e.g. CABLE Output)
+enum { SONGK_PC = 0, SONGK_CH = 2, SONGK_PLAY = 3, SONGK_CAP = 4 };
+static int     gSongKind = SONGK_PC;
+static wchar_t gSongChSrc[128] = L"";           // SONGK_CH: the channel's app / device (it may move around)
+static int     gSongChType = 0;
+static wchar_t gSongDevName[256] = L"";         // SONGK_PLAY / SONGK_CAP: the device
+static int     gSongLvlPct = 100;               // the music's level, %
+static wchar_t gSongActiveKey[300] = L"";       // what the running capture is listening to
 static int     gVocSynthSaved = 100;             // Synth value of the other side: Song style keeps its own
 static wchar_t gPadFile[SB_N][MAX_PATH];         // soundboard sounds (4 pages), then clips
 static bool    gClipAutoTrim = true;             // cut silence off the ends of new clips
@@ -3717,6 +3787,11 @@ static void LoadSettings()
     GetPrivateProfileStringW(L"settings", L"voc_song_app", L"", gSongApp, 64, gIni);
     GetPrivateProfileStringW(L"settings", L"voc_song_file", L"", gSongFile, MAX_PATH, gIni);
     gSongUseFile = INI_INT(L"voc_song_use_file", 0) != 0 && gSongFile[0];
+    gSongKind = INI_INT(L"voc_song_kind", 0); if (gSongKind != SONGK_CH && gSongKind != SONGK_PLAY && gSongKind != SONGK_CAP) gSongKind = SONGK_PC;
+    GetPrivateProfileStringW(L"settings", L"voc_song_ch", L"", gSongChSrc, 128, gIni);
+    gSongChType = INI_INT(L"voc_song_chtype", 0);
+    GetPrivateProfileStringW(L"settings", L"voc_song_dev", L"", gSongDevName, 256, gIni);
+    gSongLvlPct = Iclamp(INI_INT(L"voc_song_level", 100), 25, 400); gSongLevel = gSongLvlPct / 100.0f;
     gPadMaster = Iclamp(INI_INT(L"pad_master", 100), 0, 200);
     for (int i = 0; i < PAD_N; i++) {            // pad1-8 = page A, 9-16 = B, ...
         wchar_t key[32];
@@ -3795,6 +3870,11 @@ static void LoadSettings()
         wsprintfW(k, L"ch_%d_pan", c);    gCh[c].pan = Iclamp(INI_INT(k, 0), -100, 100);
         wsprintfW(k, L"ch_%d_mono", c);   gCh[c].mono = INI_INT(k, 0) != 0;
         wsprintfW(k, L"ch_%d_ducker", c); gCh[c].ducker = INI_INT(k, 0) != 0;
+        wsprintfW(k, L"ch_%d_eqlo", c);   gCh[c].eqLo  = Iclamp(INI_INT(k, 0), -120, 120);
+        wsprintfW(k, L"ch_%d_eqmid", c);  gCh[c].eqMid = Iclamp(INI_INT(k, 0), -120, 120);
+        wsprintfW(k, L"ch_%d_eqhi", c);   gCh[c].eqHi  = Iclamp(INI_INT(k, 0), -120, 120);
+        wsprintfW(k, L"ch_%d_comp", c);   gCh[c].comp  = Iclamp(INI_INT(k, 0), 0, 100);
+        for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); gCh[c].send[o] = Iclamp(INI_INT(k, 0), -400, 60); }
     }
     ScenesLoad();
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  int v = INI_INT(key, 0); gChW[c] = v ? Iclamp(v, 52, 240) : 0; }
@@ -4448,6 +4528,7 @@ static void StkRefresh(const RECT* also)        // pictures on top changed: re-c
 // ---- animation ----
 #define TIMER_PICANIM  41
 #define TIMER_STKSIZE  42
+#define TIMER_MIXMETER 43
 static void PicAnimTimer()                      // run the animation timer only while something animates
 {
     bool any = gBase.n > 1;
@@ -4594,6 +4675,8 @@ static void SaveSettings()
     IniSet(L"voc_song_app", gSongApp);
     IniSet(L"voc_song_file", gSongFile);
     SaveInt(L"voc_song_use_file", gSongUseFile);
+    SaveInt(L"voc_song_kind", gSongKind); IniSet(L"voc_song_ch", gSongChSrc); SaveInt(L"voc_song_chtype", gSongChType);
+    IniSet(L"voc_song_dev", gSongDevName); SaveInt(L"voc_song_level", gSongLvlPct);
     SaveInt(L"voc_synth_other", gVocSynthSaved);
     SaveInt(L"pad_master", gPadMaster);
     for (int i = 0; i < PAD_N; i++) {
@@ -4654,6 +4737,11 @@ static void SaveSettings()
         wsprintfW(k, L"ch_%d_pan", c);    SaveInt(k, gCh[c].pan);
         wsprintfW(k, L"ch_%d_mono", c);   SaveInt(k, gCh[c].mono);
         wsprintfW(k, L"ch_%d_ducker", c); SaveInt(k, gCh[c].ducker);
+        wsprintfW(k, L"ch_%d_eqlo", c);   SaveInt(k, gCh[c].eqLo);
+        wsprintfW(k, L"ch_%d_eqmid", c);  SaveInt(k, gCh[c].eqMid);
+        wsprintfW(k, L"ch_%d_eqhi", c);   SaveInt(k, gCh[c].eqHi);
+        wsprintfW(k, L"ch_%d_comp", c);   SaveInt(k, gCh[c].comp);
+        for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); SaveInt(k, gCh[c].send[o]); }
     }
     for (int c = 0; c < CH_MAX; c++) MixMemStore(c);   // (remember each app's settings for next time)
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_name", k); IniSet(key, gOutName[k]); }
@@ -5629,8 +5717,23 @@ static void AppDisplayName(const wchar_t* exe, wchar_t* out, int cap)   // "spot
 
 static wchar_t gSongList[32][64];               // exe names behind the "Music from" entries
 static int     gSongListN = 0;
+static float   gSongMeter = 0;                  // (the music level meter: what it shows)
 static int     gPrevVocStyle = VOC_HARMONY;     // style to go back to when Vocode to song is switched off
-static int     gSongState = 0;                  // 0 off, 1 one app, 2 all PC sound, 3 speakers (fallback), 4 waiting, 5 failed
+static int     gSongState = 0;                  // 0 off, 1 one app, 2 all PC sound, 3 speakers (fallback), 4 waiting, 5 failed,
+                                                // 6 file, 7 a Mixer channel, 8 a device, 9 that channel / device isn't there
+static void ChanLabel(int c, wchar_t* out, int cap);
+static int SongResolveCh()                      // which Mixer channel is the music (they can move): -1 = none
+{
+    if (gSongKind != SONGK_CH) return -1;
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE && gCh[c].type == gSongChType && !lstrcmpiW(gCh[c].src, gSongChSrc)) return c;
+    return -1;
+}
+static void SongWantKey(wchar_t* k)             // what the capture should be listening to, as text
+{
+    if (gSongKind == SONGK_CH) wsprintfW(k, L"ch:%d:%s", gSongChType, gSongChSrc);
+    else if (gSongKind == SONGK_PLAY || gSongKind == SONGK_CAP) wsprintfW(k, L"%s:%s", gSongKind == SONGK_CAP ? L"cap" : L"play", gSongDevName);
+    else wsprintfW(k, L"app:%s", gSongApp);
+}
 static wchar_t gSongActiveApp[64] = L"";
 static bool    gSongHeard = false;
 
@@ -5645,29 +5748,59 @@ static void FillSongSources()
     int n = ListAudioApps(apps, 32);
     SendMessageW(c, CB_RESETCONTENT, 0, 0);
     int sel = 0;
-    LRESULT i0 = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Music: all PC sound");
+    LRESULT i0 = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"All PC sound (except Lag Effect)");
     SendMessageW(c, CB_SETITEMDATA, i0, 0);
     gSongListN = 0;
-    bool found = gSongApp[0] == 0;
+    bool found = gSongApp[0] == 0 || gSongKind != SONGK_PC;
     for (int i = 0; i < n && gSongListN < 31; i++) {
         lstrcpynW(gSongList[gSongListN], apps[i].name, 64);
         wchar_t disp[64], label[96];
         AppDisplayName(apps[i].name, disp, 64);
-        wsprintfW(label, L"Music: %s", disp);
+        wsprintfW(label, L"App: %s", disp);
         LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
         SendMessageW(c, CB_SETITEMDATA, it, gSongListN + 1);
-        if (!lstrcmpiW(apps[i].name, gSongApp)) { sel = (int)it; found = true; }
+        if (gSongKind == SONGK_PC && !lstrcmpiW(apps[i].name, gSongApp)) { sel = (int)it; found = true; }
         gSongListN++;
     }
     if (!found) {                                // the saved app isn't playing right now: keep it listed
         lstrcpynW(gSongList[gSongListN], gSongApp, 64);
         wchar_t disp[64], label[96];
         AppDisplayName(gSongApp, disp, 64);
-        wsprintfW(label, L"Music: %s (not playing)", disp);
+        wsprintfW(label, L"App: %s (not playing)", disp);
         LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
         SendMessageW(c, CB_SETITEMDATA, it, gSongListN + 1);
         sel = (int)it;
         gSongListN++;
+    }
+    {                                           // Mixer channels, then devices
+        bool chFound = false;
+        for (int ch = 0; ch < CH_MAX; ch++) {
+            if (gCh[ch].type == CH_NONE) continue;
+            wchar_t nm[40], label[80]; ChanLabel(ch, nm, 32); wsprintfW(label, L"Mixer channel: %s", nm);
+            LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
+            SendMessageW(c, CB_SETITEMDATA, it, 2000 + ch);
+            if (gSongKind == SONGK_CH && gCh[ch].type == gSongChType && !lstrcmpiW(gCh[ch].src, gSongChSrc)) { sel = (int)it; chFound = true; }
+        }
+        if (gSongKind == SONGK_CH && !chFound) {
+            LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Mixer channel (not in the Mixer now)");
+            SendMessageW(c, CB_SETITEMDATA, it, 2999); sel = (int)it;
+        }
+        for (int pass = 0; pass < 2; pass++) {  // what an output device plays / what an input device hears
+            const bool cap = pass == 1; ma_device_info* dv = cap ? gCapDevs : gPlayDevs; const int dn = (int)(cap ? gCapCount : gPlayCount);
+            bool devFound = false;
+            for (int i = 0; i < dn && i < 64; i++) {
+                wchar_t nm[256], label[300]; Widen(dv[i].name, nm, 256);
+                wsprintfW(label, cap ? L"Recording device: %s" : L"Playback device: %s", nm);
+                LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
+                SendMessageW(c, CB_SETITEMDATA, it, (cap ? 4000 : 3000) + i);
+                if (gSongKind == (cap ? SONGK_CAP : SONGK_PLAY) && !lstrcmpW(nm, gSongDevName)) { sel = (int)it; devFound = true; }
+            }
+            if (gSongKind == (cap ? SONGK_CAP : SONGK_PLAY) && !devFound) {
+                wchar_t label[300]; wsprintfW(label, L"%s: %s (not plugged in)", cap ? L"Recording device" : L"Playback device", gSongDevName);
+                LRESULT it = SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)label);
+                SendMessageW(c, CB_SETITEMDATA, it, cap ? 4999 : 3999); sel = (int)it;
+            }
+        }
     }
     if (gSongFile[0]) {                          // the audio file, if one was picked
         const wchar_t* base = wcsrchr(gSongFile, L'\\');
@@ -5801,12 +5934,35 @@ static bool SongStartDevice(DWORD pid, bool exclude)
 }
 
 static bool SongModeOn() { return gFxOn && gFeatFx && gFxVocOn && gVocStyle == VOC_SONG; }
+static bool SongStartNamedDevice(bool cap)      // a device by name: loopback of an output, or an input
+{
+    ma_device_info* dv = cap ? gCapDevs : gPlayDevs; const int dn = (int)(cap ? gCapCount : gPlayCount);
+    int idx = -1;
+    for (int i = 0; i < dn; i++) { wchar_t nm[256]; Widen(dv[i].name, nm, 256); if (!lstrcmpW(nm, gSongDevName)) { idx = i; break; } }
+    if (idx < 0) return false;
+    ma_device_config cfg = ma_device_config_init(cap ? ma_device_type_capture : ma_device_type_loopback);
+    cfg.capture.pDeviceID = &dv[idx].id;        // (loopback: the output device whose sound to record)
+    cfg.capture.format   = ma_format_f32;
+    cfg.capture.channels = 2;
+    cfg.sampleRate       = RATE;
+    cfg.dataCallback     = SongCallback;
+    cfg.notificationCallback = SongNotify;
+    if (ma_device_init(&gCtx, &cfg, &gSongDev) != MA_SUCCESS) return false;
+    if (ma_device_start(&gSongDev) != MA_SUCCESS) { ma_device_uninit(&gSongDev); return false; }
+    gSongRunning = true; gSongLost = false;
+    return true;
+}
 
 static void UpdateSongStatusText()
 {
-    wchar_t t[96], disp[64];
+    wchar_t t[160], disp[64];
     AppDisplayName(gSongActiveApp, disp, 64);
     switch (gSongState) {
+    case 7: { const int c = SongResolveCh(); wchar_t nm[40] = L"the channel"; if (c >= 0) ChanLabel(c, nm, 32);
+              wsprintfW(t, gSongHeard ? L"Hearing the %s channel" : L"%s is silent: press play", nm); break; }
+    case 8: { wchar_t nm[48]; lstrcpynW(nm, gSongDevName, 40);
+              wsprintfW(t, gSongHeard ? L"Hearing %s" : L"%s is silent", nm); break; }
+    case 9: lstrcpyW(t, gSongKind == SONGK_CH ? L"That channel isn't in the Mixer: pick another" : L"Can't find that device: is it plugged in?"); break;
     case 1:  wsprintfW(t, gSongHeard ? L"Hearing %s" : L"%s is silent: press play", disp); break;
     case 2:  lstrcpynW(t, gSongHeard ? L"Hearing your PC" : L"No music playing yet", 96); break;
     case 3:  lstrcpynW(t, L"Using speaker sound (older Windows): turn off monitoring to avoid echo", 96); break;
@@ -5820,9 +5976,9 @@ static void UpdateSongStatusText()
     }
     default: lstrcpynW(t, gRunning ? L"Turn on to vocode music" : L"Press Start on the Main tab", 96); break;
     }
-    if (gSongLoading) lstrcpynW(t, L"Loading the song...", 96);
-    wchar_t cur[96];
-    GetDlgItemTextW(gWnd, IDC_SONGSTATUS, cur, 96);
+    if (gSongLoading) lstrcpynW(t, L"Loading the song...", 160);
+    wchar_t cur[160];
+    GetDlgItemTextW(gWnd, IDC_SONGSTATUS, cur, 160);
     if (lstrcmpW(cur, t)) SetDlgItemTextW(gWnd, IDC_SONGSTATUS, t);
 }
 
@@ -5831,16 +5987,22 @@ static void UpdateSongCapture()
 {
     bool want = gRunning && SongModeOn();
     gUseFile = gSongUseFile && gFileData != nullptr;    // file: no capture needed
-    if (gSongRunning && (!want || gSongLost || gSongUseFile || lstrcmpiW(gSongActiveApp, gSongApp))) {
+    wchar_t key[300]; SongWantKey(key);
+    if (gSongRunning && (!want || gSongLost || gSongUseFile || gSongKind == SONGK_CH || lstrcmpiW(gSongActiveKey, key))) {
         SongDevStop();
         gSongRunning = false;
     }
+    gSongCh = want && !gSongUseFile ? SongResolveCh() : -1;   // a Mixer channel: the mixer feeds the vocoder (no capture)
     if (!want) { gSongState = 0; UpdateSongStatusText(); return; }
     if (gSongUseFile) { gSongState = 6; UpdateSongStatusText(); return; }
+    if (gSongKind == SONGK_CH) { gSongState = gSongCh >= 0 ? 7 : 9; UpdateSongStatusText(); return; }
     if (gSongRunning) { UpdateSongStatusText(); return; }
 
+    lstrcpynW(gSongActiveKey, key, 300);
     lstrcpynW(gSongActiveApp, gSongApp, 64);
-    if (gSongApp[0]) {                           // one app
+    if (gSongKind == SONGK_PLAY || gSongKind == SONGK_CAP) {
+        gSongState = SongStartNamedDevice(gSongKind == SONGK_CAP) ? 8 : 9;   // (not there: the timer tries again)
+    } else if (gSongApp[0]) {                           // one app
         AudioApp apps[32];
         int n = ListAudioApps(apps, 32);
         DWORD pid = 0;
@@ -5915,6 +6077,16 @@ static void SongTick()                          // every 50 ms
     if (gSongRunning && gSongPLOn && gSongState == 1 && now - lastAlive > 3000) {
         lastAlive = now;
         if (!PidAlive(gSongPid)) gSongLost = true;
+    }
+    if (want && gSongKind == SONGK_CH && !gSongUseFile) {   // (the channel may have moved, or come back)
+        const int c = SongResolveCh();
+        if (c != gSongCh) { gSongCh = c; gSongState = c >= 0 ? 7 : 9; UpdateSongStatusText(); }
+    }
+    {                                           // the music level meter (Tune sub-tab)
+        static float shown = 0; const float pk = gSongPeakM; gSongPeakM = 0;
+        shown = pk > shown ? pk : shown * 0.82f;
+        static int lastQ = -999; const int qv = shown > 0.001f ? (int)(40.0f * log10f(shown)) : -200;
+        if (qv != lastQ && gPage == PAGE_FX && gFxSub == 1) { lastQ = qv; gSongMeter = shown; InvalidateRect(GetDlgItem(gWnd, IDC_SONGMETER), nullptr, FALSE); }
     }
     if (gSongPeak > 0.003f) lastHeard = now;    // music in the last 1.5 s?
     gSongPeak = 0;
@@ -7973,20 +8145,22 @@ static void MixMemKey(int c, wchar_t* key)
 static void MixMemStore(int c)
 {
     if (gCh[c].type == CH_NONE || !gIni[0]) return;
-    wchar_t key[200], v[400]; MixMemKey(c, key);
+    wchar_t key[200], v[700]; MixMemKey(c, key);
     int n = wsprintfW(v, L"%d,%d,%u,%d,%d,%d", (int)gCh[c].db10, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk);
     for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) n += wsprintfW(v + n, L",%d", gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i]);
     n += wsprintfW(v + n, L",%d,%d,%d,%d,%d", (int)gCh[c].chatRole, gCh[c].link, (int)gCh[c].pan, gCh[c].mono ? 1 : 0, gCh[c].ducker ? 1 : 0);
+    n += wsprintfW(v + n, L",%d,%d,%d,%d", (int)gCh[c].eqLo, (int)gCh[c].eqMid, (int)gCh[c].eqHi, (int)gCh[c].comp);
+    for (int k = 0; k < MAX_OUT; k++) n += wsprintfW(v + n, L",%d", (int)gCh[c].send[k]);
     wsprintfW(v + n, L"|%s", gCh[c].name);
     WritePrivateProfileStringW(L"mixer_memory", key, v, gIni);
 }
 static bool MixMemLoad(int c)
 {
-    wchar_t key[200], v[400]; MixMemKey(c, key);
-    if (!GetPrivateProfileStringW(L"mixer_memory", key, L"", v, 400, gIni) || !v[0]) return false;
-    int f[11 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
+    wchar_t key[200], v[700]; MixMemKey(c, key);
+    if (!GetPrivateProfileStringW(L"mixer_memory", key, L"", v, 700, gIni) || !v[0]) return false;
+    int f[20 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
     const wchar_t* q = v;
-    while (*q && *q != L'|' && nf < 11 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+    while (*q && *q != L'|' && nf < 20 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
     if (nf < 6) return false;
     gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].duck = f[1] != 0; gCh[c].routes = (unsigned)f[2] & ((1u << MAX_OUT) - 1);
     gCh[c].color = Iclamp(f[3], 0, 7); gChW[c] = f[4] ? Iclamp(f[4], 52, 240) : 0; gCh[c].holdTalk = f[5] != 0;
@@ -7997,6 +8171,10 @@ static bool MixMemLoad(int c)
         const bool has = nf >= b + 4;
         gCh[c].link = has ? Iclamp(f[b], 0, 4) : 0; gCh[c].pan = has ? Iclamp(f[b + 1], -100, 100) : 0;
         gCh[c].mono = has && f[b + 2] != 0; gCh[c].ducker = has && f[b + 3] != 0;
+        const bool has2 = nf >= b + 13;         // (added in 1.39)
+        gCh[c].eqLo = has2 ? Iclamp(f[b + 4], -120, 120) : 0; gCh[c].eqMid = has2 ? Iclamp(f[b + 5], -120, 120) : 0;
+        gCh[c].eqHi = has2 ? Iclamp(f[b + 6], -120, 120) : 0; gCh[c].comp = has2 ? Iclamp(f[b + 7], 0, 100) : 0;
+        for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = has2 ? Iclamp(f[b + 8 + k], -400, 60) : 0;
     }
     const wchar_t* nm = wcschr(v, L'|');
     lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
@@ -8021,6 +8199,8 @@ static void ChanSetSource(int c, int type, const wchar_t* src)
     if (type == CH_NONE || !MixMemLoad(c)) {    // new to the mixer (or cleared): fresh settings, no hotkeys
         gCh[c].name[0] = 0; gCh[c].db10 = 0; gCh[c].duck = false; gCh[c].holdTalk = 0; gChW[c] = 0; gCh[c].chatRole = 0;
         gCh[c].link = 0; gCh[c].pan = 0; gCh[c].mono = false; gCh[c].ducker = false;
+        gCh[c].eqLo = gCh[c].eqMid = gCh[c].eqHi = 0; gCh[c].comp = 0; for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = 0;
+        if (gCfxCh == c && gCfxWnd) DestroyWindow(gCfxWnd);
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = 0;
         if (type != CH_NONE && (wasEmpty || !gCh[c].routes)) gCh[c].routes = (1u << gRows) - 1;   // to every output
     }
@@ -8158,9 +8338,11 @@ static void SceneWrite(int i)                   // the mixer as it is now -> sce
     for (int c = 0; c < CH_MAX; c++) {
         wchar_t k[16], v[400]; wsprintfW(k, L"ch%d", c + 1);
         if (gCh[c].type == CH_NONE) lstrcpyW(v, L"0");
-        else _snwprintf(v, 399, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
+        else _snwprintf(v, 399, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
                         gCh[c].solo ? 1 : 0, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk,
-                        (int)gCh[c].chatRole, gCh[c].link, (int)gCh[c].pan, gCh[c].mono ? 1 : 0, gCh[c].ducker ? 1 : 0, gCh[c].name);
+                        (int)gCh[c].chatRole, gCh[c].link, (int)gCh[c].pan, gCh[c].mono ? 1 : 0, gCh[c].ducker ? 1 : 0,
+                        (int)gCh[c].eqLo, (int)gCh[c].eqMid, (int)gCh[c].eqHi, (int)gCh[c].comp,
+                        (int)gCh[c].send[0], (int)gCh[c].send[1], (int)gCh[c].send[2], (int)gCh[c].send[3], (int)gCh[c].send[4], gCh[c].name);
         v[399] = 0;
         WritePrivateProfileStringW(sec, k, v, gIni);
     }
@@ -8191,13 +8373,17 @@ static void SceneApply(int i)                   // switch to scene i: volumes gl
         if (!p2) continue;
         lstrcpynW(src, p1 + 1, (int)Imin(128, (int)(p2 - p1)));
         if (gCh[c].type != type || lstrcmpiW(gCh[c].src, src)) ChanSetSource(c, type, src);
-        int f[13] = {}; int nf = 0; const wchar_t* q = p2 + 1;
-        while (*q && *q != L'|' && nf < 13) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+        int f[22] = {}; int nf = 0; const wchar_t* q = p2 + 1;
+        while (*q && *q != L'|' && nf < 22) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
         if (nf >= 8) {
             gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].mute = f[1] != 0; gCh[c].solo = f[2] != 0; gCh[c].duck = f[3] != 0;
             gCh[c].routes = (unsigned)f[4] & ((1u << MAX_OUT) - 1); gCh[c].color = Iclamp(f[5], 0, 7);
             gChW[c] = f[6] ? Iclamp(f[6], 52, 240) : 0; gCh[c].holdTalk = f[7] != 0; gCh[c].chatRole = nf >= 9 ? Iclamp(f[8], 0, 2) : 0;
             if (nf >= 13) { gCh[c].link = Iclamp(f[9], 0, 4); gCh[c].pan = Iclamp(f[10], -100, 100); gCh[c].mono = f[11] != 0; gCh[c].ducker = f[12] != 0; }
+            if (nf >= 22) {
+                gCh[c].eqLo = Iclamp(f[13], -120, 120); gCh[c].eqMid = Iclamp(f[14], -120, 120); gCh[c].eqHi = Iclamp(f[15], -120, 120);
+                gCh[c].comp = Iclamp(f[16], 0, 100); for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = Iclamp(f[17 + k], -400, 60);
+            }
         }
         const wchar_t* nm = wcschr(p2 + 1, L'|');
         lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
@@ -8303,10 +8489,53 @@ static bool SliderIsPan(HWND h, int* c)
     if (id >= IDC_CHPAN0 && id < IDC_CHPAN0 + CH_MAX) { *c = id - IDC_CHPAN0; return true; }
     return false;
 }
-static int  SliderGet(HWND h) { int c; return SliderIsPan(h, &c) ? (int)gCh[c].pan : (int)gChatMix; }
+// The channel settings window (EQ, compressor, its level on each output) uses the same sliders.
+static volatile int* CfxVar(int id)
+{
+    if (gCfxCh < 0 || gCfxCh >= CH_MAX) return nullptr;
+    ChanSet& g = gCh[gCfxCh];
+    if (id == CFX_LO) return &g.eqLo; if (id == CFX_MID) return &g.eqMid; if (id == CFX_HI) return &g.eqHi; if (id == CFX_COMP) return &g.comp;
+    if (id >= CFX_SEND0 && id < CFX_SEND0 + MAX_OUT) return &g.send[id - CFX_SEND0];
+    return nullptr;
+}
+static void SliderRange(HWND h, int* lo, int* hi, int* step)
+{
+    const int id = GetDlgCtrlID(h);
+    *lo = -100; *hi = 100; *step = 5;
+    if (gCfxWnd && GetParent(h) == gCfxWnd) {
+        if (id == CFX_COMP) { *lo = 0; *hi = 100; *step = 5; }
+        else if (id >= CFX_SEND0) { *lo = -400; *hi = 60; *step = 10; }   // (tenths of a dB)
+        else { *lo = -120; *hi = 120; *step = 5; }
+    }
+}
+static void CfxValText(int id, wchar_t* t)
+{
+    volatile int* v = CfxVar(id); const int x = v ? *v : 0;
+    if (id == CFX_COMP) { if (x) wsprintfW(t, L"%d%%", x); else lstrcpyW(t, L"Off"); return; }
+    const int a = x < 0 ? -x : x;
+    if (!x) lstrcpyW(t, L"0 dB"); else wsprintfW(t, L"%s%d.%d dB", x < 0 ? L"\x2212" : L"+", a / 10, a % 10);
+}
+static void ChanFxBadge(int c);
+static int  SliderGet(HWND h)
+{
+    if (gCfxWnd && GetParent(h) == gCfxWnd) { volatile int* v = CfxVar(GetDlgCtrlID(h)); return v ? *v : 0; }
+    int c; return SliderIsPan(h, &c) ? (int)gCh[c].pan : (int)gChatMix;
+}
 static void FaderLabel(int id);
 static void SliderSet(HWND h, int v)
 {
+    if (gCfxWnd && GetParent(h) == gCfxWnd) {
+        int lo, hi, st; SliderRange(h, &lo, &hi, &st);
+        const int id = GetDlgCtrlID(h);
+        v = Iclamp(v, lo, hi);
+        if (id != CFX_COMP && v > -st && v < st) v = 0;   // (snaps to 0 dB)
+        volatile int* p = CfxVar(id); if (!p) return;
+        *p = v;
+        InvalidateRect(h, nullptr, FALSE);
+        wchar_t t[24]; CfxValText(id, t); SetDlgItemTextW(gCfxWnd, CFX_VAL + id, t);
+        ChanFxBadge(gCfxCh);
+        return;
+    }
     int c;
     if (!SliderIsPan(h, &c)) { ChatMixSet(v); return; }
     PanSet(c, v);
@@ -8327,13 +8556,14 @@ static LRESULT CALLBACK ChatMixProc(HWND h, UINT m, WPARAM w, LPARAM l)
         RECT rc; GetClientRect(h, &rc);
         {
             OffScreen os(dc, rc.right, rc.bottom); HDC d = os.dc;
-            FillRect(d, &rc, BgBrush());
+            FillRect(d, &rc, GetParent(h) == gWnd ? BgBrush() : BgSolid());
             const int tw = SC(10), cy = rc.bottom / 2, x0 = tw / 2, x1 = rc.right - tw / 2;
             const int kh = Imax(SC(4), Imin(SC(8), (int)rc.bottom / 2 - 1));     // (the pan sliders are shorter)
-            const int tx = x0 + (int)((SliderGet(h) + 100) / 200.0f * (x1 - x0));
+            int lo, hi, st; SliderRange(h, &lo, &hi, &st);
+            const int tx = x0 + (int)((float)(SliderGet(h) - lo) / Imax(1, hi - lo) * (x1 - x0));
             RECT tr = { x0, cy - Imax(1, SC(2)), x1, cy + Imax(1, SC(2)) };
             HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(d, &tr, tb); DeleteObject(tb);
-            const int mid = (x0 + x1) / 2;
+            const int mid = x0 + (int)((float)(0 - lo) / Imax(1, hi - lo) * (x1 - x0));   // (where 0 is: the fill starts there)
             RECT fr = tr; fr.left = Imin(mid, tx); fr.right = Imax(mid, tx);
             HBRUSH fb = CreateSolidBrush(ACCENT); FillRect(d, &fr, fb); DeleteObject(fb);
             RECT mk = { mid, cy - (kh - 1), mid + 1, cy + (kh - 1) };
@@ -8355,21 +8585,123 @@ static LRESULT CALLBACK ChatMixProc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (m == WM_LBUTTONDOWN || GetCapture() == h) {
             RECT rc; GetClientRect(h, &rc);
             const int tw = SC(10), x = (short)LOWORD(l);
-            SliderSet(h, (int)lround(((double)(x - tw / 2) / Imax(1, (int)rc.right - tw)) * 200.0 - 100.0));
+            int lo, hi, st; SliderRange(h, &lo, &hi, &st);
+            SliderSet(h, lo + (int)lround(((double)(x - tw / 2) / Imax(1, (int)rc.right - tw)) * (hi - lo)));
         }
         return 0;
     case WM_LBUTTONUP: case WM_CAPTURECHANGED:
         if (m == WM_LBUTTONUP && GetCapture() == h) ReleaseCapture();
         { int c; if (SliderIsPan(h, &c)) FaderLabel(IDC_CHVOL0 + c); }   // (the dB again)
         return 0;
-    case WM_MOUSEWHEEL: SliderSet(h, SliderGet(h) + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 5 : -5)); return 0;
-    case WM_KEYDOWN:
-        if (w == VK_LEFT || w == VK_DOWN) { SliderSet(h, SliderGet(h) - 5); return 0; }
-        if (w == VK_RIGHT || w == VK_UP) { SliderSet(h, SliderGet(h) + 5); return 0; }
+    case WM_MOUSEWHEEL: { int lo, hi, st; SliderRange(h, &lo, &hi, &st); SliderSet(h, SliderGet(h) + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? st : -st)); return 0; }
+    case WM_KEYDOWN: {
+        int lo, hi, st; SliderRange(h, &lo, &hi, &st);
+        if (w == VK_LEFT || w == VK_DOWN) { SliderSet(h, SliderGet(h) - st); return 0; }
+        if (w == VK_RIGHT || w == VK_UP) { SliderSet(h, SliderGet(h) + st); return 0; }
         if (w == VK_HOME) { SliderSet(h, 0); return 0; }
         break;
     }
+    }
     return DefWindowProcW(h, m, w, l);
+}
+
+// ---- a channel's settings window: 3-band EQ, compressor, and its level on each output
+static void MixerRedraw();
+static void ChanFxBadge(int c) { InvalidateRect(GetDlgItem(gWnd, IDC_CHSRC0 + c), nullptr, FALSE); for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), nullptr, FALSE); }
+static bool ChanFxUsed(int c)
+{
+    const ChanSet& g = gCh[c];
+    if (g.eqLo || g.eqMid || g.eqHi || g.comp) return true;
+    for (int k = 0; k < MAX_OUT; k++) if (g.send[k]) return true;
+    return false;
+}
+static void ChanLabel(int c, wchar_t* out, int cap);
+static void OutName(int k, wchar_t* out, int cap);
+static void ChanFxRefresh()                     // (values changed elsewhere: undo, a scene, Streamer.bot)
+{
+    if (!gCfxWnd) return;
+    static const int ids[] = { CFX_LO, CFX_MID, CFX_HI, CFX_COMP, CFX_SEND0, CFX_SEND0 + 1, CFX_SEND0 + 2, CFX_SEND0 + 3, CFX_SEND0 + 4 };
+    for (int id : ids) {
+        HWND s2 = GetDlgItem(gCfxWnd, id); if (!s2) continue;
+        wchar_t t[24], o[24]; CfxValText(id, t); GetDlgItemTextW(gCfxWnd, CFX_VAL + id, o, 24);
+        if (lstrcmpW(t, o)) { SetDlgItemTextW(gCfxWnd, CFX_VAL + id, t); InvalidateRect(s2, nullptr, FALSE); }
+    }
+    for (int k = 0; k < MAX_OUT; k++) {         // (not sent there: say so)
+        HWND lb = GetDlgItem(gCfxWnd, CFX_HDR + 10 + k); if (!lb) continue;
+        wchar_t n[40], t[64], o[64]; OutName(k, n, 32);
+        if (gCh[gCfxCh].routes & (1u << k)) lstrcpynW(t, n, 64); else wsprintfW(t, L"%s (off)", n);
+        GetWindowTextW(lb, o, 64); if (lstrcmpW(t, o)) SetWindowTextW(lb, t);
+    }
+    wchar_t g[48];
+    if (!gCh[gCfxCh].comp) lstrcpyW(g, L"");
+    else { const int d10 = (int)lround(gChGr[gCfxCh] * 10); wsprintfW(g, d10 > 0 ? L"turning down %d.%d dB" : L"not turning down now", d10 / 10, d10 % 10); }
+    wchar_t o[48]; GetDlgItemTextW(gCfxWnd, CFX_GR, o, 48); if (lstrcmpW(g, o)) SetDlgItemTextW(gCfxWnd, CFX_GR, g);
+}
+static LRESULT CALLBACK ChanFxProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_TIMER:
+        if (gCfxCh < 0 || gCh[gCfxCh].type == CH_NONE) { DestroyWindow(h); return 0; }   // (the channel went)
+        ChanFxRefresh();
+        return 0;
+    case WM_COMMAND:
+        if (LOWORD(w) == CFX_FLAT) {
+            gCh[gCfxCh].eqLo = gCh[gCfxCh].eqMid = gCh[gCfxCh].eqHi = 0; gCh[gCfxCh].comp = 0;
+            for (int k = 0; k < MAX_OUT; k++) gCh[gCfxCh].send[k] = 0;
+            ChanFxRefresh(); ChanFxBadge(gCfxCh);
+        } else if (LOWORD(w) == IDCANCEL) DestroyWindow(h);
+        return 0;
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: KillTimer(h, 1); if (gCfxWnd == h) gCfxWnd = nullptr; gCfxCh = -1; return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN:
+        return CtlColor(h, m, w, l);
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void ThemeTitleBar(HWND w);
+static void ChanFxOpen(int c)
+{
+    if (gCfxWnd) DestroyWindow(gCfxWnd);
+    if (c < 0 || c >= CH_MAX || gCh[c].type == CH_NONE) return;
+    gCfxCh = c;
+    const int rows = Imax(1, gRows), W = 380, H = 236 + rows * 30 + 44;
+    DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT r = { 0, 0, SC(W), SC(H) }; AdjustWindowRect(&r, style, FALSE);
+    RECT sr; GetWindowRect(GetDlgItem(gWnd, IDC_CHSRC0 + c), &sr);
+    HMONITOR mon = MonitorFromRect(&sr, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    const int x = Iclamp(sr.left, mi.rcWork.left, mi.rcWork.right - ww), y = Iclamp(sr.bottom + SC(4), mi.rcWork.top, mi.rcWork.bottom - wh);
+    wchar_t nm[40], title[80]; ChanLabel(c, nm, 32); wsprintfW(title, L"%s - EQ, compressor, levels", nm);
+    gCfxWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"LagChanFx", title, style, x, y, ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!gCfxWnd) { gCfxCh = -1; return; }
+    ThemeTitleBar(gCfxWnd);
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x2, int y2, int w2, int h2, int id) {
+        HWND c2 = CreateWindowExW(0, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x2), SC(y2), SC(w2), SC(h2), gCfxWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c2, WM_SETFONT, (WPARAM)gFont, TRUE);
+        return c2;
+    };
+    auto hdr = [&](const wchar_t* t, int y2) { HWND hh = mk(L"STATIC", t, SS_NOPREFIX, 14, y2, 340, 18, -1); SendMessageW(hh, WM_SETFONT, (WPARAM)gFontBold, TRUE); };
+    auto row = [&](const wchar_t* label, int y2, int id, int labelId) {
+        mk(L"STATIC", label, SS_NOPREFIX | SS_ENDELLIPSIS, 22, y2 + 2, 110, 18, labelId);
+        mk(L"LagChatMix", L"", WS_TABSTOP, 136, y2, 160, 22, id);
+        wchar_t t[24]; CfxValText(id, t); mk(L"STATIC", t, SS_NOPREFIX, 302, y2 + 2, 70, 18, CFX_VAL + id);
+    };
+    hdr(L"EQ", 12);
+    row(L"Bass (100 Hz)", 36, CFX_LO, -1);
+    row(L"Middle (1 kHz)", 64, CFX_MID, -1);
+    row(L"Treble (8 kHz)", 92, CFX_HI, -1);
+    hdr(L"Compressor", 128);
+    row(L"Amount", 152, CFX_COMP, -1);
+    mk(L"STATIC", L"Evens out loud and quiet parts (videos, games, voice chat).", SS_NOPREFIX, 22, 178, 274, 18, -1);
+    mk(L"STATIC", L"", SS_NOPREFIX, 22, 196, 274, 18, CFX_GR);
+    hdr(L"Level on each output", 218);
+    for (int k = 0; k < rows; k++) row(L"", 242 + k * 30, CFX_SEND0 + k, CFX_HDR + 10 + k);
+    mk(L"STATIC", L"On top of its fader: e.g. quieter on your stream than in your headphones.", SS_NOPREFIX, 22, 242 + rows * 30, 350, 18, -1);
+    mk(L"BUTTON", L"Reset all", WS_TABSTOP, 270, H - 36, 96, 26, CFX_FLAT);
+    ChanFxRefresh();
+    SetTimer(gCfxWnd, 1, 100, nullptr);
+    ShowWindow(gCfxWnd, SW_SHOW);
 }
 
 // ---- the channel menu (like OBS's audio sources): apps, inputs, outputs; rename, colour
@@ -8484,6 +8816,22 @@ static LRESULT CALLBACK ChanSrcProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
     }
     return DefSubclassProc(h, m, w, l);
 }
+static LRESULT CALLBACK RouteBtnProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    const int id = GetDlgCtrlID(h), c = (id - IDC_CHRT0) / MAX_OUT, k = (id - IDC_CHRT0) % MAX_OUT;
+    if (m == WM_MOUSEWHEEL) {                   // scroll: this channel's level on that output, 1 dB at a time
+        gCh[c].send[k] = Iclamp(gCh[c].send[k] + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 10 : -10), -400, 60);
+        wchar_t who[40], out[40], t[100]; ChanLabel(c, who, 32); OutName(k, out, 32);
+        const int v = gCh[c].send[k], a = v < 0 ? -v : v;
+        if (!v) wsprintfW(t, L"%s on %s: 0 dB (same as the fader)", who, out);
+        else wsprintfW(t, L"%s on %s: %s%d dB", who, out, v < 0 ? L"\x2212" : L"+", a / 10);
+        ShowOsd(t, true);
+        ChanFxBadge(c); MixerRedraw();
+        return 0;
+    }
+    if (m == WM_RBUTTONUP) { ChanFxOpen(c); return 0; }
+    return DefSubclassProc(h, m, w, l);
+}
 static void ChanMenu(int c, HWND from)
 {
     HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
@@ -8514,6 +8862,7 @@ static void ChanMenu(int c, HWND from)
         AppendMenuW(m, MF_POPUP, (UINT_PTR)lm, L"Link (faders and mute move together)");
         AppendMenuW(m, MF_STRING | (gCh[c].mono ? MF_CHECKED : 0), 40, L"Mono (left and right mixed)");
         AppendMenuW(m, MF_STRING | (gCh[c].ducker ? MF_CHECKED : 0), 41, L"Duck the others while this plays (e.g. Discord)");
+        AppendMenuW(m, MF_STRING | (ChanFxUsed(c) ? MF_CHECKED : 0), 42, L"EQ, compressor, level on each output...");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     }
     HMENU more = CreatePopupMenu(), ins = CreatePopupMenu(), outs = CreatePopupMenu();
@@ -8558,6 +8907,7 @@ static void ChanMenu(int c, HWND from)
     else if (cmd >= 20 && cmd <= 22) gCh[c].chatRole = cmd - 20;
     else if (cmd >= 30 && cmd <= 34) { gCh[c].link = cmd - 30; MixerRedraw(); }
     else if (cmd == 40) gCh[c].mono = !gCh[c].mono;
+    else if (cmd == 42) ChanFxOpen(c);
     else if (cmd == 41) { gCh[c].ducker = !gCh[c].ducker; if (gCh[c].ducker) ShowOsd(L"Channels with Duck on now get quieter while this plays too", true); }
     else if (cmd >= 100 && cmd - 100 < gChOptN) ChanSetSource(c, gChOpts[cmd - 100].type, gChOpts[cmd - 100].src);
 }
@@ -8795,6 +9145,15 @@ static void DrawChanSrc(DRAWITEMSTRUCT* d, int c)   // icon, name, and a little 
         DrawTextW(dc, g, 1, &lr, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
         SelectObject(dc, of2);
     }
+    if (ChanFxUsed(c)) {                        // EQ / compressor / output levels set: a small "fx", top left
+        RECT fr = { rc.left + (gCh[c].link ? SC(17) : SC(3)), y, 0, y + SC(13) }; fr.right = fr.left + SC(16);
+        HPEN fp = CreatePen(PS_SOLID, 1, ACCENT); HGDIOBJ o1 = SelectObject(dc, fp), o2 = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        RoundRect(dc, fr.left, fr.top, fr.right, fr.bottom, SC(4), SC(4));
+        SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(fp);
+        SetTextColor(dc, ACCENT); HGDIOBJ of3 = SelectObject(dc, FitFont(2));
+        DrawTextW(dc, L"fx", 2, &fr, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, of3);
+    }
     if (gDragCh >= 0 && (c == gDropCh || c == gDragCh)) {   // dragging: where it would go (and which one moves)
         HPEN pp = CreatePen(c == gDragCh ? PS_DOT : PS_SOLID, Imax(1, SC(2)), ACCENT);
         HGDIOBJ o1 = SelectObject(dc, pp), o2 = SelectObject(dc, GetStockObject(NULL_BRUSH));
@@ -8828,7 +9187,18 @@ static void DrawChanAdd(DRAWITEMSTRUCT* d)      // an empty channel: a dashed "+
 }
 static void DrawVMeter2(DRAWITEMSTRUCT* d, float l, float r, bool live, float holdL, float holdR, bool clip);
 static void DrawVMeter(DRAWITEMSTRUCT* d, float l, float r, bool live) { DrawVMeter2(d, l, r, live, 0, 0, false); }
+static void DrawVMeter2Raw(DRAWITEMSTRUCT* d, float l, float r, bool live, float holdL, float holdR, bool clip);
 static void DrawVMeter2(DRAWITEMSTRUCT* d, float l, float r, bool live, float holdL, float holdR, bool clip)   // upright; r < 0: one bar
+{                                               // (drawn off screen first: no flicker at 60 frames a second)
+    const RECT rc = d->rcItem; const int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    if (W <= 0 || H <= 0) return;
+    OffScreen os(d->hDC, W, H);
+    POINT bo; GetBrushOrgEx(d->hDC, &bo); SetBrushOrgEx(os.dc, bo.x - rc.left, bo.y - rc.top, nullptr);   // (a background picture lines up)
+    DRAWITEMSTRUCT d2 = *d; d2.hDC = os.dc; d2.rcItem = { 0, 0, W, H };
+    DrawVMeter2Raw(&d2, l, r, live, holdL, holdR, clip);
+    BitBlt(d->hDC, rc.left, rc.top, W, H, os.dc, 0, 0, SRCCOPY);
+}
+static void DrawVMeter2Raw(DRAWITEMSTRUCT* d, float l, float r, bool live, float holdL, float holdR, bool clip)
 {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
@@ -9125,42 +9495,47 @@ static void MeterHold(float v, float& hold, DWORD& t, DWORD now)
     if (v >= hold) { hold = v; t = now; }
     else if (now - t > 1500) hold *= 0.85f;
 }
-static void MixerMeterTick()                    // (50 ms) meters and limit lights on the Mixer page
+static DWORD gLimShowT[MAX_OUT];
+static void MixerMeterTick()                    // (~60 times a second) meters and limit lights on the Mixer page
 {
     if (gPage != PAGE_MIXER || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
+    static LARGE_INTEGER qf = {}, last = {};
+    if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    const float ms = last.QuadPart ? Min(200.0f, (float)((now.QuadPart - last.QuadPart) * 1000.0 / qf.QuadPart)) : 16.0f;
+    last = now;
+    const float fall = powf(0.82f, ms / 50.0f);   // (falls as fast as before, just in smaller steps)
+    const DWORD tn = GetTickCount();
+    auto q = [](float v) { return v > 0.001f ? (int)(80.0f * log10f(v)) : -240; };   // quarter dB: smooth, still skips tiny changes
     for (int c = 0; c < CH_MAX; c++) {
         float pl = gChA[c].peakL, pr = gChA[c].peakR; gChA[c].peakL = gChA[c].peakR = 0;
         if (gCh[c].type == CH_NONE) continue;
         const float g = gCh[c].mute ? 0.0f : DbGain10(gCh[c].db10);
         pl *= g; pr *= g;
-        gChShownL[c] = pl > gChShownL[c] ? pl : gChShownL[c] * 0.82f;
-        gChShownR[c] = pr > gChShownR[c] ? pr : gChShownR[c] * 0.82f;
-        const DWORD tn = GetTickCount();
+        gChShownL[c] = pl > gChShownL[c] ? pl : gChShownL[c] * fall;
+        gChShownR[c] = pr > gChShownR[c] ? pr : gChShownR[c] * fall;
         MeterHold(pl, gChHoldL[c], gChHoldT[c], tn);
         MeterHold(pr, gChHoldR[c], gChHoldTR[c], tn);
         if (pl >= 0.99f || pr >= 0.99f) gChClipT[c] = tn;
-        static int last[CH_MAX] = { -999, -999, -999, -999, -999, -999, -999, -999 };
-        auto q = [](float v) { return v > 0.001f ? (int)(20.0f * log10f(v)) : -60; };   // whole dB: what the bar can show
-        const int now = q(gChShownL[c]) * 100 + q(gChShownR[c]) + (q(gChHoldL[c]) + 60) * 10000 + (q(gChHoldR[c]) + 60) * 1000000
-                      + (tn - gChClipT[c] < 2000 ? 1 << 30 : 0);
-        if (now != last[c]) { last[c] = now; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
+        static long long lastC[CH_MAX] = { -999, -999, -999, -999, -999, -999, -999, -999 };
+        const long long v = (long long)(q(gChShownL[c]) + 300) + (q(gChShownR[c]) + 300) * 1000LL + (q(gChHoldL[c]) + 300) * 1000000LL
+                          + (q(gChHoldR[c]) + 300) * 1000000000LL + (tn - gChClipT[c] < 2000 ? 1LL << 50 : 0);
+        if (v != lastC[c]) { lastC[c] = v; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
-        // (UpdateMeter, just before this, already took this tick's peak into gOutShow: use that, in dB)
-        gOutShown[k] = gOutShow[k] > -79.0f ? powf(10.0f, gOutShow[k] / 20.0f) : 0.0f;
-        const DWORD tn = GetTickCount();
+        const float pk = gOutPeakMix[k]; gOutPeakMix[k] = 0;   // (its own copy: the Main tab's meter reads the other)
+        gOutShown[k] = pk > gOutShown[k] ? pk : gOutShown[k] * fall;
         MeterHold(gOutShown[k], gOutHold[k], gOutHoldT[k], tn);
-        if (gOutShow[k] > -0.2f) gOutClipT[k] = tn;
-        static int lastO[MAX_OUT] = { -999, -999, -999, -999, -999 };
-        const int now = (gOutShown[k] > 0.001f ? (int)(20.0f * log10f(gOutShown[k])) : -60)
-                      + ((gOutHold[k] > 0.001f ? (int)(20.0f * log10f(gOutHold[k])) : -60) + 60) * 1000 + (tn - gOutClipT[k] < 2000 ? 1 << 30 : 0);
-        if (now != lastO[k]) { lastO[k] = now; InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE); }
+        if (pk >= 0.97f) gOutClipT[k] = tn;
+        static long long lastO[MAX_OUT] = { -999, -999, -999, -999, -999 };
+        const long long v = (long long)(q(gOutShown[k]) + 300) + (q(gOutHold[k]) + 300) * 1000LL + (tn - gOutClipT[k] < 2000 ? 1LL << 40 : 0);
+        if (v != lastO[k]) { lastO[k] = v; InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE); }
         { static bool lastT[MAX_OUT]; const bool t = gTestTone[k] > 0; if (t != lastT[k]) { lastT[k] = t; InvalidateRect(GetDlgItem(gWnd, IDC_OTEST0 + k), nullptr, FALSE); } }
         if (gLimHit[k]) {                       // lit for a moment after each catch
             gLimHit[k] = false;
             if (!gLimShow[k]) InvalidateRect(GetDlgItem(gWnd, IDC_OLIM0 + k), nullptr, FALSE);
-            gLimShow[k] = 8;
-        } else if (gLimShow[k] > 0 && --gLimShow[k] == 0) InvalidateRect(GetDlgItem(gWnd, IDC_OLIM0 + k), nullptr, FALSE);
+            gLimShow[k] = 1; gLimShowT[k] = tn;
+        } else if (gLimShow[k] && tn - gLimShowT[k] > 400) { gLimShow[k] = 0; InvalidateRect(GetDlgItem(gWnd, IDC_OLIM0 + k), nullptr, FALSE); }
     }
 }
 static void MixerOutNames()                     // each output strip shows its device
@@ -10933,7 +11308,7 @@ static void AddTips()
         TipId(IDC_CHPAN0 + c,  L"Pan: drag left or right (scroll works too). Double-click: the middle.");
         TipId(IDC_CHVOL0 + c,  L"This channel's volume. Drag, or scroll (Shift = finer). Double-click = 0 dB. Right-click to type an exact value.");
         TipId(IDC_CHMETER0 + c, L"How loud this channel is right now (left and right).");
-        for (int k = 0; k < MAX_OUT; k++) TipId(IDC_CHRT0 + c * MAX_OUT + k, L"Send this channel to that output (lit = on).");
+        for (int k = 0; k < MAX_OUT; k++) TipId(IDC_CHRT0 + c * MAX_OUT + k, L"Send this channel to that output (lit = on). Scroll on it: its level there (a dot = not the same as the fader). Right-click: EQ, compressor and levels.");
     }
     TipId(IDC_DUCKDB,      L"How much quieter Duck channels get while you talk.");
     TipId(IDC_CHADDBTN,    L"Add a channel: an app (Spotify, a game, a browser...), another input, or what an output device plays. Up to 8.");
@@ -11129,12 +11504,17 @@ static void AddTips()
     TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
                         L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you.");
     TipId(IDC_VOCKEY,   L"The key of the song (its home note). Not sure? Try C with Major, or A with Minor.");
-    TipId(IDC_SONGBTN,  L"Vocode to song: the music playing on your PC says your words. Talk or sing and you hear the song "
+    TipId(IDC_SONGBTN,  L"Vocode to song: the music says your words. Talk or sing and you hear the song "
                         L"shaped by your voice; stay quiet and it's silent. Turns on Voice effects and the Vocoder's Song style. "
                         L"Click again to go back to the style you had.");
-    TipId(IDC_SONGSRC,  L"Where the music comes from: one app (Spotify, a browser...), all PC sound except Lag Effect "
-                        L"(so it never hears itself), or an audio file on your PC (MP3, WAV, FLAC; it loops). "
-                        L"Recording one app needs Windows 11. Open the list to refresh it.");
+    TipId(IDC_SONGSRC,  L"Where to listen for the music: all PC sound except Lag Effect (so it never hears itself), one app "
+                        L"(Spotify, a browser...; needs Windows 11), a Mixer channel (before its fader, so you can mute it and still vocode), "
+                        L"what a playback device plays, a recording device (like CABLE Output or a line in), or an audio file "
+                        L"(MP3, WAV, FLAC; it loops). Open the list to refresh it.");
+    TipId(IDC_SONGLVL,  L"The music's level going into the vocoder. Turn it up if the music is quiet (the bar stays low), "
+                        L"down if it's distorted.");
+    TipId(IDC_SONGMETER, L"How loud the music reaching the vocoder is (after Level).");
+    TipId(IDC_SONGRESTART, L"Play the audio file from the beginning.");
     TipId(IDC_SONGSTATUS, L"Whether the song is reaching the vocoder.");
     TipId(IDC_VOCRANGE, L"How high your voice is. Auto works it out as you sing. "
                         L"Low / deep: for bass and baritone voices; hears notes down to 50 Hz, uses longer, smoother slices "
@@ -11151,7 +11531,8 @@ static void AddTips()
                             L"right-click one (or press Backspace while setting it) to clear it.");
     TipId(IDC_FXKEY_MASTER, L"Set a hotkey that turns all voice effects on/off from anywhere. Right-click to clear it.");
     TipId(IDC_FXSUB0, L"Voice: Pitch, Formant (throat size) and Gender (one-knob voice change).");
-    TipId(IDC_FXSUB1, L"Tune: the Vocoder (auto-tune, harmonies, robot, song), Harmonizer (extra voices) and Whisper.");
+    TipId(IDC_FXSUB1, L"Tune: the Vocoder (auto-tune, harmonies, robot), Vocode to song and the Harmonizer (extra voices).");
+    TipId(IDC_FXSUB7, L"Whisper: a breathy whisper, even when you talk normally.");
     TipId(IDC_FXSUB2, L"Monster: Growl (sub-octave rumble and rasp), Ring mod (sci-fi robot) and Distortion.");
     TipId(IDC_FXSUB3, L"Space: Reverb (a room), Shimmer (a rising, angelic reverb) and Echo.");
     TipId(IDC_FXSUB4, L"Motion: Ghost (backwards swells), Chorus / flanger and Wobble (tremolo, vibrato).");
@@ -11467,6 +11848,7 @@ static void ChatMixText(wchar_t* t);
 struct MixSnapCh {
     int type; wchar_t src[128], name[32];
     int db10, mute, solo, duck, routes, color, holdTalk, chatRole, link, pan, mono, ducker, width;
+    int eqLo, eqMid, eqHi, comp, send[MAX_OUT];
     int keys[MIXA_N][MAX_KEYS];
 };
 struct MixSnap {
@@ -11487,6 +11869,7 @@ static void MixSnapTake(MixSnap& m)
         lstrcpynW(o.src, g.src, 128); lstrcpynW(o.name, g.name, 32);
         o.db10 = g.db10; o.mute = g.mute; o.solo = g.solo; o.duck = g.duck; o.routes = (int)g.routes; o.color = g.color;
         o.holdTalk = g.holdTalk; o.chatRole = g.chatRole; o.link = g.link; o.pan = g.pan; o.mono = g.mono; o.ducker = g.ducker; o.width = gChW[c];
+        o.eqLo = g.eqLo; o.eqMid = g.eqMid; o.eqHi = g.eqHi; o.comp = g.comp; for (int k = 0; k < MAX_OUT; k++) o.send[k] = g.send[k];
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) o.keys[a][i] = gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i];
     }
     for (int k = 0; k < MAX_OUT; k++) {
@@ -11516,6 +11899,7 @@ static void MixSnapApply(const MixSnap& m)
         lstrcpynW(g.name, o.name, 32);
         g.db10 = o.db10; g.mute = o.mute != 0; g.solo = o.solo != 0; g.duck = o.duck != 0; g.routes = (unsigned)o.routes; g.color = o.color;
         g.holdTalk = o.holdTalk; g.chatRole = o.chatRole; g.link = o.link; g.pan = o.pan; g.mono = o.mono != 0; g.ducker = o.ducker != 0; gChW[c] = o.width;
+        g.eqLo = o.eqLo; g.eqMid = o.eqMid; g.eqHi = o.eqHi; g.comp = o.comp; for (int k = 0; k < MAX_OUT; k++) g.send[k] = o.send[k];
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = o.keys[a][i];
         MixKeysShow(c); FaderLabel(IDC_CHVOL0 + c);
     }
@@ -11544,7 +11928,9 @@ static void MixSnapWhat(const MixSnap& a, const MixSnap& b, wchar_t* t)   // wha
             const wchar_t* f = x.db10 != y.db10 ? L"volume" : x.mute != y.mute ? L"mute" : x.solo != y.solo ? L"solo" : x.duck != y.duck ? L"duck"
                              : x.routes != y.routes ? L"outputs" : x.pan != y.pan ? L"pan" : x.mono != y.mono ? L"mono" : x.link != y.link ? L"link"
                              : x.ducker != y.ducker ? L"duck the others" : lstrcmpW(x.name, y.name) ? L"name" : x.color != y.color ? L"colour"
-                             : x.chatRole != y.chatRole ? L"ChatMix" : x.width != y.width ? L"width" : L"hotkeys";
+                             : x.chatRole != y.chatRole ? L"ChatMix" : x.width != y.width ? L"width"
+                             : x.eqLo != y.eqLo || x.eqMid != y.eqMid || x.eqHi != y.eqHi ? L"EQ" : x.comp != y.comp ? L"compressor"
+                             : memcmp(x.send, y.send, sizeof(x.send)) ? L"output levels" : L"hotkeys";
             _snwprintf(t, 63, L"%s %s", who, f); t[63] = 0; return;
         }
     }
@@ -12125,7 +12511,8 @@ static void Layout()
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
-        if (cid == IDC_SONGSRC || cid == IDC_SONGSTATUS) vis = vis && songStyle;
+        if (cid == IDC_SONGHINT) vis = vis && songStyle;
+        if (cid == IDC_SONGRESTART) vis = vis && gSongUseFile && gFileData;   // (an audio file: back to its start)
         if (cid == IDC_VOICEPROG) vis = vis && gVoiceInstalling;
         if (cid >= IDC_CHRT0 && cid < IDC_CHRT0 + CH_MAX * MAX_OUT) vis = vis && (cid - IDC_CHRT0) % MAX_OUT < gRows
                                                                           && gCh[(cid - IDC_CHRT0) / MAX_OUT].type != CH_NONE;
@@ -13467,6 +13854,15 @@ static void WsExec(int id, const char* m)
         if (JsonOnOff(m, "duck") >= 0) { WsBool(m, "duck", gCh[c].duck, &b); gCh[c].duck = b; }
         if (JsonOnOff(m, "mono") >= 0) { WsBool(m, "mono", gCh[c].mono, &b); gCh[c].mono = b; }
         if (JsonOnOff(m, "ducksothers") >= 0) { WsBool(m, "ducksothers", gCh[c].ducker, &b); gCh[c].ducker = b; }
+        if (JsonNum(m, "bass", &v))       gCh[c].eqLo  = Iclamp((int)lround(v * 10), -120, 120);
+        if (JsonNum(m, "middle", &v))     gCh[c].eqMid = Iclamp((int)lround(v * 10), -120, 120);
+        if (JsonNum(m, "treble", &v))     gCh[c].eqHi  = Iclamp((int)lround(v * 10), -120, 120);
+        if (JsonNum(m, "compressor", &v)) gCh[c].comp  = Iclamp((int)lround(v), 0, 100);
+        for (int o = 0; o < MAX_OUT; o++) {     // "out1db": its level on output 1 (on top of the fader)
+            char key[12]; wsprintfA(key, "out%ddb", o + 1);
+            if (JsonNum(m, key, &v)) gCh[c].send[o] = Iclamp((int)lround(v * 10), -400, 60);
+        }
+        ChanFxBadge(c);
         if (JsonNum(m, "pan", &v)) PanSet(c, (int)lround(v));
         MixerRedraw(); WsReply(id, what, nullptr); return;
     }
@@ -13574,7 +13970,8 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    {\"do\":\"pad\",\"n\":3}   play soundboard pad 3;  {\"do\":\"stopsounds\"}\n"
         L"    {\"do\":\"clip\"}   save the last few seconds;  {\"do\":\"playclip\",\"n\":1}  (needs Clips on)\n"
         L"    {\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":false,\"solo\":false,\"duck\":true}   a Mixer channel\n"
-        L"        (also \"pan\":-50 (-100 left .. 100 right), \"mono\":true, \"ducksothers\":true)\n"
+        L"        (also \"pan\":-50 (-100 left .. 100 right), \"mono\":true, \"ducksothers\":true,\n"
+        L"         \"bass\"/\"middle\"/\"treble\":3 (dB), \"compressor\":40 (0-100), \"out2db\":-10 (its level on output 2))\n"
         L"    {\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}   an output (or \"name\": what you called it)\n"
         L"    {\"do\":\"scene\",\"name\":\"Gaming\"}   switch the Mixer to a scene;  {\"do\":\"chatmix\",\"value\":-50}  (-100 game .. 100 chat)\n"
         L"    {\"do\":\"start\"}  {\"do\":\"stop\"}  {\"do\":\"status\"}  {\"do\":\"ping\"}\n\n"
@@ -13906,8 +14303,7 @@ static void CreateUI()
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
     // Sections stack downward (FX_SEC_STEP apart); there's room below for more effects.
     gBuildPage = PAGE_FX;
-    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 52, 290, 44, IDC_FXON);
-    Ctl(L"BUTTON", L"Vocode to song", BS_OWNERDRAW | WS_TABSTOP, 310, 52, 116, 44, IDC_SONGBTN);
+    Ctl(L"BUTTON", L"Voice effects", BS_OWNERDRAW | WS_TABSTOP, 14, 52, 412, 44, IDC_FXON);
     {
         wchar_t kn[120]; FxKeyButtonText(0, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 432, 52, 114, 28, IDC_FXKEY_MASTER);
@@ -13916,7 +14312,7 @@ static void CreateUI()
     }
     // sub-tabs (three effects each) and the Characters menu
     for (int t = 0; t < FX_SUBS; t++)
-        Ctl(L"BUTTON", FX_SUB_NAMES[t], BS_OWNERDRAW | WS_TABSTOP | (t == 0 ? WS_GROUP : 0), 14 + t * 76, 104, 72, 28, IDC_FXSUB0 + t);
+        Ctl(L"BUTTON", FX_SUB_NAMES[t], BS_OWNERDRAW | WS_TABSTOP | (t == 0 ? WS_GROUP : 0), 14 + t * 66, 104, 63, 28, IDC_FXSUB0 + t);
     Ctl(L"STATIC", L"Character:", 0, 16, 514, 66, 18, -1);
     {
         HWND ch = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 84, 510, 160, 500, IDC_FXCHAR);
@@ -13965,6 +14361,27 @@ static void CreateUI()
         Ctl(L"STATIC", L"How far back, how fast it spins, how soon it gets there, and how high.", 0, 30, y + 86, 500, 18, IDC_HDR);
         gBuildSub = -1;
     }
+    {                                           // Tune sub-tab: Vocode to song (the music on your PC says your words)
+        gBuildSub = 1;
+        const int y = 144 + 120;
+        AddSection(14, y, 532, 110, L"Vocode to song");
+        Ctl(L"BUTTON", L"Vocode to song", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 26, y + 12, 150, 44, IDC_SONGBTN);
+        Ctl(L"STATIC", L"", 0, 28, y + 62, 150, 40, IDC_SONGSTATUS);
+        Ctl(L"STATIC", L"Listen for the music on", 0, 192, y + 10, 230, 16, IDC_HDR);
+        HWND ss = Ctl(L"COMBOBOX", L"", COMBO, 190, y + 27, 238, 400, IDC_SONGSRC);
+        SendMessageW(ss, CB_SETDROPPEDWIDTH, 340, 0);
+        FillSongSources();
+        Ctl(L"STATIC", L"Level:", 0, 192, y + 63, 40, 18, -1);
+        Spin(IDC_SONGLVL, 234, y + 60, 70, 25, 400, gSongLvlPct);
+        Ctl(L"STATIC", L"%", 0, 308, y + 63, 16, 18, -1);
+        Ctl(L"BUTTON", L"Restart song", WS_TABSTOP, 330, y + 58, 98, 26, IDC_SONGRESTART);   // (an audio file only)
+        Ctl(L"STATIC", L"Synth and Mix: the Vocoder's knobs above.", 0, 192, y + 89, 236, 16, IDC_SONGNOTE);
+        Ctl(L"STATIC", L"Music", 0, 448, y + 10, 80, 16, IDC_HDR);
+        Ctl(L"STATIC", L"", SS_OWNERDRAW, 452, y + 30, 14, 70, IDC_SONGMETER);
+        Ctl(L"STATIC", L"Loud enough? The bar should reach the top third.", 0, 472, y + 30, 64, 72, IDC_HDR);
+        if (gSongUseFile && gSongFile[0]) LoadSongFile(gSongFile, true);   // reload last time's song, quietly
+        gBuildSub = -1;
+    }
     const int FX_SEC_Y0 = 144, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
     for (int g = 0; g < FX_GROUPS; g++) {
         int y = FX_SEC_Y0 + FX_SEC_STEP * gFxGroups[g].slot;
@@ -13990,11 +14407,7 @@ static void CreateUI()
             const wchar_t* rangeNames[3] = { L"Voice: Auto", L"Voice: High", L"Voice: Low / deep" };
             for (const wchar_t* n : rangeNames) SendMessageW(vr, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(vr, CB_SETCURSEL, gVocRange, 0);
-            HWND ss = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 40, 152, 300, IDC_SONGSRC);   // Song style only
-            SendMessageW(ss, CB_SETDROPPEDWIDTH, 220, 0);
-            FillSongSources();
-            Ctl(L"STATIC", L"", 0, 28, y + 68, 150, 34, IDC_SONGSTATUS);
-            if (gSongUseFile && gSongFile[0]) LoadSongFile(gSongFile, true);   // reload last time's song, quietly
+            Ctl(L"STATIC", L"Song style: pick the music in Vocode to song, just below.", 0, 28, y + 42, 150, 56, IDC_SONGHINT);   // Song style only
             kx = 186; kstep = 80; kw = 80;
         } else if (g == KG_RADIO) {             // preset dropdown + a line about it
             Ctl(L"STATIC", L"Preset", 0, 28, y + 10, 150, 16, IDC_HDR);
@@ -14414,6 +14827,7 @@ static void CreateUI()
         for (int k = 0; k < MAX_OUT; k++) {
             wchar_t n[4]; wsprintfW(n, L"%d", k + 1);
             Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, x + 4 + k * 11, 344, 10, 18, IDC_CHRT0 + c * MAX_OUT + k);
+            SetWindowSubclass(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), RouteBtnProc, 1, 0);
         }
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, x + 4, 96, 54, 268, IDC_CHADD0 + c);
     }
@@ -14516,7 +14930,7 @@ static LRESULT CtlColor(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     HDC dc = (HDC)w;
     int  cid    = GetDlgCtrlID((HWND)l);
-    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
+    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_SONGHINT || cid == IDC_SONGNOTE || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
                             : cid == IDT_HINT;  // dim helper text
     bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
     if (gBrPicture && !field && h == gWnd) {    // background picture: text sits on the picture, lined up with it
@@ -15249,7 +15663,7 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
         break;
     case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
-    case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6:
+    case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6: case IDC_FXSUB7:
         if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
         break;
     case IDC_MICSUB0: case IDC_MICSUB1:
@@ -15295,19 +15709,41 @@ static void OnCommand(int id, int code)
     case IDC_SONGBTN:
         if (code == BN_CLICKED) SetSongMode(!SongModeOn());
         break;
+    case IDC_SONGRESTART:
+        if (code == BN_CLICKED) gFileRestart = true;   // (the audio file: from the top)
+        break;
+    case IDC_SONGLVL:
+        if (code == EN_CHANGE && gUiReady) {
+            BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, IDC_SONGLVL, &ok, FALSE);
+            if (ok && v >= 25) { gSongLvlPct = Iclamp(v, 25, 400); gSongLevel = gSongLvlPct / 100.0f; }
+        }
+        break;
     case IDC_SONGSRC:
         if (code == CBN_DROPDOWN) FillSongSources();              // refresh: which apps are playing now
         else if (code == CBN_SELCHANGE) {
             int sel = (int)SendDlgItemMessageW(gWnd, IDC_SONGSRC, CB_GETCURSEL, 0, 0);
             int idx = (int)SendDlgItemMessageW(gWnd, IDC_SONGSRC, CB_GETITEMDATA, sel, 0);
-            if (idx == SONGSRC_BROWSE) { BrowseSongFile(); break; }
+            if (idx == SONGSRC_BROWSE) { BrowseSongFile(); Layout(); break; }
+            if (idx == 2999 || idx == 3999 || idx == 4999) break;   // (the saved one that isn't there: no change)
             if (idx == SONGSRC_FILE) {
                 if (gFileData) gSongUseFile = true; else LoadSongFile(gSongFile);
+            } else if (idx >= 2000 && idx < 2000 + CH_MAX) {   // a Mixer channel
+                gSongUseFile = false; gSongKind = SONGK_CH;
+                gSongChType = gCh[idx - 2000].type; lstrcpynW(gSongChSrc, gCh[idx - 2000].src, 128);
+            } else if ((idx >= 3000 && idx < 3000 + (int)gPlayCount) || (idx >= 4000 && idx < 4000 + (int)gCapCount)) {
+                const bool cap = idx >= 4000;
+                gSongUseFile = false; gSongKind = cap ? SONGK_CAP : SONGK_PLAY;
+                Widen(cap ? gCapDevs[idx - 4000].name : gPlayDevs[idx - 3000].name, gSongDevName, 256);
+                if (!cap)                       // the device Lag Effect plays on: it would hear itself
+                    for (int k = 0; k < gRows; k++) {
+                        wchar_t t[512] = L""; GetDlgItemTextW(gWnd, IDC_ROWDEV + k, t, 512);
+                        if (!lstrcmpW(t, gSongDevName)) { ShowOsd(L"Lag Effect plays on that device too, so it may hear itself (echo)", false); break; }
+                    }
             } else {
-                gSongUseFile = false;
+                gSongUseFile = false; gSongKind = SONGK_PC;
                 lstrcpynW(gSongApp, idx > 0 && idx <= gSongListN ? gSongList[idx - 1] : L"", 64);
             }
-            UpdateSongCapture();
+            UpdateSongCapture(); Layout();
         }
         break;
     case IDC_VOCSTYLE: case IDC_VOCKEY: case IDC_VOCSCALE: case IDC_VOCRANGE:
@@ -15425,7 +15861,15 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     }
     if (w >= IDC_CHRT0 && w < IDC_CHRT0 + CH_MAX * MAX_OUT) {
         int c = (int)(w - IDC_CHRT0) / MAX_OUT, k = (int)(w - IDC_CHRT0) % MAX_OUT;
-        DrawToggle(d, (gCh[c].routes >> k) & 1, false); return true;
+        DrawToggle(d, (gCh[c].routes >> k) & 1, false);
+        if (gCh[c].send[k]) {                   // its own level there: a little dot, top right
+            const int ds = Imax(3, SC(4)); RECT rc = d->rcItem;
+            HBRUSH db = CreateSolidBrush((gCh[c].routes >> k) & 1 ? RGB(255, 255, 255) : ACCENT);
+            HGDIOBJ o1 = SelectObject(d->hDC, db), o2 = SelectObject(d->hDC, GetStockObject(NULL_PEN));
+            Ellipse(d->hDC, rc.right - ds - SC(2), rc.top + SC(2), rc.right - SC(2) + 1, rc.top + SC(2) + ds + 1);
+            SelectObject(d->hDC, o1); SelectObject(d->hDC, o2); DeleteObject(db);
+        }
+        return true;
     }
     if (w >= IDC_OMUTE0 && w < IDC_OMUTE0 + MAX_OUT) { DrawToggle(d, gOutMute[w - IDC_OMUTE0], true); return true; }
     if (w >= IDC_OTEST0 && w < IDC_OTEST0 + MAX_OUT) { DrawToggle(d, gTestTone[w - IDC_OTEST0] > 0, false); return true; }
@@ -15444,6 +15888,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
     if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
     if (w == IDC_SONGBTN) { DrawSongButton(d); return true; }
+    if (w == IDC_SONGMETER) { DrawVMeter2(d, gSongMeter, -1.0f, SongModeOn() && gRunning, 0, 0, gSongMeter >= 0.99f); return true; }
     if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3)) {
         DrawFxSub(d); return true;
     }
@@ -15524,14 +15969,16 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         PictureInfo();
         ApplyOpacity();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
+        SetTimer(h, TIMER_MIXMETER, 15, nullptr);
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
+        if (w == TIMER_MIXMETER) { if (!gMoving) MixerMeterTick(); return 0; }   // (its own, faster timer: smooth meters)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            UpdateStatus(); UpdateMeter(); MixerMeterTick(); WsEvents(); MixUndoTick();
+            UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
                 chTick = 0; ChanTick();
@@ -15950,6 +16397,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         RegisterClassW(&fc);
         fc.lpfnWndProc = ChatMixProc; fc.lpszClassName = L"LagChatMix";
         RegisterClassW(&fc);
+        WNDCLASSW xc = {};                      // a channel's EQ / compressor / levels window
+        xc.lpfnWndProc = ChanFxProc; xc.hInstance = hi; xc.hCursor = LoadCursorW(nullptr, IDC_ARROW); xc.lpszClassName = L"LagChanFx";
+        xc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
+        RegisterClassW(&xc);
     }
 
     gRecVoice.buf = (short*)HeapAlloc(GetProcessHeap(), 0, REC_LEN * sizeof(short));   // instant replay buffers
