@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.34.0"
+#define APP_VERSION L"1.35.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -389,10 +389,15 @@ struct ChanSet {
     volatile unsigned routes;
     wchar_t name[32];                           // your name for it ("" = the app's / input's)
     int color;
+    int holdTalk;                               // its hold hotkey: 0 = silences it while held, 1 = only plays while held
+    volatile bool held;                         // (that key is held / push-to-talk without the key: quiet)
 };
 static inline float DbGain10(int db10) { return db10 <= -600 ? 0.0f : powf(10.0f, db10 / 200.0f); }
 static volatile int gDuckDb = 12;               // how much ducked channels drop while you talk
 static int  gChW[CH_MAX], gOutW[MAX_OUT];       // Mixer strip widths (design px, 0 = the normal width)
+static int  gMixStep = 2;                       // Mixer hotkeys: dB per press
+static int  gMixSub = 0;                        // Mixer tab: 0 = the strips, 1 = its hotkeys
+static void MixMemStore(int c);
 static ChanSet gCh[CH_MAX];
 static volatile bool gOutMute[MAX_OUT];
 static wchar_t gOutName[MAX_OUT][32];           // your name for an output ("" = "Out 1"...)
@@ -2176,7 +2181,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (av < frames) a.primed = false;      // about to run dry: wait for a cushion again after this block
         unsigned rt = gCh[c].routes;
         if (soloMask) { rt &= ~(1u << soloOut); if (soloMask & (1u << c)) rt |= 1u << soloOut; }
-        if (gCh[c].mute || !rt) { chRd[c] = wr; continue; }   // can't be heard: just keep its buffer empty
+        if (gCh[c].mute || gCh[c].held || !rt) { chRd[c] = wr; continue; }   // can't be heard: just keep its buffer empty
         chRd[c] = rd; chAv[c] = av;
         // Its clock and ours never match exactly: drop / repeat one sample now and then to keep the cushion steady.
         chAdj[c] = av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
@@ -2556,7 +2561,11 @@ enum {
     IDC_OMUTE0 = 1590, IDC_OVOL0 = 1600, IDC_OLBL0 = 1610, IDC_OMETER0 = 1620,
     IDC_CHSOLO0 = 1640, IDC_CHDUCK0 = 1650, IDC_CHDB0 = 1660, IDC_CHADD0 = 1670,
     IDC_ODEV0 = 1680, IDC_ODB0 = 1690, IDC_OLIM0 = 1700, IDC_DUCKDB = 1710, IDC_RESTARTAUD = 1711, IDC_CHNAMEED = 1712,
-    IDC_CHADDBTN = 1713, IDC_MIXHINT = 1714,
+    IDC_CHADDBTN = 1713, IDC_MIXHINT = 1714, IDC_MIXKEYSBTN = 1715, IDC_MIXSTEP = 1716, IDC_MIXKEYHDR = 1717, IDC_MIXSTEPDB = 1718,
+    IDC_MIXKEY0 = 1720,                         // .. +63: one button per mixer hotkey (SLOT_MIX0 order)
+    IDC_MIXKROW0 = 1790,                        // .. +13: each row's name (channels, then outputs)
+    IDC_MIXHOLDMODE0 = 1810,                    // .. +8: a channel's hold key: mutes it / push-to-talk
+    IDC_MIXKCOL0 = 1820,                        // .. +7: the column headings
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -2852,7 +2861,12 @@ static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
 #define SLOT_DIVE    (SLOT_TAPESTOP + 1)
 #define SLOT_PTT     (SLOT_DIVE + 1)             // Mic tab: push-to-talk / push-to-mute key
 #define SLOT_PROF0   (SLOT_PTT + 1)
-#define KEY_SLOTS    (SLOT_PROF0 + PROF_MAX)
+// Mixer: per channel MIXA_N hotkeys, then per output MIXO_N (after everything older, so saved keys keep their place)
+enum { MIXA_UP, MIXA_DOWN, MIXA_MUTE, MIXA_SOLO, MIXA_DUCK, MIXA_HOLD, MIXA_N };
+enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
+#define SLOT_MIX0    (SLOT_PROF0 + PROF_MAX)
+#define SLOT_MIXOUT0 (SLOT_MIX0 + CH_MAX * MIXA_N)
+#define KEY_SLOTS    (SLOT_MIXOUT0 + MAX_OUT * MIXO_N)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -3463,6 +3477,17 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 // ======================= settings =======================
 static const wchar_t* FxKeyIniName(int slot)
 {
+    if (slot >= SLOT_MIX0) {                    // mixer: "mix_ch3_up", "mix_out2_mute"...
+        static wchar_t names[KEY_SLOTS - SLOT_MIX0][24];
+        static const wchar_t* ca[MIXA_N] = { L"up", L"down", L"mute", L"solo", L"duck", L"hold" };
+        static const wchar_t* oa[MIXO_N] = { L"up", L"down", L"mute" };
+        wchar_t* n = names[slot - SLOT_MIX0];
+        if (!n[0]) {
+            if (slot < SLOT_MIXOUT0) wsprintfW(n, L"mix_ch%d_%s", (slot - SLOT_MIX0) / MIXA_N + 1, ca[(slot - SLOT_MIX0) % MIXA_N]);
+            else wsprintfW(n, L"mix_out%d_%s", (slot - SLOT_MIXOUT0) / MIXO_N + 1, oa[(slot - SLOT_MIXOUT0) % MIXO_N]);
+        }
+        return n;
+    }
     static const wchar_t* padKeys[PADS] = { L"pad1_hotkey", L"pad2_hotkey", L"pad3_hotkey", L"pad4_hotkey",
                                             L"pad5_hotkey", L"pad6_hotkey", L"pad7_hotkey", L"pad8_hotkey" };
     static const wchar_t* clipKeys[CLIPS] = { L"clip1_hotkey", L"clip2_hotkey", L"clip3_hotkey", L"clip4_hotkey",
@@ -3667,12 +3692,14 @@ static void LoadSettings()
         wsprintfW(k, L"ch_%d_duck", c);   gCh[c].duck = INI_INT(k, 0) != 0;
         wsprintfW(k, L"ch_%d_color", c);  gCh[c].color = Iclamp(INI_INT(k, c), 0, 7);
         wsprintfW(k, L"ch_%d_name", c);   GetPrivateProfileStringW(L"settings", k, L"", gCh[c].name, 32, gIni);
+        wsprintfW(k, L"ch_%d_holdtalk", c); gCh[c].holdTalk = INI_INT(k, 0) != 0;
         gCh[c].solo = false;
         wsprintfW(k, L"ch_%d_mute", c);   gCh[c].mute = INI_INT(k, 0) != 0;
         wsprintfW(k, L"ch_%d_routes", c); gCh[c].routes = (unsigned)INI_INT(k, 1) & ((1u << MAX_OUT) - 1);
         if (!gCh[c].src[0]) gCh[c].type = CH_NONE;
     }
     gDuckDb = Iclamp(INI_INT(L"mixer_duck_db", 12), 3, 30);
+    gMixStep = Iclamp(INI_INT(L"mixer_key_step", 2), 1, 10);
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  int v = INI_INT(key, 0); gChW[c] = v ? Iclamp(v, 52, 240) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); int v = INI_INT(key, 0); gOutW[k] = v ? Iclamp(v, 84, 320) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
@@ -4515,11 +4542,13 @@ static void SaveSettings()
         wsprintfW(k, L"ch_%d_duck", c);   SaveInt(k, gCh[c].duck);
         wsprintfW(k, L"ch_%d_color", c);  SaveInt(k, gCh[c].color);
         wsprintfW(k, L"ch_%d_name", c);   IniSet(k, gCh[c].name);
+        wsprintfW(k, L"ch_%d_holdtalk", c); SaveInt(k, gCh[c].holdTalk);
         wsprintfW(k, L"ch_%d_mute", c);   SaveInt(k, gCh[c].mute);
         wsprintfW(k, L"ch_%d_routes", c); SaveInt(k, (int)gCh[c].routes);
     }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); } SaveInt(L"tts_volume", gTtsVol);
-    SaveInt(L"mixer_duck_db", gDuckDb);
+    SaveInt(L"mixer_duck_db", gDuckDb); SaveInt(L"mixer_key_step", gMixStep);
+    for (int c = 0; c < CH_MAX; c++) MixMemStore(c);   // (remember each app's settings for next time)
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_name", k); IniSet(key, gOutName[k]); }
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  SaveInt(key, gChW[c]); }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); SaveInt(key, gOutW[k]); }
@@ -7382,7 +7411,17 @@ static void SlotName(int slot, wchar_t* out, int cap)
     else if (slot == SLOT_TAPESTOP) lstrcpynW(out, L"Tape stop", cap);
     else if (slot == SLOT_DIVE) lstrcpynW(out, L"Pitch dive", cap);
     else if (slot == SLOT_PTT) lstrcpynW(out, L"Push-to-talk", cap);
-    else if (slot >= SLOT_PROF0 && slot - SLOT_PROF0 < gProfCount) wsprintfW(out, L"Profile \"%s\"", gProfNames[slot - SLOT_PROF0]);
+    else if (slot >= SLOT_PROF0 && slot - SLOT_PROF0 < PROF_MAX) {
+        if (slot - SLOT_PROF0 < gProfCount) wsprintfW(out, L"Profile \"%s\"", gProfNames[slot - SLOT_PROF0]); else lstrcpynW(out, L"a profile", cap);
+    }
+    else if (slot >= SLOT_MIX0 && slot < SLOT_MIXOUT0) {
+        static const wchar_t* ca[MIXA_N] = { L"volume up", L"volume down", L"mute", L"solo", L"duck", L"hold" };
+        wsprintfW(out, L"Mixer channel %d %s", (slot - SLOT_MIX0) / MIXA_N + 1, ca[(slot - SLOT_MIX0) % MIXA_N]);
+    }
+    else if (slot >= SLOT_MIXOUT0 && slot < KEY_SLOTS) {
+        static const wchar_t* oa[MIXO_N] = { L"volume up", L"volume down", L"mute" };
+        wsprintfW(out, L"Mixer output %d %s", (slot - SLOT_MIXOUT0) / MIXO_N + 1, oa[(slot - SLOT_MIXOUT0) % MIXO_N]);
+    }
     else lstrcpynW(out, L"another hotkey", cap);
 }
 
@@ -7743,6 +7782,7 @@ static const wchar_t* CH_COLOR_NAMES[8] = { L"Teal", L"Purple", L"Orange", L"Red
 static HICON   gChIcon[CH_MAX];                 // the app's own icon (16 px)
 static wchar_t gChIconSrc[CH_MAX][128];
 static int     gSecChan = -1, gSecOut = -1;     // the Mixer's two sections (the strips are drawn inside them)
+static int     gSecKeys = -1;                   // ... and its hotkeys view
 static void MixerRedraw() { RedrawWindow(gWnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN); }
 
 static void ChanLabel(int c, wchar_t* out, int cap)   // what its strip calls it
@@ -7810,15 +7850,63 @@ static void ChanOptsFill(int c)                 // what a channel can play
     }
     if (gCh[c].type == CH_OUT) add(CH_OUT, gCh[c].src);
 }
+// ---- remembering apps: a channel's settings are kept (per app / device) when it's removed or swapped,
+// and come back when you add it again: volume, duck, routing, colour, name, width, hold mode and its hotkeys.
+static int  FxKeyButtonId(int slot);
+static void FaderLabel(int id);
+static void MixMemKey(int c, wchar_t* key)
+{
+    wsprintfW(key, L"%s|%s", gCh[c].type == CH_APP ? L"app" : gCh[c].type == CH_DEV ? L"in" : L"out", gCh[c].src);
+    CharLowerBuffW(key, lstrlenW(key));
+    for (wchar_t* q = key; *q; q++) if (*q == L'=' || *q == L'[' || *q == L']') *q = L'_';
+}
+static void MixMemStore(int c)
+{
+    if (gCh[c].type == CH_NONE || !gIni[0]) return;
+    wchar_t key[200], v[400]; MixMemKey(c, key);
+    int n = wsprintfW(v, L"%d,%d,%u,%d,%d,%d", (int)gCh[c].db10, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk);
+    for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) n += wsprintfW(v + n, L",%d", gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i]);
+    wsprintfW(v + n, L"|%s", gCh[c].name);
+    WritePrivateProfileStringW(L"mixer_memory", key, v, gIni);
+}
+static bool MixMemLoad(int c)
+{
+    wchar_t key[200], v[400]; MixMemKey(c, key);
+    if (!GetPrivateProfileStringW(L"mixer_memory", key, L"", v, 400, gIni) || !v[0]) return false;
+    int f[6 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
+    const wchar_t* q = v;
+    while (*q && *q != L'|' && nf < 6 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+    if (nf < 6) return false;
+    gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].duck = f[1] != 0; gCh[c].routes = (unsigned)f[2] & ((1u << MAX_OUT) - 1);
+    gCh[c].color = Iclamp(f[3], 0, 7); gChW[c] = f[4] ? Iclamp(f[4], 52, 240) : 0; gCh[c].holdTalk = f[5] != 0;
+    for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = Iclamp(f[6 + a * MAX_KEYS + i], 0, 255);
+    const wchar_t* nm = wcschr(v, L'|');
+    lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
+    return true;
+}
+static void MixKeysShow(int c)                  // (its hotkey buttons and hold mode, after they changed)
+{
+    for (int a = 0; a < MIXA_N; a++) {
+        wchar_t t[120]; FxKeyButtonText(SLOT_MIX0 + c * MIXA_N + a, t, 120);
+        SetDlgItemTextW(gWnd, FxKeyButtonId(SLOT_MIX0 + c * MIXA_N + a), t);
+    }
+    SetDlgItemTextW(gWnd, IDC_MIXHOLDMODE0 + c, gCh[c].holdTalk ? L"Talk" : L"Mute");
+}
 static void ChanSetSource(int c, int type, const wchar_t* src)
 {
     if (gCh[c].type == type && !lstrcmpiW(gCh[c].src, src)) return;
     const bool wasEmpty = gCh[c].type == CH_NONE;
     if (gRunning) ChanStop(c);
+    MixMemStore(c);                             // (the one leaving: remembered for next time)
     gCh[c].type = type; lstrcpynW(gCh[c].src, type == CH_NONE ? L"" : src, 128);
-    gCh[c].name[0] = 0;                         // a new source goes by its own name
-    gCh[c].solo = false;
-    if (wasEmpty && type != CH_NONE) { if (!gCh[c].routes) gCh[c].routes = (1u << gRows) - 1; }   // new: to every output
+    gCh[c].solo = false; gCh[c].held = false;
+    if (type == CH_NONE || !MixMemLoad(c)) {    // new to the mixer (or cleared): fresh settings, no hotkeys
+        gCh[c].name[0] = 0; gCh[c].db10 = 0; gCh[c].duck = false; gCh[c].holdTalk = 0; gChW[c] = 0;
+        for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = 0;
+        if (type != CH_NONE && (wasEmpty || !gCh[c].routes)) gCh[c].routes = (1u << gRows) - 1;   // to every output
+    }
+    MixKeysShow(c);
+    FaderLabel(IDC_CHVOL0 + c);
     if (gRunning && type != CH_NONE) ChanStart(c);
     ChanIconUpdate(c);
     Layout();                                   // its controls show / hide
@@ -7836,6 +7924,29 @@ static LRESULT CALLBACK RenEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR
     if (m == WM_CHAR && (w == L'\r' || w == 27)) return 0;   // (no beep)
     if (m == WM_KILLFOCUS) PostMessageW(gWnd, WM_RENAME_DONE, 1, 0);
     return DefSubclassProc(h, m, w, l);
+}
+static void DbText(int db10, wchar_t* t);
+static int  FaderGet(int id);
+static void FaderSet(int id, int db10);
+static void FaderValueEdit(int id)              // right-click a fader: type its exact volume (in dB) over its dB text
+{
+    if (gRenEdit) return;
+    const bool ch = id >= IDC_CHVOL0 && id < IDC_CHVOL0 + CH_MAX;
+    HWND b = GetDlgItem(gWnd, ch ? IDC_CHDB0 + (id - IDC_CHVOL0) : IDC_ODB0 + (id - IDC_OVOL0));
+    RECT r; GetWindowRect(b, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
+    r.right = Imax((int)r.right, (int)r.left + SC(60));
+    wchar_t t[24]; const int v = FaderGet(id);
+    if (v <= -600) lstrcpyW(t, L"-60"); else { const int a = v < 0 ? -v : v; wsprintfW(t, L"%s%d.%d", v < 0 ? L"-" : L"", a / 10, a % 10); }
+    gRenCh = 1000 + id;
+    gRenEdit = CreateWindowExW(0, L"EDIT", t, WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL | ES_CENTER, r.left, r.top - SC(2),
+                               r.right - r.left, SC(22), gWnd, (HMENU)(INT_PTR)IDC_CHNAMEED, gInst, nullptr);
+    if (!gRenEdit) return;
+    SendMessageW(gRenEdit, WM_SETFONT, (WPARAM)gFont, TRUE);
+    SendMessageW(gRenEdit, EM_LIMITTEXT, 10, 0);
+    SetWindowSubclass(gRenEdit, RenEditProc, 1, 0);
+    SetWindowPos(gRenEdit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    SetFocus(gRenEdit);
+    SendMessageW(gRenEdit, EM_SETSEL, 0, -1);
 }
 static void ChanRename(int c)                   // c < CH_MAX: a channel; CH_MAX + k: output k
 {
@@ -7860,6 +7971,13 @@ static void ChanRenameDone(bool keep)
 {
     if (!gRenEdit) return;
     HWND e = gRenEdit; gRenEdit = nullptr;      // (first: destroying it loses focus, which asks again)
+    if (keep && gRenCh >= 1000) {               // a typed volume: "-12.5", "+3", "off"
+        wchar_t t[32]; GetWindowTextW(e, t, 32);
+        for (wchar_t* q = t; *q; q++) if (*q == 0x2212) *q = L'-';   // (the minus sign this app shows)
+        wchar_t* end = nullptr; const double v = wcstod(t, &end);
+        if (!lstrcmpiW(t, L"off") || !lstrcmpiW(t, L"-inf")) FaderSet(gRenCh - 1000, -600);
+        else if (end != t) FaderSet(gRenCh - 1000, (int)lround(v * 10));
+    }
     if (keep && gRenCh >= CH_MAX && gRenCh < CH_MAX + MAX_OUT) {   // an output
         const int k = gRenCh - CH_MAX;
         wchar_t t[64]; GetWindowTextW(e, t, 32);
@@ -8014,9 +8132,9 @@ static int FaderDb10(float p)
 static int FaderSnap(int db10) { const int st = db10 > -200 ? 5 : 10; return (int)lroundf(db10 / (float)st) * st; }
 static int FaderY(int h, int th, float p) { return (h - th / 2) - (int)(p * (h - th)); }
 static float FaderP(int h, int th, int y) { return h - th > 0 ? (float)((h - th / 2) - y) / (h - th) : 0; }
-static bool ChanQuiet(int c)                    // muted, or another channel is soloed
+static bool ChanQuiet(int c)                    // muted, held quiet, or another channel is soloed
 {
-    if (gCh[c].mute) return true;
+    if (gCh[c].mute || gCh[c].held) return true;
     if (gCh[c].solo) return false;
     for (int i = 0; i < CH_MAX; i++) if (gCh[i].solo && gCh[i].type != CH_NONE) return true;
     return false;
@@ -8031,6 +8149,16 @@ static void FaderDraw(HWND h, HDC dc, const RECT& rc, int id)
     const bool quiet = FaderIsChan(id) ? ChanQuiet(id - IDC_CHVOL0) : gOutMute[Iclamp(id - IDC_OVOL0, 0, MAX_OUT - 1)];
     RECT fr = tr; fr.top = ty;
     HBRUSH fb = CreateSolidBrush(quiet ? (gDark ? RGB(90, 90, 90) : RGB(175, 175, 175)) : ACCENT); FillRect(dc, &fr, fb); DeleteObject(fb);
+    {                                           // scale marks at -6, -12, -24 and -48 dB
+        HBRUSH mb = CreateSolidBrush(gDark ? RGB(85, 85, 85) : RGB(185, 185, 185));
+        static const int marks[4] = { -60, -120, -240, -480 };
+        for (int db : marks) {
+            const int my = FaderY(H, th, FaderPos(db));
+            RECT a = { 0, my, Imax(2, SC(4)), my + 1 }, b2 = { rc.right - Imax(2, SC(4)), my, rc.right, my + 1 };
+            FillRect(dc, &a, mb); FillRect(dc, &b2, mb);
+        }
+        DeleteObject(mb);
+    }
     const int y0 = FaderY(H, th, FaderPos(0));  // a mark at 0 dB
     RECT zr = { 0, y0, rc.right, y0 + 1 };
     HBRUSH zb = CreateSolidBrush(gDark ? RGB(110, 110, 110) : RGB(150, 150, 150)); FillRect(dc, &zr, zb); DeleteObject(zb);
@@ -8082,6 +8210,7 @@ static LRESULT CALLBACK FaderProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         return 0;
     case WM_LBUTTONUP: if (GetCapture() == h) ReleaseCapture(); return 0;
+    case WM_RBUTTONUP: FaderValueEdit(id); return 0;   // right-click: type an exact value
     case WM_MOUSEWHEEL: {
         const int d = GET_WHEEL_DELTA_WPARAM(w), st = (GET_KEYSTATE_WPARAM(w) & MK_SHIFT) ? 1 : 10;
         int v = FaderGet(id); if (v <= -600 && d > 0) v = -610;   // (from Off, the first step lands on -60 dB)
@@ -8183,7 +8312,9 @@ static void DrawChanAdd(DRAWITEMSTRUCT* d)      // an empty channel: a dashed "+
     SelectObject(dc, of);
     if (d->itemState & ODS_FOCUS) { RECT f = rc; InflateRect(&f, -3, -3); DrawFocusRect(dc, &f); }
 }
-static void DrawVMeter(DRAWITEMSTRUCT* d, float l, float r, bool live)   // upright meter; r < 0: one bar
+static void DrawVMeter2(DRAWITEMSTRUCT* d, float l, float r, bool live, float holdL, float holdR, bool clip);
+static void DrawVMeter(DRAWITEMSTRUCT* d, float l, float r, bool live) { DrawVMeter2(d, l, r, live, 0, 0, false); }
+static void DrawVMeter2(DRAWITEMSTRUCT* d, float l, float r, bool live, float holdL, float holdR, bool clip)   // upright; r < 0: one bar
 {
     HDC dc = d->hDC; RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
@@ -8201,6 +8332,12 @@ static void DrawVMeter(DRAWITEMSTRUCT* d, float l, float r, bool live)   // upri
         seg(Imax(top, yY), b.bottom, METER_C);
         if (top < yY) seg(Imax(top, yR), yY, RGB(217, 165, 32));
         if (top < yR) seg(top, yR, RGB(229, 83, 75));
+        const float hv = i == 0 ? holdL : holdR;   // peak hold: a thin line where it last peaked
+        if (hv > 0.001f) {
+            const float hdb = 20.0f * log10f(hv), hp = (hdb + 60.0f) / 60.0f;
+            if (hp > 0.02f) { const int hy = b.bottom - (int)(H * (hp > 1 ? 1 : hp)); seg(Imax((int)b.top, hy - 1), Imin((int)b.bottom, hy + 1), hdb > -3 ? RGB(229, 83, 75) : RGB(230, 230, 230)); }
+        }
+        if (clip) seg(b.top, b.top + Imax(2, SC(3)), RGB(255, 60, 60));   // it hit the top (0 dB): red for 2 s
     }
 }
 static int gLimShow[MAX_OUT];
@@ -8336,6 +8473,44 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_OMUTE0 + k), tx, oy + oh - SC(30), tw, SC(22));
         if (k < gRows) x += w + SC(5);
     }
+    // the hotkeys view: a row per channel in use, then per output
+    PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYSBTN), cx0 + SC(136), chTop + SC(8), SC(116), SC(26));
+    if (gSecKeys >= 0) {
+        Section& sk = gSections[gSecKeys];
+        sk.x = UNSC(cx0); sk.y = UNSC(chTop); sk.w = UNSC(cw); sk.h = UNSC(oTop + oH - chTop); sk.ox = sk.oy = 0;
+        const int x0 = cx0 + SC(16), nameW = SC(100), modeW = SC(62), gap = SC(4);
+        const int colW = Imax(SC(40), (cw - SC(32) - nameW - modeW - gap * 7) / 6);
+        const int hy = chTop + SC(46);
+        for (int i = 1; i < 7; i++) PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0 + i), x0 + nameW + gap + (i - 1) * (colW + gap), hy, colW, SC(18));
+        const int mx = x0 + nameW + gap + 6 * (colW + gap);
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0), mx, hy, modeW, SC(18));
+        int y = hy + SC(24);
+        for (int r = 0; r < CH_MAX + MAX_OUT; r++) {
+            const bool out = r >= CH_MAX;
+            const int c = r, k = r - CH_MAX;
+            if (!out && gCh[c].type == CH_NONE) continue;
+            if (out && k >= gRows) continue;
+            if (out && k == 0) y += SC(10);     // (a little gap before the outputs)
+            HWND lb = GetDlgItem(gWnd, IDC_MIXKROW0 + r);
+            wchar_t t[64], o[64]; if (out) OutName(k, t, 64); else ChanLabel(c, t, 64);
+            GetWindowTextW(lb, o, 64); if (lstrcmpW(t, o)) SetWindowTextW(lb, t);
+            PlaceFree(lb, x0, y + SC(3), nameW, SC(20));
+            const int n = out ? MIXO_N : MIXA_N;
+            for (int a = 0; a < n; a++) {
+                const int slot = out ? SLOT_MIXOUT0 + k * MIXO_N + a : SLOT_MIX0 + c * MIXA_N + a;
+                PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(slot)), x0 + nameW + gap + a * (colW + gap), y, colW, SC(24));
+            }
+            if (!out) PlaceFree(GetDlgItem(gWnd, IDC_MIXHOLDMODE0 + c), mx, y, modeW, SC(24));
+            y += SC(28);
+        }
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYHDR), x0, y + SC(16), SC(160), SC(20));
+        HWND e = GetDlgItem(gWnd, IDC_MIXSTEP), u = GetDlgItem(gWnd, SPIN_UD(IDC_MIXSTEP));
+        RECT ur = {}; if (u) GetWindowRect(u, &ur);
+        const int uw = ur.right - ur.left;
+        PlaceFree(e, x0 + SC(166), y + SC(13), SC(56) - uw, SC(23));
+        if (u) PlaceFree(u, x0 + SC(166) + SC(56) - uw, y + SC(13), uw, SC(23));
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXSTEPDB), x0 + SC(228), y + SC(16), SC(200), SC(20));
+    }
     if (gPage == PAGE_MIXER) InvalidateRect(gWnd, nullptr, FALSE);
 }
 static bool MixerStripRect(int i, RECT* r)      // i < CH_MAX: a channel's strip; CH_MAX + k: output k's
@@ -8348,7 +8523,7 @@ static int  gEdgeDrag = -1, gEdgeX0 = 0, gEdgeW0 = 0;   // dragging a strip's ed
 static int  gEdgeLast = -1; static DWORD gEdgeLastT = 0;
 static int MixerEdgeAt(int x, int y)            // the strip whose right edge is under the mouse (-1: none)
 {
-    if (gCompact || gPage != PAGE_MIXER) return -1;
+    if (gCompact || gPage != PAGE_MIXER || gMixSub != 0) return -1;
     for (int i = 0; i < CH_MAX + gRows && i < CH_MAX + MAX_OUT; i++) {
         if (i < CH_MAX && gCh[i].type == CH_NONE) continue;   // (empty ones stay small)
         const RECT& r = gStripRc[i];
@@ -8369,7 +8544,7 @@ static void MixerEdgeSet(int i, int w)          // design px; 0 = normal
 }
 static void MixerPaintStrips(HDC dc)            // (from the window's paint) the strips' outlines and colours
 {
-    if (gCompact || gPage != PAGE_MIXER) return;
+    if (gCompact || gPage != PAGE_MIXER || gMixSub != 0) return;
     for (int i = 0; i < CH_MAX + gRows; i++) {
         RECT r; if (!MixerStripRect(i, &r)) continue;
         if (i < CH_MAX && gCh[i].type == CH_NONE) continue;   // (an empty one is just its Add box)
@@ -8386,6 +8561,13 @@ static void MixerPaintStrips(HDC dc)            // (from the window's paint) the
 }
 
 static float gChShownL[CH_MAX], gChShownR[CH_MAX], gOutShown[MAX_OUT];   // meters (falling slowly)
+static float gChHoldL[CH_MAX], gChHoldR[CH_MAX], gOutHold[MAX_OUT];       // peak hold (1.5 s, then it falls)
+static DWORD gChHoldT[CH_MAX], gChHoldTR[CH_MAX], gOutHoldT[MAX_OUT], gChClipT[CH_MAX], gOutClipT[MAX_OUT];
+static void MeterHold(float v, float& hold, DWORD& t, DWORD now)
+{
+    if (v >= hold) { hold = v; t = now; }
+    else if (now - t > 1500) hold *= 0.85f;
+}
 static void MixerMeterTick()                    // (50 ms) meters and limit lights on the Mixer page
 {
     if (gPage != PAGE_MIXER || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
@@ -8396,16 +8578,25 @@ static void MixerMeterTick()                    // (50 ms) meters and limit ligh
         pl *= g; pr *= g;
         gChShownL[c] = pl > gChShownL[c] ? pl : gChShownL[c] * 0.82f;
         gChShownR[c] = pr > gChShownR[c] ? pr : gChShownR[c] * 0.82f;
+        const DWORD tn = GetTickCount();
+        MeterHold(pl, gChHoldL[c], gChHoldT[c], tn);
+        MeterHold(pr, gChHoldR[c], gChHoldTR[c], tn);
+        if (pl >= 0.99f || pr >= 0.99f) gChClipT[c] = tn;
         static int last[CH_MAX] = { -999, -999, -999, -999, -999, -999, -999, -999 };
         auto q = [](float v) { return v > 0.001f ? (int)(20.0f * log10f(v)) : -60; };   // whole dB: what the bar can show
-        const int now = q(gChShownL[c]) * 100 + q(gChShownR[c]);
+        const int now = q(gChShownL[c]) * 100 + q(gChShownR[c]) + (q(gChHoldL[c]) + 60) * 10000 + (q(gChHoldR[c]) + 60) * 1000000
+                      + (tn - gChClipT[c] < 2000 ? 1 << 30 : 0);
         if (now != last[c]) { last[c] = now; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
         // (UpdateMeter, just before this, already took this tick's peak into gOutShow: use that, in dB)
         gOutShown[k] = gOutShow[k] > -79.0f ? powf(10.0f, gOutShow[k] / 20.0f) : 0.0f;
+        const DWORD tn = GetTickCount();
+        MeterHold(gOutShown[k], gOutHold[k], gOutHoldT[k], tn);
+        if (gOutShow[k] > -0.2f) gOutClipT[k] = tn;
         static int lastO[MAX_OUT] = { -999, -999, -999, -999, -999 };
-        const int now = gOutShown[k] > 0.001f ? (int)(20.0f * log10f(gOutShown[k])) : -60;
+        const int now = (gOutShown[k] > 0.001f ? (int)(20.0f * log10f(gOutShown[k])) : -60)
+                      + ((gOutHold[k] > 0.001f ? (int)(20.0f * log10f(gOutHold[k])) : -60) + 60) * 1000 + (tn - gOutClipT[k] < 2000 ? 1 << 30 : 0);
         if (now != lastO[k]) { lastO[k] = now; InvalidateRect(GetDlgItem(gWnd, IDC_OMETER0 + k), nullptr, FALSE); }
         if (gLimHit[k]) {                       // lit for a moment after each catch
             gLimHit[k] = false;
@@ -9608,7 +9799,7 @@ static bool SectionShown(const Section& s)
 }
 static RECT SectionRect(const Section& s)
 {
-    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0)), x = SC(s.x + s.ox) + ((gSecChan >= 0 && &s == &gSections[gSecChan]) || (gSecOut >= 0 && &s == &gSections[gSecOut]) ? 0 : gOrgX);
+    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0)), x = SC(s.x + s.ox) + ((gSecChan >= 0 && &s == &gSections[gSecChan]) || (gSecOut >= 0 && &s == &gSections[gSecOut]) || (gSecKeys >= 0 && &s == &gSections[gSecKeys]) ? 0 : gOrgX);
     RECT r = { x, y - SC(8), x + SC(s.w), y + SC(s.h) };
     return r;
 }
@@ -10167,7 +10358,7 @@ static void AddTips()
     TipId(IDC_TAB0 + PAGE_CLIPS,    L"Instant replay: save the last few seconds as a clip, trim it, and play it back on a hotkey.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
     for (int k = 0; k < MAX_OUT; k++) {
-        TipId(IDC_OVOL0 + k,  L"This output's volume: the same as its volume on the Main tab. Drag, or scroll (Shift = finer). Double-click = 0 dB.");
+        TipId(IDC_OVOL0 + k,  L"This output's volume: the same as its volume on the Main tab. Drag, or scroll (Shift = finer). Double-click = 0 dB. Right-click to type an exact value.");
         TipId(IDC_OMUTE0 + k, L"Mute: silence this output (everything going to it).");
         TipId(IDC_OMETER0 + k, L"How loud this output is right now.");
         TipId(IDC_OLIM0 + k,  L"Lights up when this output is so loud the limiter has to turn peaks down. Often lit? Lower some volumes.");
@@ -10180,12 +10371,17 @@ static void AddTips()
         TipId(IDC_CHMUTE0 + c, L"Mute: silence this channel.");
         TipId(IDC_CHSOLO0 + c, L"Solo: hear only this channel on your listening output (the \"Always hear sounds on\" one on the Main tab, else output 1). The other outputs carry on as normal.");
         TipId(IDC_CHDUCK0 + c, L"Duck: this channel gets quieter while you talk, then comes back up.");
-        TipId(IDC_CHVOL0 + c,  L"This channel's volume. Drag, or scroll (Shift = finer). Double-click = 0 dB.");
+        TipId(IDC_CHVOL0 + c,  L"This channel's volume. Drag, or scroll (Shift = finer). Double-click = 0 dB. Right-click to type an exact value.");
         TipId(IDC_CHMETER0 + c, L"How loud this channel is right now (left and right).");
         for (int k = 0; k < MAX_OUT; k++) TipId(IDC_CHRT0 + c * MAX_OUT + k, L"Send this channel to that output (lit = on).");
     }
     TipId(IDC_DUCKDB,      L"How much quieter Duck channels get while you talk.");
     TipId(IDC_CHADDBTN,    L"Add a channel: an app (Spotify, a game, a browser...), another input, or what an output device plays. Up to 8.");
+    TipId(IDC_MIXKEYSBTN,  L"Hotkeys for the Mixer: each channel's volume, mute, solo, duck and a hold key; each output's volume and mute.");
+    TipId(IDC_MIXSTEP,     L"How much one press of a volume key changes it (hold the key to keep going).");
+    for (int sl = SLOT_MIX0; sl < KEY_SLOTS; sl++) TipId(FxKeyButtonId(sl), L"Click, then press the key(s) you want. Right-click to clear it.");
+    for (int c = 0; c < CH_MAX; c++)
+        TipId(IDC_MIXHOLDMODE0 + c, L"What its Hold key does. Mute: it goes quiet while you hold the key. Talk: it only plays while you hold the key (push-to-talk, e.g. for a second mic).");
     TipId(IDC_RESTARTAUD,  L"Close and reopen every sound device. Handy after plugging something in. (Outputs that drop out also come back by themselves.)");
     TipId(IDC_TAB0 + PAGE_MIXER,    L"Mixer: bring in apps (Spotify, a game, a browser) and other inputs, set their volume and send each to the outputs you want.");
     TipId(IDC_CLIPNOW,    L"Save the last few seconds as a new clip (fills the next empty slot below).");
@@ -10681,6 +10877,73 @@ static void PadKey(int i, bool pressed, bool released);
 static bool ProfileLoad(int idx, bool osd);
 static void HoldPress(int slot);
 static void HoldRelease(int slot);
+// ---- Mixer hotkeys: volume up / down (hold to keep going), mute, solo, duck, and a hold key per channel
+static bool MixRepeat(int slot, bool down, bool pressed)   // now, then (still held) after 0.4 s every 0.09 s
+{
+    static DWORD next[KEY_SLOTS];
+    const DWORD now = GetTickCount();
+    if (pressed) { next[slot] = now + 400; return true; }
+    if (down && (int)(now - next[slot]) >= 0) { next[slot] = now + 90; return true; }
+    return false;
+}
+static void MixOsd(const wchar_t* who, const wchar_t* what, bool on)
+{
+    wchar_t t[64]; _snwprintf(t, 63, L"%s  %s", who, what); t[63] = 0;
+    ShowOsd(t, on);
+}
+static void MixKey(int slot, bool down, bool pressed, bool released)
+{
+    const DWORD shown = 0; (void)shown;
+    if (slot < SLOT_MIXOUT0) {
+        const int c = (slot - SLOT_MIX0) / MIXA_N, a = (slot - SLOT_MIX0) % MIXA_N;
+        if (gCh[c].type == CH_NONE) { if (a == MIXA_HOLD) gCh[c].held = false; return; }
+        wchar_t who[64]; ChanLabel(c, who, 40);
+        if (a == MIXA_HOLD) {                   // (its quiet state is worked out every poll: see MixHoldTick)
+            if ((pressed || released) && gCh[c].holdTalk) MixOsd(who, down ? L"on (held)" : L"off", down);
+            else if ((pressed || released)) MixOsd(who, down ? L"muted (held)" : L"back on", !down);
+            return;
+        }
+        if (a == MIXA_UP || a == MIXA_DOWN) {
+            if (!MixRepeat(slot, down, pressed)) return;
+            int v = gCh[c].db10; if (v <= -600 && a == MIXA_UP) v = -610;
+            FaderSet(IDC_CHVOL0 + c, v + (a == MIXA_UP ? 10 : -10) * gMixStep);
+            wchar_t d[24]; DbText(gCh[c].db10, d); MixOsd(who, d, true);
+            return;
+        }
+        if (!pressed) return;
+        bool on = false;
+        if (a == MIXA_MUTE) { on = gCh[c].mute = !gCh[c].mute; MixOsd(who, on ? L"muted" : L"unmuted", !on); }
+        if (a == MIXA_SOLO) { on = gCh[c].solo = !gCh[c].solo; MixOsd(who, on ? L"solo" : L"solo off", on); }
+        if (a == MIXA_DUCK) { on = gCh[c].duck = !gCh[c].duck; MixOsd(who, on ? L"ducks" : L"doesn't duck", on); }
+        MixerRedraw();
+        return;
+    }
+    const int k = (slot - SLOT_MIXOUT0) / MIXO_N, a = (slot - SLOT_MIXOUT0) % MIXO_N;
+    if (k >= gRows) return;
+    wchar_t who[40]; OutName(k, who, 32);
+    if (a == MIXO_UP || a == MIXO_DOWN) {
+        if (!MixRepeat(slot, down, pressed)) return;
+        int v = FaderGet(IDC_OVOL0 + k); if (v <= -600 && a == MIXO_UP) v = -610;
+        FaderSet(IDC_OVOL0 + k, v + (a == MIXO_UP ? 10 : -10) * gMixStep);
+        wchar_t d[24]; DbText(FaderGet(IDC_OVOL0 + k), d); MixOsd(who, d, true);
+        return;
+    }
+    if (!pressed) return;
+    gOutMute[k] = !gOutMute[k];
+    MixOsd(who, gOutMute[k] ? L"muted" : L"unmuted", !gOutMute[k]);
+    MixerRedraw();
+}
+static void MixHoldTick()                       // (every poll) each channel's hold key: quiet or not
+{
+    for (int c = 0; c < CH_MAX; c++) {
+        const int* k = gFxKeys[SLOT_MIX0 + c * MIXA_N + MIXA_HOLD];
+        const bool has = k[0] || k[1] || k[2];
+        const bool down = has && gFxKeyWasDown[SLOT_MIX0 + c * MIXA_N + MIXA_HOLD];
+        const bool quiet = has && gCh[c].type != CH_NONE && (gCh[c].holdTalk ? !down : down);
+        if (quiet != gCh[c].held) { gCh[c].held = quiet; InvalidateRect(GetDlgItem(gWnd, IDC_CHVOL0 + c), nullptr, FALSE); }
+    }
+}
+
 static void PollFxKeys()
 {
     BYTE cache[256] = {};
@@ -10697,6 +10960,7 @@ static void PollFxKeys()
             if (pressed) HoldPress(slot); else if (released) HoldRelease(slot);
             continue;
         }
+        if (slot >= SLOT_MIX0) { MixKey(slot, down, pressed, released); continue; }   // the Mixer's
         if (slot == SLOT_DIVE) { gDiveHeld = down; continue; }   // hold to bend
         if (slot == SLOT_PTT)  { gPttHeld = down; continue; }    // push-to-talk / push-to-mute
         if (slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) {      // pads: press (and release, for Hold mode)
@@ -10738,6 +11002,7 @@ static void PollFxKeys()
         ShowOsd(msg, slot == SLOT_MUTE ? !on : on);
         UpdateStatus(true);
     }
+    MixHoldTick();
 }
 
 // ---------- Mic tab ----------
@@ -11153,7 +11418,8 @@ static void Layout()
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
         bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat))
-                && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gPaged[i].page == PAGE_SETTINGS ? gSetSub : gFxSub));
+                && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gPaged[i].page == PAGE_SETTINGS ? gSetSub
+                                                         : gPaged[i].page == PAGE_MIXER ? gMixSub : gFxSub));
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
@@ -11166,6 +11432,15 @@ static void Layout()
             for (int base : chIds) if (cid >= base && cid < base + CH_MAX) vis = vis && gCh[cid - base].type != CH_NONE;
             if (cid >= IDC_CHADD0 && cid < IDC_CHADD0 + CH_MAX) vis = false;   // (one "+ Add channel" button instead)
             if (cid == IDC_MIXHINT) { bool any = false; for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) any = true; vis = vis && !any; }
+            if (cid >= IDC_MIXKEY0 && cid < IDC_MIXKEY0 + (KEY_SLOTS - SLOT_MIX0)) {   // hotkeys: channels in use, outputs there
+                const int sl = SLOT_MIX0 + cid - IDC_MIXKEY0;
+                vis = vis && (sl < SLOT_MIXOUT0 ? gCh[(sl - SLOT_MIX0) / MIXA_N].type != CH_NONE : (sl - SLOT_MIXOUT0) / MIXO_N < gRows);
+            }
+            if (cid >= IDC_MIXKROW0 && cid < IDC_MIXKROW0 + CH_MAX + MAX_OUT) {
+                const int r = cid - IDC_MIXKROW0;
+                vis = vis && (r < CH_MAX ? gCh[r].type != CH_NONE : r - CH_MAX < gRows);
+            }
+            if (cid >= IDC_MIXHOLDMODE0 && cid < IDC_MIXHOLDMODE0 + CH_MAX) vis = vis && gCh[cid - IDC_MIXHOLDMODE0].type != CH_NONE;
         }
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
@@ -11894,7 +12169,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 {
     wchar_t k[100];
     ComboName(gFxKeys[slot], MAX_KEYS, k, 100);
-    if (!k[0]) lstrcpynW(k, L"Set hotkey", 100);
+    if (!k[0]) lstrcpynW(k, slot >= SLOT_MIX0 ? L"Set" : L"Set hotkey", 100);
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
                        : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
                        : slot >= SLOT_PROF0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
@@ -11904,6 +12179,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 
 static int FxKeyButtonId(int slot)
 {
+    if (slot >= SLOT_MIX0) return IDC_MIXKEY0 + (slot - SLOT_MIX0);
     if (slot >= SLOT_PROF0)    return slot - SLOT_PROF0 == gProfSel ? IDC_PROFKEY : 0;   // the selected profile's button
     if (slot == SLOT_TAPESTOP) return IDC_TAPEKEY;
     if (slot == SLOT_PTT)      return IDC_PTTKEY;
@@ -13379,7 +13655,11 @@ static void CreateUI()
     // and the outputs it goes to. Below, one strip per output.
     gBuildPage = PAGE_MIXER;
     gSecChan = gSectionN;
+    gBuildSub = 0;                              // (the strips: Mixer sub-view 0; its hotkeys are sub-view 1)
     AddSection(14, 54, 532, 330, L"Channels");
+    gBuildSub = -1;
+    Ctl(L"BUTTON", L"Hotkeys", WS_TABSTOP, 152, 62, 110, 26, IDC_MIXKEYSBTN);
+    gBuildSub = 0;
     Ctl(L"BUTTON", L"+ Add channel", WS_TABSTOP, 30, 62, 116, 26, IDC_CHADDBTN);
     gMixHint   = Ctl(L"STATIC", L"No channels yet. Click \"+ Add channel\" to bring in an app (Spotify, a game, a browser...), "
                                 L"another input, or what an output device plays.", SS_CENTER, 30, 160, 500, 40, IDC_MIXHINT);
@@ -13387,6 +13667,7 @@ static void CreateUI()
     Spin(IDC_DUCKDB, 344, 64, 52, 3, 30, gDuckDb);
     gDuckDbLbl = Ctl(L"STATIC", L"dB", 0, 400, 67, 22, 18, 0);
     Ctl(L"BUTTON", L"Restart audio", WS_TABSTOP, 434, 62, 104, 26, IDC_RESTARTAUD);
+    gBuildSub = 0;
     for (int c = 0; c < CH_MAX; c++) {
         const int x = 21 + c * 65;
         wchar_t db[24]; DbText(gCh[c].db10, db);
@@ -13405,6 +13686,7 @@ static void CreateUI()
     }
 
     gSecOut = gSectionN;
+    gBuildSub = 0;
     AddSection(14, 400, 532, 184, L"Outputs");
     for (int k = 0; k < MAX_OUT; k++) {
         const int x = 21 + k * 105;
@@ -13417,6 +13699,25 @@ static void CreateUI()
         Ctl(L"STATIC", L"", SS_OWNERDRAW, x + 40, 522, 56, 16, IDC_OLIM0 + k);
         Ctl(L"BUTTON", L"M", BS_OWNERDRAW | WS_TABSTOP, x + 40, 546, 56, 22, IDC_OMUTE0 + k);
     }
+    // the Mixer's hotkeys (sub-view 1): a row per channel in use and per output; MixerPlace lays it out
+    gBuildSub = 1;
+    gSecKeys = gSectionN;
+    AddSection(14, 54, 532, 530, L"Mixer hotkeys");
+    {
+        static const wchar_t* cols[7] = { L"", L"Volume +", L"Volume \x2212", L"Mute", L"Solo", L"Duck", L"Hold" };
+        for (int i = 1; i < 7; i++) Ctl(L"STATIC", cols[i], SS_CENTER, 30 + i * 60, 100, 58, 18, IDC_MIXKCOL0 + i);
+        Ctl(L"STATIC", L"Hold does", SS_CENTER, 470, 100, 60, 18, IDC_MIXKCOL0);
+        for (int r = 0; r < CH_MAX + MAX_OUT; r++) Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 124 + r * 28, 88, 20, IDC_MIXKROW0 + r);
+        for (int sl = SLOT_MIX0; sl < KEY_SLOTS; sl++) {
+            wchar_t t[120]; FxKeyButtonText(sl, t, 120);
+            Ctl(L"BUTTON", t, WS_TABSTOP, 30, 124, 58, 24, FxKeyButtonId(sl));
+        }
+        for (int c = 0; c < CH_MAX; c++) Ctl(L"BUTTON", gCh[c].holdTalk ? L"Talk" : L"Mute", BS_OWNERDRAW | WS_TABSTOP, 470, 124, 58, 24, IDC_MIXHOLDMODE0 + c);
+        Ctl(L"STATIC", L"Volume keys change it by", 0, 30, 540, 160, 20, IDC_MIXKEYHDR);
+        Spin(IDC_MIXSTEP, 196, 537, 56, 1, 10, gMixStep);
+        Ctl(L"STATIC", L"dB a press (hold to keep going)", 0, 258, 540, 200, 20, IDC_MIXSTEPDB);
+    }
+    gBuildSub = -1;
     gBuildPage = -1;
     AppScanStart();                             // (icons and the apps list arrive from the background)
     for (int i = 0; i < gDesignN; i++)          // the Mixer's strips are placed by MixerPlace, not the layout
@@ -13549,10 +13850,10 @@ static void PaintWindow(HDC dc)
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
         if (s.page >= 0 && s.page != gPage) continue;
-        if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub)) continue;
+        if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : s.page == PAGE_MIXER ? gMixSub : gFxSub)) continue;
         if (gCompact) continue;
         if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
-        int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox) + (i == gSecChan || i == gSecOut ? 0 : gOrgX);
+        int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox) + (i == gSecChan || i == gSecOut || i == gSecKeys ? 0 : gOrgX);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         RECT tr = { sx + 10, y - sz.cy / 2, sx + 18 + sz.cx, y + sz.cy / 2 + 1 };
@@ -14052,6 +14353,33 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) ChanMenu(id - IDC_CHADD0, GetDlgItem(gWnd, id));
         return;
     }
+    if (id == IDC_MIXKEYSBTN) {                 // the Mixer: its strips <-> its hotkeys
+        if (code != BN_CLICKED) return;
+        if (gCapturingKey) EndKeyCapture();
+        gMixSub = !gMixSub;
+        SetWindowTextW(GetDlgItem(gWnd, id), gMixSub ? L"Back to mixer" : L"Hotkeys");
+        Layout(); MixerRedraw();
+        return;
+    }
+    if (id >= IDC_MIXKEY0 && id < IDC_MIXKEY0 + (KEY_SLOTS - SLOT_MIX0)) {
+        if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_MIX0 + id - IDC_MIXKEY0], id);
+        return;
+    }
+    if (id >= IDC_MIXHOLDMODE0 && id < IDC_MIXHOLDMODE0 + CH_MAX) {   // its hold key: mutes it / push-to-talk
+        if (code != BN_CLICKED) return;
+        const int c = id - IDC_MIXHOLDMODE0;
+        gCh[c].holdTalk = !gCh[c].holdTalk;
+        SetWindowTextW(GetDlgItem(gWnd, id), gCh[c].holdTalk ? L"Talk" : L"Mute");
+        InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
+        return;
+    }
+    if (id == IDC_MIXSTEP) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v >= 1) gMixStep = Iclamp(v, 1, 10);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gMixStep, FALSE);
+        return;
+    }
     if (id == IDC_CHADDBTN) {                   // a new channel: the first free one, then pick what it plays
         if (code == BN_CLICKED) for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_NONE) { ChanMenu(c, GetDlgItem(gWnd, id)); break; }
         return;
@@ -14329,6 +14657,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w >= IDC_CHSRC0 && w < IDC_CHSRC0 + CH_MAX)   { DrawChanSrc(d, (int)(w - IDC_CHSRC0)); return true; }
     if (w >= IDC_CHADD0 && w < IDC_CHADD0 + CH_MAX)   { DrawChanAdd(d); return true; }
     if (w >= IDC_OLIM0 && w < IDC_OLIM0 + MAX_OUT)    { DrawLimit(d, gLimShow[w - IDC_OLIM0] > 0); return true; }
+    if (w >= IDC_MIXHOLDMODE0 && w < IDC_MIXHOLDMODE0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_MIXHOLDMODE0].holdTalk != 0, ACCENT, RGB(255, 255, 255)); return true; }
     if (w >= IDC_OLBL0 && w < IDC_OLBL0 + MAX_OUT) {   // an output's name (click: rename it)
         HDC dc = d->hDC; RECT rc = d->rcItem;
         FillRect(dc, &rc, BgBrush());
@@ -14345,8 +14674,16 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
         DrawToggle(d, (gCh[c].routes >> k) & 1, false); return true;
     }
     if (w >= IDC_OMUTE0 && w < IDC_OMUTE0 + MAX_OUT) { DrawToggle(d, gOutMute[w - IDC_OMUTE0], true); return true; }
-    if (w >= IDC_CHMETER0 && w < IDC_CHMETER0 + CH_MAX) { int c = (int)(w - IDC_CHMETER0); DrawVMeter(d, gChShownL[c], gChShownR[c], gChA[c].live); return true; }
-    if (w >= IDC_OMETER0 && w < IDC_OMETER0 + MAX_OUT) { DrawVMeter(d, gOutShown[w - IDC_OMETER0], -1.0f, gRunning); return true; }
+    if (w >= IDC_CHMETER0 && w < IDC_CHMETER0 + CH_MAX) {
+        int c = (int)(w - IDC_CHMETER0);
+        DrawVMeter2(d, gChShownL[c], gChShownR[c], gChA[c].live, gChHoldL[c], gChHoldR[c], GetTickCount() - gChClipT[c] < 2000 && gChClipT[c]);
+        return true;
+    }
+    if (w >= IDC_OMETER0 && w < IDC_OMETER0 + MAX_OUT) {
+        int k = (int)(w - IDC_OMETER0);
+        DrawVMeter2(d, gOutShown[k], -1.0f, gRunning, gOutHold[k], 0, GetTickCount() - gOutClipT[k] < 2000 && gOutClipT[k]);
+        return true;
+    }
     if ((d)->hwndItem == gStatus) { DrawStatus(d); return true; }
     if (w == IDC_VOICEPROG) { DrawVoiceProgress(d); return true; }
     if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
@@ -14684,6 +15021,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_REWINDKEY)  { ClearFxKey(SLOT_REWIND); return 0; }
         if (id == IDC_PROFNEXTKEY) { ClearFxKey(SLOT_PROFNEXT); return 0; }
         if (id == IDC_PTTKEY)      { ClearFxKey(SLOT_PTT); return 0; }
+        if (id >= IDC_MIXKEY0 && id < IDC_MIXKEY0 + (KEY_SLOTS - SLOT_MIX0)) { ClearFxKey(SLOT_MIX0 + id - IDC_MIXKEY0); return 0; }
         if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) { gUserCol[id - IDC_COLSW0] = CLR_NONE; ApplyTheme(); return 0; }
         if (id == IDC_VERSION) {                // hidden: command-line control for Stream Deck / scripts
             HMENU mm = CreatePopupMenu();
