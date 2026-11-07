@@ -8151,7 +8151,8 @@ static void FaderDraw(HWND h, HDC dc, const RECT& rc, int id)
     HBRUSH fb = CreateSolidBrush(quiet ? (gDark ? RGB(90, 90, 90) : RGB(175, 175, 175)) : ACCENT); FillRect(dc, &fr, fb); DeleteObject(fb);
     {                                           // scale marks at -6, -12, -24 and -48 dB
         HBRUSH mb = CreateSolidBrush(gDark ? RGB(85, 85, 85) : RGB(185, 185, 185));
-        for (int db : { -60, -120, -240, -480 }) {
+        static const int marks[4] = { -60, -120, -240, -480 };
+        for (int db : marks) {
             const int my = FaderY(H, th, FaderPos(db));
             RECT a = { 0, my, Imax(2, SC(4)), my + 1 }, b2 = { rc.right - Imax(2, SC(4)), my, rc.right, my + 1 };
             FillRect(dc, &a, mb); FillRect(dc, &b2, mb);
