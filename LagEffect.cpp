@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.39.0"
+#define APP_VERSION L"1.40.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -414,6 +414,11 @@ static volatile float gChGr[8];                 // (each channel's compressor: h
 static volatile float gOutPeakMix[MAX_OUT];     // (each output's peak, for the Mixer's meters)
 static volatile int   gSongCh = -1;             // Vocode to song from a Mixer channel: which one (-1 = not)
 static volatile float gSongLevel = 1.0f;        // Vocode to song: the music's level (x1 = as it is)
+static int gMixFadeSecs = 3;                    // how long a fade takes
+static int gTalkbackOut = 1;                    // talkback: which output hears you (0 = output 1)
+static volatile int   gTalkback = -1;           // talkback key held: only this output gets your mic (-1 = off)
+static volatile bool  gTalkingNow = false;      // (you're talking: for Streamer.bot)
+static volatile float gChPkWs[8], gOutPkWs[MAX_OUT];   // (levels for Streamer.bot: each channel after its fader, each output)
 static volatile int gTestTone[5];               // (an output's test sound: samples still to play)
 static volatile int   gChatMix = 0;             // ChatMix: -100 (only game) .. 0 (both) .. +100 (only chat)
 static volatile DWORD gFadeSlowUntil = 0;       // (a scene switch: volumes glide over ~0.4 s instead of ~25 ms)
@@ -2214,6 +2219,19 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     static bool chFxInit = false;
     if (!chFxInit) { for (int c = 0; c < CH_MAX; c++) { chFx[c].pl = chFx[c].pm = chFx[c].ph = 9999; chFx[c].gain = chFx[c].tgt = 1; chFx[c].comp = -1; } chFxInit = true; }
     bool     chEq[CH_MAX], chComp[CH_MAX];
+    float    chG[CH_MAX] = {}, chPk[CH_MAX] = {};   // (fader gain, and this block's peak after it: Streamer.bot's levels)
+    // Talkback: while its key is held only that output gets your mic (glides over ~5 ms: no clicks).
+    // If that output doesn't normally carry your mic, it gets your full voice for as long as the key is held.
+    static float tbG[MAX_OUT] = { 1, 1, 1, 1, 1 }, tbE[MAX_OUT];
+    float tbT[MAX_OUT], tbX[MAX_OUT];
+    {
+        const int tb = gTalkback;
+        for (int k = 0; k < MAX_OUT; k++) {
+            const int md = gRowMode[k]; const bool hasMic = md == MODE_EFFECT || md == MODE_ALL || md == MODE_CLEAN;
+            tbT[k] = tb < 0 || tb == k ? 1.0f : 0.0f;
+            tbX[k] = tb == k && !hasMic ? 1.0f : 0.0f;
+        }
+    }
     const int songCh = gSongCh;
     unsigned songWr = songW;                    // (a Mixer channel as Vocode to song's music: written here)
     bool     chDk[CH_MAX], chMono[CH_MAX], chDucker[CH_MAX];
@@ -2246,6 +2264,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         unsigned rt = gCh[c].routes;
         if (soloMask) { rt &= ~(1u << soloOut); if (soloMask & (1u << c)) rt |= 1u << soloOut; }
         const float g = gCh[c].mute || gCh[c].held ? 0.0f : DbGain10(gCh[c].db10) * ChatGain(gCh[c].chatRole);
+        chG[c] = g;
         bool need = false;
         for (int k = 0; k < MAX_OUT; k++) {
             chTgt[c][k] = rt & (1u << k) ? g * DbGain10(Iclamp(gCh[c].send[k], -400, 60)) : 0.0f;   // (and its level there)
@@ -2413,6 +2432,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             talkEnv = a > talkEnv ? a : talkEnv * 0.9995f;
             const bool talking = (gateMode != GATE_OFF ? gateHold > 0 && gateGain > 0.5f : talkEnv > 0.02f) && muteGain * pttGain > 0.5f;
             if (talking) talkHold = RATE * 3 / 10; else if (talkHold > 0) talkHold--;   // stays down 0.3 s after you stop
+            gTalkingNow = talkHold > 0;
             const float want = talkHold > 0 ? duckTo : 1.0f;
             chDuck += (want - chDuck) * (want < chDuck ? 0.0015f : 0.00005f);           // down in ~15 ms, back up over ~0.5 s
             const float wantAll = talkHold > 0 || otherHold > 0 ? duckTo : 1.0f;        // (a "ducks others" channel playing too)
@@ -2552,6 +2572,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 }
                 if (chMono[c]) { L = R = (L + R) * 0.5f; }
                 L *= dk * chPanL[c]; R *= dk * chPanR[c];
+                { const float e = Max(fabsf(L), fabsf(R)) * chG[c]; if (e > chPk[c]) chPk[c] = e; }
                 if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
                 else { chRd[c]++; chAv[c]--; }
                 if (f == frames / 2 && chAdj[c] > 0 && chAv[c] > 1) { chRd[c]++; chAv[c]--; }   // skip one
@@ -2561,7 +2582,11 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                     if (g > 0.00001f) { cL[k] += L * g; cR[k] += R * g; }
                 }
             }
-        float m0 = soloMask && soloOut == 0 ? 0.0f : RowSignal(mode[0], effect, everything, clean) + sounds(0);
+        auto micSig = [&](int k) {               // your mic on output k (talkback can take it away, or add it)
+            tbG[k] += (tbT[k] - tbG[k]) * 0.004f; tbE[k] += (tbX[k] - tbE[k]) * 0.004f;
+            return RowSignal(mode[k], effect, everything, clean) * tbG[k] + everything * tbE[k];
+        };
+        float m0 = soloMask && soloOut == 0 ? 0.0f : micSig(0) + sounds(0);
         float oL = (m0 + cL[0]) * vol[0], oR = (m0 + cR[0]) * vol[0];
         if (testLeft[0] > 0) { const float t = TestToneAt(testLeft[0]--); oL += t; oR += t; }
         LimitStereo(0, oL, oR);
@@ -2571,7 +2596,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
 
         for (int k = 1; k < MAX_OUT; k++) {
             if (!on[k] || (w[k] - r[k]) >= RING_FRAMES) continue;
-            const float mk = soloMask && soloOut == k ? 0.0f : RowSignal(mode[k], effect, everything, clean) + sounds(k);
+            const float mk = soloMask && soloOut == k ? 0.0f : micSig(k) + sounds(k);
             float kL = (mk + cL[k]) * vol[k], kR = (mk + cR[k]) * vol[k];
             if (testLeft[k] > 0) { const float t = TestToneAt(testLeft[k]--); kL += t; kR += t; }
             LimitStereo(k, kL, kR);
@@ -2591,6 +2616,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
     for (int k = 0; k < MAX_OUT && k < 8; k++) if (outPk[k] > gOutPeak[k]) gOutPeak[k] = outPk[k];
     for (int k = 0; k < MAX_OUT; k++) if (outPk[k] > gOutPeakMix[k]) gOutPeakMix[k] = outPk[k];
+    for (int k = 0; k < MAX_OUT; k++) if (outPk[k] > gOutPkWs[k]) gOutPkWs[k] = outPk[k];
+    for (int c = 0; c < CH_MAX; c++) if (chPk[c] > gChPkWs[c]) gChPkWs[c] = chPk[c];
     if (songCh >= 0) { MemoryBarrier(); songW = songWr; }
     gMeterVad = nsStage ? nsVad : -1.0f;
     gMeterGateOpen = gateHold > 0;
@@ -2703,6 +2730,7 @@ enum {
     IDC_MIXKSCNNAME0 = 1950,                    // .. +8: each scene's name by its hotkey
     IDC_CHPAN0 = 1960,                          // .. +8: each channel's pan slider
     IDC_OTEST0 = 1970,                          // .. +5: each output's test sound button
+    IDC_MIXFADE = 1980, IDC_MIXFADELBL = 1981, IDC_MIXFADES = 1982, IDC_MIXKTB = 1983, IDC_TBOUT = 1984, IDC_TBHDR = 1985, IDC_TBHDR2 = 1986,
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -3007,7 +3035,9 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_CHATC   (SLOT_CHATG + 1)
 #define SCENE_MAX    8
 #define SLOT_SCENE0  (SLOT_CHATC + 1)            // a hotkey per scene
-#define KEY_SLOTS    (SLOT_SCENE0 + SCENE_MAX)
+#define SLOT_FADE0   (SLOT_SCENE0 + SCENE_MAX)     // a fade out / in key per channel
+#define SLOT_TALKBACK (SLOT_FADE0 + CH_MAX)      // hold: only one output gets your mic
+#define KEY_SLOTS    (SLOT_TALKBACK + 1)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -3618,6 +3648,13 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 // ======================= settings =======================
 static const wchar_t* FxKeyIniName(int slot)
 {
+    if (slot == SLOT_TALKBACK) return L"mix_talkback_key";
+    if (slot >= SLOT_FADE0) {
+        static wchar_t fn[CH_MAX][20];
+        wchar_t* n = fn[slot - SLOT_FADE0];
+        if (!n[0]) wsprintfW(n, L"mix_ch%d_fade", slot - SLOT_FADE0 + 1);
+        return n;
+    }
     if (slot == SLOT_CHATG) return L"mix_chatmix_game";
     if (slot == SLOT_CHATC) return L"mix_chatmix_chat";
     if (slot >= SLOT_SCENE0) {
@@ -3862,6 +3899,8 @@ static void LoadSettings()
     }
     gDuckDb = Iclamp(INI_INT(L"mixer_duck_db", 12), 3, 30);
     gMixStep = Iclamp(INI_INT(L"mixer_key_step", 2), 1, 10);
+    gMixFadeSecs = Iclamp(INI_INT(L"mixer_fade_secs", 3), 1, 30);
+    gTalkbackOut = Iclamp(INI_INT(L"mixer_talkback_out", 1), 0, MAX_OUT - 1);
     gChatMix = Iclamp(INI_INT(L"mixer_chatmix", 0), -100, 100);
     for (int c = 0; c < CH_MAX; c++) { wchar_t k[24]; wsprintfW(k, L"ch_%d_chatmix", c); gCh[c].chatRole = Iclamp(INI_INT(k, 0), 0, 2); }
     for (int c = 0; c < CH_MAX; c++) {
@@ -4729,7 +4768,7 @@ static void SaveSettings()
     }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_limit", k); SaveInt(key, gOutCeil10[k]); } SaveInt(L"tts_volume", gTtsVol);
-    SaveInt(L"mixer_duck_db", gDuckDb); SaveInt(L"mixer_key_step", gMixStep); SaveInt(L"mixer_chatmix", gChatMix);
+    SaveInt(L"mixer_duck_db", gDuckDb); SaveInt(L"mixer_key_step", gMixStep); SaveInt(L"mixer_fade_secs", gMixFadeSecs); SaveInt(L"mixer_talkback_out", gTalkbackOut); SaveInt(L"mixer_chatmix", gChatMix);
     for (int c = 0; c < CH_MAX; c++) { wchar_t k[24]; wsprintfW(k, L"ch_%d_chatmix", c); SaveInt(k, gCh[c].chatRole); }
     for (int c = 0; c < CH_MAX; c++) {
         wchar_t k[24];
@@ -8186,6 +8225,7 @@ static void MixKeysShow(int c)                  // (its hotkey buttons and hold 
         wchar_t t[120]; FxKeyButtonText(SLOT_MIX0 + c * MIXA_N + a, t, 120);
         SetDlgItemTextW(gWnd, FxKeyButtonId(SLOT_MIX0 + c * MIXA_N + a), t);
     }
+    { wchar_t t[120]; FxKeyButtonText(SLOT_FADE0 + c, t, 120); SetDlgItemTextW(gWnd, FxKeyButtonId(SLOT_FADE0 + c), t); }
     SetDlgItemTextW(gWnd, IDC_MIXHOLDMODE0 + c, gCh[c].holdTalk ? L"Talk" : L"Mute");
 }
 static void ChanSetSource(int c, int type, const wchar_t* src)
@@ -8413,6 +8453,93 @@ static void SceneMoveSection(int from, int to)  // (deleting a scene: the ones a
     if (n) WritePrivateProfileSectionW(b, buf, gIni);
     WritePrivateProfileStringW(a, nullptr, nullptr, gIni);
 }
+// ---- the whole Mixer in one file: channels (with EQ, levels, hotkeys), output names / limits, scenes, remembered apps
+static bool MixerKey(const wchar_t* k)          // a setting that belongs to the Mixer (not your devices or the rest of the app)
+{
+    if (!wcsncmp(k, L"ch_", 3) || !wcsncmp(k, L"mix_", 4) || !wcsncmp(k, L"mixer_", 6)) return true;
+    if (!wcsncmp(k, L"out_", 4) && wcscmp(k, L"out_count")) {   // output names, mutes, limits, widths (not which device)
+        const wchar_t* u = wcschr(k + 4, L'_');
+        return u && (!wcscmp(u, L"_name") || !wcscmp(u, L"_mute") || !wcscmp(u, L"_limit") || !wcscmp(u, L"_width"));
+    }
+    return false;
+}
+static void MixerExport()
+{
+    wchar_t path[MAX_PATH] = L"Mixer setup.ini";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o); o.hwndOwner = gWnd; o.lpstrFilter = L"Lag Effect mixer setup\0*.ini\0All files\0*.*\0"; o.lpstrFile = path;
+    o.nMaxFile = MAX_PATH; o.lpstrTitle = L"Export the mixer setup"; o.lpstrDefExt = L"ini";
+    o.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetSaveFileNameW(&o)) return;
+    SaveSettings();                             // (the file then has the mixer as it is right now)
+    DeleteFileW(path);
+    static wchar_t buf[65536], out[65536];
+    const DWORD n = GetPrivateProfileSectionW(L"settings", buf, 65536, gIni);
+    wchar_t* w = out;
+    for (const wchar_t* e = buf; *e && e < buf + n; e += lstrlenW(e) + 1) {
+        wchar_t k[64]; const wchar_t* eq = wcschr(e, L'='); if (!eq) continue;
+        lstrcpynW(k, e, (int)Imin(64, (int)(eq - e) + 1));
+        if (!MixerKey(k)) continue;
+        const int len = lstrlenW(e);
+        if (w + len + 2 >= out + 65536) break;
+        lstrcpyW(w, e); w += len + 1;
+    }
+    *w = 0;
+    WritePrivateProfileStringW(L"lag_effect_mixer", L"version", APP_VERSION, path);
+    WritePrivateProfileSectionW(L"settings", out, path);
+    const wchar_t* secs[] = { L"mixer_memory", L"mixer_scenes" };
+    for (const wchar_t* sec : secs) if (GetPrivateProfileSectionW(sec, buf, 65536, gIni)) WritePrivateProfileSectionW(sec, buf, path);
+    for (int i = 0; i < SCENE_MAX; i++) {
+        wchar_t sec[32]; wsprintfW(sec, L"mixer_scene_%d", i + 1);
+        if (GetPrivateProfileSectionW(sec, buf, 65536, gIni)) WritePrivateProfileSectionW(sec, buf, path);
+    }
+    ShowOsd(L"Mixer setup exported", true);
+}
+static void MixerImport()
+{
+    wchar_t path[MAX_PATH] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o); o.hwndOwner = gWnd; o.lpstrFilter = L"Lag Effect mixer setup\0*.ini\0All files\0*.*\0"; o.lpstrFile = path;
+    o.nMaxFile = MAX_PATH; o.lpstrTitle = L"Import a mixer setup"; o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&o)) return;
+    wchar_t ver[32] = L"";
+    GetPrivateProfileStringW(L"lag_effect_mixer", L"version", L"", ver, 32, path);
+    if (!ver[0]) { MessageBoxW(gWnd, L"That file isn't a Lag Effect mixer setup (use Scenes > Export the mixer setup to make one).", L"Lag Effect", MB_ICONWARNING); return; }
+    if (MessageBoxW(gWnd, L"Replace your Mixer (channels, EQ, levels, Mixer hotkeys, output names and scenes) with the one in this file? "
+                          L"Your devices and the rest of your settings stay as they are. Lag Effect will restart.",
+                    L"Lag Effect - import mixer setup", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    SaveSettings();                             // (everything else as it is now, then the Mixer from the file on top)
+    static wchar_t buf[65536];
+    {                                           // the Mixer's own settings go; the file's come in
+        static wchar_t cur[65536];
+        const DWORD n = GetPrivateProfileSectionW(L"settings", cur, 65536, gIni);
+        for (const wchar_t* e = cur; *e && e < cur + n; e += lstrlenW(e) + 1) {
+            wchar_t k[64]; const wchar_t* eq = wcschr(e, L'='); if (!eq) continue;
+            lstrcpynW(k, e, (int)Imin(64, (int)(eq - e) + 1));
+            if (MixerKey(k)) WritePrivateProfileStringW(L"settings", k, nullptr, gIni);
+        }
+        const DWORD m = GetPrivateProfileSectionW(L"settings", buf, 65536, path);
+        for (const wchar_t* e = buf; *e && e < buf + m; e += lstrlenW(e) + 1) {
+            wchar_t k[64]; const wchar_t* eq = wcschr(e, L'='); if (!eq) continue;
+            lstrcpynW(k, e, (int)Imin(64, (int)(eq - e) + 1));
+            if (MixerKey(k)) WritePrivateProfileStringW(L"settings", k, eq + 1, gIni);
+        }
+    }
+    const wchar_t* secs[] = { L"mixer_memory", L"mixer_scenes" };
+    for (const wchar_t* sec : secs) {
+        WritePrivateProfileStringW(sec, nullptr, nullptr, gIni);
+        if (GetPrivateProfileSectionW(sec, buf, 65536, path)) WritePrivateProfileSectionW(sec, buf, gIni);
+    }
+    for (int i = 0; i < SCENE_MAX; i++) {
+        wchar_t sec[32]; wsprintfW(sec, L"mixer_scene_%d", i + 1);
+        WritePrivateProfileStringW(sec, nullptr, nullptr, gIni);
+        if (GetPrivateProfileSectionW(sec, buf, 65536, path)) WritePrivateProfileSectionW(sec, buf, gIni);
+    }
+    gNoSaveOnExit = true;                       // keep what was just imported
+    wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    ShellExecuteW(nullptr, L"open", exe, L"--updated", nullptr, SW_SHOWNORMAL);   // --updated: waits for this copy to close
+    PostMessageW(gWnd, WM_CLOSE, 0, 0);
+}
 static void SceneMenu(HWND from)
 {
     HMENU m = CreatePopupMenu();
@@ -8426,10 +8553,15 @@ static void SceneMenu(HWND from)
         _snwprintf(t, 95, L"Rename \"%s\"...", gSceneName[gSceneCur]); t[95] = 0; AppendMenuW(m, MF_STRING, 3, t);
         _snwprintf(t, 95, L"Delete \"%s\"", gSceneName[gSceneCur]); t[95] = 0; AppendMenuW(m, MF_STRING, 4, t);
     }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 5, L"Export the mixer setup (channels, EQ, scenes...) to a file...");
+    AppendMenuW(m, MF_STRING, 6, L"Import a mixer setup from a file...");
     RECT r; GetWindowRect(from, &r);
     const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
     DestroyMenu(m);
     if (cmd >= 100 && cmd - 100 < gSceneN) { SceneApply(cmd - 100); return; }
+    if (cmd == 5) { MixerExport(); return; }
+    if (cmd == 6) { MixerImport(); return; }
     if (cmd == 1 && gSceneN < SCENE_MAX) {
         wchar_t name[64]; wsprintfW(name, L"Scene %d", gSceneN + 1);
         if (!InputBox(L"Lag Effect - new scene", L"A name for this mixer setup (like Gaming or Just chatting):", name, 31) || !name[0]) return;
@@ -8637,6 +8769,20 @@ static void ChanFxRefresh()                     // (values changed elsewhere: un
     else { const int d10 = (int)lround(gChGr[gCfxCh] * 10); wsprintfW(g, d10 > 0 ? L"turning down %d.%d dB" : L"not turning down now", d10 / 10, d10 % 10); }
     wchar_t o[48]; GetDlgItemTextW(gCfxWnd, CFX_GR, o, 48); if (lstrcmpW(g, o)) SetDlgItemTextW(gCfxWnd, CFX_GR, g);
 }
+// EQ presets: bass / middle / treble (tenths of a dB) and the compressor
+static const struct { const wchar_t* name; int lo, mid, hi, comp; } CFX_PRESETS[] = {
+    { L"Flat (no EQ, no compressor)",      0,    0,    0,  0 },
+    { L"Voice clarity (Discord, a friend)", -30,  20,   40, 30 },
+    { L"Podcast / voice chat, even level", -40,  30,   30, 55 },
+    { L"Music under your voice",            0,  -50,  -20, 20 },
+    { L"Bass boost",                       60,    0,   10,  0 },
+    { L"Less boomy",                      -60,    0,   10,  0 },
+    { L"Tinny game fix",                   40,  -20,  -30,  0 },
+    { L"Brighter",                          0,    0,   50,  0 },
+    { L"Quiet videos louder",              20,    0,   20, 70 },
+};
+#define CFX_PRESET_N ((int)(sizeof(CFX_PRESETS) / sizeof(CFX_PRESETS[0])))
+#define CFX_PRESET 400
 static LRESULT CALLBACK ChanFxProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -8645,6 +8791,16 @@ static LRESULT CALLBACK ChanFxProc(HWND h, UINT m, WPARAM w, LPARAM l)
         ChanFxRefresh();
         return 0;
     case WM_COMMAND:
+        if (LOWORD(w) == CFX_PRESET && HIWORD(w) == CBN_SELCHANGE) {
+            const int i = (int)SendDlgItemMessageW(h, CFX_PRESET, CB_GETCURSEL, 0, 0) - 1;   // (item 0 is "Presets...")
+            if (i >= 0 && i < CFX_PRESET_N && gCfxCh >= 0) {
+                ChanSet& g = gCh[gCfxCh];
+                g.eqLo = CFX_PRESETS[i].lo; g.eqMid = CFX_PRESETS[i].mid; g.eqHi = CFX_PRESETS[i].hi; g.comp = CFX_PRESETS[i].comp;
+                ChanFxRefresh(); ChanFxBadge(gCfxCh);
+            }
+            SendDlgItemMessageW(h, CFX_PRESET, CB_SETCURSEL, 0, 0);
+            return 0;
+        }
         if (LOWORD(w) == CFX_FLAT) {
             gCh[gCfxCh].eqLo = gCh[gCfxCh].eqMid = gCh[gCfxCh].eqHi = 0; gCh[gCfxCh].comp = 0;
             for (int k = 0; k < MAX_OUT; k++) gCh[gCfxCh].send[k] = 0;
@@ -8654,7 +8810,7 @@ static LRESULT CALLBACK ChanFxProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CLOSE: DestroyWindow(h); return 0;
     case WM_DESTROY: KillTimer(h, 1); if (gCfxWnd == h) gCfxWnd = nullptr; gCfxCh = -1; return 0;
     case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
-    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN:
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
         return CtlColor(h, m, w, l);
     }
     return DefWindowProcW(h, m, w, l);
@@ -8688,8 +8844,14 @@ static void ChanFxOpen(int c)
         wchar_t t[24]; CfxValText(id, t); mk(L"STATIC", t, SS_NOPREFIX, 302, y2 + 2, 70, 18, CFX_VAL + id);
     };
     hdr(L"EQ", 12);
-    row(L"Bass (100 Hz)", 36, CFX_LO, -1);
-    row(L"Middle (1 kHz)", 64, CFX_MID, -1);
+    {
+        HWND pc = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 136, 8, 230, 300, CFX_PRESET);
+        SendMessageW(pc, CB_ADDSTRING, 0, (LPARAM)L"Presets...");
+        for (int i = 0; i < CFX_PRESET_N; i++) SendMessageW(pc, CB_ADDSTRING, 0, (LPARAM)CFX_PRESETS[i].name);
+        SendMessageW(pc, CB_SETCURSEL, 0, 0);
+    }
+    row(L"Bass (100 Hz)", 40, CFX_LO, -1);
+    row(L"Middle (1 kHz)", 66, CFX_MID, -1);
     row(L"Treble (8 kHz)", 92, CFX_HI, -1);
     hdr(L"Compressor", 128);
     row(L"Amount", 152, CFX_COMP, -1);
@@ -8734,15 +8896,17 @@ static void ChanPermute(const int* from)        // channel slot i gets what was 
     if (!any) return;
     if (gRenEdit) ChanRenameDone(true);
     for (int i = 0; i < CH_MAX; i++) if (from[i] != i) ChanStop(i);   // (each slot's capture is tied to its number)
-    static ChanSet cs[CH_MAX]; int w[CH_MAX], keys[CH_MAX][MIXA_N][MAX_KEYS];
+    static ChanSet cs[CH_MAX]; int w[CH_MAX], keys[CH_MAX][MIXA_N][MAX_KEYS], fk[CH_MAX][MAX_KEYS];
     for (int i = 0; i < CH_MAX; i++) {
         cs[i] = gCh[i]; w[i] = gChW[i];
         for (int a = 0; a < MIXA_N; a++) for (int j = 0; j < MAX_KEYS; j++) keys[i][a][j] = gFxKeys[SLOT_MIX0 + i * MIXA_N + a][j];
+        for (int j = 0; j < MAX_KEYS; j++) fk[i][j] = gFxKeys[SLOT_FADE0 + i][j];
     }
     for (int i = 0; i < CH_MAX; i++) {
         const int f = from[i]; if (f == i) continue;
         gCh[i] = cs[f]; gChW[i] = w[f]; gCh[i].held = false;
         for (int a = 0; a < MIXA_N; a++) for (int j = 0; j < MAX_KEYS; j++) gFxKeys[SLOT_MIX0 + i * MIXA_N + a][j] = keys[f][a][j];
+        for (int j = 0; j < MAX_KEYS; j++) gFxKeys[SLOT_FADE0 + i][j] = fk[f][j];
         gChShownL[i] = gChShownR[i] = gChHoldL[i] = gChHoldR[i] = 0; gChClipT[i] = 0;
         gChNextTry[i] = gChWait[i] = 0;
         if (gChIcon[i]) { DestroyIcon(gChIcon[i]); gChIcon[i] = nullptr; } gChIconSrc[i][0] = 0;
@@ -9389,10 +9553,10 @@ static void MixerPlace()                        // the Mixer fills the window: s
         Section& sk = gSections[gSecKeys];
         sk.x = UNSC(cx0); sk.y = UNSC(chTop); sk.w = UNSC(cw); sk.h = UNSC(oTop + oH - chTop); sk.ox = sk.oy = 0;
         const int x0 = cx0 + SC(16), nameW = SC(100), modeW = SC(62), gap = SC(4);
-        const int colW = Imax(SC(40), (cw - SC(32) - nameW - modeW - gap * 7) / 6);
+        const int colW = Imax(SC(40), (cw - SC(32) - nameW - modeW - gap * 8) / 7);
         const int hy = chTop + SC(42);
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKCH), x0, hy, nameW, SC(18));
-        for (int i = 1; i < 7; i++) PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0 + i), x0 + nameW + gap + (i - 1) * (colW + gap), hy, colW, SC(18));
+        for (int i = 1; i < 8; i++) PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0 + i), x0 + nameW + gap + (i - 1 + (i == 7 ? 1 : 0)) * (colW + gap) + (i == 7 ? modeW - colW : 0), hy, colW, SC(18));
         const int mx = x0 + nameW + gap + 6 * (colW + gap);
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0), mx, hy, modeW, SC(18));
         int y = hy + SC(24);
@@ -9411,7 +9575,10 @@ static void MixerPlace()                        // the Mixer fills the window: s
                 const int slot = out ? SLOT_MIXOUT0 + k * MIXO_N + a : SLOT_MIX0 + c * MIXA_N + a;
                 PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(slot)), x0 + nameW + gap + a * (colW + gap), y, colW, SC(24));
             }
-            if (!out) PlaceFree(GetDlgItem(gWnd, IDC_MIXHOLDMODE0 + c), mx, y, modeW, SC(23));
+            if (!out) {
+                PlaceFree(GetDlgItem(gWnd, IDC_MIXHOLDMODE0 + c), mx, y, modeW, SC(23));   // (what Hold does: right after Hold)
+                PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_FADE0 + c)), mx + modeW + gap, y, colW, SC(24));
+            }
             y += SC(25);
         }
         // ChatMix keys (toward game / toward chat), and the volume keys' step on the same row
@@ -9427,6 +9594,25 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(e, stx + SC(124), y, SC(56) - uw, SC(23));
         if (u) PlaceFree(u, stx + SC(124) + SC(56) - uw, y, uw, SC(23));
         PlaceFree(GetDlgItem(gWnd, IDC_MIXSTEPDB), stx + SC(184), y + SC(3), SC(30), SC(20));
+        {                                       // ... and how long fades take
+            const int fx = stx + SC(218);
+            PlaceFree(GetDlgItem(gWnd, IDC_MIXFADELBL), fx, y + SC(3), SC(80), SC(20));
+            HWND fe = GetDlgItem(gWnd, IDC_MIXFADE), fu = GetDlgItem(gWnd, SPIN_UD(IDC_MIXFADE));
+            RECT fr = {}; if (fu) GetWindowRect(fu, &fr);
+            const int fw = fr.right - fr.left;
+            PlaceFree(fe, fx + SC(84), y, SC(52) - fw, SC(23));
+            if (fu) PlaceFree(fu, fx + SC(84) + SC(52) - fw, y, fw, SC(23));
+            PlaceFree(GetDlgItem(gWnd, IDC_MIXFADES), fx + SC(140), y + SC(3), SC(16), SC(20));
+        }
+        y += SC(25);
+        // talkback: its key, and which output hears you while it's held
+        y += SC(4);
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKTB), x0, y + SC(3), nameW, SC(20));
+        PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_TALKBACK)), x0 + nameW + gap, y, colW, SC(23));
+        const int tbx = x0 + nameW + gap + colW + gap + SC(8);
+        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR), tbx, y + SC(3), SC(84), SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_TBOUT), tbx + SC(88), y, SC(150), SC(200));
+        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR2), tbx + SC(244), y + SC(3), SC(110), SC(20));
         y += SC(25);
         // scenes: three to a row, each its name and its key
         y += SC(8);
@@ -9493,7 +9679,7 @@ static void MixerPaintStrips(HDC dc)            // (from the window's paint) the
 static void MeterHold(float v, float& hold, DWORD& t, DWORD now)
 {
     if (v >= hold) { hold = v; t = now; }
-    else if (now - t > 1500) hold *= 0.85f;
+    else if (now - t > 1500) hold *= 0.97f;     // (after 1.5 s it slides down: ~16 dB a second at 60 frames a second)
 }
 static DWORD gLimShowT[MAX_OUT];
 static void MixerMeterTick()                    // (~60 times a second) meters and limit lights on the Mixer page
@@ -9504,7 +9690,16 @@ static void MixerMeterTick()                    // (~60 times a second) meters a
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
     const float ms = last.QuadPart ? Min(200.0f, (float)((now.QuadPart - last.QuadPart) * 1000.0 / qf.QuadPart)) : 16.0f;
     last = now;
-    const float fall = powf(0.82f, ms / 50.0f);   // (falls as fast as before, just in smaller steps)
+    // Ballistics (like a studio peak meter): rises over ~30 ms instead of jumping to every peak, falls at
+    // a steady 14 dB a second instead of collapsing between words or drum hits. Worked out in dB, so it moves evenly.
+    const float rise = 1.0f - expf(-ms / 30.0f), fallDb = 14.0f * ms / 1000.0f;
+    auto ball = [&](float& shownDb, float pk) {
+        const float t = pk > 0.00001f ? Max(-60.0f, 20.0f * log10f(pk)) : -60.0f;
+        if (t > shownDb) shownDb += (t - shownDb) * rise; else shownDb = Max(t, shownDb - fallDb);
+        return shownDb > -59.9f ? powf(10.0f, shownDb / 20.0f) : 0.0f;
+    };
+    static float dbL[CH_MAX] = { -60, -60, -60, -60, -60, -60, -60, -60 }, dbR[CH_MAX] = { -60, -60, -60, -60, -60, -60, -60, -60 };
+    static float dbO[MAX_OUT] = { -60, -60, -60, -60, -60 };
     const DWORD tn = GetTickCount();
     auto q = [](float v) { return v > 0.001f ? (int)(80.0f * log10f(v)) : -240; };   // quarter dB: smooth, still skips tiny changes
     for (int c = 0; c < CH_MAX; c++) {
@@ -9512,8 +9707,8 @@ static void MixerMeterTick()                    // (~60 times a second) meters a
         if (gCh[c].type == CH_NONE) continue;
         const float g = gCh[c].mute ? 0.0f : DbGain10(gCh[c].db10);
         pl *= g; pr *= g;
-        gChShownL[c] = pl > gChShownL[c] ? pl : gChShownL[c] * fall;
-        gChShownR[c] = pr > gChShownR[c] ? pr : gChShownR[c] * fall;
+        gChShownL[c] = ball(dbL[c], pl);
+        gChShownR[c] = ball(dbR[c], pr);
         MeterHold(pl, gChHoldL[c], gChHoldT[c], tn);
         MeterHold(pr, gChHoldR[c], gChHoldTR[c], tn);
         if (pl >= 0.99f || pr >= 0.99f) gChClipT[c] = tn;
@@ -9524,8 +9719,8 @@ static void MixerMeterTick()                    // (~60 times a second) meters a
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
         const float pk = gOutPeakMix[k]; gOutPeakMix[k] = 0;   // (its own copy: the Main tab's meter reads the other)
-        gOutShown[k] = pk > gOutShown[k] ? pk : gOutShown[k] * fall;
-        MeterHold(gOutShown[k], gOutHold[k], gOutHoldT[k], tn);
+        gOutShown[k] = ball(dbO[k], pk);
+        MeterHold(pk, gOutHold[k], gOutHoldT[k], tn);
         if (pk >= 0.97f) gOutClipT[k] = tn;
         static long long lastO[MAX_OUT] = { -999, -999, -999, -999, -999 };
         const long long v = (long long)(q(gOutShown[k]) + 300) + (q(gOutHold[k]) + 300) * 1000LL + (tn - gOutClipT[k] < 2000 ? 1LL << 40 : 0);
@@ -11314,6 +11509,11 @@ static void AddTips()
     TipId(IDC_CHADDBTN,    L"Add a channel: an app (Spotify, a game, a browser...), another input, or what an output device plays. Up to 8.");
     TipId(IDC_MIXKEYSBTN,  L"Hotkeys for the Mixer: each channel's volume, mute, solo, duck and a hold key; each output's volume and mute.");
     TipId(IDC_MIXSTEP,     L"How much one press of a volume key changes it (hold the key to keep going).");
+    TipId(IDC_MIXFADE,     L"How long a channel's Fade key takes to fade it out (then it's muted, keeping its level) or back in.");
+    TipId(IDC_TBOUT,       L"Talkback: while you hold its key, only this output gets your mic (e.g. Discord, not your stream). "
+                           L"If that output doesn't normally have your mic, it gets it while you hold the key.");
+    for (int c = 0; c < CH_MAX; c++) TipId(FxKeyButtonId(SLOT_FADE0 + c), L"Fade: press to fade this channel out over a few seconds (then it's muted); press again to fade it back in.");
+    TipId(FxKeyButtonId(SLOT_TALKBACK), L"Talkback key: hold it to talk to just one output. Right-click to clear.");
     TipId(IDC_SCENEBTN,    L"Scenes: save the whole mixer (channels, volumes, mutes, routing, outputs, ChatMix) under a name and switch between them. Volumes glide to the new ones.");
     TipId(IDC_CHATMIX,     L"ChatMix: slide toward Game and chat channels get quieter; toward Chat and game channels do. Pick which is which in each channel's menu (click its name > ChatMix). Double-click: the middle.");
     TipId(FxKeyButtonId(SLOT_CHATG), L"ChatMix toward game (hold to keep going). Right-click to clear.");
@@ -11850,6 +12050,7 @@ struct MixSnapCh {
     int db10, mute, solo, duck, routes, color, holdTalk, chatRole, link, pan, mono, ducker, width;
     int eqLo, eqMid, eqHi, comp, send[MAX_OUT];
     int keys[MIXA_N][MAX_KEYS];
+    int fadeKeys[MAX_KEYS];
 };
 struct MixSnap {
     MixSnapCh ch[CH_MAX];
@@ -11871,6 +12072,7 @@ static void MixSnapTake(MixSnap& m)
         o.holdTalk = g.holdTalk; o.chatRole = g.chatRole; o.link = g.link; o.pan = g.pan; o.mono = g.mono; o.ducker = g.ducker; o.width = gChW[c];
         o.eqLo = g.eqLo; o.eqMid = g.eqMid; o.eqHi = g.eqHi; o.comp = g.comp; for (int k = 0; k < MAX_OUT; k++) o.send[k] = g.send[k];
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) o.keys[a][i] = gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i];
+        for (int i = 0; i < MAX_KEYS; i++) o.fadeKeys[i] = gFxKeys[SLOT_FADE0 + c][i];
     }
     for (int k = 0; k < MAX_OUT; k++) {
         m.vol[k] = gRowVol[k]; m.omute[k] = gOutMute[k]; m.ceil[k] = gOutCeil10[k]; m.ow[k] = gOutW[k];
@@ -11901,6 +12103,7 @@ static void MixSnapApply(const MixSnap& m)
         g.holdTalk = o.holdTalk; g.chatRole = o.chatRole; g.link = o.link; g.pan = o.pan; g.mono = o.mono != 0; g.ducker = o.ducker != 0; gChW[c] = o.width;
         g.eqLo = o.eqLo; g.eqMid = o.eqMid; g.eqHi = o.eqHi; g.comp = o.comp; for (int k = 0; k < MAX_OUT; k++) g.send[k] = o.send[k];
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = o.keys[a][i];
+        for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_FADE0 + c][i] = o.fadeKeys[i];
         MixKeysShow(c); FaderLabel(IDC_CHVOL0 + c);
     }
     for (int k = 0; k < MAX_OUT; k++) {
@@ -11973,8 +12176,79 @@ static void MixUndo(bool redo)
     MixSnapTake(gMixStable); gMixSeen = gMixStable;
     wchar_t t[90]; _snwprintf(t, 89, L"%s: %s", redo ? L"Redo" : L"Undo", what); t[89] = 0; ShowOsd(t, true);
 }
+// ---- fades: a channel slides out over a few seconds (then mutes, keeping its level), or back in
+static struct ChFade { bool on, out; int from, to, restore, last; DWORD t0, ms; } gFade[CH_MAX];
+static bool ChanFading(int c, bool* out) { if (gFade[c].on && out) *out = gFade[c].out; return gFade[c].on; }
+static void ChanFade(int c, int dir, int secs = 0)   // dir: 0 out, 1 in, -1 = whichever it isn't
+{
+    if (c < 0 || c >= CH_MAX || gCh[c].type == CH_NONE) return;
+    ChFade& f = gFade[c];
+    bool out;
+    if (dir >= 0) out = dir == 0;
+    else if (f.on) out = !f.out;               // (pressed again while fading: turn round)
+    else out = !(gCh[c].mute || gCh[c].db10 <= -600);
+    const int ms = Iclamp((secs > 0 ? secs : gMixFadeSecs) * 1000, 200, 30000);
+    const int lowest = -400;                    // (-40 dB: below that it's silent anyway, so the fade spends its time where you hear it)
+    if (out) {
+        if (gCh[c].mute && !f.on) return;       // (already out)
+        const int now = gCh[c].db10;
+        f.restore = f.on ? f.restore : now; f.from = Imax(now, lowest); f.to = lowest;
+    } else {
+        int target = f.on ? f.restore : (gCh[c].db10 > -600 ? gCh[c].db10 : 0);
+        if (!f.on && !gCh[c].mute && gCh[c].db10 > -600) return;   // (already in)
+        f.restore = target;
+        const int start = f.on ? Imax(gCh[c].db10, lowest) : lowest;
+        ChanMute(c, false);
+        FaderSet(IDC_CHVOL0 + c, start);
+        f.from = start; f.to = target;
+    }
+    f.on = true; f.out = out; f.t0 = GetTickCount(); f.ms = (DWORD)ms; f.last = gCh[c].db10;
+    wchar_t who[40], t[80]; ChanLabel(c, who, 32);
+    wsprintfW(t, out ? L"fading out (%d s)" : L"fading in (%d s)", (ms + 500) / 1000);
+    MixOsd(who, t, !out);
+    MixerRedraw();
+}
+static void FadeTick()                          // (~60 times a second)
+{
+    for (int c = 0; c < CH_MAX; c++) {
+        ChFade& f = gFade[c];
+        if (!f.on) continue;
+        if (gCh[c].type == CH_NONE || gCh[c].db10 != f.last) { f.on = false; continue; }   // you moved its fader: the fade stops
+        const DWORD el = GetTickCount() - f.t0;
+        if (el >= f.ms) {
+            f.on = false;
+            if (f.out) { ChanMute(c, true); FaderSet(IDC_CHVOL0 + c, f.restore); }   // out: muted, at the level it had
+            else FaderSet(IDC_CHVOL0 + c, f.to);
+            MixerRedraw();
+            continue;
+        }
+        const float x = (float)el / f.ms;
+        FaderSet(IDC_CHVOL0 + c, f.from + (int)lround((f.to - f.from) * x));
+        f.last = gCh[c].db10;
+        InvalidateRect(GetDlgItem(gWnd, IDC_CHVOL0 + c), nullptr, FALSE);
+    }
+}
+static void TalkbackSet(bool on)
+{
+    const int k = Iclamp(gTalkbackOut, 0, Imax(0, gRows - 1));
+    if (on == (gTalkback >= 0)) return;
+    gTalkback = on ? k : -1;
+    wchar_t who[40], t[90]; OutName(k, who, 32);
+    if (on) wsprintfW(t, L"Talkback: only %s hears you", who); else lstrcpyW(t, L"Talkback off");
+    ShowOsd(t, on);
+}
+static void TalkbackFill();
+static void TalkbackFill()                      // (the talkback list: the outputs as they're named now)
+{
+    HWND cb = GetDlgItem(gWnd, IDC_TBOUT); if (!cb) return;
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    for (int k = 0; k < Imax(1, gRows); k++) { wchar_t n[40]; OutName(k, n, 32); SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)n); }
+    SendMessageW(cb, CB_SETCURSEL, Iclamp(gTalkbackOut, 0, Imax(0, gRows - 1)), 0);
+}
 static void MixKey(int slot, bool down, bool pressed, bool released)
 {
+    if (slot == SLOT_TALKBACK) { if (pressed) TalkbackSet(true); else if (released) TalkbackSet(false); return; }   // (held)
+    if (slot >= SLOT_FADE0) { if (pressed) ChanFade(slot - SLOT_FADE0, -1); return; }
     if (slot >= SLOT_SCENE0) { if (pressed) SceneApply(slot - SLOT_SCENE0); return; }
     if (slot == SLOT_CHATG || slot == SLOT_CHATC) {
         if (!MixRepeat(slot, down, pressed)) return;
@@ -12523,7 +12797,8 @@ static void Layout()
             if (cid == IDC_MIXHINT) { bool any = false; for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) any = true; vis = vis && !any; }
             if (cid >= IDC_MIXKEY0 && cid < IDC_MIXKEY0 + (KEY_SLOTS - SLOT_MIX0)) {   // hotkeys: channels in use, outputs there
                 const int sl = SLOT_MIX0 + cid - IDC_MIXKEY0;
-                vis = vis && (sl >= SLOT_SCENE0 ? sl - SLOT_SCENE0 < gSceneN : sl >= SLOT_CHATG ? true
+                vis = vis && (sl == SLOT_TALKBACK ? true : sl >= SLOT_FADE0 ? gCh[sl - SLOT_FADE0].type != CH_NONE
+                            : sl >= SLOT_SCENE0 ? sl - SLOT_SCENE0 < gSceneN : sl >= SLOT_CHATG ? true
                             : sl < SLOT_MIXOUT0 ? gCh[(sl - SLOT_MIX0) / MIXA_N].type != CH_NONE : (sl - SLOT_MIXOUT0) / MIXO_N < gRows);
             }
             if (cid >= IDC_MIXKROW0 && cid < IDC_MIXKROW0 + CH_MAX + MAX_OUT) {
@@ -13560,6 +13835,7 @@ static bool      gWsLockInit = false, gWsNetUp = false;
 struct WsOut { int id; char* msg; };
 static WsOut     gWsQ[128]; static int gWsQN = 0;  // replies / events waiting to go out (id -1: everyone)
 static int       gWsAuthed[32], gWsAuthedN = 0; // connections that gave the password
+static int       gWsLvId[32], gWsLvMs[32], gWsLvN = 0; static DWORD gWsLvT[32];   // connections that want levels, how often
 static int       gWsCount = 0;                  // connected now (window thread's count)
 static int       gWsState = 0;                  // 0 off, 1 listening, 2 the port is in use
 
@@ -13691,7 +13967,7 @@ static void WsStop()                            // closes the port and every con
         LeaveCriticalSection(&gWsLock);
     }
     if (gWsNetUp) { WSACleanup(); gWsNetUp = false; }
-    gWsAuthedN = 0; gWsCount = 0; gWsState = 0;
+    gWsAuthedN = 0; gWsCount = 0; gWsState = 0; gWsLvN = 0;
 }
 static void WsStart()                           // (only when it's switched on in Settings)
 {
@@ -13845,9 +14121,29 @@ static void WsExec(int id, const char* m)
         if (k < 0 || k >= CLIP_N || !gClips[k].base) { WsReply(id, what, "No clip with that number \"n\"."); return; }
         gPads[CLIP0 + k].trigger = true; WsReply(id, what, nullptr); return;
     }
+    if (!strcmp(what, "levels")) {              // {"do":"levels","on":true,"rate":10}: levels this many times a second (1-20)
+        int i = 0; while (i < gWsLvN && gWsLvId[i] != id) i++;
+        if (JsonOnOff(m, "on") == 0) { if (i < gWsLvN) { gWsLvN--; gWsLvId[i] = gWsLvId[gWsLvN]; gWsLvMs[i] = gWsLvMs[gWsLvN]; gWsLvT[i] = gWsLvT[gWsLvN]; } WsReply(id, what, nullptr); return; }
+        const int rate = JsonNum(m, "rate", &v) ? Iclamp((int)v, 1, 20) : 10;
+        if (i == gWsLvN) { if (gWsLvN >= 32) { WsReply(id, what, "Too many connections want levels."); return; } gWsLvId[gWsLvN++] = id; }
+        gWsLvMs[i] = 1000 / rate; gWsLvT[i] = 0;
+        WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "talkback")) {            // {"do":"talkback","on":true,"n":2}: only output 2 gets your mic (until "on":false)
+        if (JsonNum(m, "n", &v)) gTalkbackOut = Iclamp((int)v - 1, 0, MAX_OUT - 1);
+        WsBool(m, "on", gTalkback >= 0, &b); TalkbackSet(b);
+        WsReply(id, what, nullptr); return;
+    }
     if (!strcmp(what, "channel")) {             // {"do":"channel","name":"Spotify","db":-12,"mute":true,"solo":false,"duck":true}
         const int c = WsFindChannel(m);
         if (c < 0) { WsReply(id, what, "No Mixer channel with that \"n\" or \"name\"."); return; }
+        {                                       // "fade":"out" / "in" / "toggle", over "seconds" (else the Mixer's fade time)
+            char fd[16] = ""; const char* pf = m;
+            if (JsonString(m, "fade", &pf, fd, 16)) {
+                const int secs = JsonNum(m, "seconds", &v) ? Iclamp((int)lround(v), 1, 30) : 0;
+                ChanFade(c, !_stricmp(fd, "out") ? 0 : !_stricmp(fd, "in") ? 1 : -1, secs);
+            }
+        }
         if (JsonNum(m, "db", &v)) FaderSet(IDC_CHVOL0 + c, (int)lround(v * 10));
         if (JsonOnOff(m, "mute") >= 0) { WsBool(m, "mute", gCh[c].mute, &b); ChanMute(c, b); }
         if (JsonOnOff(m, "solo") >= 0) { WsBool(m, "solo", gCh[c].solo, &b); gCh[c].solo = b; }
@@ -13908,6 +14204,81 @@ static void WsEvents()                          // (50 ms, while anything is con
         }
         lastProf = gProfCur;
     }
+    auto esc = [](const wchar_t* w, char* e, int cap) { char n[200]; WideCharToMultiByte(CP_UTF8, 0, w, -1, n, 200, nullptr, nullptr); JsonEsc(n, e, cap); };
+    {                                           // a Mixer channel muted / soloed (by anything: a click, a key, a fade, a scene)
+        static int last[CH_MAX] = { -1, -1, -1, -1, -1, -1, -1, -1 };
+        for (int c = 0; c < CH_MAX; c++) {
+            const int st = gCh[c].type == CH_NONE ? 0 : 1 | (gCh[c].mute ? 2 : 0) | (gCh[c].solo ? 4 : 0);
+            if (st == last[c]) continue;
+            const bool tell = last[c] > 0 && st > 0; last[c] = st;
+            if (!tell) continue;
+            wchar_t nm[40]; ChanLabel(c, nm, 32); char e[200]; esc(nm, e, 200);
+            snprintf(r, sizeof(r), "{\"event\":\"channel\",\"n\":%d,\"name\":\"%s\",\"mute\":%s,\"solo\":%s}", c + 1, e,
+                     gCh[c].mute ? "true" : "false", gCh[c].solo ? "true" : "false");
+            WsQueue(-1, r);
+        }
+    }
+    {
+        static int last[MAX_OUT] = { -1, -1, -1, -1, -1 };
+        for (int k = 0; k < MAX_OUT; k++) {
+            const int st = k >= gRows ? 0 : 1 | (gOutMute[k] ? 2 : 0);
+            if (st == last[k]) continue;
+            const bool tell = last[k] > 0 && st > 0; last[k] = st;
+            if (!tell) continue;
+            wchar_t nm[40]; OutName(k, nm, 32); char e[200]; esc(nm, e, 200);
+            snprintf(r, sizeof(r), "{\"event\":\"output\",\"n\":%d,\"name\":\"%s\",\"mute\":%s}", k + 1, e, gOutMute[k] ? "true" : "false");
+            WsQueue(-1, r);
+        }
+    }
+    {
+        static int lastScene = -2;
+        if (gSceneCur != lastScene) {
+            if (lastScene != -2 && gSceneCur >= 0 && gSceneCur < gSceneN) {
+                char e[200]; esc(gSceneName[gSceneCur], e, 200);
+                snprintf(r, sizeof(r), "{\"event\":\"scene\",\"name\":\"%s\"}", e); WsQueue(-1, r);
+            }
+            lastScene = gSceneCur;
+        }
+    }
+    {
+        static int lastTalk = -1, lastTb = -2;
+        const int t = gRunning && gTalkingNow ? 1 : 0;
+        if (t != lastTalk) { if (lastTalk >= 0) { snprintf(r, sizeof(r), "{\"event\":\"talking\",\"on\":%s}", t ? "true" : "false"); WsQueue(-1, r); } lastTalk = t; }
+        if (gTalkback != lastTb) {
+            if (lastTb != -2) {
+                wchar_t nm[40] = L""; if (gTalkback >= 0) OutName(gTalkback, nm, 32); char e[200]; esc(nm, e, 200);
+                snprintf(r, sizeof(r), "{\"event\":\"talkback\",\"on\":%s,\"output\":\"%s\"}", gTalkback >= 0 ? "true" : "false", e); WsQueue(-1, r);
+            }
+            lastTb = gTalkback;
+        }
+    }
+    if (gWsLvN) {                               // levels, to the connections that asked (dB, -60 = silent)
+        static float chMax[CH_MAX], outMax[MAX_OUT];
+        for (int c = 0; c < CH_MAX; c++) { const float p = gChPkWs[c]; gChPkWs[c] = 0; if (p > chMax[c]) chMax[c] = p; }
+        for (int k = 0; k < MAX_OUT; k++) { const float p = gOutPkWs[k]; gOutPkWs[k] = 0; if (p > outMax[k]) outMax[k] = p; }
+        const DWORD now = GetTickCount();
+        bool due = false; for (int i = 0; i < gWsLvN; i++) if (now - gWsLvT[i] >= (DWORD)gWsLvMs[i] - 10) due = true;
+        if (due) {
+            static char big[4000]; int n = snprintf(big, sizeof(big), "{\"event\":\"levels\",\"talking\":%s,\"channels\":[", gTalkingNow ? "true" : "false");
+            bool first = true;
+            for (int c = 0; c < CH_MAX && n < 3500; c++) {
+                if (gCh[c].type == CH_NONE) continue;
+                wchar_t nm[40]; ChanLabel(c, nm, 32); char e[200]; esc(nm, e, 200);
+                const float db = chMax[c] > 0.001f ? 20.0f * log10f(chMax[c]) : -60.0f;
+                n += snprintf(big + n, sizeof(big) - n, "%s{\"n\":%d,\"name\":\"%s\",\"db\":%.1f}", first ? "" : ",", c + 1, e, db); first = false;
+            }
+            n += snprintf(big + n, sizeof(big) - n, "],\"outputs\":[");
+            for (int k = 0; k < gRows && k < MAX_OUT && n < 3800; k++) {
+                wchar_t nm[40]; OutName(k, nm, 32); char e[200]; esc(nm, e, 200);
+                const float db = outMax[k] > 0.001f ? 20.0f * log10f(outMax[k]) : -60.0f;
+                n += snprintf(big + n, sizeof(big) - n, "%s{\"n\":%d,\"name\":\"%s\",\"db\":%.1f}", k ? "," : "", k + 1, e, db);
+            }
+            snprintf(big + n, sizeof(big) - n, "]}");
+            for (int i = 0; i < gWsLvN; i++) if (now - gWsLvT[i] >= (DWORD)gWsLvMs[i] - 10) { gWsLvT[i] = now; WsQueue(gWsLvId[i], big); }
+            for (int c = 0; c < CH_MAX; c++) chMax[c] = 0;
+            for (int k = 0; k < MAX_OUT; k++) outMax[k] = 0;
+        }
+    }
 }
 static void WsStatusText()                      // Settings: what it's doing
 {
@@ -13945,8 +14316,8 @@ static void WsHelp()                            // Settings: how to set up Strea
 }
 static void WsGuide()                           // Settings: the walkthrough, and how messages are written
 {
-    wchar_t t[4500];
-    swprintf(t, 4500,
+    static wchar_t t[8000];
+    swprintf(t, 8000,
         L"USING LAG EFFECT WITH STREAMER.BOT\n\n"
         L"1. Here: tick \"Let apps on this PC control Lag Effect\". The line under it says ws://127.0.0.1:%d.\n\n"
         L"2. In Streamer.bot: Servers/Clients > Websocket Clients > right-click > Add.\n"
@@ -13973,12 +14344,17 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"        (also \"pan\":-50 (-100 left .. 100 right), \"mono\":true, \"ducksothers\":true,\n"
         L"         \"bass\"/\"middle\"/\"treble\":3 (dB), \"compressor\":40 (0-100), \"out2db\":-10 (its level on output 2))\n"
         L"    {\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}   an output (or \"name\": what you called it)\n"
+        L"        \"fade\":\"out\" / \"in\" / \"toggle\" (with \"seconds\":5 if you like): fade it out (then muted) or in\n"
         L"    {\"do\":\"scene\",\"name\":\"Gaming\"}   switch the Mixer to a scene;  {\"do\":\"chatmix\",\"value\":-50}  (-100 game .. 100 chat)\n"
+        L"    {\"do\":\"talkback\",\"on\":true,\"n\":2}   only output 2 hears your mic, until \"on\":false\n"
+        L"    {\"do\":\"levels\",\"on\":true,\"rate\":10}   get every channel's and output's level 10 times a second (for overlays)\n"
         L"    {\"do\":\"start\"}  {\"do\":\"stop\"}  {\"do\":\"status\"}  {\"do\":\"ping\"}\n\n"
         L"REPLIES AND EVENTS\n"
         L"Every message gets a reply: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}. Lag Effect also tells Streamer.bot\n"
         L"when things change: {\"event\":\"mute\",\"on\":true}, {\"event\":\"lag\",...}, {\"event\":\"fx\",...},\n"
-        L"{\"event\":\"profile\",\"name\":...}, {\"event\":\"running\",...}. Use them with the trigger\n"
+        L"{\"event\":\"profile\",\"name\":...}, {\"event\":\"running\",...}, {\"event\":\"scene\",\"name\":...},\n"
+        L"{\"event\":\"channel\",\"name\":...,\"mute\":...,\"solo\":...}, {\"event\":\"output\",\"n\":2,\"mute\":...},\n"
+        L"{\"event\":\"talking\",\"on\":true} (you started / stopped talking), {\"event\":\"talkback\",...}. Use them with the trigger\n"
         L"Core > Websocket > Client > Websocket Client Message (the text is in %%message%%).\n\n"
         L"PASSWORD\n"
         L"If you set one, send {\"do\":\"auth\",\"password\":\"...\"} first after connecting (\"Copy C# code\" includes it).\n\n"
@@ -14852,8 +15228,8 @@ static void CreateUI()
     gSecKeys = gSectionN;
     AddSection(14, 54, 532, 530, L"Mixer hotkeys");
     {
-        static const wchar_t* cols[7] = { L"", L"Vol +", L"Vol \x2212", L"Mute", L"Solo", L"Duck", L"Hold" };
-        for (int i = 1; i < 7; i++) Ctl(L"STATIC", cols[i], SS_CENTER, 30 + i * 60, 100, 58, 18, IDC_MIXKCOL0 + i);
+        static const wchar_t* cols[8] = { L"", L"Vol +", L"Vol \x2212", L"Mute", L"Solo", L"Duck", L"Hold", L"Fade" };
+        for (int i = 1; i < 8; i++) Ctl(L"STATIC", cols[i], SS_CENTER, 30 + i * 60, 100, 58, 18, IDC_MIXKCOL0 + i);
         Ctl(L"STATIC", L"Hold does", SS_CENTER, 470, 100, 60, 18, IDC_MIXKCOL0);
         Ctl(L"STATIC", L"Channels", 0, 30, 100, 90, 18, IDC_MIXKCH);
         Ctl(L"STATIC", L"Outputs", 0, 30, 300, 90, 18, IDC_MIXKOUT);
@@ -14869,6 +15245,15 @@ static void CreateUI()
         Ctl(L"STATIC", L"Volume keys step:", SS_RIGHT, 30, 540, 120, 20, IDC_MIXKEYHDR);
         Spin(IDC_MIXSTEP, 196, 537, 56, 1, 10, gMixStep);
         Ctl(L"STATIC", L"dB", 0, 258, 540, 30, 20, IDC_MIXSTEPDB);
+        Ctl(L"STATIC", L"Fades take:", SS_RIGHT, 300, 540, 80, 20, IDC_MIXFADELBL);
+        Spin(IDC_MIXFADE, 384, 537, 56, 1, 30, gMixFadeSecs);
+        Ctl(L"STATIC", L"s", 0, 444, 540, 20, 20, IDC_MIXFADES);
+        Ctl(L"STATIC", L"Talkback", 0, 30, 500, 90, 18, IDC_MIXKTB);
+        Ctl(L"STATIC", L"Hold it: only", SS_RIGHT, 200, 500, 90, 18, IDC_TBHDR);
+        HWND tb = Ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 300, 497, 140, 200, IDC_TBOUT);
+        SendMessageW(tb, CB_SETDROPPEDWIDTH, 240, 0);
+        Ctl(L"STATIC", L"hears your mic", 0, 446, 500, 100, 18, IDC_TBHDR2);
+        TalkbackFill();
     }
     gBuildSub = -1;
     gBuildPage = -1;
@@ -15528,6 +15913,19 @@ static void OnCommand(int id, int code)
         InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
         return;
     }
+    if (id == IDC_MIXFADE) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v >= 1) gMixFadeSecs = Iclamp(v, 1, 30);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)gMixFadeSecs, FALSE);
+        return;
+    }
+    if (id == IDC_TBOUT) {
+        HWND cb = GetDlgItem(gWnd, IDC_TBOUT);
+        if (code == CBN_DROPDOWN) TalkbackFill();
+        else if (code == CBN_SELCHANGE) gTalkbackOut = Iclamp((int)SendMessageW(cb, CB_GETCURSEL, 0, 0), 0, MAX_OUT - 1);
+        return;
+    }
     if (id == IDC_MIXSTEP) {
         if (!gUiReady) return;
         BOOL ok = FALSE; int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
@@ -15974,7 +16372,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
-        if (w == TIMER_MIXMETER) { if (!gMoving) MixerMeterTick(); return 0; }   // (its own, faster timer: smooth meters)
+        if (w == TIMER_MIXMETER) { FadeTick(); if (!gMoving) MixerMeterTick(); return 0; }   // (its own, faster timer: smooth meters, fades)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
@@ -16045,6 +16443,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         else {
             gWsCount = Imax(0, gWsCount - 1);
             for (int i = 0; i < gWsAuthedN; i++) if (gWsAuthed[i] == (int)w) { gWsAuthed[i] = gWsAuthed[--gWsAuthedN]; break; }
+            for (int i = 0; i < gWsLvN; i++) if (gWsLvId[i] == (int)w) { gWsLvN--; gWsLvId[i] = gWsLvId[gWsLvN]; gWsLvMs[i] = gWsLvMs[gWsLvN]; gWsLvT[i] = gWsLvT[gWsLvN]; break; }
         }
         if (l && gWsThread) { char r[700]; WsStatusJson(r, 700); WsQueue((int)w, r); }   // (a newcomer gets the state)
         WsStatusText();
