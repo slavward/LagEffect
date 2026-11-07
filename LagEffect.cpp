@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.35.1"
+#define APP_VERSION L"1.36.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -391,13 +391,25 @@ struct ChanSet {
     int color;
     int holdTalk;                               // its hold hotkey: 0 = silences it while held, 1 = only plays while held
     volatile bool held;                         // (that key is held / push-to-talk without the key: quiet)
+    volatile int chatRole;                      // ChatMix: 0 = not in it, 1 = game, 2 = chat
 };
+static volatile int   gChatMix = 0;             // ChatMix: -100 (only game) .. 0 (both) .. +100 (only chat)
+static volatile DWORD gFadeSlowUntil = 0;       // (a scene switch: volumes glide over ~0.4 s instead of ~25 ms)
+static volatile bool  gChAudible[8];            // (the audio thread: still fading out, so keep feeding it)
+static inline float ChatGain(int role)          // what ChatMix does to a game / chat channel
+{
+    const int v = gChatMix;
+    if (role == 1) return v > 0 ? 1.0f - v / 100.0f : 1.0f;   // toward chat: game goes down
+    if (role == 2) return v < 0 ? 1.0f + v / 100.0f : 1.0f;   // toward game: chat goes down
+    return 1.0f;
+}
 static inline float DbGain10(int db10) { return db10 <= -600 ? 0.0f : powf(10.0f, db10 / 200.0f); }
 static volatile int gDuckDb = 12;               // how much ducked channels drop while you talk
 static int  gChW[CH_MAX], gOutW[MAX_OUT];       // Mixer strip widths (design px, 0 = the normal width)
 static int  gMixStep = 2;                       // Mixer hotkeys: dB per press
 static int  gMixSub = 0;                        // Mixer tab: 0 = the strips, 1 = its hotkeys
 static void MixMemStore(int c);
+static void ScenesLoad();
 static ChanSet gCh[CH_MAX];
 static volatile bool gOutMute[MAX_OUT];
 static wchar_t gOutName[MAX_OUT][32];           // your name for an output ("" = "Out 1"...)
@@ -411,7 +423,7 @@ static void ChanPush(int c, const float* in, unsigned frames, int chans)   // (c
 {
     ChanAudio& a = gChA[c];
     if (!a.live || !in) return;
-    if (gCh[c].mute || (!gCh[c].routes && !gCh[c].solo)) {   // can't be heard: only the meter needs it
+    if (!gChAudible[c] && (gCh[c].mute || gCh[c].held || (!gCh[c].routes && !gCh[c].solo))) {   // can't be heard: only the meter needs it
         float pl = 0, pr = 0;
         for (unsigned f = 0; f < frames; f++) {
             float l = fabsf(in[f * chans]), r = chans > 1 ? fabsf(in[f * chans + 1]) : l;
@@ -2162,8 +2174,11 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     if (looping) spMode = SP_NONE;
 
     // Mixer channels: how much each has buffered, its gain and where it goes (read once per block).
-    float    chG[CH_MAX]; unsigned chRd[CH_MAX], chAv[CH_MAX], chRt[CH_MAX]; int chAdj[CH_MAX], act[CH_MAX], nAct = 0; bool anyCh = false;
+    unsigned chRd[CH_MAX], chAv[CH_MAX]; int chAdj[CH_MAX], act[CH_MAX], nAct = 0; bool anyCh = false;
     bool     chDk[CH_MAX];
+    static float chCur[CH_MAX][MAX_OUT];        // each channel's gain on each output now (it glides: no clicks)
+    float    chTgt[CH_MAX][MAX_OUT];            // ... and where it's heading
+    const float fc = (int)(GetTickCount() - gFadeSlowUntil) < 0 ? 0.00024f : 0.005f;   // per sample: down 40 dB in ~0.4 s / ~20 ms
     // Solo: while any channel is soloed, your listening output (the "Always hear sounds on" one, else output 1)
     // plays only the soloed channels; every other output carries on as normal.
     unsigned soloMask = 0;
@@ -2171,8 +2186,9 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const int soloOut = gHearOut >= 1 && gHearOut <= MAX_OUT ? gHearOut - 1 : 0;
     for (int c = 0; c < CH_MAX; c++) {
         ChanAudio& a = gChA[c];
-        chG[c] = 0; chRt[c] = 0; chAv[c] = 0; chRd[c] = a.r;
-        if (!a.live) { a.primed = false; continue; }
+        chAv[c] = 0; chRd[c] = a.r;
+        for (int k = 0; k < MAX_OUT; k++) chTgt[c][k] = chCur[c][k];   // (not playing this block: stays where it is)
+        if (!a.live) { a.primed = false; gChAudible[c] = false; continue; }
         const unsigned wr = a.w; MemoryBarrier();
         unsigned rd = a.r, av = wr - rd;
         const unsigned target = frames + 1024;  // ~20 ms + a block of cushion against the capture's bursts
@@ -2181,13 +2197,18 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (av < frames) a.primed = false;      // about to run dry: wait for a cushion again after this block
         unsigned rt = gCh[c].routes;
         if (soloMask) { rt &= ~(1u << soloOut); if (soloMask & (1u << c)) rt |= 1u << soloOut; }
-        if (gCh[c].mute || gCh[c].held || !rt) { chRd[c] = wr; continue; }   // can't be heard: just keep its buffer empty
+        const float g = gCh[c].mute || gCh[c].held ? 0.0f : DbGain10(gCh[c].db10) * ChatGain(gCh[c].chatRole);
+        bool need = false;
+        for (int k = 0; k < MAX_OUT; k++) {
+            chTgt[c][k] = rt & (1u << k) ? g : 0.0f;
+            if (chTgt[c][k] > 0.0f || chCur[c][k] > 0.0001f) need = true;
+        }
+        gChAudible[c] = need;
+        if (!need) { for (int k = 0; k < MAX_OUT; k++) chCur[c][k] = 0; chRd[c] = wr; continue; }   // silent: keep its buffer empty
         chRd[c] = rd; chAv[c] = av;
         // Its clock and ours never match exactly: drop / repeat one sample now and then to keep the cushion steady.
         chAdj[c] = av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
-        chG[c] = DbGain10(gCh[c].db10);
         chDk[c] = gCh[c].duck;
-        chRt[c] = rt;
         act[nAct++] = c;                        // (the per-sample loop only visits these)
         anyCh = true;
     }
@@ -2431,12 +2452,16 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 const int c = act[ci];
                 if (!chAv[c]) continue;
                 const unsigned i = (chRd[c] & (CH_RING - 1)) * 2;
-                const float g = chDk[c] ? chG[c] * chDuck : chG[c];
-                const float L = gChA[c].buf[i] * g, R = gChA[c].buf[i + 1] * g;
+                const float dk = chDk[c] ? chDuck : 1.0f;
+                const float L = gChA[c].buf[i] * dk, R = gChA[c].buf[i + 1] * dk;
                 if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
                 else { chRd[c]++; chAv[c]--; }
                 if (f == frames / 2 && chAdj[c] > 0 && chAv[c] > 1) { chRd[c]++; chAv[c]--; }   // skip one
-                for (int k = 0; k < MAX_OUT; k++) if (chRt[c] & (1u << k)) { cL[k] += L; cR[k] += R; }
+                for (int k = 0; k < MAX_OUT; k++) {
+                    float& g = chCur[c][k];
+                    g += (chTgt[c][k] - g) * fc;         // (glides to where it's heading)
+                    if (g > 0.00001f) { cL[k] += L * g; cR[k] += R * g; }
+                }
             }
         float m0 = soloMask && soloOut == 0 ? 0.0f : RowSignal(mode[0], effect, everything, clean) + sounds(0);
         float oL = (m0 + cL[0]) * vol[0], oR = (m0 + cR[0]) * vol[0];
@@ -2456,7 +2481,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             w[k]++;
         }
     }
-    for (int c = 0; c < CH_MAX; c++) if (gChA[c].live) gChA[c].r = chRd[c];
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gChA[c].live) gChA[c].r = chRd[c];
+        for (int k = 0; k < MAX_OUT; k++) if (fabsf(chCur[c][k] - chTgt[c][k]) < 0.0001f) chCur[c][k] = chTgt[c][k];   // (arrived)
+    }
     MemoryBarrier();
     for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
@@ -2562,10 +2590,13 @@ enum {
     IDC_CHSOLO0 = 1640, IDC_CHDUCK0 = 1650, IDC_CHDB0 = 1660, IDC_CHADD0 = 1670,
     IDC_ODEV0 = 1680, IDC_ODB0 = 1690, IDC_OLIM0 = 1700, IDC_DUCKDB = 1710, IDC_RESTARTAUD = 1711, IDC_CHNAMEED = 1712,
     IDC_CHADDBTN = 1713, IDC_MIXHINT = 1714, IDC_MIXKEYSBTN = 1715, IDC_MIXSTEP = 1716, IDC_MIXKEYHDR = 1717, IDC_MIXSTEPDB = 1718,
-    IDC_MIXKEY0 = 1720,                         // .. +63: one button per mixer hotkey (SLOT_MIX0 order)
-    IDC_MIXKROW0 = 1790,                        // .. +13: each row's name (channels, then outputs)
-    IDC_MIXHOLDMODE0 = 1810,                    // .. +8: a channel's hold key: mutes it / push-to-talk
-    IDC_MIXKCOL0 = 1820,                        // .. +7: the column headings
+    IDC_MIXKEY0 = 1720,                         // .. +73: one button per mixer hotkey (SLOT_MIX0 order)
+    IDC_MIXKROW0 = 1900,                        // .. +13: each row's name (channels, then outputs)
+    IDC_MIXHOLDMODE0 = 1920,                    // .. +8: a channel's hold key: mutes it / push-to-talk
+    IDC_MIXKCOL0 = 1930,                        // .. +7: the column headings
+    IDC_SCENEBTN = 1940, IDC_CHATMIX = 1941, IDC_CHATLBLG = 1942, IDC_CHATLBLC = 1943,
+    IDC_MIXKCH = 1944, IDC_MIXKOUT = 1945, IDC_MIXKCHAT = 1946, IDC_MIXKSCN = 1947,
+    IDC_MIXKSCNNAME0 = 1950,                    // .. +8: each scene's name by its hotkey
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -2866,7 +2897,11 @@ enum { MIXA_UP, MIXA_DOWN, MIXA_MUTE, MIXA_SOLO, MIXA_DUCK, MIXA_HOLD, MIXA_N };
 enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_MIX0    (SLOT_PROF0 + PROF_MAX)
 #define SLOT_MIXOUT0 (SLOT_MIX0 + CH_MAX * MIXA_N)
-#define KEY_SLOTS    (SLOT_MIXOUT0 + MAX_OUT * MIXO_N)
+#define SLOT_CHATG   (SLOT_MIXOUT0 + MAX_OUT * MIXO_N)   // ChatMix: toward game / toward chat
+#define SLOT_CHATC   (SLOT_CHATG + 1)
+#define SCENE_MAX    8
+#define SLOT_SCENE0  (SLOT_CHATC + 1)            // a hotkey per scene
+#define KEY_SLOTS    (SLOT_SCENE0 + SCENE_MAX)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -3477,6 +3512,14 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 // ======================= settings =======================
 static const wchar_t* FxKeyIniName(int slot)
 {
+    if (slot == SLOT_CHATG) return L"mix_chatmix_game";
+    if (slot == SLOT_CHATC) return L"mix_chatmix_chat";
+    if (slot >= SLOT_SCENE0) {
+        static wchar_t sn[SCENE_MAX][20];
+        wchar_t* n = sn[slot - SLOT_SCENE0];
+        if (!n[0]) wsprintfW(n, L"mix_scene%d_key", slot - SLOT_SCENE0 + 1);
+        return n;
+    }
     if (slot >= SLOT_MIX0) {                    // mixer: "mix_ch3_up", "mix_out2_mute"...
         static wchar_t names[KEY_SLOTS - SLOT_MIX0][24];
         static const wchar_t* ca[MIXA_N] = { L"up", L"down", L"mute", L"solo", L"duck", L"hold" };
@@ -3700,6 +3743,9 @@ static void LoadSettings()
     }
     gDuckDb = Iclamp(INI_INT(L"mixer_duck_db", 12), 3, 30);
     gMixStep = Iclamp(INI_INT(L"mixer_key_step", 2), 1, 10);
+    gChatMix = Iclamp(INI_INT(L"mixer_chatmix", 0), -100, 100);
+    for (int c = 0; c < CH_MAX; c++) { wchar_t k[24]; wsprintfW(k, L"ch_%d_chatmix", c); gCh[c].chatRole = Iclamp(INI_INT(k, 0), 0, 2); }
+    ScenesLoad();
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  int v = INI_INT(key, 0); gChW[c] = v ? Iclamp(v, 52, 240) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); int v = INI_INT(key, 0); gOutW[k] = v ? Iclamp(v, 84, 320) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
@@ -4547,7 +4593,8 @@ static void SaveSettings()
         wsprintfW(k, L"ch_%d_routes", c); SaveInt(k, (int)gCh[c].routes);
     }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); } SaveInt(L"tts_volume", gTtsVol);
-    SaveInt(L"mixer_duck_db", gDuckDb); SaveInt(L"mixer_key_step", gMixStep);
+    SaveInt(L"mixer_duck_db", gDuckDb); SaveInt(L"mixer_key_step", gMixStep); SaveInt(L"mixer_chatmix", gChatMix);
+    for (int c = 0; c < CH_MAX; c++) { wchar_t k[24]; wsprintfW(k, L"ch_%d_chatmix", c); SaveInt(k, gCh[c].chatRole); }
     for (int c = 0; c < CH_MAX; c++) MixMemStore(c);   // (remember each app's settings for next time)
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_name", k); IniSet(key, gOutName[k]); }
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  SaveInt(key, gChW[c]); }
@@ -7418,6 +7465,9 @@ static void SlotName(int slot, wchar_t* out, int cap)
         static const wchar_t* ca[MIXA_N] = { L"volume up", L"volume down", L"mute", L"solo", L"duck", L"hold" };
         wsprintfW(out, L"Mixer channel %d %s", (slot - SLOT_MIX0) / MIXA_N + 1, ca[(slot - SLOT_MIX0) % MIXA_N]);
     }
+    else if (slot == SLOT_CHATG) lstrcpynW(out, L"ChatMix toward game", cap);
+    else if (slot == SLOT_CHATC) lstrcpynW(out, L"ChatMix toward chat", cap);
+    else if (slot >= SLOT_SCENE0) wsprintfW(out, L"Mixer scene %d", slot - SLOT_SCENE0 + 1);
     else if (slot >= SLOT_MIXOUT0 && slot < KEY_SLOTS) {
         static const wchar_t* oa[MIXO_N] = { L"volume up", L"volume down", L"mute" };
         wsprintfW(out, L"Mixer output %d %s", (slot - SLOT_MIXOUT0) / MIXO_N + 1, oa[(slot - SLOT_MIXOUT0) % MIXO_N]);
@@ -7866,6 +7916,7 @@ static void MixMemStore(int c)
     wchar_t key[200], v[400]; MixMemKey(c, key);
     int n = wsprintfW(v, L"%d,%d,%u,%d,%d,%d", (int)gCh[c].db10, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk);
     for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) n += wsprintfW(v + n, L",%d", gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i]);
+    n += wsprintfW(v + n, L",%d", (int)gCh[c].chatRole);
     wsprintfW(v + n, L"|%s", gCh[c].name);
     WritePrivateProfileStringW(L"mixer_memory", key, v, gIni);
 }
@@ -7873,13 +7924,14 @@ static bool MixMemLoad(int c)
 {
     wchar_t key[200], v[400]; MixMemKey(c, key);
     if (!GetPrivateProfileStringW(L"mixer_memory", key, L"", v, 400, gIni) || !v[0]) return false;
-    int f[6 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
+    int f[7 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
     const wchar_t* q = v;
-    while (*q && *q != L'|' && nf < 6 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+    while (*q && *q != L'|' && nf < 7 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
     if (nf < 6) return false;
     gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].duck = f[1] != 0; gCh[c].routes = (unsigned)f[2] & ((1u << MAX_OUT) - 1);
     gCh[c].color = Iclamp(f[3], 0, 7); gChW[c] = f[4] ? Iclamp(f[4], 52, 240) : 0; gCh[c].holdTalk = f[5] != 0;
     for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = Iclamp(f[6 + a * MAX_KEYS + i], 0, 255);
+    gCh[c].chatRole = nf > 6 + MIXA_N * MAX_KEYS ? Iclamp(f[6 + MIXA_N * MAX_KEYS], 0, 2) : 0;
     const wchar_t* nm = wcschr(v, L'|');
     lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
     return true;
@@ -7901,7 +7953,7 @@ static void ChanSetSource(int c, int type, const wchar_t* src)
     gCh[c].type = type; lstrcpynW(gCh[c].src, type == CH_NONE ? L"" : src, 128);
     gCh[c].solo = false; gCh[c].held = false;
     if (type == CH_NONE || !MixMemLoad(c)) {    // new to the mixer (or cleared): fresh settings, no hotkeys
-        gCh[c].name[0] = 0; gCh[c].db10 = 0; gCh[c].duck = false; gCh[c].holdTalk = 0; gChW[c] = 0;
+        gCh[c].name[0] = 0; gCh[c].db10 = 0; gCh[c].duck = false; gCh[c].holdTalk = 0; gChW[c] = 0; gCh[c].chatRole = 0;
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = 0;
         if (type != CH_NONE && (wasEmpty || !gCh[c].routes)) gCh[c].routes = (1u << gRows) - 1;   // to every output
     }
@@ -8004,6 +8056,224 @@ static void ChanRenameDone(bool keep)
     DestroyWindow(e);
 }
 
+// ---- scenes: the whole mixer saved under a name (channels, volumes, mutes, routing, outputs, ducking, ChatMix)
+static int     gSceneN = 0, gSceneCur = -1;
+static wchar_t gSceneName[SCENE_MAX][32];
+static void ScenesSaveList()
+{
+    wchar_t v[16]; wsprintfW(v, L"%d", gSceneN); WritePrivateProfileStringW(L"mixer_scenes", L"count", v, gIni);
+    wsprintfW(v, L"%d", gSceneCur); WritePrivateProfileStringW(L"mixer_scenes", L"current", v, gIni);
+    for (int i = 0; i < SCENE_MAX; i++) {
+        wchar_t k[16]; wsprintfW(k, L"name%d", i + 1);
+        WritePrivateProfileStringW(L"mixer_scenes", k, i < gSceneN ? gSceneName[i] : nullptr, gIni);
+    }
+}
+static void ScenesLoad()
+{
+    gSceneN = Iclamp(GetPrivateProfileIntW(L"mixer_scenes", L"count", 0, gIni), 0, SCENE_MAX);
+    gSceneCur = Iclamp(GetPrivateProfileIntW(L"mixer_scenes", L"current", -1, gIni), -1, gSceneN - 1);
+    for (int i = 0; i < gSceneN; i++) {
+        wchar_t k[16]; wsprintfW(k, L"name%d", i + 1);
+        GetPrivateProfileStringW(L"mixer_scenes", k, L"Scene", gSceneName[i], 32, gIni);
+    }
+}
+static void SceneBtnText()
+{
+    wchar_t t[64];
+    if (gSceneCur >= 0 && gSceneCur < gSceneN) _snwprintf(t, 63, L"Scene: %s", gSceneName[gSceneCur]); else lstrcpyW(t, L"Scenes...");
+    t[63] = 0;
+    SetDlgItemTextW(gWnd, IDC_SCENEBTN, t);
+}
+static void SceneWrite(int i)                   // the mixer as it is now -> scene i
+{
+    wchar_t sec[32]; wsprintfW(sec, L"mixer_scene_%d", i + 1);
+    WritePrivateProfileStringW(sec, nullptr, nullptr, gIni);   // (start clean)
+    for (int c = 0; c < CH_MAX; c++) {
+        wchar_t k[16], v[400]; wsprintfW(k, L"ch%d", c + 1);
+        if (gCh[c].type == CH_NONE) lstrcpyW(v, L"0");
+        else _snwprintf(v, 399, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
+                        gCh[c].solo ? 1 : 0, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk,
+                        (int)gCh[c].chatRole, gCh[c].name);
+        v[399] = 0;
+        WritePrivateProfileStringW(sec, k, v, gIni);
+    }
+    for (int k = 0; k < MAX_OUT; k++) {
+        wchar_t kk[16], v[32]; wsprintfW(kk, L"out%d", k + 1); wsprintfW(v, L"%d,%d", (int)gRowVol[k], gOutMute[k] ? 1 : 0);
+        WritePrivateProfileStringW(sec, kk, v, gIni);
+    }
+    wchar_t v[16];
+    wsprintfW(v, L"%d", (int)gDuckDb);  WritePrivateProfileStringW(sec, L"duck", v, gIni);
+    wsprintfW(v, L"%d", (int)gChatMix); WritePrivateProfileStringW(sec, L"chatmix", v, gIni);
+}
+static void ChanSetSource(int c, int type, const wchar_t* src);
+static void MixKeysShow(int c);
+static void FaderLabel(int id);
+static void SceneApply(int i)                   // switch to scene i: volumes glide there over ~0.4 s
+{
+    if (i < 0 || i >= gSceneN) return;
+    if (gRenEdit) ChanRenameDone(true);
+    gFadeSlowUntil = GetTickCount() + 500;
+    wchar_t sec[32]; wsprintfW(sec, L"mixer_scene_%d", i + 1);
+    for (int c = 0; c < CH_MAX; c++) {
+        wchar_t k[16], v[400]; wsprintfW(k, L"ch%d", c + 1);
+        GetPrivateProfileStringW(sec, k, L"0", v, 400, gIni);
+        const int type = _wtoi(v);
+        const wchar_t* p1 = wcschr(v, L'|');
+        if (type < CH_APP || type > CH_OUT || !p1) { if (gCh[c].type != CH_NONE) ChanSetSource(c, CH_NONE, L""); continue; }
+        wchar_t src[128] = L""; const wchar_t* p2 = wcschr(p1 + 1, L'|');
+        if (!p2) continue;
+        lstrcpynW(src, p1 + 1, (int)Imin(128, (int)(p2 - p1)));
+        if (gCh[c].type != type || lstrcmpiW(gCh[c].src, src)) ChanSetSource(c, type, src);
+        int f[9] = {}; int nf = 0; const wchar_t* q = p2 + 1;
+        while (*q && *q != L'|' && nf < 9) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+        if (nf >= 8) {
+            gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].mute = f[1] != 0; gCh[c].solo = f[2] != 0; gCh[c].duck = f[3] != 0;
+            gCh[c].routes = (unsigned)f[4] & ((1u << MAX_OUT) - 1); gCh[c].color = Iclamp(f[5], 0, 7);
+            gChW[c] = f[6] ? Iclamp(f[6], 52, 240) : 0; gCh[c].holdTalk = f[7] != 0; gCh[c].chatRole = nf >= 9 ? Iclamp(f[8], 0, 2) : 0;
+        }
+        const wchar_t* nm = wcschr(p2 + 1, L'|');
+        lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
+        MixKeysShow(c); FaderLabel(IDC_CHVOL0 + c);
+    }
+    for (int k = 0; k < MAX_OUT; k++) {
+        wchar_t kk[16], v[32]; wsprintfW(kk, L"out%d", k + 1);
+        if (!GetPrivateProfileStringW(sec, kk, L"", v, 32, gIni) || !v[0]) continue;
+        gRowVol[k] = Iclamp(_wtoi(v), 0, 200);
+        const wchar_t* q = wcschr(v, L','); gOutMute[k] = q && _wtoi(q + 1) != 0;
+        SendDlgItemMessageW(gWnd, SPIN_UD(IDC_ROWVOL + k), UDM_SETPOS32, 0, gRowVol[k]);
+        FaderLabel(IDC_OVOL0 + k);
+    }
+    gDuckDb = Iclamp(GetPrivateProfileIntW(sec, L"duck", gDuckDb, gIni), 3, 30);
+    SendDlgItemMessageW(gWnd, SPIN_UD(IDC_DUCKDB), UDM_SETPOS32, 0, gDuckDb);
+    gChatMix = Iclamp(GetPrivateProfileIntW(sec, L"chatmix", gChatMix, gIni), -100, 100);
+    gSceneCur = i; ScenesSaveList(); SceneBtnText();
+    Layout(); MixerRedraw();
+    wchar_t t[64]; _snwprintf(t, 63, L"Scene: %s", gSceneName[i]); t[63] = 0; ShowOsd(t, true);
+}
+static void SceneMoveSection(int from, int to)  // (deleting a scene: the ones after it move up)
+{
+    wchar_t a[32], b[32]; wsprintfW(a, L"mixer_scene_%d", from + 1); wsprintfW(b, L"mixer_scene_%d", to + 1);
+    static wchar_t buf[16000];
+    DWORD n = GetPrivateProfileSectionW(a, buf, 16000, gIni);
+    WritePrivateProfileStringW(b, nullptr, nullptr, gIni);
+    if (n) WritePrivateProfileSectionW(b, buf, gIni);
+    WritePrivateProfileStringW(a, nullptr, nullptr, gIni);
+}
+static void SceneMenu(HWND from)
+{
+    HMENU m = CreatePopupMenu();
+    for (int i = 0; i < gSceneN; i++) AppendMenuW(m, MF_STRING | (i == gSceneCur ? MF_CHECKED : 0), 100 + i, gSceneName[i]);
+    if (!gSceneN) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"(no scenes yet)");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (gSceneN >= SCENE_MAX ? MF_GRAYED : 0), 1, L"Save the mixer as a new scene...");
+    if (gSceneCur >= 0) {
+        wchar_t t[96];
+        _snwprintf(t, 95, L"Update \"%s\" to the mixer as it is now", gSceneName[gSceneCur]); t[95] = 0; AppendMenuW(m, MF_STRING, 2, t);
+        _snwprintf(t, 95, L"Rename \"%s\"...", gSceneName[gSceneCur]); t[95] = 0; AppendMenuW(m, MF_STRING, 3, t);
+        _snwprintf(t, 95, L"Delete \"%s\"", gSceneName[gSceneCur]); t[95] = 0; AppendMenuW(m, MF_STRING, 4, t);
+    }
+    RECT r; GetWindowRect(from, &r);
+    const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd >= 100 && cmd - 100 < gSceneN) { SceneApply(cmd - 100); return; }
+    if (cmd == 1 && gSceneN < SCENE_MAX) {
+        wchar_t name[64]; wsprintfW(name, L"Scene %d", gSceneN + 1);
+        if (!InputBox(L"Lag Effect - new scene", L"A name for this mixer setup (like Gaming or Just chatting):", name, 31) || !name[0]) return;
+        lstrcpynW(gSceneName[gSceneN], name, 32);
+        SceneWrite(gSceneN);
+        gSceneCur = gSceneN++;
+        ScenesSaveList(); SceneBtnText(); Layout();
+        wchar_t t[64]; _snwprintf(t, 63, L"Saved scene: %s", name); t[63] = 0; ShowOsd(t, true);
+    } else if (cmd == 2 && gSceneCur >= 0) {
+        SceneWrite(gSceneCur);
+        wchar_t t[64]; _snwprintf(t, 63, L"Updated: %s", gSceneName[gSceneCur]); t[63] = 0; ShowOsd(t, true);
+    } else if (cmd == 3 && gSceneCur >= 0) {
+        wchar_t name[64]; lstrcpynW(name, gSceneName[gSceneCur], 64);
+        if (!InputBox(L"Lag Effect - rename scene", L"Its new name:", name, 31) || !name[0]) return;
+        lstrcpynW(gSceneName[gSceneCur], name, 32);
+        ScenesSaveList(); SceneBtnText(); Layout();
+    } else if (cmd == 4 && gSceneCur >= 0) {
+        wchar_t q[120]; _snwprintf(q, 119, L"Delete the scene \"%s\"?", gSceneName[gSceneCur]); q[119] = 0;
+        if (MessageBoxW(gWnd, q, L"Lag Effect", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        const int d = gSceneCur;
+        for (int j = d; j < gSceneN - 1; j++) {     // the ones after it move up (names, settings and hotkeys)
+            SceneMoveSection(j + 1, j);
+            lstrcpynW(gSceneName[j], gSceneName[j + 1], 32);
+            for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_SCENE0 + j][i] = gFxKeys[SLOT_SCENE0 + j + 1][i];
+        }
+        gSceneN--;
+        { wchar_t sec[32]; wsprintfW(sec, L"mixer_scene_%d", gSceneN + 1); WritePrivateProfileStringW(sec, nullptr, nullptr, gIni); }
+        for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_SCENE0 + gSceneN][i] = 0;
+        for (int j = 0; j < SCENE_MAX; j++) { wchar_t t[120]; FxKeyButtonText(SLOT_SCENE0 + j, t, 120); SetDlgItemTextW(gWnd, IDC_MIXKEY0 + SLOT_SCENE0 + j - SLOT_MIX0, t); }
+        gSceneCur = -1;
+        ScenesSaveList(); SceneBtnText(); Layout();
+    }
+}
+
+// ---- ChatMix: one slider between game and chat (each channel's menu says which it is)
+static void ChatMixSet(int v)
+{
+    v = Iclamp(v, -100, 100);
+    if (v > -4 && v < 4) v = 0;                 // (snaps to the middle)
+    gChatMix = v;
+    InvalidateRect(GetDlgItem(gWnd, IDC_CHATMIX), nullptr, FALSE);
+}
+static void ChatMixText(wchar_t* t)             // "game 100%  ·  chat 60%"
+{
+    wsprintfW(t, L"ChatMix: game %d%%  \x00B7  chat %d%%", (int)lround(ChatGain(1) * 100), (int)lround(ChatGain(2) * 100));
+}
+static LRESULT CALLBACK ChatMixProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_GETDLGCODE: return DLGC_WANTARROWS;
+    case WM_SETFOCUS: case WM_KILLFOCUS: InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        {
+            OffScreen os(dc, rc.right, rc.bottom); HDC d = os.dc;
+            FillRect(d, &rc, BgBrush());
+            const int tw = SC(10), cy = rc.bottom / 2, x0 = tw / 2, x1 = rc.right - tw / 2;
+            const int tx = x0 + (int)((gChatMix + 100) / 200.0f * (x1 - x0));
+            RECT tr = { x0, cy - Imax(1, SC(2)), x1, cy + Imax(1, SC(2)) };
+            HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(d, &tr, tb); DeleteObject(tb);
+            const int mid = (x0 + x1) / 2;
+            RECT fr = tr; fr.left = Imin(mid, tx); fr.right = Imax(mid, tx);
+            HBRUSH fb = CreateSolidBrush(ACCENT); FillRect(d, &fr, fb); DeleteObject(fb);
+            RECT mk = { mid, cy - SC(7), mid + 1, cy + SC(7) };
+            HBRUSH mb = CreateSolidBrush(gDark ? RGB(110, 110, 110) : RGB(150, 150, 150)); FillRect(d, &mk, mb); DeleteObject(mb);
+            HBRUSH kb = CreateSolidBrush(gDark ? RGB(214, 214, 214) : RGB(252, 252, 252));
+            HPEN   kp = CreatePen(PS_SOLID, 1, gDark ? RGB(150, 150, 150) : RGB(130, 130, 130));
+            HGDIOBJ ob = SelectObject(d, kb), op = SelectObject(d, kp);
+            RoundRect(d, tx - tw / 2, cy - SC(8), tx - tw / 2 + tw, cy + SC(8), SC(4), SC(4));
+            SelectObject(d, ob); SelectObject(d, op); DeleteObject(kb); DeleteObject(kp);
+            if (GetFocus() == h) { RECT f = rc; DrawFocusRect(d, &f); }
+            BitBlt(dc, 0, 0, rc.right, rc.bottom, d, 0, 0, SRCCOPY);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_LBUTTONDBLCLK: ChatMixSet(0); return 0;
+    case WM_LBUTTONDOWN: SetFocus(h); SetCapture(h); // fall through
+    case WM_MOUSEMOVE:
+        if (m == WM_LBUTTONDOWN || GetCapture() == h) {
+            RECT rc; GetClientRect(h, &rc);
+            const int tw = SC(10), x = (short)LOWORD(l);
+            ChatMixSet((int)lround(((double)(x - tw / 2) / Imax(1, (int)rc.right - tw)) * 200.0 - 100.0));
+        }
+        return 0;
+    case WM_LBUTTONUP: if (GetCapture() == h) ReleaseCapture(); return 0;
+    case WM_MOUSEWHEEL: ChatMixSet(gChatMix + (GET_WHEEL_DELTA_WPARAM(w) > 0 ? 5 : -5)); return 0;
+    case WM_KEYDOWN:
+        if (w == VK_LEFT || w == VK_DOWN) { ChatMixSet(gChatMix - 5); return 0; }
+        if (w == VK_RIGHT || w == VK_UP) { ChatMixSet(gChatMix + 5); return 0; }
+        if (w == VK_HOME) { ChatMixSet(0); return 0; }
+        break;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
 // ---- the channel menu (like OBS's audio sources): apps, inputs, outputs; rename, colour
 static void ChanPickExe(int c, bool browse)     // an app that isn't in the lists: type its name, or find its .exe
 {
@@ -8036,6 +8306,11 @@ static void ChanMenu(int c, HWND from)
         HMENU cm = CreatePopupMenu();
         for (int i = 0; i < 8; i++) AppendMenuW(cm, MF_STRING | (gCh[c].color == i ? MF_CHECKED : 0), 10 + i, CH_COLOR_NAMES[i]);
         AppendMenuW(m, MF_POPUP, (UINT_PTR)cm, L"Colour");
+        HMENU rm = CreatePopupMenu();
+        AppendMenuW(rm, MF_STRING | (gCh[c].chatRole == 1 ? MF_CHECKED : 0), 21, L"Game (quieter as ChatMix goes to chat)");
+        AppendMenuW(rm, MF_STRING | (gCh[c].chatRole == 2 ? MF_CHECKED : 0), 22, L"Chat (quieter as ChatMix goes to game)");
+        AppendMenuW(rm, MF_STRING | (gCh[c].chatRole == 0 ? MF_CHECKED : 0), 20, L"Not in ChatMix");
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)rm, L"ChatMix");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     }
     HMENU more = CreatePopupMenu(), ins = CreatePopupMenu(), outs = CreatePopupMenu();
@@ -8077,6 +8352,7 @@ static void ChanMenu(int c, HWND from)
     else if (cmd == 2) ChanSetSource(c, CH_NONE, L"");
     else if (cmd == 3 || cmd == 4) ChanPickExe(c, cmd == 4);
     else if (cmd >= 10 && cmd < 18) { gCh[c].color = cmd - 10; MixerRedraw(); }
+    else if (cmd >= 20 && cmd <= 22) gCh[c].chatRole = cmd - 20;
     else if (cmd >= 100 && cmd - 100 < gChOptN) ChanSetSource(c, gChOpts[cmd - 100].type, gChOpts[cmd - 100].src);
 }
 
@@ -8400,33 +8676,39 @@ static void MixerPlace()                        // the Mixer fills the window: s
     const int W = Imax((int)cr.right, MixerNeedW()), H = cr.bottom;
     const int extraH = Imax(0, H - SC(DesignH()));
     const int cx0 = SC(14), cw = W - SC(28);
-    const int chTop = SC(54), chH = SC(330) + extraH * 2 / 3;
-    const int oTop = chTop + chH + SC(16), oH = SC(184) + (extraH - extraH * 2 / 3);
+    const int chTop = SC(54), chH = SC(354) + extraH * 2 / 3;
+    const int oTop = chTop + chH + SC(16), oH = SC(160) + (extraH - extraH * 2 / 3);
     Section& sc = gSections[gSecChan]; sc.x = UNSC(cx0); sc.y = UNSC(chTop); sc.w = UNSC(cw); sc.h = UNSC(chH); sc.ox = sc.oy = 0;
     Section& so = gSections[gSecOut];  so.x = UNSC(cx0); so.y = UNSC(oTop);  so.w = UNSC(cw); so.h = UNSC(oH);  so.ox = so.oy = 0;
 
     // the top row: hint on the left; Duck by [ ] dB and Restart audio on the right
     const int rx = cx0 + cw - SC(12) - SC(104);
     PlaceFree(GetDlgItem(gWnd, IDC_RESTARTAUD), rx, chTop + SC(8), SC(104), SC(26));
-    const int dbx = rx - SC(10) - SC(22);
-    PlaceFree(gDuckDbLbl, dbx, chTop + SC(13), SC(22), SC(18));
+    // the second row: ChatMix on the left, Duck by [ ] dB on the right
+    const int r2 = chTop + SC(40);
+    PlaceFree(GetDlgItem(gWnd, IDC_CHATLBLG), cx0 + SC(12), r2 + SC(4), SC(40), SC(18));
+    PlaceFree(GetDlgItem(gWnd, IDC_CHATMIX), cx0 + SC(56), r2, SC(190), SC(26));
+    PlaceFree(GetDlgItem(gWnd, IDC_CHATLBLC), cx0 + SC(250), r2 + SC(4), SC(40), SC(18));
+    PlaceFree(GetDlgItem(gWnd, IDC_SCENEBTN), cx0 + SC(260), chTop + SC(8), SC(146), SC(26));
+    const int dbx = cx0 + cw - SC(12) - SC(22);
+    PlaceFree(gDuckDbLbl, dbx, r2 + SC(4), SC(22), SC(18));
     {
         HWND e = GetDlgItem(gWnd, IDC_DUCKDB), u = GetDlgItem(gWnd, SPIN_UD(IDC_DUCKDB));
         RECT ur = {}; if (u) GetWindowRect(u, &ur);
         const int uw = ur.right - ur.left, sw = SC(52), sx = dbx - SC(4) - sw;
-        PlaceFree(e, sx, chTop + SC(10), sw - uw, SC(23));
-        if (u) PlaceFree(u, sx + sw - uw, chTop + SC(10), uw, SC(23));
-        PlaceFree(gDuckLbl, sx - SC(4) - SC(50), chTop + SC(13), SC(50), SC(18));
+        PlaceFree(e, sx, r2 + SC(1), sw - uw, SC(23));
+        if (u) PlaceFree(u, sx + sw - uw, r2 + SC(1), uw, SC(23));
+        PlaceFree(gDuckLbl, sx - SC(4) - SC(50), r2 + SC(4), SC(50), SC(18));
     }
     PlaceFree(GetDlgItem(gWnd, IDC_CHADDBTN), cx0 + SC(12), chTop + SC(8), SC(116), SC(26));
     {
         bool full = true; for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_NONE) full = false;
         EnableWindow(GetDlgItem(gWnd, IDC_CHADDBTN), !full);
     }
-    PlaceFree(gMixHint, cx0 + SC(40), chTop + chH / 2 - SC(20), cw - SC(80), SC(40));
+    PlaceFree(gMixHint, cx0 + SC(40), chTop + SC(72) + (chH - SC(88)) / 2 - SC(20), cw - SC(80), SC(40));
 
     // channel strips
-    const int sy = chTop + SC(36), sh = chH - SC(52);
+    const int sy = chTop + SC(72), sh = chH - SC(88);
     int x = SC(21);
     const int n = Imax(1, Imin(gRows, MAX_OUT));
     for (int c = 0; c < CH_MAX; c++) {
@@ -8480,7 +8762,8 @@ static void MixerPlace()                        // the Mixer fills the window: s
         sk.x = UNSC(cx0); sk.y = UNSC(chTop); sk.w = UNSC(cw); sk.h = UNSC(oTop + oH - chTop); sk.ox = sk.oy = 0;
         const int x0 = cx0 + SC(16), nameW = SC(100), modeW = SC(62), gap = SC(4);
         const int colW = Imax(SC(40), (cw - SC(32) - nameW - modeW - gap * 7) / 6);
-        const int hy = chTop + SC(46);
+        const int hy = chTop + SC(42);
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKCH), x0, hy, nameW, SC(18));
         for (int i = 1; i < 7; i++) PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0 + i), x0 + nameW + gap + (i - 1) * (colW + gap), hy, colW, SC(18));
         const int mx = x0 + nameW + gap + 6 * (colW + gap);
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKCOL0), mx, hy, modeW, SC(18));
@@ -8490,7 +8773,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
             const int c = r, k = r - CH_MAX;
             if (!out && gCh[c].type == CH_NONE) continue;
             if (out && k >= gRows) continue;
-            if (out && k == 0) y += SC(10);     // (a little gap before the outputs)
+            if (out && k == 0) { PlaceFree(GetDlgItem(gWnd, IDC_MIXKOUT), x0, y + SC(4), nameW, SC(18)); y += SC(22); }   // "Outputs"
             HWND lb = GetDlgItem(gWnd, IDC_MIXKROW0 + r);
             wchar_t t[64], o[64]; if (out) OutName(k, t, 64); else ChanLabel(c, t, 64);
             GetWindowTextW(lb, o, 64); if (lstrcmpW(t, o)) SetWindowTextW(lb, t);
@@ -8500,16 +8783,35 @@ static void MixerPlace()                        // the Mixer fills the window: s
                 const int slot = out ? SLOT_MIXOUT0 + k * MIXO_N + a : SLOT_MIX0 + c * MIXA_N + a;
                 PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(slot)), x0 + nameW + gap + a * (colW + gap), y, colW, SC(24));
             }
-            if (!out) PlaceFree(GetDlgItem(gWnd, IDC_MIXHOLDMODE0 + c), mx, y, modeW, SC(24));
-            y += SC(28);
+            if (!out) PlaceFree(GetDlgItem(gWnd, IDC_MIXHOLDMODE0 + c), mx, y, modeW, SC(23));
+            y += SC(25);
         }
-        PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYHDR), x0, y + SC(16), SC(160), SC(20));
+        // ChatMix keys (toward game / toward chat), and the volume keys' step on the same row
+        y += SC(8);
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKCHAT), x0, y + SC(3), nameW, SC(20));
+        PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_CHATG)), x0 + nameW + gap, y, colW, SC(23));
+        PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_CHATC)), x0 + nameW + gap + colW + gap, y, colW, SC(23));
+        const int stx = x0 + nameW + gap + 2 * (colW + gap) + SC(8);
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYHDR), stx, y + SC(3), SC(120), SC(20));
         HWND e = GetDlgItem(gWnd, IDC_MIXSTEP), u = GetDlgItem(gWnd, SPIN_UD(IDC_MIXSTEP));
         RECT ur = {}; if (u) GetWindowRect(u, &ur);
         const int uw = ur.right - ur.left;
-        PlaceFree(e, x0 + SC(166), y + SC(13), SC(56) - uw, SC(23));
-        if (u) PlaceFree(u, x0 + SC(166) + SC(56) - uw, y + SC(13), uw, SC(23));
-        PlaceFree(GetDlgItem(gWnd, IDC_MIXSTEPDB), x0 + SC(228), y + SC(16), SC(200), SC(20));
+        PlaceFree(e, stx + SC(124), y, SC(56) - uw, SC(23));
+        if (u) PlaceFree(u, stx + SC(124) + SC(56) - uw, y, uw, SC(23));
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXSTEPDB), stx + SC(184), y + SC(3), SC(30), SC(20));
+        y += SC(25);
+        // scenes: three to a row, each its name and its key
+        y += SC(8);
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKSCN), x0, y + SC(3), nameW, SC(20));
+        const int cellW = (cw - SC(32) - nameW - gap) / 3, keyW = Imin(colW, cellW / 2);
+        for (int i = 0; i < SCENE_MAX; i++) {
+            const int cx = x0 + nameW + gap + (i % 3) * cellW, cy = y + (i / 3) * SC(25);
+            HWND lb = GetDlgItem(gWnd, IDC_MIXKSCNNAME0 + i);
+            wchar_t o[40]; GetWindowTextW(lb, o, 40);
+            if (i < gSceneN && lstrcmpW(o, gSceneName[i])) SetWindowTextW(lb, gSceneName[i]);
+            PlaceFree(lb, cx, cy + SC(3), cellW - keyW - SC(6), SC(20));
+            PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_SCENE0 + i)), cx + cellW - keyW - SC(2), cy, keyW, SC(23));
+        }
     }
     if (gPage == PAGE_MIXER) InvalidateRect(gWnd, nullptr, FALSE);
 }
@@ -10379,7 +10681,12 @@ static void AddTips()
     TipId(IDC_CHADDBTN,    L"Add a channel: an app (Spotify, a game, a browser...), another input, or what an output device plays. Up to 8.");
     TipId(IDC_MIXKEYSBTN,  L"Hotkeys for the Mixer: each channel's volume, mute, solo, duck and a hold key; each output's volume and mute.");
     TipId(IDC_MIXSTEP,     L"How much one press of a volume key changes it (hold the key to keep going).");
-    for (int sl = SLOT_MIX0; sl < KEY_SLOTS; sl++) TipId(FxKeyButtonId(sl), L"Click, then press the key(s) you want. Right-click to clear it.");
+    TipId(IDC_SCENEBTN,    L"Scenes: save the whole mixer (channels, volumes, mutes, routing, outputs, ChatMix) under a name and switch between them. Volumes glide to the new ones.");
+    TipId(IDC_CHATMIX,     L"ChatMix: slide toward Game and chat channels get quieter; toward Chat and game channels do. Pick which is which in each channel's menu (click its name > ChatMix). Double-click: the middle.");
+    TipId(FxKeyButtonId(SLOT_CHATG), L"ChatMix toward game (hold to keep going). Right-click to clear.");
+    TipId(FxKeyButtonId(SLOT_CHATC), L"ChatMix toward chat (hold to keep going). Right-click to clear.");
+    for (int sl = SLOT_MIX0; sl < KEY_SLOTS; sl++)
+        if (sl != SLOT_CHATG && sl != SLOT_CHATC) TipId(FxKeyButtonId(sl), L"Click, then press the key(s) you want. Right-click to clear it.");
     for (int c = 0; c < CH_MAX; c++)
         TipId(IDC_MIXHOLDMODE0 + c, L"What its Hold key does. Mute: it goes quiet while you hold the key. Talk: it only plays while you hold the key (push-to-talk, e.g. for a second mic).");
     TipId(IDC_RESTARTAUD,  L"Close and reopen every sound device. Handy after plugging something in. (Outputs that drop out also come back by themselves.)");
@@ -10891,9 +11198,18 @@ static void MixOsd(const wchar_t* who, const wchar_t* what, bool on)
     wchar_t t[64]; _snwprintf(t, 63, L"%s  %s", who, what); t[63] = 0;
     ShowOsd(t, on);
 }
+static void SceneApply(int i);
+static void ChatMixSet(int v);
+static void ChatMixText(wchar_t* t);
 static void MixKey(int slot, bool down, bool pressed, bool released)
 {
-    const DWORD shown = 0; (void)shown;
+    if (slot >= SLOT_SCENE0) { if (pressed) SceneApply(slot - SLOT_SCENE0); return; }
+    if (slot == SLOT_CHATG || slot == SLOT_CHATC) {
+        if (!MixRepeat(slot, down, pressed)) return;
+        ChatMixSet(gChatMix + (slot == SLOT_CHATC ? 10 : -10));
+        wchar_t t[64]; ChatMixText(t); ShowOsd(t, true);
+        return;
+    }
     if (slot < SLOT_MIXOUT0) {
         const int c = (slot - SLOT_MIX0) / MIXA_N, a = (slot - SLOT_MIX0) % MIXA_N;
         if (gCh[c].type == CH_NONE) { if (a == MIXA_HOLD) gCh[c].held = false; return; }
@@ -11434,13 +11750,16 @@ static void Layout()
             if (cid == IDC_MIXHINT) { bool any = false; for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) any = true; vis = vis && !any; }
             if (cid >= IDC_MIXKEY0 && cid < IDC_MIXKEY0 + (KEY_SLOTS - SLOT_MIX0)) {   // hotkeys: channels in use, outputs there
                 const int sl = SLOT_MIX0 + cid - IDC_MIXKEY0;
-                vis = vis && (sl < SLOT_MIXOUT0 ? gCh[(sl - SLOT_MIX0) / MIXA_N].type != CH_NONE : (sl - SLOT_MIXOUT0) / MIXO_N < gRows);
+                vis = vis && (sl >= SLOT_SCENE0 ? sl - SLOT_SCENE0 < gSceneN : sl >= SLOT_CHATG ? true
+                            : sl < SLOT_MIXOUT0 ? gCh[(sl - SLOT_MIX0) / MIXA_N].type != CH_NONE : (sl - SLOT_MIXOUT0) / MIXO_N < gRows);
             }
             if (cid >= IDC_MIXKROW0 && cid < IDC_MIXKROW0 + CH_MAX + MAX_OUT) {
                 const int r = cid - IDC_MIXKROW0;
                 vis = vis && (r < CH_MAX ? gCh[r].type != CH_NONE : r - CH_MAX < gRows);
             }
             if (cid >= IDC_MIXHOLDMODE0 && cid < IDC_MIXHOLDMODE0 + CH_MAX) vis = vis && gCh[cid - IDC_MIXHOLDMODE0].type != CH_NONE;
+            if (cid >= IDC_MIXKSCNNAME0 && cid < IDC_MIXKSCNNAME0 + SCENE_MAX) vis = vis && cid - IDC_MIXKSCNNAME0 < gSceneN;
+            if (cid == IDC_MIXKSCN) vis = vis && gSceneN > 0;
         }
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
@@ -12762,6 +13081,23 @@ static void WsExec(int id, const char* m)
         if (JsonOnOff(m, "duck") >= 0) { WsBool(m, "duck", gCh[c].duck, &b); gCh[c].duck = b; }
         MixerRedraw(); WsReply(id, what, nullptr); return;
     }
+    if (!strcmp(what, "scene")) {               // {"do":"scene","name":"Gaming"} or {"do":"scene","n":2}
+        int k = -1;
+        if (JsonNum(m, "n", &v)) k = (int)v - 1;
+        else {
+            char nm[200]; const char* np = m;
+            if (JsonString(m, "name", &np, nm, 200)) {
+                wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200);
+                for (int i = 0; i < gSceneN; i++) if (!lstrcmpiW(gSceneName[i], w)) k = i;
+            }
+        }
+        if (k < 0 || k >= gSceneN) { WsReply(id, what, "No scene with that \"name\" or \"n\"."); return; }
+        SceneApply(k); WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "chatmix")) {             // {"do":"chatmix","value":-50}: -100 only game .. 0 both .. 100 only chat
+        if (!JsonNum(m, "value", &v)) { WsReply(id, what, "Give its \"value\" (-100 game .. 100 chat)."); return; }
+        ChatMixSet((int)lround(v)); WsReply(id, what, nullptr); return;
+    }
     if (!strcmp(what, "output")) {              // {"do":"output","n":2,"mute":true,"volume":80}
         const int k = WsFindOutput(m);
         if (k < 0) { WsReply(id, what, "No output with that \"n\" or \"name\"."); return; }
@@ -12769,7 +13105,7 @@ static void WsExec(int id, const char* m)
         if (JsonOnOff(m, "mute") >= 0) { WsBool(m, "mute", gOutMute[k], &b); gOutMute[k] = b; }
         MixerRedraw(); WsReply(id, what, nullptr); return;
     }
-    WsReply(id, what, "Unknown command. Try ping, status, mute, lag, fx, character, profile, tts, pad, clip, channel or output.");
+    WsReply(id, what, "Unknown command. Try ping, status, mute, lag, fx, character, profile, tts, pad, clip, channel, output, scene or chatmix.");
 }
 static void WsEvents()                          // (50 ms, while anything is connected) tell them what changed
 {
@@ -12850,6 +13186,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    {\"do\":\"clip\"}   save the last few seconds;  {\"do\":\"playclip\",\"n\":1}  (needs Clips on)\n"
         L"    {\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":false,\"solo\":false,\"duck\":true}   a Mixer channel\n"
         L"    {\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}   an output (or \"name\": what you called it)\n"
+        L"    {\"do\":\"scene\",\"name\":\"Gaming\"}   switch the Mixer to a scene;  {\"do\":\"chatmix\",\"value\":-50}  (-100 game .. 100 chat)\n"
         L"    {\"do\":\"start\"}  {\"do\":\"stop\"}  {\"do\":\"status\"}  {\"do\":\"ping\"}\n\n"
         L"REPLIES AND EVENTS\n"
         L"Every message gets a reply: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}. Lag Effect also tells Streamer.bot\n"
@@ -13659,7 +13996,11 @@ static void CreateUI()
     AddSection(14, 54, 532, 330, L"Channels");
     gBuildSub = -1;
     Ctl(L"BUTTON", L"Hotkeys", WS_TABSTOP, 152, 62, 110, 26, IDC_MIXKEYSBTN);
+    Ctl(L"BUTTON", L"Scenes...", WS_TABSTOP, 268, 62, 150, 26, IDC_SCENEBTN);
     gBuildSub = 0;
+    Ctl(L"STATIC", L"Game", SS_RIGHT, 30, 98, 40, 18, IDC_CHATLBLG);
+    Ctl(L"LagChatMix", L"", WS_TABSTOP, 74, 94, 180, 26, IDC_CHATMIX);
+    Ctl(L"STATIC", L"Chat", 0, 258, 98, 40, 18, IDC_CHATLBLC);
     Ctl(L"BUTTON", L"+ Add channel", WS_TABSTOP, 30, 62, 116, 26, IDC_CHADDBTN);
     gMixHint   = Ctl(L"STATIC", L"No channels yet. Click \"+ Add channel\" to bring in an app (Spotify, a game, a browser...), "
                                 L"another input, or what an output device plays.", SS_CENTER, 30, 160, 500, 40, IDC_MIXHINT);
@@ -13704,18 +14045,23 @@ static void CreateUI()
     gSecKeys = gSectionN;
     AddSection(14, 54, 532, 530, L"Mixer hotkeys");
     {
-        static const wchar_t* cols[7] = { L"", L"Volume +", L"Volume \x2212", L"Mute", L"Solo", L"Duck", L"Hold" };
+        static const wchar_t* cols[7] = { L"", L"Vol +", L"Vol \x2212", L"Mute", L"Solo", L"Duck", L"Hold" };
         for (int i = 1; i < 7; i++) Ctl(L"STATIC", cols[i], SS_CENTER, 30 + i * 60, 100, 58, 18, IDC_MIXKCOL0 + i);
         Ctl(L"STATIC", L"Hold does", SS_CENTER, 470, 100, 60, 18, IDC_MIXKCOL0);
+        Ctl(L"STATIC", L"Channels", 0, 30, 100, 90, 18, IDC_MIXKCH);
+        Ctl(L"STATIC", L"Outputs", 0, 30, 300, 90, 18, IDC_MIXKOUT);
+        Ctl(L"STATIC", L"ChatMix", 0, 30, 440, 90, 18, IDC_MIXKCHAT);
+        Ctl(L"STATIC", L"Scenes", 0, 30, 470, 90, 18, IDC_MIXKSCN);
+        for (int i = 0; i < SCENE_MAX; i++) Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS | SS_RIGHT, 130, 470, 70, 18, IDC_MIXKSCNNAME0 + i);
         for (int r = 0; r < CH_MAX + MAX_OUT; r++) Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 124 + r * 28, 88, 20, IDC_MIXKROW0 + r);
         for (int sl = SLOT_MIX0; sl < KEY_SLOTS; sl++) {
             wchar_t t[120]; FxKeyButtonText(sl, t, 120);
             Ctl(L"BUTTON", t, WS_TABSTOP, 30, 124, 58, 24, FxKeyButtonId(sl));
         }
         for (int c = 0; c < CH_MAX; c++) Ctl(L"BUTTON", gCh[c].holdTalk ? L"Talk" : L"Mute", BS_OWNERDRAW | WS_TABSTOP, 470, 124, 58, 24, IDC_MIXHOLDMODE0 + c);
-        Ctl(L"STATIC", L"Volume keys change it by", 0, 30, 540, 160, 20, IDC_MIXKEYHDR);
+        Ctl(L"STATIC", L"Volume keys step:", SS_RIGHT, 30, 540, 120, 20, IDC_MIXKEYHDR);
         Spin(IDC_MIXSTEP, 196, 537, 56, 1, 10, gMixStep);
-        Ctl(L"STATIC", L"dB a press (hold to keep going)", 0, 258, 540, 200, 20, IDC_MIXSTEPDB);
+        Ctl(L"STATIC", L"dB", 0, 258, 540, 30, 20, IDC_MIXSTEPDB);
     }
     gBuildSub = -1;
     gBuildPage = -1;
@@ -13724,6 +14070,7 @@ static void CreateUI()
         if (gDesign[i].page == PAGE_MIXER) gDesign[i].free = true;
     for (int c = 0; c < CH_MAX; c++) FaderLabel(IDC_CHVOL0 + c);
     for (int k = 0; k < MAX_OUT; k++) FaderLabel(IDC_OVOL0 + k);
+    SceneBtnText();
 
     // compact mode's own buttons (shown only in compact mode)
     gBuildPage = -1;
@@ -14353,6 +14700,7 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) ChanMenu(id - IDC_CHADD0, GetDlgItem(gWnd, id));
         return;
     }
+    if (id == IDC_SCENEBTN) { if (code == BN_CLICKED) SceneMenu(GetDlgItem(gWnd, id)); return; }
     if (id == IDC_MIXKEYSBTN) {                 // the Mixer: its strips <-> its hotkeys
         if (code != BN_CLICKED) return;
         if (gCapturingKey) EndKeyCapture();
@@ -15192,6 +15540,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         WNDCLASSW fc = {};
         fc.style = CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW; fc.lpfnWndProc = FaderProc; fc.hInstance = hi;
         fc.hCursor = LoadCursorW(nullptr, IDC_HAND); fc.lpszClassName = L"LagFader";
+        RegisterClassW(&fc);
+        fc.lpfnWndProc = ChatMixProc; fc.lpszClassName = L"LagChatMix";
         RegisterClassW(&fc);
     }
 
