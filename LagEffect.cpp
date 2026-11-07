@@ -21,7 +21,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.35.0"
+#define APP_VERSION L"1.35.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4808,14 +4808,14 @@ struct Design  {
     int  s0, x0, y0, w0, ht0, hh0, ww0, udx0, udy0, udw0, udh0;   // (resizing) its size at the UI size s0, kept so sizes never drift
     bool free;                                  // placed by its own code (the Mixer's strips), not from the layout
 };
-#define MAX_DESIGN 1400
+#define MAX_DESIGN 3000                         // (every control the window builds; plenty of room)
 static void LayoutSave(const wchar_t* path);
 static bool LayoutLoad(const wchar_t* path, bool apply);
 static void EdFollow();
 static Design  gDesign[MAX_DESIGN];  static int gDesignN = 0;
-#define MAX_SECTIONS 48
-#define MAX_FRAMED   48
-#define MAX_PAGED    800
+#define MAX_SECTIONS 128
+#define MAX_FRAMED   256
+#define MAX_PAGED    3000                       // (a control past this would show on every tab)
 static Section gSections[MAX_SECTIONS]; static int gSectionN = 0;
 static Framed  gFramed[MAX_FRAMED];     static int gFramedN = 0;
 static Paged   gPaged[MAX_PAGED];       static int gPagedN = 0;
@@ -12172,7 +12172,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     if (!k[0]) lstrcpynW(k, slot >= SLOT_MIX0 ? L"Set" : L"Set hotkey", 100);
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
                        : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
-                       : slot >= SLOT_PROF0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
+                       : slot >= SLOT_PROF0 && slot < SLOT_MIX0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
                        : slot == SLOT_DIVE ? L"Pitch dive (hold): " : slot == SLOT_PTT ? L"Key: " : L"";
     wsprintfW(buf, L"%s%s", pre, k);
 }
