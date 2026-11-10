@@ -23,7 +23,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.41.0"
+#define APP_VERSION L"1.42.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -104,10 +104,17 @@ static inline int FocusRectIfKeys(HDC dc, const RECT* r) { return gKbdNav ? Draw
 namespace SB = Steinberg;
 namespace SV = Steinberg::Vst;
 
-#define VST_SLOTS     4
+#define VST_MIC       4                         // slots on your mic (Mic > Plugins)
+#define VST_PER       2                         // slots on each Mixer channel's rack, and on each output
+#define VST_CHANS     8                         // Mixer channels (= CH_MAX below)
+#define VST_RACKS     8                         // racks for Mixer channels: one per app / device that has plugins
+#define VST_OUTS      5                         // outputs (= MAX_OUT below)
+#define VST_CH0       VST_MIC                   // slot numbers: the mic's, then the racks', then the outputs'
+#define VST_OUT0      (VST_CH0 + VST_RACKS * VST_PER)
+#define VST_SLOTS     (VST_OUT0 + VST_OUTS * VST_PER)
 #define VST_RATE      48000                     // (the app runs everything at 48 kHz: same as RATE below)
 #define VST_BLOCK     1024                      // biggest block handed to a plugin in one go
-#define VST_MAXFRAMES 16384                     // (a callback bigger than this skips the plugins)
+#define VST_MAXFRAMES 8192                      // (a callback bigger than this skips the plugins)
 #define VST_MAXCH     8                         // channels of one bus we can feed
 #define VST_MAXBUS    6                         // buses each way (main + side-chains)
 #define VST_RING      256                       // parameter changes waiting to cross threads
@@ -333,6 +340,7 @@ struct VstSlot {
     SV::IEditController*  ctrl;
     SV::IConnectionPoint* cpA; SV::IConnectionPoint* cpB;   // its two halves, wired to each other
     bool single;                                // one object is both halves
+    bool stereo;                                // a Mixer channel's or an output's slot (the mic's are mono): set before it's opened
     int  nIn, nOut;                             // audio buses each way
     int  chIn[VST_MAXBUS], chOut[VST_MAXBUS];   // channels of each
     int  latency;                               // samples of delay it adds
@@ -352,6 +360,7 @@ struct VstSlot {
 };
 static VstSlot gVst[VST_SLOTS];
 static std::atomic<int> gVstLive;               // how many slots hold a running plugin (0: the audio thread skips all this)
+static std::atomic<int> gVstChMap[VST_CHANS];   // each Mixer channel's rack + 1 (0 = it has none): plugins follow the app / device
 
 SB::tresult PLUGIN_API VstHandler::performEdit(SV::ParamID id, SV::ParamValue v)
 {
@@ -376,7 +385,8 @@ static void VstPause(VstSlot& s)                // stop the audio thread using i
 }
 static void VstResume(VstSlot& s) { if (!s.live.exchange(1)) gVstLive++; }
 
-// Its buses: ask for mono in and out (a mic is mono), else stereo, then go with whatever it settled on.
+// Its buses: ask for mono in and out on a mic slot (stereo first on a Mixer one), else the other, then go
+// with whatever it settled on.
 static const wchar_t* VstSetupBuses(VstSlot& s)
 {
     s.nIn = s.comp->getBusCount(SV::kAudio, SV::kInput);
@@ -390,7 +400,7 @@ static const wchar_t* VstSetupBuses(VstSlot& s)
     const SV::SpeakerArrangement in0 = in[0], out0 = out[0];
     bool set = false;
     for (int t = 0; t < 2 && !set; t++) {
-        in[0] = out[0] = t ? VST_STEREO : VST_MONO;
+        in[0] = out[0] = (t != 0) != s.stereo ? VST_STEREO : VST_MONO;
         set = s.proc->setBusArrangements(in, s.nIn, out, s.nOut) == SB::kResultOk;
     }
     if (!set) { in[0] = in0; out[0] = out0; s.proc->setBusArrangements(in, s.nIn, out, s.nOut); }   // (back to how it came)
@@ -555,7 +565,7 @@ static bool VstProcessGuarded(SV::IAudioProcessor* p, SV::ProcessData* d)   // f
 #else
 static bool VstProcessGuarded(SV::IAudioProcessor* p, SV::ProcessData* d) { p->process(*d); return true; }
 #endif
-static bool VstRunBlock(VstSlot& s, float* buf, int n)   // n <= VST_BLOCK; false: it crashed
+static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLOCK; r: null on a mono (mic) slot; false: it crashed
 {
     s.inCh.n = 0; s.outCh.n = 0;
     for (unsigned r = s.taR.load(); r != s.taW.load(); r++) {      // knob moves from its window
@@ -576,9 +586,16 @@ static bool VstRunBlock(VstSlot& s, float* buf, int n)   // n <= VST_BLOCK; fals
         outB[b].numChannels = s.chOut[b]; outB[b].channelBuffers32 = outP[b]; outB[b].silenceFlags = 0;
         for (int c = 0; c < s.chOut[b]; c++) outP[b][c] = b == 0 ? gVstBufOut[c] : gVstJunk;
     }
-    memcpy(gVstBufIn[0], buf, n * sizeof(float));
-    if (s.chIn[0] > 1) memcpy(gVstBufIn[1], buf, n * sizeof(float));
     const int oc = s.chOut[0] > 1 ? 2 : 1;
+    if (!r) {                                   // mono in: the same on both channels of a stereo plugin
+        memcpy(gVstBufIn[0], l, n * sizeof(float));
+        if (s.chIn[0] > 1) memcpy(gVstBufIn[1], l, n * sizeof(float));
+    } else if (s.chIn[0] > 1) {
+        memcpy(gVstBufIn[0], l, n * sizeof(float));
+        memcpy(gVstBufIn[1], r, n * sizeof(float));
+    } else {                                    // stereo into a mono-only plugin: it gets left and right mixed
+        for (int i = 0; i < n; i++) gVstBufIn[0][i] = 0.5f * (l[i] + r[i]);
+    }
     for (int c = 0; c < s.chOut[0]; c++) memset(gVstBufOut[c], 0, n * sizeof(float));
     SV::ProcessContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -602,20 +619,37 @@ static bool VstRunBlock(VstSlot& s, float* buf, int n)   // n <= VST_BLOCK; fals
         if (w - s.tuR.load() < VST_RING) { s.toUi[w % VST_RING] = { q.id, q.val[q.n - 1] }; s.tuW.store(w + 1); }
     }
     const float want = s.on.load() ? 1.0f : 0.0f;
-    const float* l = gVstBufOut[0]; const float* r = gVstBufOut[oc - 1];
+    const float* ol = gVstBufOut[0]; const float* orr = gVstBufOut[oc - 1];
     float mix = s.mix;
-    for (int i = 0; i < n; i++) {
-        float w = oc == 2 ? 0.5f * (l[i] + r[i]) : l[i];
-        if (!(w > -64.0f && w < 64.0f)) w = 0;  // (garbage or NaN out of a plugin: silence, not a bang)
-        mix += (want - mix) * 0.004f;           // ~5 ms
-        buf[i] += (w - buf[i]) * mix;
+    if (!r) {
+        for (int i = 0; i < n; i++) {
+            float w = oc == 2 ? 0.5f * (ol[i] + orr[i]) : ol[i];
+            if (!(w > -64.0f && w < 64.0f)) w = 0;  // (garbage or NaN out of a plugin: silence, not a bang)
+            mix += (want - mix) * 0.004f;           // ~5 ms
+            l[i] += (w - l[i]) * mix;
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            float wl = ol[i], wr = orr[i];
+            if (!(wl > -64.0f && wl < 64.0f)) wl = 0;
+            if (!(wr > -64.0f && wr < 64.0f)) wr = 0;
+            mix += (want - mix) * 0.004f;
+            l[i] += (wl - l[i]) * mix;
+            r[i] += (wr - r[i]) * mix;
+        }
     }
     s.mix = want == 0.0f && mix < 0.0005f ? 0.0f : mix;
     return true;
 }
-static void VstRun(float* buf, int n)           // your mic, through each slot in turn
+static bool VstRangeOn(int first, int count)    // would any of these slots do something to the sound right now?
 {
-    for (int k = 0; k < VST_SLOTS; k++) {
+    for (int k = first; k < first + count; k++)
+        if (gVst[k].live.load() && (gVst[k].on.load() || gVst[k].mix > 0.0f)) return true;
+    return false;
+}
+static void VstRunRange(int first, int count, float* l, float* r, int n)   // a block through each of these slots in turn
+{
+    for (int k = first; k < first + count; k++) {
         VstSlot& s = gVst[k];
         if (!s.live.load()) continue;
         if (!s.on.load() && s.mix <= 0.0f) continue;   // bypassed, and faded all the way out
@@ -623,12 +657,13 @@ static void VstRun(float* buf, int n)           // your mic, through each slot i
         if (s.live.load()) {
             for (int off = 0; off < n; off += VST_BLOCK) {
                 const int m = n - off < VST_BLOCK ? n - off : VST_BLOCK;
-                if (!VstRunBlock(s, buf + off, m)) { if (s.live.exchange(0)) gVstLive--; s.crashed = 1; break; }
+                if (!VstRunBlock(s, l + off, r ? r + off : nullptr, m)) { if (s.live.exchange(0)) gVstLive--; s.crashed = 1; break; }
             }
         }
         s.busy.store(0);
     }
 }
+static void VstRun(float* buf, int n) { VstRunRange(0, VST_MIC, buf, nullptr, n); }   // your mic, through its slots
 // ======================= end of the VST3 host core =======================
 
 // ---- a slot as the window sees it: which plugin, its file, its own window ----
@@ -653,6 +688,7 @@ struct VstUi {
     VstFrame frame;
 };
 static VstUi gVstUi[VST_SLOTS];
+static wchar_t gVstRackKey[VST_RACKS][140];     // which app / device each Mixer rack belongs to ("type|source"; "" = free)
 static void VstYield() { Sleep(1); }
 
 static int Imin(int a, int b) { return a < b ? a : b; }
@@ -719,6 +755,9 @@ static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & F
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
 // Plugins on (Settings > Features): the mic's own stages for one block, before and after the plugins ran over them.
 static float gVstMic[VST_MAXFRAMES], gVstDuck[VST_MAXFRAMES], gVstDuckAll[VST_MAXFRAMES];
+// ...and a block of each Mixer channel / each output that has plugins (left, right).
+static float gVstChL[VST_CHANS][VST_MAXFRAMES], gVstChR[VST_CHANS][VST_MAXFRAMES];
+static float gVstOutL[VST_OUTS][VST_MAXFRAMES], gVstOutR[VST_OUTS][VST_MAXFRAMES];
 static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
 static volatile int  gRewindTop = 350, gRewindRamp = 30, gRewindPitch = 0;   // Rewind: top speed %, % of it spent speeding up, semitones
 static volatile bool gTapeReq = false, gDiveHeld = false, gBeatSync = false, gFxBypass = false;   // A/B: hear yourself dry
@@ -3031,10 +3070,32 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     };
     // Plugins (Mic > Plugins) work on a whole block, so with any loaded the mic's own stages run for the block
     // first, then the plugins, and the loop below picks the result up. (Without plugins nothing changes.)
-    const bool vstOn = gFeatVst && gVstLive.load() > 0 && frames <= VST_MAXFRAMES;
+    const bool vstAny = gFeatVst && gVstLive.load() > 0 && frames <= VST_MAXFRAMES;
+    const bool vstOn = vstAny && VstRangeOn(0, VST_MIC);
     if (vstOn) {
         for (ma_uint32 f = 0; f < frames; f++) { gVstMic[f] = micPre(f); gVstDuck[f] = chDuck; gVstDuckAll[f] = chDuckAll; }
         VstRun(gVstMic, (int)frames);
+    }
+    // Mixer channels whose app / device has plugins: this block of each goes through them first (before its EQ,
+    // compressor and fader). Outputs with plugins: their mix is collected in the loop and finished after it.
+    bool chVst[CH_MAX] = {}, outVst[MAX_OUT] = {};
+    if (vstAny) {
+        for (int ci = 0; ci < nAct; ci++) {
+            const int c = act[ci], rk = gVstChMap[c].load() - 1;
+            if (rk < 0 || rk >= VST_RACKS || !chAv[c] || !VstRangeOn(VST_CH0 + rk * VST_PER, VST_PER)) continue;
+            float* L = gVstChL[c]; float* R = gVstChR[c];
+            unsigned rd = chRd[c], av = chAv[c];
+            for (ma_uint32 f = 0; f < frames; f++) {    // exactly the samples the loop below takes (its clock nudge included)
+                if (!av) { L[f] = R[f] = 0; continue; }
+                const unsigned i = (rd & (CH_RING - 1)) * 2;
+                L[f] = gChA[c].buf[i]; R[f] = gChA[c].buf[i + 1];
+                if (!(f == frames / 2 && chAdj[c] < 0)) { rd++; av--; }
+                if (f == frames / 2 && chAdj[c] > 0 && av > 1) { rd++; av--; }
+            }
+            VstRunRange(VST_CH0 + rk * VST_PER, VST_PER, L, R, (int)frames);
+            chVst[c] = true;
+        }
+        for (int k = 0; k < MAX_OUT; k++) outVst[k] = (k == 0 || on[k]) && VstRangeOn(VST_OUT0 + k * VST_PER, VST_PER);
     }
     for (ma_uint32 f = 0; f < frames; f++) {
         float sbFx = 0; int padsOn = 0;
@@ -3147,6 +3208,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                     const float a = Max(fabsf(L), fabsf(R)); if (a > gSongPeak) gSongPeak = a;
                 }
                 if (chDucker[c]) { const float e = Max(fabsf(L), fabsf(R)); chTrig[c] = e > chTrig[c] ? e : chTrig[c] * 0.9995f; }
+                if (chVst[c]) { L = gVstChL[c][f]; R = gVstChR[c][f]; }   // (its plugins already ran over this block)
                 if (chEq[c]) {
                     ChFx& x = chFx[c];
                     L = BqRun(x.hi[0], BqRun(x.mid[0], BqRun(x.lo[0], L)));
@@ -3182,15 +3244,24 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             return RowSignal(mode[k], effect, everything, clean) * tbG[k] + everything * tbE[k];
         };
         float m0 = soloMask && soloOut == 0 ? 0.0f : micSig(0) + sounds(0);
-        float oL = (m0 + cL[0]) * vol[0], oR = (m0 + cR[0]) * vol[0];
-        if (testLeft[0] > 0) { const float t = TestToneAt(testLeft[0]--); oL += t; oR += t; }
-        LimitStereo(0, oL, oR);
-        { float a = Max(fabsf(oL), fabsf(oR)); if (a > outPk[0]) outPk[0] = a; }
-        out[f * 2] = oL;
-        out[f * 2 + 1] = oR;
+        if (outVst[0]) { gVstOutL[0][f] = m0 + cL[0]; gVstOutR[0][f] = m0 + cR[0]; }   // (plugins on it: finished after the loop)
+        else {
+            float oL = (m0 + cL[0]) * vol[0], oR = (m0 + cR[0]) * vol[0];
+            if (testLeft[0] > 0) { const float t = TestToneAt(testLeft[0]--); oL += t; oR += t; }
+            LimitStereo(0, oL, oR);
+            { float a = Max(fabsf(oL), fabsf(oR)); if (a > outPk[0]) outPk[0] = a; }
+            out[f * 2] = oL;
+            out[f * 2 + 1] = oR;
+        }
 
         for (int k = 1; k < MAX_OUT; k++) {
-            if (!on[k] || (w[k] - r[k]) >= RING_FRAMES) continue;
+            if (!on[k]) continue;
+            if (outVst[k]) {
+                const float mv = soloMask && soloOut == k ? 0.0f : micSig(k) + sounds(k);
+                gVstOutL[k][f] = mv + cL[k]; gVstOutR[k][f] = mv + cR[k];
+                continue;
+            }
+            if ((w[k] - r[k]) >= RING_FRAMES) continue;
             const float mk = soloMask && soloOut == k ? 0.0f : micSig(k) + sounds(k);
             float kL = (mk + cL[k]) * vol[k], kR = (mk + cR[k]) * vol[k];
             if (testLeft[k] > 0) { const float t = TestToneAt(testLeft[k]--); kL += t; kR += t; }
@@ -3199,6 +3270,20 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             ring[k][i] = kL; ring[k][i + 1] = kR;
             { float a = Max(fabsf(kL), fabsf(kR)); if (a > outPk[k]) outPk[k] = a; }
             w[k]++;
+        }
+    }
+    for (int k = 0; k < MAX_OUT; k++) {         // outputs with plugins: the block through them, then volume, limiter and out as usual
+        if (!outVst[k]) continue;
+        float* L = gVstOutL[k]; float* R = gVstOutR[k];
+        VstRunRange(VST_OUT0 + k * VST_PER, VST_PER, L, R, (int)frames);
+        for (ma_uint32 f = 0; f < frames; f++) {
+            if (k > 0 && (w[k] - r[k]) >= RING_FRAMES) break;
+            float oL = L[f] * vol[k], oR = R[f] * vol[k];
+            if (testLeft[k] > 0) { const float t = TestToneAt(testLeft[k]--); oL += t; oR += t; }
+            LimitStereo(k, oL, oR);
+            { float a = Max(fabsf(oL), fabsf(oR)); if (a > outPk[k]) outPk[k] = a; }
+            if (k == 0) { out[f * 2] = oL; out[f * 2 + 1] = oR; }
+            else { const unsigned i = (w[k] & (RING_FRAMES - 1)) * 2; ring[k][i] = oL; ring[k][i + 1] = oR; w[k]++; }
         }
     }
     for (int c = 0; c < CH_MAX; c++) {
@@ -3328,7 +3413,8 @@ enum {
     IDC_MIXFADE = 1980, IDC_MIXFADELBL = 1981, IDC_MIXFADES = 1982, IDC_MIXKTB = 1983, IDC_TBOUT = 1984, IDC_TBHDR = 1985, IDC_TBHDR2 = 1986,
     // Plugins (Mic > Plugins): their own range, clear of the number boxes' arrows (id + 2000)
     IDC_MICSUB2 = 4400, IDC_FEATVST = 4401, IDC_VSTHINT = 4402, IDC_VSTLIC = 4403,
-    IDC_VSTON0 = 4410, IDC_VSTNAME0 = 4420, IDC_VSTEDIT0 = 4430, IDC_VSTINFO0 = 4440, IDC_VSTNUM0 = 4450,   // + slot (VST_SLOTS)
+    IDC_VSTON0 = 4410, IDC_VSTNAME0 = 4420, IDC_VSTEDIT0 = 4430, IDC_VSTINFO0 = 4440, IDC_VSTNUM0 = 4450,   // + mic slot (VST_MIC)
+    IDC_OFX0 = 4460,                            // .. +5: each output's plugins button
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -4480,6 +4566,7 @@ static void LoadSettings()
         wsprintfW(key, L"plugin%d_on", k + 1);   u.want = u.path[0] && INI_INT(key, 0) != 0;
         WideCharToMultiByte(CP_ACP, 0, id, -1, u.cid, 33, nullptr, nullptr); u.cid[32] = 0;
     }
+    for (int r = 0; r < VST_RACKS; r++) { wchar_t key[32]; wsprintfW(key, L"plugin_rack%d", r + 1); GetPrivateProfileStringW(L"settings", key, L"", gVstRackKey[r], 140, gIni); }
     gWsOn   = INI_INT(L"remote_on", 0) != 0;     // (off unless you switch it on)
     gWsPort = Iclamp(INI_INT(L"remote_port", 7600), 1024, 65535);
     GetPrivateProfileStringW(L"settings", L"remote_password", L"", gWsPass, 64, gIni);
@@ -5370,6 +5457,7 @@ static void SaveSettings()
         wsprintfW(key, L"plugin%d_name", k + 1); IniSet(key, u.path[0] ? u.name : nullptr);
         wsprintfW(key, L"plugin%d_on", k + 1);   IniSet(key, u.path[0] ? (u.want ? L"1" : L"0") : nullptr);
     }
+    for (int r = 0; r < VST_RACKS; r++) { wchar_t key[32]; wsprintfW(key, L"plugin_rack%d", r + 1); IniSet(key, gVstRackKey[r][0] ? gVstRackKey[r] : nullptr); }
     SaveInt(L"random_lag_every_s", gRandLagSec);
 
     SaveInt(L"repeat_word_times", gRepeatN);
@@ -9623,6 +9711,8 @@ static LRESULT CALLBACK RouteBtnProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PT
     if (m == WM_RBUTTONUP) { ChanFxOpen(c); return 0; }
     return DefSubclassProc(h, m, w, l);
 }
+static void RackOpen(int t);                    // (plugins: defined with them)
+static bool VstTargetOn(int t);
 static void ChanMenu(int c, HWND from)
 {
     HCURSOR old = SetCursor(LoadCursor(nullptr, IDC_WAIT));
@@ -9654,6 +9744,7 @@ static void ChanMenu(int c, HWND from)
         AppendMenuW(m, MF_STRING | (gCh[c].mono ? MF_CHECKED : 0), 40, L"Mono (left and right mixed)");
         AppendMenuW(m, MF_STRING | (gCh[c].ducker ? MF_CHECKED : 0), 41, L"Duck the others while this plays (e.g. Discord)");
         AppendMenuW(m, MF_STRING | (ChanFxUsed(c) ? MF_CHECKED : 0), 42, L"EQ, compressor, level on each output...");
+        if (gFeatVst) AppendMenuW(m, MF_STRING | (VstTargetOn(c) ? MF_CHECKED : 0), 43, L"Plugins (VST3)...");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     }
     HMENU more = CreatePopupMenu(), ins = CreatePopupMenu(), outs = CreatePopupMenu();
@@ -9699,6 +9790,7 @@ static void ChanMenu(int c, HWND from)
     else if (cmd >= 30 && cmd <= 34) { gCh[c].link = cmd - 30; MixerRedraw(); }
     else if (cmd == 40) gCh[c].mono = !gCh[c].mono;
     else if (cmd == 42) ChanFxOpen(c);
+    else if (cmd == 43) RackOpen(c);
     else if (cmd == 41) { gCh[c].ducker = !gCh[c].ducker; if (gCh[c].ducker) ShowOsd(L"Channels with Duck on now get quieter while this plays too", true); }
     else if (cmd >= 100 && cmd - 100 < gChOptN) ChanSetSource(c, gChOpts[cmd - 100].type, gChOpts[cmd - 100].src);
 }
@@ -10169,6 +10261,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_OLBL0 + k), tx, oy + SC(6), tw, SC(18));
         PlaceFree(GetDlgItem(gWnd, IDC_ODEV0 + k), tx, oy + SC(25), tw, SC(18));
         PlaceFree(GetDlgItem(gWnd, IDC_ODB0 + k),  tx, oy + SC(44), tw, SC(18));
+        PlaceFree(GetDlgItem(gWnd, IDC_OFX0 + k),  tx, oy + SC(66), tw, SC(20));
         PlaceFree(GetDlgItem(gWnd, IDC_OLIM0 + k), tx, oy + oh - SC(54), tw, SC(16));
         PlaceFree(GetDlgItem(gWnd, IDC_OMUTE0 + k), tx, oy + oh - SC(30), tw - SC(26), SC(22));
         PlaceFree(GetDlgItem(gWnd, IDC_OTEST0 + k), tx + tw - SC(22), oy + oh - SC(30), SC(22), SC(22));
@@ -12116,6 +12209,7 @@ static void AddTips()
         TipId(IDC_OVOL0 + k,  L"This output's volume: the same as its volume on the Main tab. Drag, or scroll (Shift = finer). Double-click = 0 dB. Right-click to type an exact value.");
         TipId(IDC_OMUTE0 + k, L"Mute: silence this output (everything going to it).");
         TipId(IDC_OTEST0 + k, L"Test: play a short beep on just this output, so you can tell which device it is.");
+        TipId(IDC_OFX0 + k,   L"Plugins on everything this output plays (VST3), before its volume and limiter. Lit while one is on.");
         TipId(IDC_OMETER0 + k, L"How loud this output is right now.");
         TipId(IDC_OLIM0 + k,  L"Lights up when this output is so loud the limiter has to turn peaks down. Often lit? Lower some volumes. Click to pick how loud peaks may get (normally -1 dB; lower it for a stream that should stay quieter).");
         TipId(IDC_ODEV0 + k,  L"The device this output plays on (change it on the Main tab).");
@@ -12368,14 +12462,14 @@ static void AddTips()
     TipId(IDC_MICSUB0, L"Cleanup: AI noise suppression and the noise gate.");
     TipId(IDC_MICSUB1, L"Tone: mic level, low cut, leveler, de-esser, broadcast voice and a 5-band equalizer.");
     TipId(IDC_MICSUB2, L"Plugins: VST3 effects on your mic, after Cleanup and Tone.");
-    for (int k = 0; k < VST_SLOTS; k++) {
+    for (int k = 0; k < VST_MIC; k++) {
         TipId(IDC_VSTON0 + k,   L"On: your mic runs through this plugin. Off: bypassed (it fades, no click) and it uses no processing time.");
         TipId(IDC_VSTNAME0 + k, L"Click to pick the plugin for this slot, reload it, move it up or down the chain, or remove it.");
         TipId(IDC_VSTEDIT0 + k, L"Open the plugin's own window to change its settings. They're saved when you close it.");
         TipId(IDC_VSTINFO0 + k, L"\"+N ms delay\": the plugin makes your voice that much later (look-ahead, noise removal...).");
     }
     TipId(IDC_VSTLIC, L"The licence of the VST3 interface Lag Effect uses to talk to plugins.");
-    TipId(IDC_FEATVST, L"Plugins: adds a Plugins page to the Mic tab for VST3 effects. Off: no plugin is loaded and none of it runs.");
+    TipId(IDC_FEATVST, L"Plugins: VST3 effects on your mic (Mic > Plugins), on Mixer channels (their menu) and on outputs (their FX button). Off: no plugin is loaded and none of it runs.");
     TipId(IDC_HARMMUTE,  L"Silences the extra voices but keeps the Harmonizer on and your own voice at full level. Click again to bring them back.");
     TipId(IDC_HARMSTYLE, L"Which extra voices sing along: an octave up or down, a chord, a fifth, a power chord or an angel choir.");
     TipId(IDC_BROADCAST, L"Radio-host sound: strong, even compression, a little presence and less mud, and the esses tamed. "
@@ -13447,7 +13541,7 @@ static void Layout()
         }
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
-                cid == IDC_ODEV0 + k || cid == IDC_ODB0 + k || cid == IDC_OLIM0 + k || cid == IDC_OTEST0 + k) vis = false;
+                cid == IDC_ODEV0 + k || cid == IDC_ODB0 + k || cid == IDC_OLIM0 + k || cid == IDC_OTEST0 + k || cid == IDC_OFX0 + k) vis = false;
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
@@ -13555,9 +13649,11 @@ static void AddOutput()
     RestartIfRunning();
 }
 
+static void VstOutDeleted(int k);
 static void RemoveOutput(int k)
 {
     if (k <= 0 || k >= gRows) return;
+    VstOutDeleted(k);                           // (its plugins go; the later outputs' move up with them)
     for (int j = k; j < gRows - 1; j++) {
         LRESULT sel = SendDlgItemMessageW(gWnd, IDC_ROWDEV + j + 1, CB_GETCURSEL, 0, 0);
         SendDlgItemMessageW(gWnd, IDC_ROWDEV + j, CB_SETCURSEL, sel, 0);
@@ -14081,6 +14177,14 @@ static void SetupVbCable()
 #if RATE != VST_RATE
 #error "The plugin host and the app disagree about the sample rate"
 #endif
+#if CH_MAX != VST_CHANS || MAX_OUT != VST_OUTS
+#error "The plugin host and the Mixer disagree about how many channels / outputs there are"
+#endif
+static void VstGroup(int k, int* first, int* count)   // the slots that run one after another with slot k (your mic's 4, or a pair)
+{
+    if (k < VST_MIC) { *first = 0; *count = VST_MIC; }
+    else { *first = VST_CH0 + (k - VST_CH0) / VST_PER * VST_PER; *count = VST_PER; }
+}
 static void SaveSettings();
 static void VstRefreshUi();
 static void VstEditorClose(int k);
@@ -14280,6 +14384,7 @@ static bool VstLoad(int k, bool quiet)          // start the plugin this slot is
         wchar_t sp[MAX_PATH]; VstStatePath(k, sp);
         int stLen = 0; unsigned char* st = VstReadFile(sp, &stLen);
         const wchar_t* e2 = nullptr;
+        s.stereo = k >= VST_MIC;                // (Mixer channels and outputs are stereo; your mic is mono)
         s.on = u.want ? 1 : 0;                  // (set before it goes live, so a bypassed one never sounds for a moment)
         auto job = [&] { e2 = VstOpen(s, u.fac, cid, st, stLen); };
         if (VstGuard(job)) err = e2;
@@ -14374,7 +14479,7 @@ static void VstSwap(int a, int b)               // move a plugin up or down the 
     DeleteFileW(pt);
     MoveFileW(pa, pt); MoveFileW(pb, pa); MoveFileW(pt, pb);
     const int both[2] = { a, b };
-    for (int k : both) if (gVstUi[k].want && !VstLoad(k, true)) gVstUi[k].want = false;
+    if (gFeatVst) for (int k : both) if (gVstUi[k].want && !VstLoad(k, true)) gVstUi[k].want = false;   // (Plugins off: just the bookkeeping)
     SaveSettings();
     VstRefreshUi();
 }
@@ -14546,8 +14651,9 @@ static void VstMenu(int k, HWND from)           // a slot's button: what's in it
     if (u.path[0]) {
         AppendMenuW(m, MF_STRING, 1, L"Open its window");
         AppendMenuW(m, MF_STRING, 2, u.loaded ? L"Reload it (keeps its settings)" : L"Load it");
-        AppendMenuW(m, MF_STRING | (k > 0 ? 0 : MF_GRAYED), 4, L"Move up (runs earlier)");
-        AppendMenuW(m, MF_STRING | (k < VST_SLOTS - 1 ? 0 : MF_GRAYED), 5, L"Move down (runs later)");
+        int g0, gn; VstGroup(k, &g0, &gn);
+        AppendMenuW(m, MF_STRING | (k > g0 ? 0 : MF_GRAYED), 4, L"Move up (runs earlier)");
+        AppendMenuW(m, MF_STRING | (k < g0 + gn - 1 ? 0 : MF_GRAYED), 5, L"Move down (runs later)");
         AppendMenuW(m, MF_STRING, 3, L"Remove it from this slot");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     }
@@ -14614,25 +14720,119 @@ static void VstMenu(int k, HWND from)           // a slot's button: what's in it
     else if (cmd >= 100 && cmd - 100 < gVstFoundN) VstAssign(k, gVstFound[cmd - 100].path);
 }
 
+// ---- Mixer channels: plugins belong to the app / device, not to the strip ----
+// A channel's plugins sit in a "rack" kept under its source (like the remembered apps). So they follow the app
+// through reordering, scenes and undo, and come back when the app is added again. Outputs have a fixed pair each.
+static void VstChanKey(int c, wchar_t* out)     // what a channel's plugins are kept under
+{
+    if (c < 0 || c >= CH_MAX || gCh[c].type == CH_NONE) { out[0] = 0; return; }
+    _snwprintf(out, 139, L"%d|%s", gCh[c].type, gCh[c].src); out[139] = 0;
+}
+static bool VstRackEmpty(int r)
+{
+    for (int j = 0; j < VST_PER; j++) if (gVstUi[VST_CH0 + r * VST_PER + j].path[0]) return false;
+    return true;
+}
+static int VstRackOf(int c)                     // the rack with this channel's plugins, or -1
+{
+    wchar_t key[140]; VstChanKey(c, key);
+    if (!key[0]) return -1;
+    for (int r = 0; r < VST_RACKS; r++) if (gVstRackKey[r][0] && !lstrcmpiW(key, gVstRackKey[r])) return r;
+    return -1;
+}
+static int VstRackMake(int c)                   // ...or a free one for it (-1: none to be had)
+{
+    int r = VstRackOf(c);
+    if (r >= 0) return r;
+    wchar_t key[140]; VstChanKey(c, key);
+    if (!key[0]) return -1;
+    for (r = 0; r < VST_RACKS; r++) if (VstRackEmpty(r)) { lstrcpynW(gVstRackKey[r], key, 140); return r; }
+    for (r = 0; r < VST_RACKS; r++) {           // all eight hold plugins: one whose app isn't in the Mixer now can make room
+        bool used = false;
+        for (int c2 = 0; c2 < CH_MAX; c2++) if (VstRackOf(c2) == r) used = true;
+        if (used) continue;
+        const wchar_t* nm = wcschr(gVstRackKey[r], L'|'); nm = nm ? nm + 1 : gVstRackKey[r];
+        wchar_t m[500];
+        _snwprintf(m, 499, L"Plugins are remembered for up to %d apps or devices, and all %d are taken.\n\n"
+                           L"Forget the plugins of \"%s\" (it isn't in the Mixer right now) to make room?", VST_RACKS, VST_RACKS, nm);
+        m[499] = 0;
+        if (MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_YESNO | MB_ICONQUESTION) != IDYES) return -1;
+        for (int j = 0; j < VST_PER; j++) { VstUnload(VST_CH0 + r * VST_PER + j, false); VstClearSlot(VST_CH0 + r * VST_PER + j); }
+        lstrcpynW(gVstRackKey[r], key, 140);
+        return r;
+    }
+    return -1;                                  // (can't happen with 8 channels and 8 racks, but never guess)
+}
+static void VstMapChannels()                    // which rack each channel runs through, for the audio thread; loads what's newly needed
+{
+    bool taken[VST_RACKS] = {}, changed = false;
+    for (int c = 0; c < CH_MAX; c++) {
+        int r = VstRackOf(c);
+        if (r >= 0 && (taken[r] || VstRackEmpty(r))) r = -1;   // (the same app on two channels: the first one has the plugins)
+        if (r >= 0) taken[r] = true;
+        if (gVstChMap[c].load() != r + 1) gVstChMap[c].store(r + 1);
+        if (r < 0) continue;
+        for (int j = 0; j < VST_PER; j++) {
+            const int k = VST_CH0 + r * VST_PER + j;
+            VstUi& u = gVstUi[k];
+            if (!u.want || !u.path[0] || u.loaded || u.dead) continue;
+            if (!VstLoad(k, true)) u.want = false;
+            changed = true;
+        }
+    }
+    if (changed) { SaveSettings(); VstRefreshUi(); }
+}
+static int VstTargetSlot(int t, int j, bool make)   // the slot behind row j of a channel's (t = 0..7) or an output's (t = 100 + k) plugins; -1: none yet
+{
+    if (t >= 100) return t - 100 < MAX_OUT ? VST_OUT0 + (t - 100) * VST_PER + j : -1;
+    const int r = make ? VstRackMake(t) : VstRackOf(t);
+    return r < 0 ? -1 : VST_CH0 + r * VST_PER + j;
+}
+static bool VstTargetOn(int t)                  // does this channel / output have a plugin switched on?
+{
+    for (int j = 0; j < VST_PER; j++) { const int k = VstTargetSlot(t, j, false); if (k >= 0 && gVstUi[k].path[0] && gVstUi[k].want) return true; }
+    return false;
+}
+static void VstOutDeleted(int k)                // an output row was removed: the ones after it move up, their plugins with them
+{
+    if (k < 0 || k >= MAX_OUT) return;
+    for (int j = 0; j < VST_PER; j++) { const int a = VST_OUT0 + k * VST_PER + j; if (gVstUi[a].path[0]) { VstUnload(a, false); VstClearSlot(a); } }
+    for (int o = k; o < MAX_OUT - 1; o++)
+        for (int j = 0; j < VST_PER; j++) {
+            const int a = VST_OUT0 + o * VST_PER + j, b = a + VST_PER;
+            if (gVstUi[a].path[0] || gVstUi[b].path[0]) VstSwap(a, b);
+        }
+    VstRefreshUi();
+}
+
 // ---- the Mic > Plugins page ----
+static void RackRefresh();
+static void VstInfoText(int k, wchar_t* t)      // a slot's state in a word or two
+{
+    const VstUi& u = gVstUi[k];
+    if (!u.path[0]) t[0] = 0;
+    else if (u.dead) lstrcpyW(t, L"Crashed");
+    else if (!u.loaded) lstrcpyW(t, L"Not loaded");
+    else if (!u.want) lstrcpyW(t, L"Bypassed");
+    else if (gVst[k].latency > 0) wsprintfW(t, L"On, +%d ms delay", (gVst[k].latency * 1000 + RATE / 2) / RATE);
+    else if (k >= VST_MIC && gVst[k].chIn[0] < 2) lstrcpyW(t, L"On (mono)");   // (a mono-only plugin on a stereo channel / output)
+    else lstrcpyW(t, L"On");
+}
 static void VstRefreshUi()
 {
     if (!gWnd || !GetDlgItem(gWnd, IDC_VSTNAME0)) return;
-    for (int k = 0; k < VST_SLOTS; k++) {
+    for (int k = 0; k < VST_MIC; k++) {
         const VstUi& u = gVstUi[k];
         wchar_t t[120];
         if (!u.path[0]) lstrcpyW(t, L"+  Add a plugin...");
         else lstrcpynW(t, u.name[0] ? u.name : L"(plugin)", 100);
         SetDlgItemTextW(gWnd, IDC_VSTNAME0 + k, t);
         CheckDlgButton(gWnd, IDC_VSTON0 + k, u.want && u.path[0] ? BST_CHECKED : BST_UNCHECKED);
-        if (!u.path[0]) t[0] = 0;
-        else if (u.dead) lstrcpyW(t, L"Crashed");
-        else if (!u.loaded) lstrcpyW(t, L"Not loaded");
-        else if (!u.want) lstrcpyW(t, L"Bypassed");
-        else if (gVst[k].latency > 0) wsprintfW(t, L"On, +%d ms delay", (gVst[k].latency * 1000 + RATE / 2) / RATE);
-        else lstrcpyW(t, L"On");
+        VstInfoText(k, t);
         SetDlgItemTextW(gWnd, IDC_VSTINFO0 + k, t);
     }
+    for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_OFX0 + k), nullptr, FALSE);   // (lit while an output has a plugin on)
+    RackRefresh();
 }
 static void VstSetOn(int k, bool on)            // a slot's On switch
 {
@@ -14644,6 +14844,108 @@ static void VstSetOn(int k, bool on)            // a slot's On switch
     SaveSettings();
     VstRefreshUi();
 }
+// ---- a Mixer channel's or an output's plugins: a small window with its two slots ----
+static HWND gRackWnd = nullptr;
+static int  gRackT = -1;                        // whose it shows: 0..7 a Mixer channel, 100 + k an output
+enum { RK_ON0 = 10, RK_NAME0 = 20, RK_OPEN0 = 30, RK_INFO0 = 40 };
+static void ThemeTitleBar(HWND w);
+static void RackTitle(wchar_t* out)
+{
+    wchar_t nm[40];
+    if (gRackT >= 100) OutName(gRackT - 100, nm, 32); else ChanLabel(gRackT, nm, 32);
+    _snwprintf(out, 79, L"%s - plugins", nm); out[79] = 0;
+}
+static void RackSet(int id, const wchar_t* t)   // (only when it changed: no flicker from the timer)
+{
+    wchar_t cur[128]; GetDlgItemTextW(gRackWnd, id, cur, 128);
+    if (lstrcmpW(cur, t)) SetDlgItemTextW(gRackWnd, id, t);
+}
+static void RackRefresh()
+{
+    if (!gRackWnd) return;
+    for (int j = 0; j < VST_PER; j++) {
+        const int k = VstTargetSlot(gRackT, j, false);
+        const bool has = k >= 0 && gVstUi[k].path[0];
+        wchar_t t[120];
+        if (has) lstrcpynW(t, gVstUi[k].name[0] ? gVstUi[k].name : L"(plugin)", 100); else lstrcpyW(t, L"+  Add a plugin...");
+        RackSet(RK_NAME0 + j, t);
+        RackSet(RK_ON0 + j, has && gVstUi[k].want ? L"On" : L"Off");
+        if (has) VstInfoText(k, t); else t[0] = 0;
+        RackSet(RK_INFO0 + j, t);
+    }
+    wchar_t title[80], cur[80]; RackTitle(title);
+    GetWindowTextW(gRackWnd, cur, 80);
+    if (lstrcmpW(cur, title)) SetWindowTextW(gRackWnd, title);
+}
+static LRESULT CALLBACK RackProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_TIMER:
+        if (!gFeatVst || (gRackT < 100 ? gCh[gRackT].type == CH_NONE : gRackT - 100 >= gRows)) { DestroyWindow(h); return 0; }   // (it went)
+        RackRefresh();
+        return 0;
+    case WM_COMMAND: {
+        const int id = LOWORD(w);
+        if (id == IDCANCEL) { DestroyWindow(h); return 0; }
+        if (HIWORD(w) != BN_CLICKED) return 0;
+        const int j = id % 10, what = id - j;
+        if (j >= VST_PER || (what != RK_ON0 && what != RK_NAME0 && what != RK_OPEN0)) return 0;
+        int k = VstTargetSlot(gRackT, j, false);
+        const bool has = k >= 0 && gVstUi[k].path[0];
+        if (what == RK_NAME0 || !has) {         // its menu (an empty slot: whichever button you pressed)
+            k = VstTargetSlot(gRackT, j, true);
+            if (k >= 0) VstMenu(k, GetDlgItem(h, RK_NAME0 + j));
+        }
+        else if (what == RK_ON0) VstSetOn(k, !gVstUi[k].want);
+        else VstEditorOpen(k);
+        if (gRackWnd == h) RackRefresh();
+        return 0;
+    }
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_DESTROY: KillTimer(h, 1); if (gRackWnd == h) { gRackWnd = nullptr; gRackT = -1; } return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX:
+        return CtlColor(h, m, w, l);
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void RackOpen(int t)                     // t: 0..7 a Mixer channel, 100 + k an output
+{
+    if (gRackWnd) DestroyWindow(gRackWnd);
+    if (!gFeatVst) return;
+    if (t < 100 ? (t < 0 || t >= CH_MAX || gCh[t].type == CH_NONE) : t - 100 >= gRows) return;
+    gRackT = t;
+    const int W = 478, H = 20 + VST_PER * 38 + 50;
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
+    RECT r = { 0, 0, SC(W), SC(H) }; AdjustWindowRect(&r, style, FALSE);
+    RECT sr; GetWindowRect(GetDlgItem(gWnd, t < 100 ? IDC_CHSRC0 + t : IDC_OLBL0 + (t - 100)), &sr);
+    HMONITOR mon = MonitorFromRect(&sr, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    const int x = Iclamp(sr.left, mi.rcWork.left, mi.rcWork.right - ww), y = Iclamp(sr.bottom + SC(4), mi.rcWork.top, mi.rcWork.bottom - wh);
+    wchar_t title[80]; RackTitle(title);
+    gRackWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"LagVstRack", title, style, x, y, ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!gRackWnd) { gRackT = -1; return; }
+    ThemeTitleBar(gRackWnd);
+    auto mk = [&](const wchar_t* cls, const wchar_t* tx, DWORD st, int x2, int y2, int w2, int h2, int id) {
+        HWND c2 = CreateWindowExW(0, cls, tx, WS_CHILD | WS_VISIBLE | st, SC(x2), SC(y2), SC(w2), SC(h2), gRackWnd, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c2, WM_SETFONT, (WPARAM)gFont, TRUE);
+        return c2;
+    };
+    for (int j = 0; j < VST_PER; j++) {
+        const int ry = 14 + j * 38;
+        mk(L"BUTTON", L"Off", WS_TABSTOP, 14, ry, 44, 28, RK_ON0 + j);
+        mk(L"BUTTON", L"+  Add a plugin...", WS_TABSTOP, 62, ry, 232, 28, RK_NAME0 + j);
+        mk(L"BUTTON", L"Open", WS_TABSTOP, 298, ry, 60, 28, RK_OPEN0 + j);
+        mk(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 366, ry + 6, 104, 18, RK_INFO0 + j);
+    }
+    mk(L"STATIC", t < 100 ? L"In stereo, before this channel's EQ, compressor and fader. They're kept for this app or device, and come back with it."
+                          : L"In stereo, on everything this output plays, before its volume and limiter.",
+       SS_NOPREFIX, 14, 14 + VST_PER * 38 + 4, 452, 38, -1);
+    RackRefresh();
+    SetTimer(gRackWnd, 1, 300, nullptr);
+    ShowWindow(gRackWnd, SW_SHOW);
+}
+
 static bool gVstStarted = false;                // the plugins from last time have been started this run
 static void VstStartAll()                       // at start-up, and when Plugins is switched on in Settings > Features
 {
@@ -14656,8 +14958,10 @@ static void VstStartAll()                       // at start-up, and when Plugins
     if (bad >= 1 && bad <= VST_SLOTS && gVstUi[bad - 1].path[0]) { gVstUi[bad - 1].want = false; lstrcpynW(culprit, gVstUi[bad - 1].name, 80); }
     for (int k = 0; k < VST_SLOTS; k++) {
         VstUi& u = gVstUi[k];
+        if (k >= VST_CH0 && k < VST_OUT0) continue;   // (a Mixer channel's: loaded by VstMapChannels once its app / device is in the Mixer)
         if (u.want && u.path[0] && !u.loaded && !VstLoad(k, true)) u.want = false;
     }
+    VstMapChannels();
     VstRefreshUi();
     if (culprit[0]) {
         SaveSettings();
@@ -14670,6 +14974,8 @@ static void VstStartAll()                       // at start-up, and when Plugins
 }
 static void VstStopAll(bool quitting)           // quitting, or Plugins switched off in Settings > Features: nothing stays loaded
 {
+    if (gRackWnd) DestroyWindow(gRackWnd);
+    for (int c = 0; c < CH_MAX; c++) gVstChMap[c].store(0);
     for (int k = 0; k < VST_SLOTS; k++) VstUnload(k, true, quitting);
 }
 static void VstTick()                           // ~10 times a second while Plugins is on
@@ -14693,11 +14999,12 @@ static void VstTick()                           // ~10 times a second while Plug
         if (minute && u.wnd) VstSaveState(k);   // its window is open: keep what you're setting, once a minute
     }
     gVstTempo = Iclamp(gBpm, 40, 300);          // (tempo-synced plugins follow the Main tab's BPM)
+    VstMapChannels();                           // (a scene, an undo or a new source may have moved apps between channels)
     if (changed) VstRefreshUi();
     busy = false;
 }
 
-// ---- profiles: which plugins, on or off, and each one's own settings ----
+// ---- profiles: which plugins are on your mic, on or off, and each one's own settings (the Mixer's stay as they are) ----
 static void VstProfileBin(const wchar_t* name, int k, wchar_t* out)
 {
     wchar_t dir[MAX_PATH]; ProfileDir(dir);
@@ -14706,7 +15013,7 @@ static void VstProfileBin(const wchar_t* name, int k, wchar_t* out)
 static void VstProfileSave(const wchar_t* name, const wchar_t* path)
 {
     if (!gFeatVst) return;                      // (Plugins off: profiles neither store nor touch them)
-    for (int k = 0; k < VST_SLOTS; k++) {
+    for (int k = 0; k < VST_MIC; k++) {
         const VstUi& u = gVstUi[k];
         wchar_t key[32], id[40], bin[MAX_PATH], sp[MAX_PATH];
         wsprintfW(key, L"plugin%d_path", k + 1); WritePrivateProfileStringW(L"profile", key, u.path, path);
@@ -14722,7 +15029,7 @@ static void VstProfileSave(const wchar_t* name, const wchar_t* path)
 static void VstProfileLoad(const wchar_t* name, const wchar_t* path)
 {
     if (!gFeatVst) return;
-    for (int k = 0; k < VST_SLOTS; k++) {
+    for (int k = 0; k < VST_MIC; k++) {
         VstUi& u = gVstUi[k];
         wchar_t key[32], np[MAX_PATH], wid[40], nname[80], bin[MAX_PATH], sp[MAX_PATH];
         wsprintfW(key, L"plugin%d_path", k + 1);
@@ -14759,7 +15066,7 @@ static void VstProfileLoad(const wchar_t* name, const wchar_t* path)
 }
 static void VstProfileDelete(const wchar_t* name)
 {
-    for (int k = 0; k < VST_SLOTS; k++) { wchar_t bin[MAX_PATH]; VstProfileBin(name, k, bin); DeleteFileW(bin); }
+    for (int k = 0; k < VST_MIC; k++) { wchar_t bin[MAX_PATH]; VstProfileBin(name, k, bin); DeleteFileW(bin); }
 }
 
 static void ShowHelp()
@@ -14828,7 +15135,9 @@ static void ShowHelp()
         L"PLUGINS (Mic tab > Plugins; switch it on in Settings > Features)\n"
         L"Up to 4 VST3 effect plugins on your mic, after Cleanup and Tone and before the voice effects. Click a slot to pick a plugin, "
         L"Open shows the plugin's own window, On switches it in and out without a click. Plugins and their settings are saved, "
-        L"and profiles keep their own. A plugin that crashes is switched off and your voice carries on without it.\n\n"
+        L"and profiles keep their own. A plugin that crashes is switched off and your voice carries on without it.\n"
+        L"In the Mixer: a channel's menu > Plugins (VST3) gives it two stereo slots, kept for that app or device. "
+        L"Each output's FX button gives it two slots that run on everything it plays, before its volume and limiter.\n\n"
         L"MIC TEST (Mic tab)\n"
         L"Record 5 s and hear exactly what Discord hears.\n\n"
         L"LAG EXTRAS (Main tab)\n"
@@ -15937,7 +16246,7 @@ static void CreateUI()
         AddSection(14, y, 532, 318, L"Plugins (VST3)");
         Ctl(L"STATIC", L"Your mic runs through these from top to bottom, after Cleanup and Tone and before your voice effects.",
             0, 30, y + 20, 500, 18, IDC_HDR);
-        for (int k = 0; k < VST_SLOTS; k++) {
+        for (int k = 0; k < VST_MIC; k++) {
             const int ry = y + 50 + k * 42;
             wchar_t num[4]; wsprintfW(num, L"%d", k + 1);
             Ctl(L"STATIC", num, 0, 30, ry + 6, 14, 18, IDC_VSTNUM0 + k);
@@ -16404,7 +16713,7 @@ static void CreateUI()
             { IDC_FEATFX,    L"Voice FX", L"Effects for your live voice, characters and Vocode to song. Adds a tab.", gFeatFx },
             { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, and text to speech. Adds a tab.", gFeatSound },
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
-            { IDC_FEATVST,   L"Plugins (VST3)", L"Run VST3 effect plugins on your mic. Adds a Plugins page to the Mic tab.", gFeatVst },
+            { IDC_FEATVST,   L"Plugins (VST3)", L"VST3 effect plugins on your mic (Mic > Plugins), Mixer channels and outputs.", gFeatVst },
         };
         for (int i = 0; i < 5; i++) {
             const int y = 150 + i * 47;
@@ -16574,6 +16883,9 @@ static void CreateUI()
         Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, x + 40, 522, 56, 16, IDC_OLIM0 + k);
         Ctl(L"BUTTON", L"M", BS_OWNERDRAW | WS_TABSTOP, x + 40, 546, 30, 22, IDC_OMUTE0 + k);
         Ctl(L"BUTTON", L"\x25B6", BS_OWNERDRAW | WS_TABSTOP, x + 74, 546, 22, 22, IDC_OTEST0 + k);
+        gBuildFeat = FEAT_VST;                  // (Settings > Features > Plugins)
+        Ctl(L"BUTTON", L"FX", BS_OWNERDRAW | WS_TABSTOP, x + 40, 484, 56, 20, IDC_OFX0 + k);
+        gBuildFeat = 0;
     }
     // the Mixer's hotkeys (sub-view 1): a row per channel in use and per output; MixerPlace lays it out
     gBuildSub = 1;
@@ -16879,15 +17191,15 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_WSHELP)  { if (code == BN_CLICKED) WsHelp(); return; }
     if (id == IDC_WSGUIDE) { if (code == BN_CLICKED) WsGuide(); return; }
-    if (id >= IDC_VSTON0 && id < IDC_VSTON0 + VST_SLOTS) {       // Mic > Plugins: a slot's On switch
+    if (id >= IDC_VSTON0 && id < IDC_VSTON0 + VST_MIC) {       // Mic > Plugins: a slot's On switch
         if (code != BN_CLICKED) return;
         const int k = id - IDC_VSTON0;
         if (!gVstUi[k].path[0]) { CheckDlgButton(gWnd, id, BST_UNCHECKED); VstMenu(k, GetDlgItem(gWnd, IDC_VSTNAME0 + k)); }   // (nothing in it yet: pick one)
         else VstSetOn(k, Checked(id));
         return;
     }
-    if (id >= IDC_VSTNAME0 && id < IDC_VSTNAME0 + VST_SLOTS) { if (code == BN_CLICKED) VstMenu(id - IDC_VSTNAME0, GetDlgItem(gWnd, id)); return; }
-    if (id >= IDC_VSTEDIT0 && id < IDC_VSTEDIT0 + VST_SLOTS) {
+    if (id >= IDC_VSTNAME0 && id < IDC_VSTNAME0 + VST_MIC) { if (code == BN_CLICKED) VstMenu(id - IDC_VSTNAME0, GetDlgItem(gWnd, id)); return; }
+    if (id >= IDC_VSTEDIT0 && id < IDC_VSTEDIT0 + VST_MIC) {
         if (code != BN_CLICKED) return;
         const int k = id - IDC_VSTEDIT0;
         if (gVstUi[k].path[0]) VstEditorOpen(k); else VstMenu(k, GetDlgItem(gWnd, IDC_VSTNAME0 + k));
@@ -17337,6 +17649,7 @@ static void OnCommand(int id, int code)
         if (code == STN_CLICKED) OutCeilMenu(id - IDC_OLIM0, GetDlgItem(gWnd, id));
         return;
     }
+    if (id >= IDC_OFX0 && id < IDC_OFX0 + MAX_OUT) { if (code == BN_CLICKED) RackOpen(100 + id - IDC_OFX0); return; }   // an output's plugins
     if (id >= IDC_OTEST0 && id < IDC_OTEST0 + MAX_OUT) {   // a short beep on just this output
         if (code == BN_CLICKED) {
             const int k = id - IDC_OTEST0;
@@ -17645,6 +17958,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     }
     if (w >= IDC_OMUTE0 && w < IDC_OMUTE0 + MAX_OUT) { DrawToggle(d, gOutMute[w - IDC_OMUTE0], true); return true; }
     if (w >= IDC_OTEST0 && w < IDC_OTEST0 + MAX_OUT) { DrawToggle(d, gTestTone[w - IDC_OTEST0] > 0, false); return true; }
+    if (w >= IDC_OFX0 && w < IDC_OFX0 + MAX_OUT) { DrawToggle(d, VstTargetOn(100 + (int)(w - IDC_OFX0)), false); return true; }
     if (w >= IDC_CHMETER0 && w < IDC_CHMETER0 + CH_MAX) {
         int c = (int)(w - IDC_CHMETER0);
         DrawVMeter2(d, gChShownL[c], gChShownR[c], gChA[c].live, gChHoldL[c], gChHoldR[c], GetTickCount() - gChClipT[c] < 2000 && gChClipT[c]);
@@ -18180,6 +18494,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         xc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
         RegisterClassW(&xc);
         xc.lpfnWndProc = VstEdProc; xc.lpszClassName = L"LagVstEd";   // a plugin's own window
+        RegisterClassW(&xc);
+        xc.lpfnWndProc = RackProc; xc.lpszClassName = L"LagVstRack";  // a Mixer channel's / an output's plugin slots
         RegisterClassW(&xc);
     }
 
