@@ -1,27 +1,29 @@
 // LagEffect.cpp - hold (or toggle) a hotkey to loop the last chunk of your mic.
 // Windows app with a settings window and tray icon. Settings save to LagEffect.ini.
 // Built for Discord / OBS: several outputs each playing Off / Effect only / Everything,
-// built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater,
+// built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater, VST3 plugins on the mic,
 // a Voice FX page (pitch shift, reverb and a Voloco-style vocoder on your live voice, set with knobs),
 // and a Mic page (AI noise suppression, noise gate, voice quality).
 //
 // Build (GitHub Actions does this automatically, see .github/workflows/build.yml):
 //   1. Put miniaudio.h (https://github.com/mackron/miniaudio, 0.11.25) next to this file.
 //      RNNoise (noise suppression) is included in the rnnoise folder.
+//      For plugins, clone https://github.com/steinbergmedia/vst3_pluginterfaces (v3.8.1_build_84) to vst3/pluginterfaces.
 //   2. Visual Studio (Developer Command Prompt):
 //        rc LagEffect.rc
-//        cl /O2 /MT /utf-8 /D_USE_MATH_DEFINES /I rnnoise\\include LagEffect.cpp rnnoise\src\denoise.c rnnoise\src\rnn.c
+//        cl /O2 /MT /utf-8 /EHsc /D_USE_MATH_DEFINES /I rnnoise\\include /I vst3 LagEffect.cpp rnnoise\src\denoise.c rnnoise\src\rnn.c
 //           rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
 //           LagEffect.res /link /SUBSYSTEM:WINDOWS
 //      MinGW / MSYS2:
 //        windres LagEffect.rc -O coff -o LagEffect_res.o
 //        gcc -O2 -Irnnoise/include -c rnnoise/src/{denoise,rnn,rnn_data,pitch,kiss_fft,celt_lpc}.c
-//        g++ -O2 LagEffect.cpp *.o LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
+//        g++ -O2 -Ivst3 LagEffect.cpp *.o LagEffect_res.o -o LagEffect.exe -mwindows -lcomctl32 -lwinhttp -static
+//        (MinGW builds run plugins without the crash guard: that needs Visual Studio's __try.)
 //
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.40.0"
+#define APP_VERSION L"1.41.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -56,6 +58,26 @@
 #define HAVE_SSE_FLAGS 1
 #endif
 
+// VST3 plugins (Mic > Plugins). Only Steinberg's interface headers are used (MIT licence), none of the SDK's
+// libraries: put github.com/steinbergmedia/vst3_pluginterfaces next to this file as vst3/pluginterfaces and
+// build with /I vst3 (the GitHub build does both).
+#include <atomic>
+#define INIT_CLASS_IID                          // (this file is the one place the interface IDs get defined)
+#include "pluginterfaces/base/funknown.h"
+#include "pluginterfaces/base/ipluginbase.h"
+#include "pluginterfaces/base/ibstream.h"
+#include "pluginterfaces/vst/ivstcomponent.h"
+#include "pluginterfaces/vst/ivstaudioprocessor.h"
+#include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivsthostapplication.h"
+#include "pluginterfaces/vst/ivstmessage.h"
+#include "pluginterfaces/vst/ivstattributes.h"
+#include "pluginterfaces/vst/ivstparameterchanges.h"
+#include "pluginterfaces/vst/ivstprocesscontext.h"
+#include "pluginterfaces/vst/ivstevents.h"
+#include "pluginterfaces/gui/iplugview.h"
+#include "pluginterfaces/base/funknown.cpp"     // (the one source file the headers need: IDs and reference counting)
+
 // Focus boxes (the dotted outline on the control you last used) only show once you move around with the
 // keyboard (Tab / arrows), like most apps; clicking with the mouse hides them again.
 static bool gKbdNav = false;
@@ -74,6 +96,564 @@ static inline int FocusRectIfKeys(HDC dc, const RECT* r) { return gKbdNav ? Draw
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
+
+// ======================= VST3 plugins: the host core =======================
+// What a VST3 plugin needs from its host, and the audio-thread side. Nothing in this part touches
+// Windows, so it can be tested by itself: the windows, menus and files are further down.
+// (Uses only Steinberg's interface headers, MIT licence: github.com/steinbergmedia/vst3_pluginterfaces.)
+namespace SB = Steinberg;
+namespace SV = Steinberg::Vst;
+
+#define VST_SLOTS     4
+#define VST_RATE      48000                     // (the app runs everything at 48 kHz: same as RATE below)
+#define VST_BLOCK     1024                      // biggest block handed to a plugin in one go
+#define VST_MAXFRAMES 16384                     // (a callback bigger than this skips the plugins)
+#define VST_MAXCH     8                         // channels of one bus we can feed
+#define VST_MAXBUS    6                         // buses each way (main + side-chains)
+#define VST_RING      256                       // parameter changes waiting to cross threads
+#define VST_PQ        48                        // parameters that can change in one block
+#define VST_PP        8                         // values per parameter in one block
+
+static void VstYield();                         // (the platform's "wait a millisecond")
+static volatile int gVstTempo = 120;            // what plugins are told the tempo is (tempo-synced delays...)
+
+static bool VstSame(const void* a, const void* b) { return memcmp(a, b, 16) == 0; }
+// Host objects that live as long as the app don't count references...
+#define VST_NOREF SB::uint32 PLUGIN_API addRef() override { return 100; } \
+                  SB::uint32 PLUGIN_API release() override { return 100; }
+// ...the ones made on request do.
+#define VST_REF   std::atomic<int> refs{1}; \
+                  SB::uint32 PLUGIN_API addRef() override { return (SB::uint32)++refs; } \
+                  SB::uint32 PLUGIN_API release() override { const int n = --refs; if (!n) delete this; return (SB::uint32)n; }
+#define VST_QI1(Iface) \
+    SB::tresult PLUGIN_API queryInterface(const SB::TUID iid, void** obj) override { \
+        if (VstSame(iid, SB::FUnknown::iid) || VstSame(iid, Iface::iid)) { addRef(); *obj = static_cast<Iface*>(this); return SB::kResultOk; } \
+        *obj = nullptr; return SB::kNoInterface; }
+
+static char* VstStrDup(const char* s) { const size_t n = strlen(s) + 1; char* d = (char*)malloc(n); if (d) memcpy(d, s, n); return d; }
+
+// ---- a message between a plugin's two halves, and its list of values ----
+struct VstAttr { char* id; int type; SB::int64 i; double f; void* data; SB::uint32 size; VstAttr* next; };   // type: 0 int, 1 float, 2 string, 3 binary
+class VstAttrs : public SV::IAttributeList {
+    VstAttr* head = nullptr;
+    VstAttr* Find(const char* id, bool make)
+    {
+        if (!id) return nullptr;
+        for (VstAttr* a = head; a; a = a->next) if (!strcmp(a->id, id)) return a;
+        if (!make) return nullptr;
+        VstAttr* a = (VstAttr*)calloc(1, sizeof(VstAttr));
+        if (!a) return nullptr;
+        a->id = VstStrDup(id);
+        if (!a->id) { free(a); return nullptr; }
+        a->next = head; head = a;
+        return a;
+    }
+    SB::tresult Put(const char* id, int type, const void* data, SB::uint32 size)
+    {
+        VstAttr* a = Find(id, true);
+        if (!a) return SB::kOutOfMemory;
+        free(a->data); a->data = nullptr; a->size = 0; a->type = type;
+        if (size) { a->data = malloc(size); if (!a->data) return SB::kOutOfMemory; memcpy(a->data, data, size); a->size = size; }
+        return SB::kResultOk;
+    }
+public:
+    VST_REF
+    VST_QI1(SV::IAttributeList)
+    virtual ~VstAttrs() { while (head) { VstAttr* n = head->next; free(head->id); free(head->data); free(head); head = n; } }
+    SB::tresult PLUGIN_API setInt(AttrID id, SB::int64 v) override { VstAttr* a = Find(id, true); if (!a) return SB::kOutOfMemory; a->type = 0; a->i = v; return SB::kResultOk; }
+    SB::tresult PLUGIN_API getInt(AttrID id, SB::int64& v) override { VstAttr* a = Find(id, false); if (!a || a->type != 0) return SB::kResultFalse; v = a->i; return SB::kResultOk; }
+    SB::tresult PLUGIN_API setFloat(AttrID id, double v) override { VstAttr* a = Find(id, true); if (!a) return SB::kOutOfMemory; a->type = 1; a->f = v; return SB::kResultOk; }
+    SB::tresult PLUGIN_API getFloat(AttrID id, double& v) override { VstAttr* a = Find(id, false); if (!a || a->type != 1) return SB::kResultFalse; v = a->f; return SB::kResultOk; }
+    SB::tresult PLUGIN_API setString(AttrID id, const SV::TChar* s) override
+    {
+        if (!s) return SB::kInvalidArgument;
+        SB::uint32 n = 0; while (s[n]) n++;
+        return Put(id, 2, s, (n + 1) * (SB::uint32)sizeof(SV::TChar));
+    }
+    SB::tresult PLUGIN_API getString(AttrID id, SV::TChar* s, SB::uint32 sizeInBytes) override
+    {
+        VstAttr* a = Find(id, false);
+        if (!a || a->type != 2 || !s || sizeInBytes < sizeof(SV::TChar)) return SB::kResultFalse;
+        const SB::uint32 n = a->size < sizeInBytes ? a->size : sizeInBytes;
+        memcpy(s, a->data, n);
+        s[sizeInBytes / sizeof(SV::TChar) - 1] = 0;   // (cut short: still ends properly)
+        return SB::kResultOk;
+    }
+    SB::tresult PLUGIN_API setBinary(AttrID id, const void* data, SB::uint32 size) override { return Put(id, 3, data, size); }
+    SB::tresult PLUGIN_API getBinary(AttrID id, const void*& data, SB::uint32& size) override
+    {
+        VstAttr* a = Find(id, false);
+        if (!a || a->type != 3) { data = nullptr; size = 0; return SB::kResultFalse; }
+        data = a->data; size = a->size; return SB::kResultOk;
+    }
+};
+class VstMsg : public SV::IMessage {
+    char* id = nullptr;
+    VstAttrs* attrs = nullptr;
+public:
+    VST_REF
+    VST_QI1(SV::IMessage)
+    virtual ~VstMsg() { free(id); if (attrs) attrs->release(); }
+    SB::FIDString PLUGIN_API getMessageID() override { return id ? id : ""; }
+    void PLUGIN_API setMessageID(SB::FIDString s) override { free(id); id = s ? VstStrDup(s) : nullptr; }
+    SV::IAttributeList* PLUGIN_API getAttributes() override { if (!attrs) attrs = new VstAttrs; return attrs; }
+};
+
+// ---- the host itself, as plugins see it ----
+class VstHost : public SV::IHostApplication {
+public:
+    VST_NOREF
+    VST_QI1(SV::IHostApplication)
+    SB::tresult PLUGIN_API getName(SV::String128 name) override
+    {
+        const char* n = "Lag Effect";
+        int i = 0; for (; n[i]; i++) name[i] = (SV::TChar)n[i];
+        name[i] = 0;
+        return SB::kResultOk;
+    }
+    SB::tresult PLUGIN_API createInstance(SB::TUID cid, SB::TUID iid, void** obj) override
+    {
+        if (!obj) return SB::kInvalidArgument;
+        if (VstSame(cid, SV::IMessage::iid) && VstSame(iid, SV::IMessage::iid)) { *obj = static_cast<SV::IMessage*>(new VstMsg); return SB::kResultOk; }
+        if (VstSame(cid, SV::IAttributeList::iid) && VstSame(iid, SV::IAttributeList::iid)) { *obj = static_cast<SV::IAttributeList*>(new VstAttrs); return SB::kResultOk; }
+        *obj = nullptr;
+        return SB::kResultFalse;
+    }
+};
+static VstHost gVstHost;
+
+// ---- a plugin's settings, as a block of memory ----
+class VstStream : public SB::IBStream {
+public:
+    unsigned char* data = nullptr;
+    SB::int64 size = 0, cap = 0, pos = 0;
+    VST_REF
+    VST_QI1(SB::IBStream)
+    virtual ~VstStream() { free(data); }
+    SB::tresult PLUGIN_API read(void* buf, SB::int32 n, SB::int32* done) override
+    {
+        if (done) *done = 0;
+        if (!buf || n < 0) return SB::kInvalidArgument;
+        SB::int64 m = size - pos; if (m > n) m = n; if (m < 0) m = 0;
+        if (m) memcpy(buf, data + pos, (size_t)m);
+        pos += m;
+        if (done) *done = (SB::int32)m;
+        return SB::kResultOk;
+    }
+    SB::tresult PLUGIN_API write(void* buf, SB::int32 n, SB::int32* done) override
+    {
+        if (done) *done = 0;
+        if (!buf || n < 0) return SB::kInvalidArgument;
+        if (pos + n > cap) {
+            SB::int64 nc = cap ? cap * 2 : 4096; while (nc < pos + n) nc *= 2;
+            unsigned char* nd = (unsigned char*)realloc(data, (size_t)nc);
+            if (!nd) return SB::kOutOfMemory;
+            data = nd; cap = nc;
+        }
+        if (n) memcpy(data + pos, buf, (size_t)n);
+        pos += n; if (pos > size) size = pos;
+        if (done) *done = n;
+        return SB::kResultOk;
+    }
+    SB::tresult PLUGIN_API seek(SB::int64 p, SB::int32 mode, SB::int64* result) override
+    {
+        SB::int64 np = mode == kIBSeekSet ? p : mode == kIBSeekCur ? pos + p : mode == kIBSeekEnd ? size + p : -1;
+        if (np < 0 || np > size) { if (result) *result = pos; return SB::kResultFalse; }
+        pos = np; if (result) *result = pos;
+        return SB::kResultOk;
+    }
+    SB::tresult PLUGIN_API tell(SB::int64* p) override { if (!p) return SB::kInvalidArgument; *p = pos; return SB::kResultOk; }
+};
+
+// ---- parameter changes for one block (fixed size: used on the audio thread, never allocates) ----
+class VstQueue : public SV::IParamValueQueue {
+public:
+    SV::ParamID id = 0;
+    int n = 0;
+    SB::int32 off[VST_PP]; double val[VST_PP];
+    VST_NOREF
+    VST_QI1(SV::IParamValueQueue)
+    SV::ParamID PLUGIN_API getParameterId() override { return id; }
+    SB::int32 PLUGIN_API getPointCount() override { return n; }
+    SB::tresult PLUGIN_API getPoint(SB::int32 i, SB::int32& o, SV::ParamValue& v) override
+    {
+        if (i < 0 || i >= n) return SB::kResultFalse;
+        o = off[i]; v = val[i]; return SB::kResultOk;
+    }
+    SB::tresult PLUGIN_API addPoint(SB::int32 o, SV::ParamValue v, SB::int32& index) override
+    {
+        if (n < VST_PP) n++;                    // (full: the newest value replaces the last one)
+        off[n - 1] = o; val[n - 1] = v; index = n - 1;
+        return SB::kResultOk;
+    }
+};
+class VstChanges : public SV::IParameterChanges {
+public:
+    VstQueue q[VST_PQ];
+    int n = 0;
+    VST_NOREF
+    VST_QI1(SV::IParameterChanges)
+    SB::int32 PLUGIN_API getParameterCount() override { return n; }
+    SV::IParamValueQueue* PLUGIN_API getParameterData(SB::int32 i) override { return i >= 0 && i < n ? &q[i] : nullptr; }
+    SV::IParamValueQueue* PLUGIN_API addParameterData(const SV::ParamID& id, SB::int32& index) override
+    {
+        for (int i = 0; i < n; i++) if (q[i].id == id) { index = i; return &q[i]; }
+        if (n >= VST_PQ) return nullptr;
+        q[n].id = id; q[n].n = 0; index = n;
+        return &q[n++];
+    }
+};
+class VstNoEvents : public SV::IEventList {     // (no MIDI here: an empty list, so plugins that expect one get one)
+public:
+    VST_NOREF
+    VST_QI1(SV::IEventList)
+    SB::int32 PLUGIN_API getEventCount() override { return 0; }
+    SB::tresult PLUGIN_API getEvent(SB::int32, SV::Event&) override { return SB::kResultFalse; }
+    SB::tresult PLUGIN_API addEvent(SV::Event&) override { return SB::kResultOk; }
+};
+static VstNoEvents gVstNoEvents;
+
+// ---- one plugin slot ----
+struct VstEdit { SB::uint32 id; double v; };
+struct VstSlot;
+class VstHandler : public SV::IComponentHandler {   // what a plugin's window calls when you turn its knobs
+public:
+    VstSlot* slot = nullptr;
+    VST_NOREF
+    VST_QI1(SV::IComponentHandler)
+    SB::tresult PLUGIN_API beginEdit(SV::ParamID) override { return SB::kResultOk; }
+    SB::tresult PLUGIN_API performEdit(SV::ParamID id, SV::ParamValue v) override;
+    SB::tresult PLUGIN_API endEdit(SV::ParamID) override { return SB::kResultOk; }
+    SB::tresult PLUGIN_API restartComponent(SB::int32 flags) override;
+};
+struct VstSlot {
+    // the plugin (only the window's thread touches these)
+    SV::IComponent*       comp;
+    SV::IAudioProcessor*  proc;
+    SV::IEditController*  ctrl;
+    SV::IConnectionPoint* cpA; SV::IConnectionPoint* cpB;   // its two halves, wired to each other
+    bool single;                                // one object is both halves
+    int  nIn, nOut;                             // audio buses each way
+    int  chIn[VST_MAXBUS], chOut[VST_MAXBUS];   // channels of each
+    int  latency;                               // samples of delay it adds
+    // shared with the audio thread
+    std::atomic<int> live;                      // the audio thread may run it
+    std::atomic<int> busy;                      // ...and is inside it right now
+    std::atomic<int> on;                        // your switch (off = bypassed, still loaded)
+    std::atomic<int> crashed;                   // it crashed while processing: never called again
+    std::atomic<int> restart;                   // restartComponent flags waiting for the window's thread
+    VstEdit toAudio[VST_RING]; std::atomic<unsigned> taW, taR;   // knob moves: window -> audio
+    VstEdit toUi[VST_RING];    std::atomic<unsigned> tuW, tuR;   // meters and such: audio -> window
+    // audio thread only
+    float     mix;                              // 0 = dry .. 1 = through the plugin (glides: no click on the switch)
+    SB::int64 pos;                              // samples processed so far (its "song position")
+    VstChanges inCh, outCh;
+    VstHandler handler;
+};
+static VstSlot gVst[VST_SLOTS];
+static std::atomic<int> gVstLive;               // how many slots hold a running plugin (0: the audio thread skips all this)
+
+SB::tresult PLUGIN_API VstHandler::performEdit(SV::ParamID id, SV::ParamValue v)
+{
+    VstSlot& s = *slot;
+    const unsigned w = s.taW.load();
+    if (w - s.taR.load() < VST_RING) { s.toAudio[w % VST_RING] = { id, v }; s.taW.store(w + 1); }
+    return SB::kResultOk;
+}
+SB::tresult PLUGIN_API VstHandler::restartComponent(SB::int32 flags)
+{
+    slot->restart.fetch_or(flags);              // (done from the timer, not in the middle of the plugin's own call)
+    return SB::kResultOk;
+}
+
+static int VstChannels(SV::SpeakerArrangement a) { int n = 0; while (a) { n += (int)(a & 1); a >>= 1; } return n; }
+static const SV::SpeakerArrangement VST_MONO = (SV::SpeakerArrangement)1 << 19, VST_STEREO = 3;
+
+static void VstPause(VstSlot& s)                // stop the audio thread using it, and wait until it's out
+{
+    if (s.live.exchange(0)) gVstLive--;
+    for (int i = 0; i < 2000 && s.busy.load(); i++) VstYield();
+}
+static void VstResume(VstSlot& s) { if (!s.live.exchange(1)) gVstLive++; }
+
+// Its buses: ask for mono in and out (a mic is mono), else stereo, then go with whatever it settled on.
+static const wchar_t* VstSetupBuses(VstSlot& s)
+{
+    s.nIn = s.comp->getBusCount(SV::kAudio, SV::kInput);
+    s.nOut = s.comp->getBusCount(SV::kAudio, SV::kOutput);
+    if (s.nOut < 1) return L"It has no sound output.";
+    if (s.nIn < 1) return L"It's an instrument (it makes its own sound). Only effects can go on your mic.";
+    if (s.nIn > VST_MAXBUS || s.nOut > VST_MAXBUS) return L"It has more inputs or outputs than Lag Effect can feed.";
+    SV::SpeakerArrangement in[VST_MAXBUS], out[VST_MAXBUS];
+    for (int i = 0; i < s.nIn; i++)  { in[i] = 0;  s.proc->getBusArrangement(SV::kInput, i, in[i]); }
+    for (int i = 0; i < s.nOut; i++) { out[i] = 0; s.proc->getBusArrangement(SV::kOutput, i, out[i]); }
+    const SV::SpeakerArrangement in0 = in[0], out0 = out[0];
+    bool set = false;
+    for (int t = 0; t < 2 && !set; t++) {
+        in[0] = out[0] = t ? VST_STEREO : VST_MONO;
+        set = s.proc->setBusArrangements(in, s.nIn, out, s.nOut) == SB::kResultOk;
+    }
+    if (!set) { in[0] = in0; out[0] = out0; s.proc->setBusArrangements(in, s.nIn, out, s.nOut); }   // (back to how it came)
+    for (int i = 0; i < s.nIn; i++)  { SV::SpeakerArrangement a = 0; s.proc->getBusArrangement(SV::kInput, i, a);  s.chIn[i] = VstChannels(a); }
+    for (int i = 0; i < s.nOut; i++) { SV::SpeakerArrangement a = 0; s.proc->getBusArrangement(SV::kOutput, i, a); s.chOut[i] = VstChannels(a); }
+    if (s.chIn[0] < 1 || s.chOut[0] < 1) return L"Its main input or output has no channels.";
+    for (int i = 0; i < s.nIn; i++)  if (s.chIn[i] > VST_MAXCH)  return L"It needs more channels than Lag Effect can feed (surround).";
+    for (int i = 0; i < s.nOut; i++) if (s.chOut[i] > VST_MAXCH) return L"It needs more channels than Lag Effect can feed (surround).";
+    for (int i = 0; i < s.nIn; i++)  s.comp->activateBus(SV::kAudio, SV::kInput, i, i == 0);    // (side-chains stay off)
+    for (int i = 0; i < s.nOut; i++) s.comp->activateBus(SV::kAudio, SV::kOutput, i, i == 0);
+    return nullptr;
+}
+static const wchar_t* VstActivate(VstSlot& s)
+{
+    SV::ProcessSetup su;
+    su.processMode = SV::kRealtime; su.symbolicSampleSize = SV::kSample32; su.maxSamplesPerBlock = VST_BLOCK; su.sampleRate = VST_RATE;
+    if (s.proc->canProcessSampleSize(SV::kSample32) != SB::kResultOk) return L"It can't process normal (32-bit) sound.";
+    if (s.proc->setupProcessing(su) != SB::kResultOk) return L"It wouldn't accept Lag Effect's sound format (48 kHz).";
+    if (s.comp->setActive(true) != SB::kResultOk) return L"It wouldn't switch on.";
+    s.latency = (int)s.proc->getLatencySamples();
+    s.proc->setProcessing(true);                // (plenty of plugins answer "not implemented": that's fine)
+    return nullptr;
+}
+static void VstDeactivate(VstSlot& s)
+{
+    if (s.proc) s.proc->setProcessing(false);
+    if (s.comp) s.comp->setActive(false);
+}
+
+// A slot's settings as one block: "LVS1", then the processor's part and the window's part, each with its length.
+static bool VstGetState(VstSlot& s, unsigned char** out, int* len)
+{
+    *out = nullptr; *len = 0;
+    if (!s.comp) return false;
+    VstStream* a = new VstStream; VstStream* b = new VstStream;
+    if (s.comp->getState(a) != SB::kResultOk) a->size = 0;
+    if (!s.ctrl || s.ctrl->getState(b) != SB::kResultOk) b->size = 0;
+    const SB::uint32 la = (SB::uint32)a->size, lb = (SB::uint32)b->size;
+    unsigned char* d = (unsigned char*)malloc(12 + (size_t)la + lb);
+    if (d) {
+        memcpy(d, "LVS1", 4); memcpy(d + 4, &la, 4); if (la) memcpy(d + 8, a->data, la);
+        memcpy(d + 8 + la, &lb, 4); if (lb) memcpy(d + 12 + la, b->data, lb);
+        *out = d; *len = (int)(12 + la + lb);
+    }
+    a->release(); b->release();
+    return d != nullptr;
+}
+static void VstSetState(VstSlot& s, const unsigned char* st, int len)   // (st null: just tell the window half where the processor stands)
+{
+    SB::uint32 la = 0, lb = 0;
+    bool have = st && len >= 12 && !memcmp(st, "LVS1", 4);
+    if (have) { memcpy(&la, st + 4, 4); have = (SB::int64)la + 12 <= len; }
+    if (have) { memcpy(&lb, st + 8 + la, 4); have = (SB::int64)la + lb + 12 <= len; }
+    VstStream* a = new VstStream;
+    if (have && la) {
+        a->write((void*)(st + 8), (SB::int32)la, nullptr); a->pos = 0;
+        s.comp->setState(a);
+    } else if (s.comp->getState(a) != SB::kResultOk) a->size = 0;
+    if (s.ctrl && a->size) { a->pos = 0; s.ctrl->setComponentState(a); }
+    a->release();
+    if (have && lb && s.ctrl) {
+        VstStream* b = new VstStream;
+        b->write((void*)(st + 12 + la), (SB::int32)lb, nullptr); b->pos = 0;
+        s.ctrl->setState(b);
+        b->release();
+    }
+}
+
+static void VstClose(VstSlot& s)                // (its window must be closed first)
+{
+    VstPause(s);
+    VstDeactivate(s);
+    if (s.cpA && s.cpB) { s.cpA->disconnect(s.cpB); s.cpB->disconnect(s.cpA); }
+    if (s.cpA) s.cpA->release();
+    if (s.cpB) s.cpB->release();
+    if (s.ctrl) s.ctrl->setComponentHandler(nullptr);
+    if (s.comp) s.comp->terminate();
+    if (s.ctrl && !s.single) s.ctrl->terminate();
+    if (s.ctrl) s.ctrl->release();
+    if (s.proc) s.proc->release();
+    if (s.comp) s.comp->release();
+    s.comp = nullptr; s.proc = nullptr; s.ctrl = nullptr; s.cpA = s.cpB = nullptr; s.single = false;
+    s.restart = 0; s.taR.store(s.taW.load()); s.tuR.store(s.tuW.load());
+}
+static void VstForget(VstSlot& s)               // after a crash: don't call into it again, not even to tidy up
+{
+    if (s.live.exchange(0)) gVstLive--;
+    s.comp = nullptr; s.proc = nullptr; s.ctrl = nullptr; s.cpA = s.cpB = nullptr; s.single = false;
+    s.restart = 0; s.busy = 0;
+}
+
+// Start the plugin class `cid` from `f` in this slot, with its saved settings if there are any.
+// Returns nullptr when it's running, else what went wrong.
+static const wchar_t* VstOpen(VstSlot& s, SB::IPluginFactory* f, const SB::TUID cid, const unsigned char* st, int stLen)
+{
+    s.handler.slot = &s;
+    s.comp = nullptr; s.proc = nullptr; s.ctrl = nullptr; s.cpA = s.cpB = nullptr; s.single = false;
+    s.latency = 0; s.mix = 0; s.pos = 0; s.crashed = 0; s.restart = 0;
+    void* p = nullptr;
+    if (f->createInstance(cid, SV::IComponent::iid, &p) != SB::kResultOk || !p) return L"The plugin couldn't be started.";
+    s.comp = (SV::IComponent*)p;
+    if (s.comp->initialize(&gVstHost) != SB::kResultOk) { s.comp->release(); s.comp = nullptr; return L"The plugin wouldn't start up."; }
+    p = nullptr;
+    if (s.comp->queryInterface(SV::IAudioProcessor::iid, &p) != SB::kResultOk || !p) { VstClose(s); return L"It isn't an audio effect."; }
+    s.proc = (SV::IAudioProcessor*)p;
+    p = nullptr;
+    if (s.comp->queryInterface(SV::IEditController::iid, &p) == SB::kResultOk && p) { s.ctrl = (SV::IEditController*)p; s.single = true; }
+    else {
+        SB::TUID ccid;
+        p = nullptr;
+        if (s.comp->getControllerClassId(ccid) == SB::kResultOk && f->createInstance(ccid, SV::IEditController::iid, &p) == SB::kResultOk && p) {
+            s.ctrl = (SV::IEditController*)p;
+            if (s.ctrl->initialize(&gVstHost) != SB::kResultOk) { s.ctrl->release(); s.ctrl = nullptr; }
+        }
+    }
+    if (s.ctrl) {                               // (no window half: it still works, it just has no window)
+        s.ctrl->setComponentHandler(&s.handler);
+        if (!s.single) {
+            void* a = nullptr; void* b = nullptr;
+            s.comp->queryInterface(SV::IConnectionPoint::iid, &a);
+            s.ctrl->queryInterface(SV::IConnectionPoint::iid, &b);
+            s.cpA = (SV::IConnectionPoint*)a; s.cpB = (SV::IConnectionPoint*)b;
+            if (s.cpA && s.cpB) { s.cpA->connect(s.cpB); s.cpB->connect(s.cpA); }
+        }
+    }
+    VstSetState(s, st, stLen);
+    const wchar_t* err = VstSetupBuses(s);
+    if (!err) err = VstActivate(s);
+    if (err) { VstClose(s); return err; }
+    VstResume(s);
+    return nullptr;
+}
+
+// Things a plugin asked for, done on the window's thread (call a few times a second).
+static void VstService(VstSlot& s)
+{
+    if (!s.comp) return;
+    for (unsigned r = s.tuR.load(); r != s.tuW.load(); r++) {      // values the processor reported (meters, automation)
+        const VstEdit e = s.toUi[r % VST_RING];
+        if (s.ctrl) s.ctrl->setParamNormalized(e.id, e.v);
+        s.tuR.store(r + 1);
+    }
+    const int fl = s.restart.exchange(0);
+    if (fl & (SV::kReloadComponent | SV::kIoChanged | SV::kLatencyChanged)) {
+        const bool was = s.live.load() != 0;
+        VstPause(s);
+        VstDeactivate(s);
+        const wchar_t* err = fl & SV::kIoChanged ? VstSetupBuses(s) : nullptr;
+        if (!err) err = VstActivate(s);
+        if (!err && was) VstResume(s);
+    }
+}
+
+// ---- the audio thread ----
+static float gVstBufIn[VST_MAXCH][VST_BLOCK], gVstBufOut[VST_MAXCH][VST_BLOCK], gVstZero[VST_BLOCK], gVstJunk[VST_BLOCK];
+#ifdef _MSC_VER
+static bool VstProcessGuarded(SV::IAudioProcessor* p, SV::ProcessData* d)   // false: the plugin crashed
+{
+    __try { p->process(*d); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+#else
+static bool VstProcessGuarded(SV::IAudioProcessor* p, SV::ProcessData* d) { p->process(*d); return true; }
+#endif
+static bool VstRunBlock(VstSlot& s, float* buf, int n)   // n <= VST_BLOCK; false: it crashed
+{
+    s.inCh.n = 0; s.outCh.n = 0;
+    for (unsigned r = s.taR.load(); r != s.taW.load(); r++) {      // knob moves from its window
+        const VstEdit e = s.toAudio[r % VST_RING];
+        SB::int32 idx = 0;
+        SV::IParamValueQueue* q = s.inCh.addParameterData(e.id, idx);
+        if (q) q->addPoint(0, e.v, idx);
+        s.taR.store(r + 1);
+    }
+    SV::AudioBusBuffers inB[VST_MAXBUS], outB[VST_MAXBUS];
+    float* inP[VST_MAXBUS][VST_MAXCH]; float* outP[VST_MAXBUS][VST_MAXCH];
+    for (int b = 0; b < s.nIn; b++) {
+        inB[b].numChannels = s.chIn[b]; inB[b].channelBuffers32 = inP[b];
+        inB[b].silenceFlags = b ? ((SB::uint64)1 << s.chIn[b]) - 1 : 0;
+        for (int c = 0; c < s.chIn[b]; c++) inP[b][c] = b == 0 && c < 2 ? gVstBufIn[c] : gVstZero;   // your voice on the first one or two channels
+    }
+    for (int b = 0; b < s.nOut; b++) {
+        outB[b].numChannels = s.chOut[b]; outB[b].channelBuffers32 = outP[b]; outB[b].silenceFlags = 0;
+        for (int c = 0; c < s.chOut[b]; c++) outP[b][c] = b == 0 ? gVstBufOut[c] : gVstJunk;
+    }
+    memcpy(gVstBufIn[0], buf, n * sizeof(float));
+    if (s.chIn[0] > 1) memcpy(gVstBufIn[1], buf, n * sizeof(float));
+    const int oc = s.chOut[0] > 1 ? 2 : 1;
+    for (int c = 0; c < s.chOut[0]; c++) memset(gVstBufOut[c], 0, n * sizeof(float));
+    SV::ProcessContext ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    const double tempo = (double)gVstTempo;
+    ctx.state = SV::ProcessContext::kPlaying | SV::ProcessContext::kTempoValid | SV::ProcessContext::kTimeSigValid |
+                SV::ProcessContext::kContTimeValid | SV::ProcessContext::kProjectTimeMusicValid;
+    ctx.sampleRate = VST_RATE; ctx.projectTimeSamples = s.pos; ctx.continousTimeSamples = s.pos;
+    ctx.tempo = tempo; ctx.timeSigNumerator = 4; ctx.timeSigDenominator = 4;
+    ctx.projectTimeMusic = (double)s.pos / VST_RATE * tempo / 60.0;
+    SV::ProcessData d;
+    d.processMode = SV::kRealtime; d.symbolicSampleSize = SV::kSample32; d.numSamples = n;
+    d.numInputs = s.nIn; d.numOutputs = s.nOut; d.inputs = inB; d.outputs = outB;
+    d.inputParameterChanges = &s.inCh; d.outputParameterChanges = &s.outCh;
+    d.inputEvents = &gVstNoEvents; d.outputEvents = &gVstNoEvents; d.processContext = &ctx;
+    if (!VstProcessGuarded(s.proc, &d)) return false;
+    s.pos += n;
+    for (int i = 0; i < s.outCh.n; i++) {       // what it reports back: the last value of each
+        const VstQueue& q = s.outCh.q[i];
+        if (!q.n) continue;
+        const unsigned w = s.tuW.load();
+        if (w - s.tuR.load() < VST_RING) { s.toUi[w % VST_RING] = { q.id, q.val[q.n - 1] }; s.tuW.store(w + 1); }
+    }
+    const float want = s.on.load() ? 1.0f : 0.0f;
+    const float* l = gVstBufOut[0]; const float* r = gVstBufOut[oc - 1];
+    float mix = s.mix;
+    for (int i = 0; i < n; i++) {
+        float w = oc == 2 ? 0.5f * (l[i] + r[i]) : l[i];
+        if (!(w > -64.0f && w < 64.0f)) w = 0;  // (garbage or NaN out of a plugin: silence, not a bang)
+        mix += (want - mix) * 0.004f;           // ~5 ms
+        buf[i] += (w - buf[i]) * mix;
+    }
+    s.mix = want == 0.0f && mix < 0.0005f ? 0.0f : mix;
+    return true;
+}
+static void VstRun(float* buf, int n)           // your mic, through each slot in turn
+{
+    for (int k = 0; k < VST_SLOTS; k++) {
+        VstSlot& s = gVst[k];
+        if (!s.live.load()) continue;
+        if (!s.on.load() && s.mix <= 0.0f) continue;   // bypassed, and faded all the way out
+        s.busy.store(1);
+        if (s.live.load()) {
+            for (int off = 0; off < n; off += VST_BLOCK) {
+                const int m = n - off < VST_BLOCK ? n - off : VST_BLOCK;
+                if (!VstRunBlock(s, buf + off, m)) { if (s.live.exchange(0)) gVstLive--; s.crashed = 1; break; }
+            }
+        }
+        s.busy.store(0);
+    }
+}
+// ======================= end of the VST3 host core =======================
+
+// ---- a slot as the window sees it: which plugin, its file, its own window ----
+class VstFrame : public SB::IPlugFrame {        // a plugin's window asking to be a different size
+public:
+    int  slot = 0;
+    bool busy = false;
+    VST_NOREF
+    VST_QI1(SB::IPlugFrame)
+    SB::tresult PLUGIN_API resizeView(SB::IPlugView* view, SB::ViewRect* r) override;
+};
+struct VstUi {
+    wchar_t path[MAX_PATH];                     // the .vst3 file (or bundle folder) you picked; empty = free slot
+    char    cid[33];                            // which effect inside it (its class ID as hex)
+    wchar_t name[80];
+    bool    want;                               // your On switch (kept in the settings file)
+    bool    loaded;                             // it's running in gVst[slot]
+    bool    dead;                               // it crashed: left alone until you reload or remove it
+    HMODULE mod;
+    SB::IPluginFactory* fac;
+    SB::IPlugView* view; HWND wnd;              // its window, while open
+    VstFrame frame;
+};
+static VstUi gVstUi[VST_SLOTS];
+static void VstYield() { Sleep(1); }
 
 static int Imin(int a, int b) { return a < b ? a : b; }
 static int Imax(int a, int b) { return a > b ? a : b; }
@@ -128,15 +708,17 @@ static float gOutShow[8] = { -80, -80, -80, -80, -80, -80, -80, -80 };
 // Random lag: the stutter fires by itself now and then. Rewind / Repeat word: hotkey requests to the audio thread.
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 // Settings > Features: each of these is hidden and doesn't run at all while it's off (new installs: all off).
-static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false;
+static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false, gFeatVst = false;
 // Remote control (Streamer.bot & co.): a WebSocket server on this PC only, and only while it's switched on.
 static bool    gWsOn = false;
 static int     gWsPort = 7600;
 static wchar_t gWsPass[64] = L"";
 static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutter until then
-enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8 };
-static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips); }
+enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16 };
+static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst); }
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
+// Plugins on (Settings > Features): the mic's own stages for one block, before and after the plugins ran over them.
+static float gVstMic[VST_MAXFRAMES], gVstDuck[VST_MAXFRAMES], gVstDuckAll[VST_MAXFRAMES];
 static volatile int  gRandLagSec = 8, gRewindMs = 2000, gRepeatN = 3;
 static volatile int  gRewindTop = 350, gRewindRamp = 30, gRewindPitch = 0;   // Rewind: top speed %, % of it spent speeding up, semitones
 static volatile bool gTapeReq = false, gDiveHeld = false, gBeatSync = false, gFxBypass = false;   // A/B: hear yourself dry
@@ -2393,10 +2975,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
 
     bool padsIdle = true;                       // nothing playing / starting / stopping: skip the soundboard mixer this block
     for (int i = 0; i < SB_N && padsIdle; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) padsIdle = false; }
-    for (ma_uint32 f = 0; f < frames; f++) {
-        float sbFx = 0; int padsOn = 0;
-        const float sb = padsIdle ? 0.0f : PadsMix(sbFx, padsOn);   // soundboard: every output that isn't Off (sbFx: through the effects)
-        duckGain += ((gPadDuck && padsOn ? 0.32f : 1.0f) - duckGain) * 0.002f;   // "lower my voice while a pad plays"
+    // Your mic up to the end of the Mic tab (cleanup, then tone), one sample at a time.
+    auto micPre = [&](ma_uint32 f) -> float {
         float s = in ? in[f] * boost : 0.0f;
         muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
         s *= muteGain;
@@ -2447,8 +3027,23 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s *= powf(10.0f, gdb / 20.0f);
         }
 
-        s = ToneRun(s, deEss, broadcast);      // Mic tab: EQ, broadcast voice, de-esser
-        float clean = s;                        // for outputs set to "Clean voice"
+        return ToneRun(s, deEss, broadcast);   // Mic tab: EQ, broadcast voice, de-esser
+    };
+    // Plugins (Mic > Plugins) work on a whole block, so with any loaded the mic's own stages run for the block
+    // first, then the plugins, and the loop below picks the result up. (Without plugins nothing changes.)
+    const bool vstOn = gFeatVst && gVstLive.load() > 0 && frames <= VST_MAXFRAMES;
+    if (vstOn) {
+        for (ma_uint32 f = 0; f < frames; f++) { gVstMic[f] = micPre(f); gVstDuck[f] = chDuck; gVstDuckAll[f] = chDuckAll; }
+        VstRun(gVstMic, (int)frames);
+    }
+    for (ma_uint32 f = 0; f < frames; f++) {
+        float sbFx = 0; int padsOn = 0;
+        const float sb = padsIdle ? 0.0f : PadsMix(sbFx, padsOn);   // soundboard: every output that isn't Off (sbFx: through the effects)
+        duckGain += ((gPadDuck && padsOn ? 0.32f : 1.0f) - duckGain) * 0.002f;   // "lower my voice while a pad plays"
+        float s;
+        if (vstOn) { s = gVstMic[f]; chDuck = gVstDuck[f]; chDuckAll = gVstDuckAll[f]; }   // (the Mixer's ducking still glides per sample)
+        else s = micPre(f);
+        float clean = s;                        // for outputs set to "Clean voice" (cleanup, tone and plugins, no voice effects)
         s += sbFx;                              // pads / clips set to play through the voice effects
         if (fxPitch)  s = PitchShift(gPsFx, s, psRatio, psGrain, psMix);
         if (fxGender) s = Gender(s, gdAmt, gdMix);
@@ -2731,6 +3326,9 @@ enum {
     IDC_CHPAN0 = 1960,                          // .. +8: each channel's pan slider
     IDC_OTEST0 = 1970,                          // .. +5: each output's test sound button
     IDC_MIXFADE = 1980, IDC_MIXFADELBL = 1981, IDC_MIXFADES = 1982, IDC_MIXKTB = 1983, IDC_TBOUT = 1984, IDC_TBHDR = 1985, IDC_TBHDR2 = 1986,
+    // Plugins (Mic > Plugins): their own range, clear of the number boxes' arrows (id + 2000)
+    IDC_MICSUB2 = 4400, IDC_FEATVST = 4401, IDC_VSTHINT = 4402, IDC_VSTLIC = 4403,
+    IDC_VSTON0 = 4410, IDC_VSTNAME0 = 4420, IDC_VSTEDIT0 = 4430, IDC_VSTINFO0 = 4440, IDC_VSTNUM0 = 4450,   // + slot (VST_SLOTS)
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
     IDC_FXGRP_ON = 1000, IDC_FXGRP_RESET = 1020, IDC_FXGRP_KEY = 1040, IDC_FXGRP_HOLD = 1060,   // + group index (room for 20 effects)
     IDC_KNOB = 600,                             // + knob index (needs room for ~40 knobs: keep clear of other ranges)
@@ -2984,7 +3582,8 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 #define FX_SUBS 8
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun", L"Whisper" };
-static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone
+static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features)
+static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : -1; }
 static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features
 static FxGroup gFxGroups[] = {
     { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
@@ -3870,6 +4469,16 @@ static void LoadSettings()
         gFeatFx    = INI_INT(L"feat_voicefx", had) != 0;
         gFeatSound = INI_INT(L"feat_soundboard", had) != 0;
         gFeatClips = INI_INT(L"feat_clips", had) != 0;
+        gFeatVst   = INI_INT(L"feat_plugins", 0) != 0;       // (new in 1.41: off for everyone until switched on)
+    }
+    for (int k = 0; k < VST_SLOTS; k++) {       // which plugin is in each slot (their own settings: Plugins\slotN.bin)
+        VstUi& u = gVstUi[k];
+        wchar_t key[32], id[40];
+        wsprintfW(key, L"plugin%d_path", k + 1); GetPrivateProfileStringW(L"settings", key, L"", u.path, MAX_PATH, gIni);
+        wsprintfW(key, L"plugin%d_id", k + 1);   GetPrivateProfileStringW(L"settings", key, L"", id, 40, gIni);
+        wsprintfW(key, L"plugin%d_name", k + 1); GetPrivateProfileStringW(L"settings", key, L"", u.name, 80, gIni);
+        wsprintfW(key, L"plugin%d_on", k + 1);   u.want = u.path[0] && INI_INT(key, 0) != 0;
+        WideCharToMultiByte(CP_ACP, 0, id, -1, u.cid, 33, nullptr, nullptr); u.cid[32] = 0;
     }
     gWsOn   = INI_INT(L"remote_on", 0) != 0;     // (off unless you switch it on)
     gWsPort = Iclamp(INI_INT(L"remote_port", 7600), 1024, 65535);
@@ -3933,7 +4542,8 @@ static void LoadSettings()
     gDiveSemis = Iclamp(INI_INT(L"pitch_dive_semitones", -12), -12, 12);
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
     gHarmMute = INI_INT(L"fx_harm_mute", 0) != 0;
-    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 1);
+    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 2);
+    if (gMicSub == 2 && !gFeatVst) gMicSub = 0;
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
     gChoStyle  = Iclamp(INI_INT(L"fx_chorus_style", 0), 0, CHO_N - 1);
     gMufStyle  = Iclamp(INI_INT(L"fx_muffle_style", 0), 0, MUF_N - 1);
@@ -4568,6 +5178,7 @@ static void StkRefresh(const RECT* also)        // pictures on top changed: re-c
 #define TIMER_PICANIM  41
 #define TIMER_STKSIZE  42
 #define TIMER_MIXMETER 43
+#define TIMER_VST      44                      // plugins: only runs while Plugins is on in Settings > Features
 static void PicAnimTimer()                      // run the animation timer only while something animates
 {
     bool any = gBase.n > 1;
@@ -4749,6 +5360,16 @@ static void SaveSettings()
     SaveInt(L"random_lag", gRandLagOn);
     SaveInt(L"remote_on", gWsOn); SaveInt(L"remote_port", gWsPort); IniSet(L"remote_password", gWsPass);
     SaveInt(L"feat_lag", gFeatLag); SaveInt(L"feat_voicefx", gFeatFx); SaveInt(L"feat_soundboard", gFeatSound); SaveInt(L"feat_clips", gFeatClips);
+    SaveInt(L"feat_plugins", gFeatVst);
+    for (int k = 0; k < VST_SLOTS; k++) {
+        const VstUi& u = gVstUi[k];
+        wchar_t key[32], id[40];
+        MultiByteToWideChar(CP_ACP, 0, u.cid, -1, id, 40);
+        wsprintfW(key, L"plugin%d_path", k + 1); IniSet(key, u.path[0] ? u.path : nullptr);
+        wsprintfW(key, L"plugin%d_id", k + 1);   IniSet(key, u.path[0] ? id : nullptr);
+        wsprintfW(key, L"plugin%d_name", k + 1); IniSet(key, u.path[0] ? u.name : nullptr);
+        wsprintfW(key, L"plugin%d_on", k + 1);   IniSet(key, u.path[0] ? (u.want ? L"1" : L"0") : nullptr);
+    }
     SaveInt(L"random_lag_every_s", gRandLagSec);
 
     SaveInt(L"repeat_word_times", gRepeatN);
@@ -7236,6 +7857,9 @@ static void ProfileKeysSave()
     }
 }
 
+static void VstProfileSave(const wchar_t* name, const wchar_t* path);   // (plugins: defined with them)
+static void VstProfileLoad(const wchar_t* name, const wchar_t* path);
+static void VstProfileDelete(const wchar_t* name);
 static bool ProfileSave(const wchar_t* name)
 {
     wchar_t path[MAX_PATH]; ProfilePath(name, path);
@@ -7245,6 +7869,7 @@ static bool ProfileSave(const wchar_t* name)
     for (const FxGroup& g : gFxGroups) put(g.key, *g.on ? 1 : 0);
     for (const Knob& k : gKnobs) put(k.key, *k.var);
     LayoutSave(path);                           // each profile keeps where you moved things to
+    VstProfileSave(name, path);                 // ...and its plugins, with their settings (only with Plugins on)
     return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
 }
 
@@ -7306,6 +7931,7 @@ static bool ProfileLoad(int idx, bool osd)
     for (const Knob& k : gKnobs) *k.var = get(k.key, *k.var, k.lo, k.hi);
     gProfCur = idx;
     if (LayoutLoad(path, true)) LayoutSave(gIni);   // its layout (older profiles have none: keep the current one)
+    VstProfileLoad(gProfNames[idx], path);
     RefreshSoundUI();
     if (osd) { wchar_t m[96]; wsprintfW(m, L"Profile: %s", gProfNames[idx]); ShowOsd(m, true); }
     return true;
@@ -7363,6 +7989,7 @@ static void ProfileDeleteClicked()
     if (MessageBoxW(gWnd, q, L"Lag Effect - Profiles", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     wchar_t path[MAX_PATH], key[96]; ProfilePath(gProfNames[gProfSel], path); ProfileKeyName(gProfNames[gProfSel], key);
     DeleteFileW(path);
+    VstProfileDelete(gProfNames[gProfSel]);
     IniSet(key, nullptr);
     gProfCur = -1;
     ProfilesScan();
@@ -10917,7 +11544,7 @@ static void LayoutSaveNow()                     // to the settings and the profi
 static bool EdIsSubTab(HWND h)
 {
     int id = GetDlgCtrlID(h);
-    return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || id == IDC_MICSUB0 || id == IDC_MICSUB1 ||
+    return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || MicSubOf(id) >= 0 ||
            (id >= IDC_SETSUB0 && id <= IDC_SETSUB3);
 }
 static bool SectionShown(const Section& s)
@@ -11740,6 +12367,15 @@ static void AddTips()
     TipId(IDC_FXSUB6, L"Fun: Glitch (a bad connection).");
     TipId(IDC_MICSUB0, L"Cleanup: AI noise suppression and the noise gate.");
     TipId(IDC_MICSUB1, L"Tone: mic level, low cut, leveler, de-esser, broadcast voice and a 5-band equalizer.");
+    TipId(IDC_MICSUB2, L"Plugins: VST3 effects on your mic, after Cleanup and Tone.");
+    for (int k = 0; k < VST_SLOTS; k++) {
+        TipId(IDC_VSTON0 + k,   L"On: your mic runs through this plugin. Off: bypassed (it fades, no click) and it uses no processing time.");
+        TipId(IDC_VSTNAME0 + k, L"Click to pick the plugin for this slot, reload it, move it up or down the chain, or remove it.");
+        TipId(IDC_VSTEDIT0 + k, L"Open the plugin's own window to change its settings. They're saved when you close it.");
+        TipId(IDC_VSTINFO0 + k, L"\"+N ms delay\": the plugin makes your voice that much later (look-ahead, noise removal...).");
+    }
+    TipId(IDC_VSTLIC, L"The licence of the VST3 interface Lag Effect uses to talk to plugins.");
+    TipId(IDC_FEATVST, L"Plugins: adds a Plugins page to the Mic tab for VST3 effects. Off: no plugin is loaded and none of it runs.");
     TipId(IDC_HARMMUTE,  L"Silences the extra voices but keeps the Harmonizer on and your own voice at full level. Click again to bring them back.");
     TipId(IDC_HARMSTYLE, L"Which extra voices sing along: an octave up or down, a chord, a fifth, a power chord or an angel choir.");
     TipId(IDC_BROADCAST, L"Radio-host sound: strong, even compression, a little presence and less mud, and the esses tamed. "
@@ -11838,13 +12474,13 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 }
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
-static const wchar_t* MIC_SUB_NAMES[2] = { L"Cleanup", L"Tone" };
+static const wchar_t* MIC_SUB_NAMES[3] = { L"Cleanup", L"Tone", L"Plugins" };
 static const wchar_t* SET_SUB_NAMES[4] = { L"General", L"Look", L"Pictures", L"Features" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings sub-tabs
 {
     const bool set = (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB3;
-    const bool mic = !set && (int)d->CtlID >= IDC_MICSUB0 && (int)d->CtlID <= IDC_MICSUB1;
-    int t = (int)d->CtlID - (set ? IDC_SETSUB0 : mic ? IDC_MICSUB0 : IDC_FXSUB0);
+    const bool mic = !set && MicSubOf((int)d->CtlID) >= 0;
+    int t = mic ? MicSubOf((int)d->CtlID) : (int)d->CtlID - (set ? IDC_SETSUB0 : IDC_FXSUB0);
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
@@ -13439,6 +14075,693 @@ static void SetupVbCable()
         L"Lag Effect - VB-Cable ready", MB_ICONINFORMATION);
 }
 
+// ======================= VST3 plugins: files, menus and windows (Mic > Plugins) =======================
+// The plugin slots sit on your mic after Cleanup and Tone and before the voice effects. Everything here is
+// off (nothing loaded, nothing scanned) unless Plugins is switched on in Settings > Features.
+#if RATE != VST_RATE
+#error "The plugin host and the app disagree about the sample rate"
+#endif
+static void SaveSettings();
+static void VstRefreshUi();
+static void VstEditorClose(int k);
+
+static const wchar_t* VST_LICENCE =
+    L"Lag Effect loads VST3 plugins using Steinberg's VST 3 interface headers, used under the MIT licence:\n\n"
+    L"MIT License\n\nCopyright (c) 2026, Steinberg Media Technologies GmbH\n\n"
+    L"Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated "
+    L"documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation "
+    L"the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to "
+    L"permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\n"
+    L"The above copyright notice and this permission notice shall be included in all copies or substantial portions of "
+    L"the Software.\n\n"
+    L"THE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO "
+    L"THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE "
+    L"AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, "
+    L"TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE "
+    L"SOFTWARE.\n\n"
+    L"VST is a registered trademark of Steinberg Media Technologies GmbH.";
+
+// Run something inside a plugin's code. false: the plugin crashed (the app carries on).
+#ifdef _MSC_VER
+template <class F> static bool VstGuard(F& f)
+{
+    __try { f(); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+#else
+template <class F> static bool VstGuard(F& f) { f(); return true; }
+#endif
+
+// ---- files ----
+static void VstStatePath(int k, wchar_t* out)   // each slot's settings: Plugins\slot1.bin next to the settings file
+{
+    lstrcpynW(out, gIni, MAX_PATH - 24);
+    wchar_t* slash = wcsrchr(out, L'\\');
+    if (slash) slash[1] = 0; else out[0] = 0;
+    lstrcatW(out, L"Plugins");
+    CreateDirectoryW(out, nullptr);
+    wchar_t t[24]; wsprintfW(t, L"\\slot%d.bin", k + 1);
+    lstrcatW(out, t);
+}
+static unsigned char* VstReadFile(const wchar_t* path, int* len)   // (HeapFree it)
+{
+    *len = 0;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    LARGE_INTEGER sz; unsigned char* d = nullptr;
+    if (GetFileSizeEx(f, &sz) && sz.QuadPart > 0 && sz.QuadPart < 64 * 1024 * 1024) {
+        d = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, (SIZE_T)sz.QuadPart);
+        DWORD got = 0;
+        if (d && ReadFile(f, d, (DWORD)sz.QuadPart, &got, nullptr) && got == (DWORD)sz.QuadPart) *len = (int)got;
+        else if (d) { HeapFree(GetProcessHeap(), 0, d); d = nullptr; }
+    }
+    CloseHandle(f);
+    return d;
+}
+static bool VstWriteFile(const wchar_t* path, const unsigned char* d, int len)
+{
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    const bool ok = WriteFile(f, d, (DWORD)len, &put, nullptr) && put == (DWORD)len;
+    CloseHandle(f);
+    return ok;
+}
+static void VstCidHex(const SB::TUID id, char* out)
+{
+    static const char* h = "0123456789ABCDEF";
+    for (int i = 0; i < 16; i++) { out[i * 2] = h[((unsigned char)id[i]) >> 4]; out[i * 2 + 1] = h[((unsigned char)id[i]) & 15]; }
+    out[32] = 0;
+}
+static bool VstCidFromHex(const char* s, SB::TUID id)
+{
+    for (int i = 0; i < 32; i++) {
+        const char c = s[i];
+        const int v = c >= '0' && c <= '9' ? c - '0' : c >= 'A' && c <= 'F' ? c - 'A' + 10 : c >= 'a' && c <= 'f' ? c - 'a' + 10 : -1;
+        if (v < 0) return false;
+        if (i & 1) id[i / 2] = (char)(((unsigned char)id[i / 2]) | v); else id[i / 2] = (char)(v << 4);
+    }
+    return s[32] == 0;
+}
+
+// ---- a plugin's file ----
+typedef bool (PLUGIN_API *VstInitFn)();
+typedef SB::IPluginFactory* (PLUGIN_API *VstFactoryFn)();
+static void VstResolve(const wchar_t* path, wchar_t* dll)   // a .vst3 "bundle" is a folder: the real file is inside it
+{
+    lstrcpynW(dll, path, MAX_PATH);
+    const DWORD a = GetFileAttributesW(path);
+    if (a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY)) {
+        const wchar_t* base = wcsrchr(path, L'\\'); base = base ? base + 1 : path;
+        _snwprintf(dll, MAX_PATH - 1, L"%s\\Contents\\x86_64-win\\%s", path, base); dll[MAX_PATH - 1] = 0;
+    }
+}
+static const wchar_t* VstModuleOpen(int k)      // nullptr: its file is loaded and it handed over its factory
+{
+    VstUi& u = gVstUi[k];
+    wchar_t dll[MAX_PATH]; VstResolve(u.path, dll);
+    if (GetFileAttributesW(dll) == INVALID_FILE_ATTRIBUTES) return L"Its file isn't there any more (moved or uninstalled?).";
+    const UINT em = SetErrorMode(SEM_FAILCRITICALERRORS);
+    HMODULE m = nullptr; SB::IPluginFactory* f = nullptr; DWORD le = 0; bool initOk = true;
+    auto job = [&] {
+        m = LoadLibraryExW(dll, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);   // (so it finds the DLLs it ships with)
+        if (!m) { le = GetLastError(); return; }
+        VstInitFn init = (VstInitFn)(void*)GetProcAddress(m, "InitDll");
+        if (init && !init()) { initOk = false; return; }
+        VstFactoryFn gf = (VstFactoryFn)(void*)GetProcAddress(m, "GetPluginFactory");
+        if (gf) f = gf();
+    };
+    const bool ok = VstGuard(job);
+    SetErrorMode(em);
+    if (!ok) return L"It crashed while loading.";
+    if (!m) return le == ERROR_BAD_EXE_FORMAT ? L"It's a 32-bit plugin. Lag Effect needs the 64-bit (x64) version."
+                                              : L"Windows couldn't load its file (something it needs may be missing).";
+    if (!initOk || !f) { FreeLibrary(m); return L"It isn't a VST3 plugin (or it refused to start)."; }
+    u.mod = m; u.fac = f;
+    return nullptr;
+}
+static void VstModuleClose(int k)
+{
+    VstUi& u = gVstUi[k];
+    HMODULE m = u.mod; SB::IPluginFactory* f = u.fac;
+    u.mod = nullptr; u.fac = nullptr;
+    if (!m) return;
+    auto job = [&] {
+        if (f) f->release();
+        VstInitFn ex = (VstInitFn)(void*)GetProcAddress(m, "ExitDll");
+        if (ex) ex();
+        FreeLibrary(m);
+    };
+    VstGuard(job);
+}
+struct VstClass { SB::TUID cid; wchar_t name[80]; };
+static int VstListClasses(SB::IPluginFactory* f, VstClass* out, int cap)   // the audio effects inside a plugin file
+{
+    int n = 0;
+    void* p2 = nullptr; SB::IPluginFactory2* f2 = nullptr;
+    if (f->queryInterface(SB::IPluginFactory2::iid, &p2) == SB::kResultOk) f2 = (SB::IPluginFactory2*)p2;
+    const int cnt = f->countClasses();
+    for (int i = 0; i < cnt && n < cap; i++) {
+        SB::PClassInfo ci;
+        if (f->getClassInfo(i, &ci) != SB::kResultOk) continue;
+        char cat[40]; memcpy(cat, ci.category, 32); cat[32] = 0;
+        if (strcmp(cat, kVstAudioEffectClass)) continue;
+        SB::PClassInfo2 c2;
+        if (f2 && f2->getClassInfo2(i, &c2) == SB::kResultOk) {
+            char sub[136]; memcpy(sub, c2.subCategories, 128); sub[128] = 0;
+            if (strstr(sub, "Instrument") && !strstr(sub, "Fx")) continue;   // a synth: nothing for a mic
+        }
+        char nm[72]; memcpy(nm, ci.name, 64); nm[64] = 0;
+        memcpy(out[n].cid, ci.cid, 16);
+        if (!MultiByteToWideChar(CP_UTF8, 0, nm, -1, out[n].name, 80)) lstrcpyW(out[n].name, L"(no name)");
+        out[n].name[79] = 0;
+        n++;
+    }
+    if (f2) f2->release();
+    return n;
+}
+
+// ---- loading, unloading, saving ----
+static void VstSaveState(int k)                 // the plugin's own settings, to its slot file
+{
+    VstUi& u = gVstUi[k];
+    if (!u.loaded) return;
+    unsigned char* d = nullptr; int len = 0; bool ok = false;
+    auto job = [&] { ok = VstGetState(gVst[k], &d, &len); };
+    if (VstGuard(job) && ok) { wchar_t sp[MAX_PATH]; VstStatePath(k, sp); VstWriteFile(sp, d, len); }
+    free(d);
+}
+static void VstCrashed(int k)                    // it crashed: never call into it again, tell you, carry on without it
+{
+    VstUi& u = gVstUi[k];
+    VstForget(gVst[k]);
+    if (u.wnd) ShowWindow(u.wnd, SW_HIDE);      // (hidden, not closed: closing would run its code again)
+    u.wnd = nullptr; u.view = nullptr;
+    u.mod = nullptr; u.fac = nullptr;           // (its file stays loaded: unloading a crashed plugin is asking for another crash)
+    u.loaded = false; u.dead = true; u.want = false;
+    wchar_t m[64]; _snwprintf(m, 63, L"Plugin crashed: %s", u.name); m[63] = 0;
+    ShowOsd(m, false);
+    SaveSettings();
+    VstRefreshUi();
+}
+static bool VstLoad(int k, bool quiet)          // start the plugin this slot is set to (false: it didn't start)
+{
+    VstUi& u = gVstUi[k]; VstSlot& s = gVst[k];
+    if (u.loaded) return true;
+    if (!u.path[0] || !gFeatVst) return false;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    wchar_t num[8]; wsprintfW(num, L"%d", k + 1);
+    WritePrivateProfileStringW(L"settings", L"vst_loading", num, gIni);   // (still there at the next start: this plugin took the app down)
+    const wchar_t* err = u.mod ? nullptr : VstModuleOpen(k);
+    SB::TUID cid;
+    if (!err && !VstCidFromHex(u.cid, cid)) err = L"Its saved ID is damaged: remove it and add the plugin again.";
+    bool crashed = false;
+    if (!err) {
+        wchar_t sp[MAX_PATH]; VstStatePath(k, sp);
+        int stLen = 0; unsigned char* st = VstReadFile(sp, &stLen);
+        const wchar_t* e2 = nullptr;
+        s.on = u.want ? 1 : 0;                  // (set before it goes live, so a bypassed one never sounds for a moment)
+        auto job = [&] { e2 = VstOpen(s, u.fac, cid, st, stLen); };
+        if (VstGuard(job)) err = e2;
+        else { crashed = true; err = L"It crashed while starting, so it has been left switched off."; }
+        if (st) HeapFree(GetProcessHeap(), 0, st);
+    }
+    WritePrivateProfileStringW(L"settings", L"vst_loading", nullptr, gIni);
+    SetCursor(old);
+    if (crashed) { VstForget(s); u.mod = nullptr; u.fac = nullptr; u.dead = true; u.want = false; }
+    else if (err) VstModuleClose(k);
+    if (err) {
+        if (!quiet) {
+            wchar_t m[700]; _snwprintf(m, 699, L"\"%s\" couldn't be used.\n\n%s", u.name[0] ? u.name : u.path, err); m[699] = 0;
+            MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_ICONWARNING);
+        }
+        return false;
+    }
+    u.loaded = true; u.dead = false;
+    s.on = u.want ? 1 : 0;
+    return true;
+}
+static void VstUnload(int k, bool save, bool keepFile = false)   // (keepFile: when quitting, leave its DLL alone)
+{
+    VstUi& u = gVstUi[k];
+    VstEditorClose(k);
+    if (u.loaded) {
+        if (save) VstSaveState(k);
+        auto job = [&] { VstClose(gVst[k]); };
+        if (!VstGuard(job)) { VstForget(gVst[k]); u.mod = nullptr; u.fac = nullptr; }
+        u.loaded = false;
+    }
+    u.dead = false;
+    if (!keepFile) VstModuleClose(k);
+}
+static void VstClearSlot(int k)                 // empty the slot (its plugin must be unloaded already)
+{
+    VstUi& u = gVstUi[k];
+    u.path[0] = 0; u.cid[0] = 0; u.name[0] = 0; u.want = false;
+    wchar_t sp[MAX_PATH]; VstStatePath(k, sp); DeleteFileW(sp);
+}
+static void VstAssign(int k, const wchar_t* path)   // put the plugin in this file into the slot
+{
+    VstUi& u = gVstUi[k];
+    VstUnload(k, false);
+    VstClearSlot(k);
+    lstrcpynW(u.path, path, MAX_PATH);
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const wchar_t* err = VstModuleOpen(k);
+    SetCursor(old);
+    static VstClass cl[400];
+    int n = 0, pick = 0;
+    if (!err) {
+        auto job = [&] { n = VstListClasses(u.fac, cl, 400); };
+        if (!VstGuard(job)) { err = L"It crashed while Lag Effect was asking what's in it."; u.mod = nullptr; u.fac = nullptr; }
+        else if (!n) err = L"There's no audio effect in it (it's an instrument, or not a VST3 plugin).";
+    }
+    if (!err && n > 1) {                        // several effects in one file: which one?
+        HMENU m = CreatePopupMenu();
+        for (int i = 0; i < n; i++) AppendMenuW(m, MF_STRING | (i && i % 32 == 0 ? MF_MENUBARBREAK : 0), 1 + i, cl[i].name);
+        POINT pt; GetCursorPos(&pt);
+        SetForegroundWindow(gWnd);
+        const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, gWnd, nullptr);
+        DestroyMenu(m);
+        if (cmd < 1) { VstModuleClose(k); VstClearSlot(k); VstRefreshUi(); return; }
+        pick = cmd - 1;
+    }
+    if (err) {
+        wchar_t m[700]; _snwprintf(m, 699, L"That plugin couldn't be used.\n\n%s\n\n%s", err, path); m[699] = 0;
+        MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_ICONWARNING);
+        VstModuleClose(k); VstClearSlot(k); VstRefreshUi();
+        return;
+    }
+    VstCidHex(cl[pick].cid, u.cid);
+    lstrcpynW(u.name, cl[pick].name, 80);
+    u.want = true;
+    if (!VstLoad(k, false) && !u.dead) VstClearSlot(k);   // (one that crashed stays listed as "crashed", so you can see which it was)
+    SaveSettings();
+    VstRefreshUi();
+}
+static void VstSwap(int a, int b)               // move a plugin up or down the chain, settings and all
+{
+    if (a < 0 || b < 0 || a >= VST_SLOTS || b >= VST_SLOTS) return;
+    VstUnload(a, true); VstUnload(b, true);
+    VstUi& x = gVstUi[a]; VstUi& y = gVstUi[b];
+    wchar_t tp[MAX_PATH], tn[80]; char tc[33]; bool tw;
+    lstrcpynW(tp, x.path, MAX_PATH); lstrcpynW(tn, x.name, 80); memcpy(tc, x.cid, 33); tw = x.want;
+    lstrcpynW(x.path, y.path, MAX_PATH); lstrcpynW(x.name, y.name, 80); memcpy(x.cid, y.cid, 33); x.want = y.want;
+    lstrcpynW(y.path, tp, MAX_PATH); lstrcpynW(y.name, tn, 80); memcpy(y.cid, tc, 33); y.want = tw;
+    wchar_t pa[MAX_PATH], pb[MAX_PATH], pt[MAX_PATH + 8];
+    VstStatePath(a, pa); VstStatePath(b, pb);
+    lstrcpyW(pt, pa); lstrcatW(pt, L".tmp");
+    DeleteFileW(pt);
+    MoveFileW(pa, pt); MoveFileW(pb, pa); MoveFileW(pt, pb);
+    const int both[2] = { a, b };
+    for (int k : both) if (gVstUi[k].want && !VstLoad(k, true)) gVstUi[k].want = false;
+    SaveSettings();
+    VstRefreshUi();
+}
+
+// ---- a plugin's own window ----
+SB::tresult PLUGIN_API VstFrame::resizeView(SB::IPlugView* view, SB::ViewRect* r)
+{
+    VstUi& u = gVstUi[slot];
+    if (!view || !r || !u.wnd) return SB::kInvalidArgument;
+    if (busy) return SB::kResultFalse;
+    busy = true;
+    RECT rc = { 0, 0, r->right - r->left, r->bottom - r->top };
+    AdjustWindowRectEx(&rc, (DWORD)GetWindowLongPtrW(u.wnd, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrW(u.wnd, GWL_EXSTYLE));
+    SetWindowPos(u.wnd, nullptr, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    view->onSize(r);
+    busy = false;
+    return SB::kResultTrue;
+}
+static LRESULT CALLBACK VstEdProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    const int k = (int)GetWindowLongPtrW(h, GWLP_USERDATA) - 1;
+    VstUi* u = k >= 0 && k < VST_SLOTS && gVstUi[k].wnd == h ? &gVstUi[k] : nullptr;
+    switch (m) {
+    case WM_ERASEBKGND: { RECT r; GetClientRect(h, &r); FillRect((HDC)w, &r, (HBRUSH)GetStockObject(BLACK_BRUSH)); return 1; }
+    case WM_SIZING:                             // you're dragging its edge: let the plugin pick the nearest size it can do
+        if (u && u->view) {
+            RECT* wr = (RECT*)l; RECT fr = { 0, 0, 0, 0 };
+            AdjustWindowRectEx(&fr, (DWORD)GetWindowLongPtrW(h, GWL_STYLE), FALSE, (DWORD)GetWindowLongPtrW(h, GWL_EXSTYLE));
+            const int fw = fr.right - fr.left, fh = fr.bottom - fr.top;
+            SB::ViewRect vr(0, 0, (wr->right - wr->left) - fw, (wr->bottom - wr->top) - fh);
+            SB::IPlugView* v = u->view; bool ok = false;
+            auto job = [&] { ok = v->checkSizeConstraint(&vr) == SB::kResultTrue; };
+            if (VstGuard(job) && ok) { wr->right = wr->left + (vr.right - vr.left) + fw; wr->bottom = wr->top + (vr.bottom - vr.top) + fh; }
+            return TRUE;
+        }
+        break;
+    case WM_SIZE:
+        if (u && u->view && !u->frame.busy && w != SIZE_MINIMIZED) {
+            SB::ViewRect vr(0, 0, LOWORD(l), HIWORD(l));
+            SB::IPlugView* v = u->view;
+            u->frame.busy = true;
+            auto job = [&] { v->onSize(&vr); };
+            VstGuard(job);
+            u->frame.busy = false;
+        }
+        return 0;
+    case WM_CLOSE:
+        if (u) VstEditorClose(k); else DestroyWindow(h);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void VstEditorClose(int k)
+{
+    VstUi& u = gVstUi[k];
+    SB::IPlugView* v = u.view; HWND w = u.wnd;
+    if (!v && !w) return;
+    u.view = nullptr;
+    if (v) {
+        auto job = [&] { v->setFrame(nullptr); v->removed(); v->release(); };
+        VstGuard(job);
+    }
+    u.wnd = nullptr;
+    if (w) DestroyWindow(w);
+    VstSaveState(k);                            // (what you just set in its window is kept even if something crashes later)
+}
+static void VstEditorOpen(int k)
+{
+    VstUi& u = gVstUi[k]; VstSlot& s = gVst[k];
+    if (u.wnd) { ShowWindow(u.wnd, SW_RESTORE); SetForegroundWindow(u.wnd); return; }
+    if (!u.path[0]) return;
+    if (u.dead) {
+        MessageBoxW(gWnd, L"This plugin crashed, so it isn't running.\n\nTo try it again, click its name and pick \"Load it\".", L"Lag Effect - Plugins", MB_ICONINFORMATION);
+        return;
+    }
+    if (!u.loaded) { VstLoad(k, false); VstRefreshUi(); if (!u.loaded) return; }   // (switched off = not loaded yet: load it, still bypassed)
+    if (!s.ctrl) { MessageBoxW(gWnd, L"This plugin has no window of its own, so there's nothing to open.", L"Lag Effect - Plugins", MB_ICONINFORMATION); return; }
+    SB::IPlugView* v = nullptr; SB::ViewRect vr; bool sized = false, resizable = false, hwndOk = false;
+    auto make = [&] {
+        v = s.ctrl->createView(SV::ViewType::kEditor);
+        if (!v) return;
+        hwndOk = v->isPlatformTypeSupported(SB::kPlatformTypeHWND) == SB::kResultTrue;
+        if (!hwndOk) { v->release(); v = nullptr; return; }
+        sized = v->getSize(&vr) == SB::kResultOk;
+        resizable = v->canResize() == SB::kResultTrue;
+    };
+    if (!VstGuard(make)) { VstCrashed(k); return; }
+    if (!v) { MessageBoxW(gWnd, L"This plugin has no window of its own, so there's nothing to open.", L"Lag Effect - Plugins", MB_ICONINFORMATION); return; }
+    int cw = vr.right - vr.left, ch = vr.bottom - vr.top;
+    if (!sized || cw < 40 || ch < 40) { cw = 640; ch = 400; }
+    const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_CLIPCHILDREN | (resizable ? WS_THICKFRAME | WS_MAXIMIZEBOX : 0);
+    RECT rc = { 0, 0, cw, ch };
+    AdjustWindowRectEx(&rc, style, FALSE, 0);
+    wchar_t title[128]; _snwprintf(title, 127, L"%s - Lag Effect", u.name); title[127] = 0;
+    HWND w = CreateWindowExW(0, L"LagVstEd", title, style, CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
+                             gWnd, nullptr, gInst, nullptr);
+    if (!w) { auto drop = [&] { v->release(); }; VstGuard(drop); return; }
+    SetWindowLongPtrW(w, GWLP_USERDATA, k + 1);
+    u.frame.slot = k; u.frame.busy = false;
+    u.wnd = w; u.view = v;
+    bool attached = false;
+    auto attach = [&] {
+        v->setFrame(&u.frame);
+        attached = v->attached((void*)w, SB::kPlatformTypeHWND) == SB::kResultTrue;
+        SB::ViewRect now;                       // (some only know their real size once they're in a window)
+        if (attached && v->getSize(&now) == SB::kResultOk && now.right - now.left >= 40 && now.bottom - now.top >= 40 &&
+            (now.right - now.left != cw || now.bottom - now.top != ch)) u.frame.resizeView(v, &now);
+    };
+    if (!VstGuard(attach)) { VstCrashed(k); return; }
+    if (!attached) {
+        VstEditorClose(k);
+        MessageBoxW(gWnd, L"The plugin wouldn't open its window.", L"Lag Effect - Plugins", MB_ICONWARNING);
+        return;
+    }
+    ShowWindow(w, SW_SHOWNORMAL);
+}
+
+// ---- the plugins found on this PC ----
+struct VstFound { wchar_t path[MAX_PATH]; wchar_t label[64]; wchar_t group[40]; };
+#define VST_FOUND_MAX 500
+static VstFound* gVstFound = nullptr;
+static int gVstFoundN = -1;                     // -1: not looked yet (only when you first open the menu)
+static void VstScanDir(const wchar_t* dir, const wchar_t* group, int depth)
+{
+    wchar_t pat[MAX_PATH];
+    if (_snwprintf(pat, MAX_PATH - 1, L"%s\\*", dir) < 0) return;
+    pat[MAX_PATH - 1] = 0;
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        wchar_t full[MAX_PATH];
+        if (_snwprintf(full, MAX_PATH - 1, L"%s\\%s", dir, fd.cFileName) < 0) continue;
+        full[MAX_PATH - 1] = 0;
+        const int len = lstrlenW(fd.cFileName);
+        if (len > 5 && !lstrcmpiW(fd.cFileName + len - 5, L".vst3")) {   // a plugin: one file, or a bundle folder
+            if (gVstFoundN >= VST_FOUND_MAX) continue;
+            VstFound& v = gVstFound[gVstFoundN++];
+            lstrcpynW(v.path, full, MAX_PATH);
+            lstrcpynW(v.label, fd.cFileName, Imin(64, len - 5 + 1));   // (without ".vst3")
+            lstrcpynW(v.group, group, 40);
+        } else if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && depth < 4) {
+            VstScanDir(full, depth == 0 ? fd.cFileName : group, depth + 1);   // (a maker's own folder)
+        }
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+static void VstScan()
+{
+    if (!gVstFound) gVstFound = (VstFound*)HeapAlloc(GetProcessHeap(), 0, sizeof(VstFound) * VST_FOUND_MAX);
+    gVstFoundN = 0;
+    if (!gVstFound) return;
+    wchar_t dir[MAX_PATH];
+    if (ExpandEnvironmentStringsW(L"%CommonProgramFiles%\\VST3", dir, MAX_PATH)) VstScanDir(dir, L"", 0);
+    if (ExpandEnvironmentStringsW(L"%LOCALAPPDATA%\\Programs\\Common\\VST3", dir, MAX_PATH)) VstScanDir(dir, L"", 0);
+    for (int i = 1; i < gVstFoundN; i++) {      // by maker's folder, then name (ones not in a folder first)
+        VstFound t = gVstFound[i]; int j = i - 1;
+        auto after = [&](const VstFound& a) { const int g = lstrcmpiW(a.group, t.group); return g > 0 || (g == 0 && lstrcmpiW(a.label, t.label) > 0); };
+        while (j >= 0 && after(gVstFound[j])) { gVstFound[j + 1] = gVstFound[j]; j--; }
+        gVstFound[j + 1] = t;
+    }
+}
+static void VstMenu(int k, HWND from)           // a slot's button: what's in it, and what could go in it
+{
+    VstUi& u = gVstUi[k];
+    if (gVstFoundN < 0) { HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT)); VstScan(); SetCursor(old); }
+    HMENU m = CreatePopupMenu();
+    if (u.path[0]) {
+        AppendMenuW(m, MF_STRING, 1, L"Open its window");
+        AppendMenuW(m, MF_STRING, 2, u.loaded ? L"Reload it (keeps its settings)" : L"Load it");
+        AppendMenuW(m, MF_STRING | (k > 0 ? 0 : MF_GRAYED), 4, L"Move up (runs earlier)");
+        AppendMenuW(m, MF_STRING | (k < VST_SLOTS - 1 ? 0 : MF_GRAYED), 5, L"Move down (runs later)");
+        AppendMenuW(m, MF_STRING, 3, L"Remove it from this slot");
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    }
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, u.path[0] ? L"Put another plugin here instead" : L"Plugins on this PC");
+    int loose = 0;
+    for (int i = 0; i < gVstFoundN; i++) if (!gVstFound[i].group[0]) loose++;
+    HMENU sub = nullptr; int inSub = 0, first = -1;
+    auto closeSub = [&](int last) {             // name a letter-range submenu once it's full
+        if (!sub) return;
+        wchar_t t[64];
+        const wchar_t a = (wchar_t)towupper(gVstFound[first].label[0]), b = (wchar_t)towupper(gVstFound[last].label[0]);
+        if (a == b) wsprintfW(t, L"%c", a); else wsprintfW(t, L"%c \x2013 %c", a, b);
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)sub, t);
+        sub = nullptr; inSub = 0;
+    };
+    int i = 0;
+    for (; i < gVstFoundN && !gVstFound[i].group[0]; i++) {   // not in a maker's folder: listed directly, or by letter if there are many
+        if (loose <= 24) { AppendMenuW(m, MF_STRING, 100 + i, gVstFound[i].label); continue; }
+        if (!sub) { sub = CreatePopupMenu(); first = i; }
+        AppendMenuW(sub, MF_STRING, 100 + i, gVstFound[i].label);
+        if (++inSub >= 24) closeSub(i);
+    }
+    if (i > 0) closeSub(i - 1);
+    while (i < gVstFoundN) {                    // each maker's folder: its own submenu
+        HMENU gm = CreatePopupMenu();
+        const int g0 = i;
+        for (; i < gVstFoundN && !lstrcmpiW(gVstFound[i].group, gVstFound[g0].group); i++)
+            AppendMenuW(gm, MF_STRING | (i > g0 && (i - g0) % 32 == 0 ? MF_MENUBARBREAK : 0), 100 + i, gVstFound[i].label);
+        AppendMenuW(m, MF_POPUP, (UINT_PTR)gm, gVstFound[g0].group);
+    }
+    if (!gVstFoundN) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"   (none found in Program Files\\Common Files\\VST3)");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 6, L"Find a .vst3 file...");
+    AppendMenuW(m, MF_STRING, 7, L"Look for plugins again");
+    RECT r; GetWindowRect(from, &r);
+    const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == 1) VstEditorOpen(k);
+    else if (cmd == 2) {                        // (a fresh start for one that's misbehaving, or that crashed)
+        VstUnload(k, true);
+        u.want = true;
+        if (!VstLoad(k, false)) u.want = false;
+        SaveSettings(); VstRefreshUi();
+    }
+    else if (cmd == 3) { VstUnload(k, false); VstClearSlot(k); SaveSettings(); VstRefreshUi(); }
+    else if (cmd == 4) VstSwap(k, k - 1);
+    else if (cmd == 5) VstSwap(k, k + 1);
+    else if (cmd == 6) {
+        wchar_t path[MAX_PATH] = L"";
+        wchar_t dir[MAX_PATH] = L"";
+        ExpandEnvironmentStringsW(L"%CommonProgramFiles%\\VST3", dir, MAX_PATH);
+        OPENFILENAMEW o = {};
+        o.lStructSize = sizeof(o);
+        o.hwndOwner   = gWnd;
+        o.lpstrFilter = L"VST3 plugins (*.vst3)\0*.vst3\0All files\0*.*\0";
+        o.lpstrFile   = path;
+        o.nMaxFile    = MAX_PATH;
+        o.lpstrInitialDir = dir;
+        o.lpstrTitle  = L"Pick a VST3 plugin";
+        o.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+        if (GetOpenFileNameW(&o)) VstAssign(k, path);
+    }
+    else if (cmd == 7) { gVstFoundN = -1; VstMenu(k, from); }
+    else if (cmd >= 100 && cmd - 100 < gVstFoundN) VstAssign(k, gVstFound[cmd - 100].path);
+}
+
+// ---- the Mic > Plugins page ----
+static void VstRefreshUi()
+{
+    if (!gWnd || !GetDlgItem(gWnd, IDC_VSTNAME0)) return;
+    for (int k = 0; k < VST_SLOTS; k++) {
+        const VstUi& u = gVstUi[k];
+        wchar_t t[120];
+        if (!u.path[0]) lstrcpyW(t, L"+  Add a plugin...");
+        else lstrcpynW(t, u.name[0] ? u.name : L"(plugin)", 100);
+        SetDlgItemTextW(gWnd, IDC_VSTNAME0 + k, t);
+        CheckDlgButton(gWnd, IDC_VSTON0 + k, u.want && u.path[0] ? BST_CHECKED : BST_UNCHECKED);
+        if (!u.path[0]) t[0] = 0;
+        else if (u.dead) lstrcpyW(t, L"Crashed");
+        else if (!u.loaded) lstrcpyW(t, L"Not loaded");
+        else if (!u.want) lstrcpyW(t, L"Bypassed");
+        else if (gVst[k].latency > 0) wsprintfW(t, L"On, +%d ms delay", (gVst[k].latency * 1000 + RATE / 2) / RATE);
+        else lstrcpyW(t, L"On");
+        SetDlgItemTextW(gWnd, IDC_VSTINFO0 + k, t);
+    }
+}
+static void VstSetOn(int k, bool on)            // a slot's On switch
+{
+    VstUi& u = gVstUi[k];
+    if (!u.path[0]) { VstRefreshUi(); return; }
+    u.want = on;
+    if (on && !u.loaded && !VstLoad(k, false)) u.want = false;   // (off since the start = never loaded: load it now)
+    gVst[k].on = u.want ? 1 : 0;
+    SaveSettings();
+    VstRefreshUi();
+}
+static bool gVstStarted = false;                // the plugins from last time have been started this run
+static void VstStartAll()                       // at start-up, and when Plugins is switched on in Settings > Features
+{
+    gVstStarted = true;
+    if (!gFeatVst) return;
+    // A plugin that was loading when Lag Effect last died is left switched off, so the app can't get stuck crashing at every start.
+    const int bad = (int)GetPrivateProfileIntW(L"settings", L"vst_loading", 0, gIni);
+    WritePrivateProfileStringW(L"settings", L"vst_loading", nullptr, gIni);
+    wchar_t culprit[80] = L"";
+    if (bad >= 1 && bad <= VST_SLOTS && gVstUi[bad - 1].path[0]) { gVstUi[bad - 1].want = false; lstrcpynW(culprit, gVstUi[bad - 1].name, 80); }
+    for (int k = 0; k < VST_SLOTS; k++) {
+        VstUi& u = gVstUi[k];
+        if (u.want && u.path[0] && !u.loaded && !VstLoad(k, true)) u.want = false;
+    }
+    VstRefreshUi();
+    if (culprit[0]) {
+        SaveSettings();
+        wchar_t m[500];
+        _snwprintf(m, 499, L"Lag Effect closed unexpectedly while it was loading the plugin \"%s\" last time, so that plugin has been "
+                           L"switched off.\n\nYou can switch it back on in Mic > Plugins, or remove it there.", culprit);
+        m[499] = 0;
+        MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_ICONWARNING);
+    }
+}
+static void VstStopAll(bool quitting)           // quitting, or Plugins switched off in Settings > Features: nothing stays loaded
+{
+    for (int k = 0; k < VST_SLOTS; k++) VstUnload(k, true, quitting);
+}
+static void VstTick()                           // ~10 times a second while Plugins is on
+{
+    if (!gVstStarted) { VstStartAll(); return; }
+    static bool busy = false;                   // (a message box from in here keeps the timer running)
+    if (busy) return;
+    busy = true;
+    static int tick = 0;
+    const bool minute = ++tick >= 600;
+    if (minute) tick = 0;
+    bool changed = false;
+    for (int k = 0; k < VST_SLOTS; k++) {
+        VstUi& u = gVstUi[k]; VstSlot& s = gVst[k];
+        if (!u.loaded) continue;
+        if (s.crashed.exchange(0)) { VstCrashed(k); continue; }
+        const int lat = s.latency;
+        auto job = [&] { VstService(s); };
+        if (!VstGuard(job)) { VstCrashed(k); continue; }
+        if (s.latency != lat) changed = true;
+        if (minute && u.wnd) VstSaveState(k);   // its window is open: keep what you're setting, once a minute
+    }
+    gVstTempo = Iclamp(gBpm, 40, 300);          // (tempo-synced plugins follow the Main tab's BPM)
+    if (changed) VstRefreshUi();
+    busy = false;
+}
+
+// ---- profiles: which plugins, on or off, and each one's own settings ----
+static void VstProfileBin(const wchar_t* name, int k, wchar_t* out)
+{
+    wchar_t dir[MAX_PATH]; ProfileDir(dir);
+    _snwprintf(out, MAX_PATH - 1, L"%s\\%s.plugin%d.bin", dir, name, k + 1); out[MAX_PATH - 1] = 0;
+}
+static void VstProfileSave(const wchar_t* name, const wchar_t* path)
+{
+    if (!gFeatVst) return;                      // (Plugins off: profiles neither store nor touch them)
+    for (int k = 0; k < VST_SLOTS; k++) {
+        const VstUi& u = gVstUi[k];
+        wchar_t key[32], id[40], bin[MAX_PATH], sp[MAX_PATH];
+        wsprintfW(key, L"plugin%d_path", k + 1); WritePrivateProfileStringW(L"profile", key, u.path, path);
+        MultiByteToWideChar(CP_ACP, 0, u.cid, -1, id, 40);
+        wsprintfW(key, L"plugin%d_id", k + 1);   WritePrivateProfileStringW(L"profile", key, id, path);
+        wsprintfW(key, L"plugin%d_name", k + 1); WritePrivateProfileStringW(L"profile", key, u.name, path);
+        wsprintfW(key, L"plugin%d_on", k + 1);   WritePrivateProfileStringW(L"profile", key, u.want ? L"1" : L"0", path);
+        VstSaveState(k);
+        VstProfileBin(name, k, bin); VstStatePath(k, sp);
+        if (!u.path[0] || !CopyFileW(sp, bin, FALSE)) DeleteFileW(bin);
+    }
+}
+static void VstProfileLoad(const wchar_t* name, const wchar_t* path)
+{
+    if (!gFeatVst) return;
+    for (int k = 0; k < VST_SLOTS; k++) {
+        VstUi& u = gVstUi[k];
+        wchar_t key[32], np[MAX_PATH], wid[40], nname[80], bin[MAX_PATH], sp[MAX_PATH];
+        wsprintfW(key, L"plugin%d_path", k + 1);
+        GetPrivateProfileStringW(L"profile", key, L"\x01", np, MAX_PATH, path);
+        if (np[0] == 1) continue;               // a profile from before plugins: it leaves them as they are
+        wsprintfW(key, L"plugin%d_id", k + 1);   GetPrivateProfileStringW(L"profile", key, L"", wid, 40, path);
+        wsprintfW(key, L"plugin%d_name", k + 1); GetPrivateProfileStringW(L"profile", key, L"", nname, 80, path);
+        wsprintfW(key, L"plugin%d_on", k + 1);
+        const bool on = GetPrivateProfileIntW(L"profile", key, 0, path) != 0;
+        char nid[40]; WideCharToMultiByte(CP_ACP, 0, wid, -1, nid, 40, nullptr, nullptr); nid[32] = 0;
+        VstProfileBin(name, k, bin); VstStatePath(k, sp);
+        if (np[0] && !lstrcmpiW(np, u.path) && !_stricmp(nid, u.cid)) {   // the same plugin: just its settings change (no reload)
+            if (u.loaded) {
+                int len = 0; unsigned char* st = VstReadFile(bin, &len);
+                if (st) {
+                    VstSlot& s = gVst[k];
+                    auto job = [&] { VstPause(s); VstSetState(s, st, len); VstResume(s); };
+                    const bool ok = VstGuard(job);
+                    HeapFree(GetProcessHeap(), 0, st);
+                    if (!ok) { VstCrashed(k); continue; }
+                }
+            } else if (!CopyFileW(bin, sp, FALSE)) DeleteFileW(sp);
+        } else {                                // a different plugin (or none) in this slot
+            VstUnload(k, false);
+            VstClearSlot(k);
+            lstrcpynW(u.path, np, MAX_PATH); memcpy(u.cid, nid, 33); lstrcpynW(u.name, nname, 80);
+            if (np[0]) CopyFileW(bin, sp, FALSE);
+        }
+        u.want = on && u.path[0] != 0;
+        if (u.want && !u.loaded && !VstLoad(k, true)) u.want = false;
+        gVst[k].on = u.want ? 1 : 0;
+    }
+    VstRefreshUi();
+}
+static void VstProfileDelete(const wchar_t* name)
+{
+    for (int k = 0; k < VST_SLOTS; k++) { wchar_t bin[MAX_PATH]; VstProfileBin(name, k, bin); DeleteFileW(bin); }
+}
+
 static void ShowHelp()
 {
     MessageBoxW(gWnd,
@@ -13502,6 +14825,10 @@ static void ShowHelp()
         L"PROFILES (Settings tab)\n"
         L"Save how you sound as a named profile (Gaming, Streaming, Trolling...) and switch by picking it or with its hotkey. "
         L"Effect hotkeys can be Hold: the effect is on only while you hold the key.\n\n"
+        L"PLUGINS (Mic tab > Plugins; switch it on in Settings > Features)\n"
+        L"Up to 4 VST3 effect plugins on your mic, after Cleanup and Tone and before the voice effects. Click a slot to pick a plugin, "
+        L"Open shows the plugin's own window, On switches it in and out without a click. Plugins and their settings are saved, "
+        L"and profiles keep their own. A plugin that crashes is switched off and your voice carries on without it.\n\n"
         L"MIC TEST (Mic tab)\n"
         L"Record 5 s and hear exactly what Discord hears.\n\n"
         L"LAG EXTRAS (Main tab)\n"
@@ -14602,6 +15929,30 @@ static void CreateUI()
     Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 56, 532, 52, IDC_METER);
     Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 90, 28, IDC_MICSUB0);
     Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 108, 116, 90, 28, IDC_MICSUB1);
+    gBuildFeat = FEAT_VST;                      // (Settings > Features > Plugins: this sub-tab only exists while it's on)
+    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 202, 116, 90, 28, IDC_MICSUB2);
+    {
+        gBuildSub = 2;
+        const int y = 160;
+        AddSection(14, y, 532, 318, L"Plugins (VST3)");
+        Ctl(L"STATIC", L"Your mic runs through these from top to bottom, after Cleanup and Tone and before your voice effects.",
+            0, 30, y + 20, 500, 18, IDC_HDR);
+        for (int k = 0; k < VST_SLOTS; k++) {
+            const int ry = y + 50 + k * 42;
+            wchar_t num[4]; wsprintfW(num, L"%d", k + 1);
+            Ctl(L"STATIC", num, 0, 30, ry + 6, 14, 18, IDC_VSTNUM0 + k);
+            Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | (k == 0 ? WS_GROUP : 0), 48, ry + 4, 48, 20, IDC_VSTON0 + k);
+            Ctl(L"BUTTON", L"+  Add a plugin...", WS_TABSTOP, 100, ry, 250, 28, IDC_VSTNAME0 + k);
+            Ctl(L"BUTTON", L"Open", WS_TABSTOP, 356, ry, 64, 28, IDC_VSTEDIT0 + k);
+            Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 428, ry + 6, 112, 18, IDC_VSTINFO0 + k);
+        }
+        Ctl(L"STATIC", L"Only 64-bit VST3 effects work here (no instruments, no VST2). A plugin runs inside Lag Effect, so a faulty "
+                       L"one can freeze or close the app: add them one at a time, and try each before you go live.",
+            0, 30, y + 226, 500, 52, IDC_VSTHINT);
+        Ctl(L"BUTTON", L"Licence...", WS_TABSTOP | WS_GROUP, 30, y + 282, 90, 26, IDC_VSTLIC);
+        gBuildSub = -1;
+    }
+    gBuildFeat = 0;
     {
         const int MIC_Y0 = 160, MIC_STEP = 146, MIC_H = 126;
         int y = MIC_Y0;                         // noise suppression
@@ -15053,9 +16404,10 @@ static void CreateUI()
             { IDC_FEATFX,    L"Voice FX", L"Effects for your live voice, characters and Vocode to song. Adds a tab.", gFeatFx },
             { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, and text to speech. Adds a tab.", gFeatSound },
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
+            { IDC_FEATVST,   L"Plugins (VST3)", L"Run VST3 effect plugins on your mic. Adds a Plugins page to the Mic tab.", gFeatVst },
         };
-        for (int i = 0; i < 4; i++) {
-            const int y = 156 + i * 56;
+        for (int i = 0; i < 5; i++) {
+            const int y = 150 + i * 47;
             Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 160, 20, f[i].id);
             CheckDlgButton(gWnd, f[i].id, f[i].on ? BST_CHECKED : BST_UNCHECKED);
             Ctl(L"STATIC", f[i].what, 0, 50, y + 22, 480, 18, IDC_HDR);
@@ -15527,9 +16879,29 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_WSHELP)  { if (code == BN_CLICKED) WsHelp(); return; }
     if (id == IDC_WSGUIDE) { if (code == BN_CLICKED) WsGuide(); return; }
-    if (id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) {   // Settings > Features
+    if (id >= IDC_VSTON0 && id < IDC_VSTON0 + VST_SLOTS) {       // Mic > Plugins: a slot's On switch
+        if (code != BN_CLICKED) return;
+        const int k = id - IDC_VSTON0;
+        if (!gVstUi[k].path[0]) { CheckDlgButton(gWnd, id, BST_UNCHECKED); VstMenu(k, GetDlgItem(gWnd, IDC_VSTNAME0 + k)); }   // (nothing in it yet: pick one)
+        else VstSetOn(k, Checked(id));
+        return;
+    }
+    if (id >= IDC_VSTNAME0 && id < IDC_VSTNAME0 + VST_SLOTS) { if (code == BN_CLICKED) VstMenu(id - IDC_VSTNAME0, GetDlgItem(gWnd, id)); return; }
+    if (id >= IDC_VSTEDIT0 && id < IDC_VSTEDIT0 + VST_SLOTS) {
+        if (code != BN_CLICKED) return;
+        const int k = id - IDC_VSTEDIT0;
+        if (gVstUi[k].path[0]) VstEditorOpen(k); else VstMenu(k, GetDlgItem(gWnd, IDC_VSTNAME0 + k));
+        return;
+    }
+    if (id == IDC_VSTLIC) { if (code == BN_CLICKED) MessageBoxW(gWnd, VST_LICENCE, L"Lag Effect - Plugins", MB_ICONINFORMATION); return; }
+    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
+        if (id == IDC_FEATVST) {                // off: every plugin is saved and unloaded, and nothing of this runs
+            gFeatVst = on;
+            if (on) { SetTimer(gWnd, TIMER_VST, 100, nullptr); VstStartAll(); }
+            else { KillTimer(gWnd, TIMER_VST); VstStopAll(false); if (gMicSub == 2) gMicSub = 0; }
+        }
         if (id == IDC_FEATLAG)   gFeatLag = on;
         if (id == IDC_FEATFX)    { gFeatFx = on; if (!on && gFxOn) SetFxOn(false); }   // (off: the effects stop too)
         if (id == IDC_FEATSOUND) { gFeatSound = on; if (!on) for (int i = 0; i < PADS; i++) gPads[i].stop = true; }
@@ -16064,11 +17436,13 @@ static void OnCommand(int id, int code)
     case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6: case IDC_FXSUB7:
         if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
         break;
-    case IDC_MICSUB0: case IDC_MICSUB1:
-        if (code == BN_CLICKED && gMicSub != id - IDC_MICSUB0) {
-            gMicSub = id - IDC_MICSUB0;
+    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2:
+        if (code == BN_CLICKED && gMicSub != MicSubOf(id)) {
+            gMicSub = MicSubOf(id);
             Layout();
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB1), nullptr, FALSE);
+            InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB2), nullptr, FALSE);
+            if (gMicSub == 2) VstRefreshUi();
         }
         break;
     case IDC_HARMMUTE:
@@ -16287,7 +17661,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
     if (w == IDC_SONGBTN) { DrawSongButton(d); return true; }
     if (w == IDC_SONGMETER) { DrawVMeter2(d, gSongMeter, -1.0f, SongModeOn() && gRunning, 0, 0, gSongMeter >= 0.99f); return true; }
-    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || w == IDC_MICSUB0 || w == IDC_MICSUB1 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3)) {
+    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || MicSubOf((int)w) >= 0 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3)) {
         DrawFxSub(d); return true;
     }
     if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch(d); return true; }
@@ -16368,11 +17742,13 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         ApplyOpacity();
         SetTimer(h, TIMER_STATUS, 50, nullptr);
         SetTimer(h, TIMER_MIXMETER, 15, nullptr);
+        if (gFeatVst) SetTimer(h, TIMER_VST, 100, nullptr);   // (its first tick loads the plugins, once the window is up)
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
     case WM_TIMER:
         if (w == TIMER_MIXMETER) { FadeTick(); if (!gMoving) MixerMeterTick(); return 0; }   // (its own, faster timer: smooth meters, fades)
+        if (w == TIMER_VST) { if (gFeatVst) VstTick(); return 0; }
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
@@ -16689,6 +18065,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             SaveInt(L"win_y", wp.rcNormalPosition.top);
         }
         if (!gNoSaveOnExit) SaveSettings();     // (after Import, the imported file is kept as it is)
+        KillTimer(h, TIMER_VST);
+        VstStopAll(true);                       // each plugin's settings are saved, its window closed, and it's shut down
         WsStop();
         StopAudio();
         RemoveTray();
@@ -16701,6 +18079,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             if (GetWindowPlacement(h, &wp)) { SaveInt(L"win_x", wp.rcNormalPosition.left); SaveInt(L"win_y", wp.rcNormalPosition.top); }
             SaveSettings();
         }
+        for (int k = 0; k < VST_SLOTS; k++) VstSaveState(k);
         return TRUE;
     case WM_DESTROY:
         PostQuitMessage(0);
@@ -16799,6 +18178,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         WNDCLASSW xc = {};                      // a channel's EQ / compressor / levels window
         xc.lpfnWndProc = ChanFxProc; xc.hInstance = hi; xc.hCursor = LoadCursorW(nullptr, IDC_ARROW); xc.lpszClassName = L"LagChanFx";
         xc.hIcon = LoadIconW(hi, MAKEINTRESOURCEW(1));
+        RegisterClassW(&xc);
+        xc.lpfnWndProc = VstEdProc; xc.lpszClassName = L"LagVstEd";   // a plugin's own window
         RegisterClassW(&xc);
     }
 
