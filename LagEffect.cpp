@@ -13653,7 +13653,7 @@ static void VstOutDeleted(int k);
 static void RemoveOutput(int k)
 {
     if (k <= 0 || k >= gRows) return;
-    if (gFeatVst) VstOutDeleted(k);
+    VstOutDeleted(k);                           // (its plugins go; the later outputs' move up with them)
     for (int j = k; j < gRows - 1; j++) {
         LRESULT sel = SendDlgItemMessageW(gWnd, IDC_ROWDEV + j + 1, CB_GETCURSEL, 0, 0);
         SendDlgItemMessageW(gWnd, IDC_ROWDEV + j, CB_SETCURSEL, sel, 0);
@@ -14479,7 +14479,7 @@ static void VstSwap(int a, int b)               // move a plugin up or down the 
     DeleteFileW(pt);
     MoveFileW(pa, pt); MoveFileW(pb, pa); MoveFileW(pt, pb);
     const int both[2] = { a, b };
-    for (int k : both) if (gVstUi[k].want && !VstLoad(k, true)) gVstUi[k].want = false;
+    if (gFeatVst) for (int k : both) if (gVstUi[k].want && !VstLoad(k, true)) gVstUi[k].want = false;   // (Plugins off: just the bookkeeping)
     SaveSettings();
     VstRefreshUi();
 }
