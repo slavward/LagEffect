@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.44.0"
+#define APP_VERSION L"1.45.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1750,16 +1750,36 @@ static float VocDetect(int minLag, int maxLag, int win, float prevF0)
     gVoc.level = sqrtf(energy / win);
     if (gVoc.level < 0.002f) return 0;         // too quiet to have a pitch (about -54 dBFS)
 
+    // The stretch being compared, laid out in a row (the ring wraps): cur[j] is sample j of the window, cur[j - lag]
+    // the same sample lag earlier. This is most of the vocoder's cost, so four lags are worked out side by side.
+    // (Each lag still adds up its own terms in the same order, so the result is exactly what one at a time gives.)
+    static float lin[PD_WIN + PD_MAXLAG + 8];
+    for (int i = 0; i < win + maxLag; i++) lin[i] = gVoc.pdBuf[(base + i) & (PD_BUF - 1)];
+    const float* cur = lin + maxLag;
     d[0] = 1; float run = 0;
-    for (int tau = 1; tau <= maxLag; tau++) {
-        float sum = 0;
+    int lag = 1;
+#ifdef HAVE_SSE_FLAGS
+    for (; lag + 3 <= maxLag; lag += 4) {
+        __m128 acc = _mm_setzero_ps();          // lanes: lags lag+3, lag+2, lag+1, lag
+        const float* old = cur - lag - 3;
         for (int j = 0; j < win; j++) {
-            float a = gVoc.pdBuf[(base + maxLag + j) & (PD_BUF - 1)];
-            float b = gVoc.pdBuf[(base + maxLag + j - tau) & (PD_BUF - 1)];
-            sum += (a - b) * (a - b);
+            const __m128 df = _mm_sub_ps(_mm_set1_ps(cur[j]), _mm_loadu_ps(old + j));
+            acc = _mm_add_ps(acc, _mm_mul_ps(df, df));
         }
+        float part[4]; _mm_storeu_ps(part, acc);
+        for (int k = 0; k < 4; k++) {
+            const float sum = part[3 - k];
+            run += sum;
+            d[lag + k] = run > 0 ? sum * (lag + k) / run : 1;   // cumulative mean normalised difference
+        }
+    }
+#endif
+    for (; lag <= maxLag; lag++) {
+        const float* old = cur - lag;
+        float sum = 0;
+        for (int j = 0; j < win; j++) { const float df = cur[j] - old[j]; sum += df * df; }
         run += sum;
-        d[tau] = run > 0 ? sum * tau / run : 1;   // cumulative mean normalised difference
+        d[lag] = run > 0 ? sum * lag / run : 1;
     }
     int tau = -1;
     for (int t = minLag; t < maxLag; t++)
@@ -1880,7 +1900,7 @@ static inline float SongRead()                  // audio thread
 }
 
 // Per-block settings, read once per audio callback.
-static struct VocParams { int style, key, scale, range; float retuneCoef, synth, mix; } gVp;
+static struct VocParams { int style, key, scale, range; float retuneCoef, synth, mix, blendCos, blendSin; } gVp;
 
 static void VocBlock()
 {
@@ -1890,6 +1910,7 @@ static void VocBlock()
     float ms  = (float)gVocRetuneMs;
     gVp.retuneCoef = ms <= 0 ? 1.0f : 1.0f - expf(-1.0f / (ms * 0.001f * RATE));
     gVp.synth = gVocSynth / 100.0f;
+    { const float a = gVp.synth * 1.5707963f; gVp.blendCos = cosf(a); gVp.blendSin = sinf(a); }   // (the Synth blend: once a block, not once a sample)
     gVp.mix   = gVocMix / 100.0f;
     gVp.range = Iclamp(gVocRange, 0, 2);
 }
@@ -1920,8 +1941,7 @@ static float Vocoder(float x)
         if (v.bandsLow) VocBands(false);
         float voc = VocodeBands(v, x, song, 0.00005f) * SONG_GAIN;
         voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], x)) * 0.15f;  // a hint of "s" / "t" for clarity, not your voice
-        float a = gVp.synth * 1.5707963f;                         // Synth: how much of your voice the song replaces
-        float out = x * cosf(a) + voc * sinf(a);
+        float out = x * gVp.blendCos + voc * gVp.blendSin;        // Synth: how much of your voice the song replaces
         return x + (out - x) * gVp.mix;
     }
     SongRead();                                 // keep the music buffer fresh even when not used
@@ -1978,8 +1998,8 @@ static float Vocoder(float x)
 
     // --- synth carrier ---
     v.voiced += ((v.f0 > 0 ? 1.0f : 0.0f) - v.voiced) * 0.002f;   // ~10 ms fade
-    int steps[VOC_OSC], octs[VOC_OSC]; float gains[VOC_OSC];
-    VocVoices(gVp.style, v.low, steps, gains, octs);
+    static int steps[VOC_OSC], octs[VOC_OSC], voicesFor = -1; static float gains[VOC_OSC];
+    if (voicesFor != gVp.style * 2 + (v.low ? 1 : 0)) { voicesFor = gVp.style * 2 + (v.low ? 1 : 0); VocVoices(gVp.style, v.low, steps, gains, octs); }   // (only when the style changes)
     float car = 0;
     if (v.targetNote >= 0) {
         float bend = v.outNote - (float)v.targetNote;              // follow vibrato and slides
@@ -2009,8 +2029,7 @@ static float Vocoder(float x)
     float out;
     if (gVp.style == VOC_HARMONY) out = tuned + voc * gVp.synth;   // your tuned voice + harmonies
     else {                                                         // blend toward pure synth voice, equal loudness
-        float a = gVp.synth * 1.5707963f;
-        out = tuned * cosf(a) + voc * sinf(a);
+        out = tuned * gVp.blendCos + voc * gVp.blendSin;
     }
     return x + (out - x) * gVp.mix;
 }
@@ -10654,23 +10673,37 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKCHAT), x0, y + SC(3), nameW, SC(20));
         PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_CHATG)), x0 + nameW + gap, y, colW, SC(23));
         PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_CHATC)), x0 + nameW + gap + colW + gap, y, colW, SC(23));
+        // (These labels are right-aligned, so one that's too narrow for its text loses its *start*: each gets the
+        //  width its text needs in the font in use, and what follows it moves along.)
+        auto textW = [&](int id, int atLeast) {
+            HWND c = GetDlgItem(gWnd, id);
+            wchar_t t[100]; t[0] = 0; GetWindowTextW(c, t, 100);
+            HDC dc = GetDC(gWnd);
+            HFONT f = (HFONT)SendMessageW(c, WM_GETFONT, 0, 0);
+            HGDIOBJ of = SelectObject(dc, f ? f : gFont);
+            SIZE sz = {}; GetTextExtentPoint32W(dc, t, lstrlenW(t), &sz);
+            SelectObject(dc, of); ReleaseDC(gWnd, dc);
+            return Imax(atLeast, (int)sz.cx + SC(6));
+        };
+        const int stepLblW = textW(IDC_MIXKEYHDR, SC(120)), fadeLblW = textW(IDC_MIXFADELBL, SC(80)), tbLblW = textW(IDC_TBHDR, SC(84));
         const int stx = x0 + nameW + gap + 2 * (colW + gap) + SC(8);
-        PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYHDR), stx, y + SC(3), SC(120), SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYHDR), stx, y + SC(3), stepLblW, SC(20));
         HWND e = GetDlgItem(gWnd, IDC_MIXSTEP), u = GetDlgItem(gWnd, SPIN_UD(IDC_MIXSTEP));
         RECT ur = {}; if (u) GetWindowRect(u, &ur);
         const int uw = ur.right - ur.left;
-        PlaceFree(e, stx + SC(124), y, SC(56) - uw, SC(23));
-        if (u) PlaceFree(u, stx + SC(124) + SC(56) - uw, y, uw, SC(23));
-        PlaceFree(GetDlgItem(gWnd, IDC_MIXSTEPDB), stx + SC(184), y + SC(3), SC(30), SC(20));
+        const int sx = stx + stepLblW + SC(4);  // (the number box, right after its label)
+        PlaceFree(e, sx, y, SC(56) - uw, SC(23));
+        if (u) PlaceFree(u, sx + SC(56) - uw, y, uw, SC(23));
+        PlaceFree(GetDlgItem(gWnd, IDC_MIXSTEPDB), sx + SC(60), y + SC(3), SC(30), SC(20));
         {                                       // ... and how long fades take
-            const int fx = stx + SC(218);
-            PlaceFree(GetDlgItem(gWnd, IDC_MIXFADELBL), fx, y + SC(3), SC(80), SC(20));
+            const int fx = sx + SC(94);
+            PlaceFree(GetDlgItem(gWnd, IDC_MIXFADELBL), fx, y + SC(3), fadeLblW, SC(20));
             HWND fe = GetDlgItem(gWnd, IDC_MIXFADE), fu = GetDlgItem(gWnd, SPIN_UD(IDC_MIXFADE));
             RECT fr = {}; if (fu) GetWindowRect(fu, &fr);
             const int fw = fr.right - fr.left;
-            PlaceFree(fe, fx + SC(84), y, SC(52) - fw, SC(23));
-            if (fu) PlaceFree(fu, fx + SC(84) + SC(52) - fw, y, fw, SC(23));
-            PlaceFree(GetDlgItem(gWnd, IDC_MIXFADES), fx + SC(140), y + SC(3), SC(16), SC(20));
+            PlaceFree(fe, fx + fadeLblW + SC(4), y, SC(52) - fw, SC(23));
+            if (fu) PlaceFree(fu, fx + fadeLblW + SC(4) + SC(52) - fw, y, fw, SC(23));
+            PlaceFree(GetDlgItem(gWnd, IDC_MIXFADES), fx + fadeLblW + SC(60), y + SC(3), SC(16), SC(20));
         }
         y += SC(25);
         // talkback: its key, and which output hears you while it's held
@@ -10678,9 +10711,9 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKTB), x0, y + SC(3), nameW, SC(20));
         PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_TALKBACK)), x0 + nameW + gap, y, colW, SC(23));
         const int tbx = x0 + nameW + gap + colW + gap + SC(8);
-        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR), tbx, y + SC(3), SC(84), SC(20));
-        PlaceFree(GetDlgItem(gWnd, IDC_TBOUT), tbx + SC(88), y, SC(150), SC(200));
-        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR2), tbx + SC(244), y + SC(3), SC(110), SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR), tbx, y + SC(3), tbLblW, SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_TBOUT), tbx + tbLblW + SC(4), y, SC(150), SC(200));
+        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR2), tbx + tbLblW + SC(160), y + SC(3), textW(IDC_TBHDR2, SC(110)), SC(20));
         y += SC(25);
         // scenes: three to a row, each its name and its key
         y += SC(8);
@@ -14813,6 +14846,62 @@ static int VstListClasses(SB::IPluginFactory* f, VstClass* out, int cap)   // th
     return n;
 }
 
+// ---- strikes: a plugin that keeps crashing gets switched off ----
+// One strike for each crash Lag Effect caught, and one for each time the app closed unexpectedly with the plugin
+// switched on. A session that ends normally with the plugin running wipes its strikes. (Written straight to the
+// settings file, not with the rest of the settings: after a crash there's no "save on exit".)
+static int  gVstStrikes[VST_SLOTS];
+static bool gVstRunMark = false;                // "plugins are running" is in the settings file (still there at the next start = it didn't close normally)
+static void VstStrikeSet(int k, int n)
+{
+    gVstStrikes[k] = n;
+    wchar_t key[32], num[12];
+    wsprintfW(key, L"plugin%d_strikes", k + 1); wsprintfW(num, L"%d", n);
+    WritePrivateProfileStringW(L"settings", key, n > 0 ? num : nullptr, gIni);
+}
+static void VstRunMark(bool on)
+{
+    if (on == gVstRunMark) return;
+    gVstRunMark = on;
+    WritePrivateProfileStringW(L"settings", L"plugins_running", on ? L"1" : nullptr, gIni);
+}
+
+// ---- a test run outside Lag Effect ----
+// A plugin you add is first loaded and run for a moment in a second, hidden copy of Lag Effect. If it crashes or
+// hangs there, it never gets near your live sound. ("LagEffect.exe --plugin-check ..." is that second copy.)
+enum { VCHK_OK = 0, VCHK_CANT = 1, VCHK_ERROR = 2, VCHK_CRASH = 3, VCHK_FROZE = 4 };
+static int VstCheck(const wchar_t* mode, const wchar_t* path, const wchar_t* id, bool stereo, wchar_t* outFile)   // outFile: MAX_PATH; delete it after
+{
+    outFile[0] = 0;
+    wchar_t exe[MAX_PATH], tdir[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, exe, MAX_PATH) || !GetTempPathW(MAX_PATH, tdir) || !GetTempFileNameW(tdir, L"lfx", 0, outFile)) return VCHK_CANT;
+    if (wcschr(path, L'"') || wcschr(id, L'"')) return VCHK_CANT;
+    static wchar_t cmd[MAX_PATH * 3 + 400];
+    _snwprintf(cmd, MAX_PATH * 3 + 399, L"\"%s\" --plugin-check %s \"%s\" \"%s\" %d \"%s\"", exe, mode, path, id, stereo ? 1 : 0, outFile);
+    cmd[MAX_PATH * 3 + 399] = 0;
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(exe, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return VCHK_CANT;
+    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    int rc;
+    if (WaitForSingleObject(pi.hProcess, 20000) != WAIT_OBJECT_0) { TerminateProcess(pi.hProcess, 9); rc = VCHK_FROZE; }
+    else { DWORD code = 99; GetExitCodeProcess(pi.hProcess, &code); rc = code == 0 ? VCHK_OK : code == 2 ? VCHK_ERROR : VCHK_CRASH; }
+    SetCursor(old);
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    return rc;
+}
+static bool VstCheckFailedAsk(int rc, const wchar_t* name)   // it crashed / froze in its test run: true = you want it anyway
+{
+    wchar_t m[700];
+    _snwprintf(m, 699, rc == VCHK_FROZE
+        ? L"\"%s\" didn't finish its test run within 20 seconds, so it hasn't been added.\n\n"
+          L"It may be waiting for something (a licence window, a sign-in), or it may have hung. Inside Lag Effect that would freeze your sound.\n\nAdd it anyway?"
+        : L"\"%s\" crashed in its test run, so it hasn't been added.\n\n"
+          L"The test ran outside Lag Effect, so nothing was harmed. Inside Lag Effect a crash like that can cut your sound or close the app.\n\nAdd it anyway?", name);
+    m[699] = 0;
+    return MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == IDYES;
+}
+
 // ---- loading, unloading, saving ----
 static void VstSaveState(int k)                 // the plugin's own settings, to its slot file
 {
@@ -14832,6 +14921,7 @@ static void VstCrashed(int k)                    // it crashed: never call into 
     u.wnd = nullptr; u.view = nullptr; u.cgui = false;
     VstDropModule(u);                           // (its file stays loaded: unloading a crashed plugin is asking for another crash)
     u.loaded = false; u.dead = true; u.want = false;
+    VstStrikeSet(k, gVstStrikes[k] + 1);
     wchar_t m[64]; _snwprintf(m, 63, L"Plugin crashed: %s", u.name); m[63] = 0;
     ShowOsd(m, false);
     SaveSettings();
@@ -14864,7 +14954,7 @@ static bool VstLoad(int k, bool quiet)          // start the plugin this slot is
     }
     WritePrivateProfileStringW(L"settings", L"vst_loading", nullptr, gIni);
     SetCursor(old);
-    if (crashed) { ClapTimersDrop(&s); VstForget(s); VstDropModule(u); u.dead = true; u.want = false; }
+    if (crashed) { ClapTimersDrop(&s); VstForget(s); VstDropModule(u); u.dead = true; u.want = false; VstStrikeSet(k, gVstStrikes[k] + 1); }
     else if (err) VstModuleClose(k);
     if (err) {
         if (!quiet) {
@@ -14875,6 +14965,7 @@ static bool VstLoad(int k, bool quiet)          // start the plugin this slot is
     }
     u.loaded = true; u.dead = false;
     s.on = u.want ? 1 : 0;
+    VstRunMark(true);
     return true;
 }
 static void VstUnload(int k, bool save, bool keepFile = false)   // (keepFile: when quitting, leave its DLL alone)
@@ -14895,6 +14986,7 @@ static void VstClearSlot(int k)                 // empty the slot (its plugin mu
 {
     VstUi& u = gVstUi[k];
     u.path[0] = 0; u.cid[0] = 0; u.clapId[0] = 0; u.name[0] = 0; u.want = false; u.post = false;
+    if (gVstStrikes[k]) VstStrikeSet(k, 0);
     wchar_t sp[MAX_PATH]; VstStatePath(k, sp); DeleteFileW(sp);
 }
 static void VstAssign(int k, const wchar_t* path)   // put the plugin in this file into the slot
@@ -14903,15 +14995,42 @@ static void VstAssign(int k, const wchar_t* path)   // put the plugin in this fi
     VstUnload(k, false);
     VstClearSlot(k);
     lstrcpynW(u.path, path, MAX_PATH);
-    HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
-    const wchar_t* err = VstModuleOpen(k);
-    SetCursor(old);
     static VstClass cl[400];
+    static wchar_t emsg[300];
     int n = 0, pick = 0;
-    if (!err) {
-        auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400) : VstListClasses(u.fac, cl, 400); };
-        if (!VstGuard(job)) { err = L"It crashed while Lag Effect was asking what's in it."; VstDropModule(u); }
-        else if (!n) err = L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
+    const wchar_t* err = nullptr;
+    const wchar_t* base = wcsrchr(path, L'\\'); base = base ? base + 1 : path;
+    auto giveUp = [&] { VstModuleClose(k); VstClearSlot(k); VstRefreshUi(); };
+    auto readMsg = [&](const wchar_t* file) {   // what the test run said was wrong
+        int len = 0; unsigned char* d = VstReadFile(file, &len);
+        emsg[0] = 0;
+        if (d) { const int nch = Imin(len / (int)sizeof(wchar_t), 299); memcpy(emsg, d, nch * sizeof(wchar_t)); emsg[nch] = 0; HeapFree(GetProcessHeap(), 0, d); }
+        return emsg[0] ? emsg : L"It couldn't be used.";
+    };
+    // What's in the file: asked in a test run outside Lag Effect, so a plugin that crashes on being loaded can't touch the app.
+    wchar_t tmp[MAX_PATH];
+    int rc = VstCheck(L"list", path, L"", false, tmp);
+    bool tested = rc == VCHK_OK;                // (false: the test run isn't available, or you chose to go ahead without it)
+    if (rc == VCHK_OK) {
+        int len = 0; unsigned char* d = VstReadFile(tmp, &len);
+        n = d ? Imin(len / (int)sizeof(VstClass), 400) : 0;
+        if (n) memcpy(cl, d, n * sizeof(VstClass));
+        if (d) HeapFree(GetProcessHeap(), 0, d);
+        for (int i = 0; i < n; i++) { cl[i].name[79] = 0; cl[i].clapId[sizeof(cl[i].clapId) - 1] = 0; }
+        if (!n) err = L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
+    }
+    else if (rc == VCHK_ERROR) err = readMsg(tmp);
+    if (tmp[0]) DeleteFileW(tmp);
+    if ((rc == VCHK_CRASH || rc == VCHK_FROZE) && !VstCheckFailedAsk(rc, base)) { giveUp(); return; }
+    if (rc == VCHK_CANT || rc == VCHK_CRASH || rc == VCHK_FROZE) {   // no test run: look inside it here, as before
+        HCURSOR old = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        err = VstModuleOpen(k);
+        SetCursor(old);
+        if (!err) {
+            auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400) : VstListClasses(u.fac, cl, 400); };
+            if (!VstGuard(job)) { err = L"It crashed while Lag Effect was asking what's in it."; VstDropModule(u); }
+            else if (!n) err = L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
+        }
     }
     if (!err && n > 1) {                        // several effects in one file: which one?
         HMENU m = CreatePopupMenu();
@@ -14920,17 +15039,27 @@ static void VstAssign(int k, const wchar_t* path)   // put the plugin in this fi
         SetForegroundWindow(gWnd);
         const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, gWnd, nullptr);
         DestroyMenu(m);
-        if (cmd < 1) { VstModuleClose(k); VstClearSlot(k); VstRefreshUi(); return; }
+        if (cmd < 1) { giveUp(); return; }
         pick = cmd - 1;
     }
+    char hex[33] = "";
+    if (!err && !cl[pick].clapId[0]) VstCidHex(cl[pick].cid, hex);
+    if (!err && tested) {                       // ...then the effect itself: started, fed some sound, its settings saved and put back, closed
+        wchar_t wid[160];
+        MultiByteToWideChar(CP_UTF8, 0, cl[pick].clapId[0] ? cl[pick].clapId : hex, -1, wid, 160); wid[159] = 0;
+        rc = VstCheck(L"run", path, wid, k >= VST_MIC, tmp);
+        if (rc == VCHK_ERROR) err = readMsg(tmp);
+        if (tmp[0]) DeleteFileW(tmp);
+        if ((rc == VCHK_CRASH || rc == VCHK_FROZE) && !VstCheckFailedAsk(rc, cl[pick].name)) { giveUp(); return; }
+    }
     if (err) {
-        wchar_t m[700]; _snwprintf(m, 699, L"That plugin couldn't be used.\n\n%s\n\n%s", err, path); m[699] = 0;
+        wchar_t m[900]; _snwprintf(m, 899, L"That plugin couldn't be used.\n\n%s\n\n%s", err, path); m[899] = 0;
         MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_ICONWARNING);
-        VstModuleClose(k); VstClearSlot(k); VstRefreshUi();
+        giveUp();
         return;
     }
     if (cl[pick].clapId[0]) { u.cid[0] = 0; lstrcpynA(u.clapId, cl[pick].clapId, sizeof(u.clapId)); }
-    else { u.clapId[0] = 0; VstCidHex(cl[pick].cid, u.cid); }
+    else { u.clapId[0] = 0; memcpy(u.cid, hex, 33); }
     lstrcpynW(u.name, cl[pick].name, 80);
     u.want = true;
     if (!VstLoad(k, false) && !u.dead) VstClearSlot(k);   // (one that crashed stays listed as "crashed", so you can see which it was)
@@ -14947,6 +15076,7 @@ static void VstSwap(int a, int b)               // move a plugin up or down the 
     lstrcpynW(x.path, y.path, MAX_PATH); lstrcpynW(x.name, y.name, 80); memcpy(x.cid, y.cid, 33); x.want = y.want; x.post = y.post;
     lstrcpynW(y.path, tp, MAX_PATH); lstrcpynW(y.name, tn, 80); memcpy(y.cid, tc, 33); y.want = tw; y.post = to;
     { char ti[160]; memcpy(ti, x.clapId, 160); memcpy(x.clapId, y.clapId, 160); memcpy(y.clapId, ti, 160); }
+    { const int sa = gVstStrikes[a], sb = gVstStrikes[b]; if (sa != sb) { VstStrikeSet(a, sb); VstStrikeSet(b, sa); } }
     for (int i = 0; i < MAX_KEYS; i++) { const int t = gFxKeys[SLOT_VST0 + a][i]; gFxKeys[SLOT_VST0 + a][i] = gFxKeys[SLOT_VST0 + b][i]; gFxKeys[SLOT_VST0 + b][i] = t; }   // (its hotkey goes with it)
     wchar_t pa[MAX_PATH], pb[MAX_PATH], pt[MAX_PATH + 8];
     VstStatePath(a, pa); VstStatePath(b, pb);
@@ -15250,6 +15380,12 @@ static void VstMenu(int k, HWND from)           // a slot's button: what's in it
     DestroyMenu(m);
     if (cmd == 1) VstEditorOpen(k);
     else if (cmd == 2) {                        // (a fresh start for one that's misbehaving, or that crashed)
+        if (gVstStrikes[k] >= 2) {
+            wchar_t q[400];
+            _snwprintf(q, 399, L"\"%s\" has crashed %d times.\n\nA plugin that keeps crashing can cut your sound or close Lag Effect while you're live.\n\nLoad it anyway?", u.name, gVstStrikes[k]);
+            q[399] = 0;
+            if (MessageBoxW(gWnd, q, L"Lag Effect - Plugins", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return;
+        }
         VstUnload(k, true);
         u.want = true;
         if (!VstLoad(k, false)) u.want = false;
@@ -15373,7 +15509,7 @@ static void VstInfoText(int k, wchar_t* t)      // a slot's state in a word or t
 {
     const VstUi& u = gVstUi[k];
     if (!u.path[0]) t[0] = 0;
-    else if (u.dead) lstrcpyW(t, L"Crashed");
+    else if (u.dead) { if (gVstStrikes[k] >= 2) wsprintfW(t, L"Crashed %d times", gVstStrikes[k]); else lstrcpyW(t, L"Crashed"); }
     else if (!u.loaded) lstrcpyW(t, L"Not loaded");
     else if (!u.want) lstrcpyW(t, L"Bypassed");
     else if (gVst[k].latency > 0) wsprintfW(t, u.post ? L"After FX, +%d ms" : L"On, +%d ms", (gVst[k].latency * 1000 + RATE / 2) / RATE);
@@ -15546,6 +15682,26 @@ static void VstStartAll()                       // at start-up, and when Plugins
     WritePrivateProfileStringW(L"settings", L"vst_loading", nullptr, gIni);
     wchar_t culprit[80] = L"";
     if (bad >= 1 && bad <= VST_SLOTS && gVstUi[bad - 1].path[0]) { gVstUi[bad - 1].want = false; lstrcpynW(culprit, gVstUi[bad - 1].name, 80); }
+    // Strikes. If Lag Effect didn't close normally last time while plugins were running, every plugin that was
+    // switched on gets one; at two in a row it's switched off (and starts again from zero).
+    static bool strikesRead = false;
+    const bool unclean = !strikesRead && GetPrivateProfileIntW(L"settings", L"plugins_running", 0, gIni) != 0;
+    if (!strikesRead) {
+        strikesRead = true;
+        for (int k = 0; k < VST_SLOTS; k++) { wchar_t key[32]; wsprintfW(key, L"plugin%d_strikes", k + 1); gVstStrikes[k] = (int)GetPrivateProfileIntW(L"settings", key, 0, gIni); }
+    }
+    WritePrivateProfileStringW(L"settings", L"plugins_running", nullptr, gIni); gVstRunMark = false;
+    wchar_t struck[600] = L""; int nStruck = 0;
+    if (culprit[0]) VstStrikeSet(bad - 1, gVstStrikes[bad - 1] + 1);   // (the one that was loading takes the blame alone)
+    else if (unclean) {
+        for (int k = 0; k < VST_SLOTS; k++) {
+            VstUi& u = gVstUi[k];
+            if (!u.want || !u.path[0]) continue;
+            if (gVstStrikes[k] + 1 < 2) { VstStrikeSet(k, gVstStrikes[k] + 1); continue; }
+            u.want = false; VstStrikeSet(k, 0);
+            if (nStruck++ < 6 && lstrlenW(struck) < 480) { lstrcatW(struck, L"\n    "); lstrcatW(struck, u.name[0] ? u.name : L"(plugin)"); }
+        }
+    }
     for (int k = 0; k < VST_SLOTS; k++) {
         VstUi& u = gVstUi[k];
         if (k >= VST_CH0 && k < VST_OUT0) continue;   // (a Mixer channel's: loaded by VstMapChannels once its app / device is in the Mixer)
@@ -15561,10 +15717,25 @@ static void VstStartAll()                       // at start-up, and when Plugins
         m[499] = 0;
         MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_ICONWARNING);
     }
+    if (nStruck) {
+        SaveSettings();
+        wchar_t m[1100];
+        _snwprintf(m, 1099, L"Lag Effect closed unexpectedly twice in a row while %s switched on, so %s been switched off:\n%s%s\n\n"
+                            L"One of them may be the cause. You can switch them back on one at a time (Mic > Plugins, or the Mixer) to find out which.",
+                   nStruck == 1 ? L"this plugin was" : L"these plugins were", nStruck == 1 ? L"it has" : L"they have", struck, nStruck > 6 ? L"\n    ..." : L"");
+        m[1099] = 0;
+        MessageBoxW(gWnd, m, L"Lag Effect - Plugins", MB_ICONWARNING);
+    }
+}
+static void VstCleanEnd()                       // this session is ending normally: plugins that ran through it are in the clear
+{
+    for (int k = 0; k < VST_SLOTS; k++) if (gVstUi[k].loaded && !gVstUi[k].dead && gVstStrikes[k]) VstStrikeSet(k, 0);
+    VstRunMark(false);
 }
 static void VstStopAll(bool quitting)           // quitting, or Plugins switched off in Settings > Features: nothing stays loaded
 {
     if (gRackWnd) DestroyWindow(gRackWnd);
+    VstCleanEnd();
     for (int c = 0; c < CH_MAX; c++) gVstChMap[c].store(0);
     for (int k = 0; k < VST_SLOTS; k++) VstUnload(k, true, quitting);
 }
@@ -15669,6 +15840,64 @@ static void VstProfileDelete(const wchar_t* name)
     for (int k = 0; k < VST_MIC; k++) { wchar_t bin[MAX_PATH]; VstProfileBin(name, k, bin); DeleteFileW(bin); }
 }
 
+// The second, hidden copy of Lag Effect that test-runs a plugin (see VstCheck). No window, no settings, no sound device.
+// Exit code: 0 fine, 2 it can't be used (why: in the out file), 3 it crashed. If it hangs, the first copy stops it.
+static LONG WINAPI VstCheckCrashed(EXCEPTION_POINTERS*) { ExitProcess(3); return EXCEPTION_EXECUTE_HANDLER; }
+static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t* id, bool stereo, const wchar_t* outFile)
+{
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   // (no "has stopped working" window)
+    SetUnhandledExceptionFilter(VstCheckCrashed);
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    gFeatVst = true;
+    VstUi& u = gVstUi[0]; VstSlot& s = gVst[0];
+    lstrcpynW(u.path, path, MAX_PATH);
+    auto fail = [&](const wchar_t* why) { VstWriteFile(outFile, (const unsigned char*)why, (lstrlenW(why) + 1) * (int)sizeof(wchar_t)); return 2; };
+    const wchar_t* err = VstModuleOpen(0);
+    if (err) return fail(err);
+    if (!lstrcmpW(mode, L"list")) {
+        static VstClass cl[400];
+        int n = 0;
+        memset(cl, 0, sizeof(cl));
+        auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400) : VstListClasses(u.fac, cl, 400); };
+        if (!VstGuard(job)) return 3;
+        if (!VstWriteFile(outFile, (const unsigned char*)cl, n * (int)sizeof(VstClass))) return fail(L"The test run couldn't write its result.");
+        return 0;
+    }
+    char aid[160]; SB::TUID cid;
+    WideCharToMultiByte(CP_UTF8, 0, id, -1, aid, sizeof(aid), nullptr, nullptr); aid[sizeof(aid) - 1] = 0;
+    const bool clap = u.cfac != nullptr;
+    if (!clap && !VstCidFromHex(aid, cid)) return fail(L"Its ID is damaged.");
+    s.stereo = stereo; s.post = 0; s.on = 1;
+    const wchar_t* e2 = nullptr;
+    auto open = [&] { e2 = clap ? ClapOpen(s, u.cfac, aid, nullptr, 0) : VstOpen(s, u.fac, cid, nullptr, 0); };
+    if (!VstGuard(open)) return 3;
+    if (e2) return fail(e2);
+    static float L[480], R[480];
+    unsigned seed = 1;
+    gClapAudioRole = 1;                         // (this one thread plays the sound thread's part too)
+    for (int b = 0; b < 100 && !s.crashed.load(); b++) {   // a second of sound: silence, then noise at a talking level, then silence
+        for (int i = 0; i < 480; i++) {
+            seed = seed * 1664525u + 1013904223u; const float a = ((seed >> 9) & 0xffff) / 65536.0f - 0.5f;
+            seed = seed * 1664525u + 1013904223u; const float c = ((seed >> 9) & 0xffff) / 65536.0f - 0.5f;
+            const float g = b >= 10 && b < 80 ? 0.2f : 0.0f;
+            L[i] = a * g; R[i] = c * g;
+        }
+        VstRunRange(0, 1, L, stereo ? R : nullptr, 480);
+    }
+    gClapAudioRole = 0;
+    if (s.crashed.load()) return 3;
+    auto rest = [&] {
+        VstService(s);
+        unsigned char* st = nullptr; int len = 0;
+        if (VstGetState(s, &st, &len)) { VstPause(s); VstSetState(s, st, len); VstResume(s); }   // its settings out and back in, as a restart would
+        free(st);
+        VstClose(s);
+    };
+    if (!VstGuard(rest)) return 3;
+    VstModuleClose(0);
+    return 0;
+}
+
 static void ShowHelp()
 {
     MessageBoxW(gWnd,
@@ -15736,7 +15965,8 @@ static void ShowHelp()
         L"Up to 4 VST3 or CLAP effect plugins on your mic, after Cleanup and Tone and before the voice effects. Click a slot to pick a plugin, "
         L"Open shows the plugin's own window, On switches it in and out without a click, and each slot can have a hotkey that does "
         L"the same from anywhere. A slot's menu can move it to after the voice effects. Plugins and their settings are saved, "
-        L"and profiles keep their own. A plugin that crashes is switched off and your voice carries on without it.\n"
+        L"and profiles keep their own. A plugin you add is first test-run outside Lag Effect, so one that crashes on loading never reaches "
+        L"your sound. A plugin that crashes later is switched off and your voice carries on without it.\n"
         L"In the Mixer: a channel's menu > Plugins gives it two stereo slots, kept for that app or device. "
         L"Each output's FX button gives it two slots that run on everything it plays, before its volume and limiter.\n\n"
         L"MIC TEST (Mic tab)\n"
@@ -19018,7 +19248,11 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             SaveSettings();
         }
         for (int k = 0; k < VST_SLOTS; k++) VstSaveState(k);
+        VstCleanEnd();                          // (Windows is shutting down: that's a normal end too)
         return TRUE;
+    case WM_ENDSESSION:                         // (the shutdown was called off: plugins are still running after all)
+        if (!w) for (int k = 0; k < VST_SLOTS; k++) if (gVstUi[k].loaded) { VstRunMark(true); break; }
+        return 0;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;
@@ -19034,6 +19268,15 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     icc.dwICC = ICC_STANDARD_CLASSES | ICC_UPDOWN_CLASS | ICC_BAR_CLASSES;   // BAR = tooltips
     InitCommonControlsEx(&icc);
 
+    {   // "--plugin-check": this copy only test-runs a plugin for the real one, then exits (see VstCheckMain)
+        int ac = 0; LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &ac);
+        if (av && ac >= 7 && !lstrcmpW(av[1], L"--plugin-check")) {
+            const UINT code = (UINT)VstCheckMain(av[2], av[3], av[4], av[5][0] == L'1', av[6]);
+            TerminateProcess(GetCurrentProcess(), code);   // (straight out: the plugin gets no chance to crash on the way)
+            return (int)code;
+        }
+        if (av) LocalFree(av);
+    }
     bool justUpdated = wcsstr(GetCommandLineW(), L"--updated") != nullptr;
     gResumeAudio = justUpdated && wcsstr(GetCommandLineW(), L"--resume") != nullptr;
 
