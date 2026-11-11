@@ -990,6 +990,14 @@ static wchar_t gVstRackKey[VST_RACKS][140];     // which app / device each Mixer
 static void VstYield() { Sleep(1); }
 
 static int Imin(int a, int b) { return a < b ? a : b; }
+static inline int BitIndex(unsigned m)          // the lowest bit that's set (m isn't 0)
+{
+#ifdef _MSC_VER
+    unsigned long i; _BitScanForward(&i, m); return (int)i;
+#else
+    return __builtin_ctz(m);
+#endif
+}
 static int Imax(int a, int b) { return a > b ? a : b; }
 static int Iclamp(int v, int lo, int hi) { return Imax(lo, Imin(hi, v)); }
 
@@ -3159,6 +3167,9 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     static bool chFxInit = false;
     if (!chFxInit) { for (int c = 0; c < CH_MAX; c++) { chFx[c].pl = chFx[c].pm = chFx[c].ph = 9999; chFx[c].gain = chFx[c].tgt = 1; chFx[c].comp = -1; } chFxInit = true; }
     bool     chEq[CH_MAX], chComp[CH_MAX];
+    unsigned chEqB[CH_MAX];                     // which EQ bands do anything this block (1 low, 2 middle, 4 high)
+    unsigned chGo[CH_MAX];                      // which outputs this channel adds to this block (bit per output)
+    unsigned chGlide[CH_MAX];                   // ...and on which of those its level is still gliding
     float    chG[CH_MAX] = {}, chPk[CH_MAX] = {};   // (fader gain, and this block's peak after it: Streamer.bot's levels)
     // Talkback: while its key is held only that output gets your mic (glides over ~5 ms: no clicks).
     // If that output doesn't normally carry your mic, it gets your full voice for as long as the key is held.
@@ -3227,6 +3238,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             const bool eqNow = lo || mi || hi;
             if (eqNow && !x.eq) for (int s2 = 0; s2 < 2; s2++) { x.lo[s2].z1 = x.lo[s2].z2 = x.mid[s2].z1 = x.mid[s2].z2 = x.hi[s2].z1 = x.hi[s2].z2 = 0; }
             x.eq = eqNow; chEq[c] = eqNow;
+            // A band at 0 dB whose filter has settled is an exact pass-through (its coefficients cancel): skip it.
+            // (Just set to 0 dB, its filter still rings out for a moment: that's kept, so nothing changes.)
+            auto live = [](const Biquad* q, int db) { return db != 0 || q[0].z1 != 0 || q[0].z2 != 0 || q[1].z1 != 0 || q[1].z2 != 0; };
+            chEqB[c] = (live(x.lo, lo) ? 1u : 0u) | (live(x.mid, mi) ? 2u : 0u) | (live(x.hi, hi) ? 4u : 0u);
             const int cp = Iclamp(gCh[c].comp, 0, 100);
             if (cp != x.comp) {                 // one knob: lower threshold, higher ratio, and make-up gain to match
                 x.comp = cp; const float a = cp / 100.0f;
@@ -3236,6 +3251,11 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             if (!cp) { x.gain = x.tgt = 1; x.env = 0; gChGr[c] = 0; }
         }
         { const int pn = Iclamp(gCh[c].pan, -100, 100); chPanL[c] = pn > 0 ? 1.0f - pn / 100.0f : 1.0f; chPanR[c] = pn < 0 ? 1.0f + pn / 100.0f : 1.0f; }
+        chGo[c] = chGlide[c] = 0;               // per output: still gliding, or there and audible (else nothing to add)
+        for (int k = 0; k < MAX_OUT; k++) {
+            if (chCur[c][k] != chTgt[c][k]) { chGlide[c] |= 1u << k; chGo[c] |= 1u << k; }
+            else if (chCur[c][k] > 0.00001f) chGo[c] |= 1u << k;
+        }
         act[nAct++] = c;                        // (the per-sample loop only visits these)
         anyCh = true;
     }
@@ -3550,8 +3570,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 if (chVst[c]) { L = gVstChL[c][f]; R = gVstChR[c][f]; }   // (its plugins already ran over this block)
                 if (chEq[c]) {
                     ChFx& x = chFx[c];
-                    L = BqRun(x.hi[0], BqRun(x.mid[0], BqRun(x.lo[0], L)));
-                    R = BqRun(x.hi[1], BqRun(x.mid[1], BqRun(x.lo[1], R)));
+                    const unsigned eb = chEqB[c];
+                    if (eb & 1) { L = BqRun(x.lo[0], L);  R = BqRun(x.lo[1], R); }
+                    if (eb & 2) { L = BqRun(x.mid[0], L); R = BqRun(x.mid[1], R); }
+                    if (eb & 4) { L = BqRun(x.hi[0], L);  R = BqRun(x.hi[1], R); }
                 }
                 if (chComp[c]) {                 // compressor: 5 ms attack, 150 ms release, gain worked out every 16 samples
                     ChFx& x = chFx[c];
@@ -3572,9 +3594,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
                 else { chRd[c]++; chAv[c]--; }
                 if (f == frames / 2 && chAdj[c] > 0 && chAv[c] > 1) { chRd[c]++; chAv[c]--; }   // skip one
-                for (int k = 0; k < MAX_OUT; k++) {
+                for (unsigned go = chGo[c]; go; go &= go - 1) {   // only the outputs it reaches (or is fading out of)
+                    const int k = BitIndex(go);
                     float& g = chCur[c][k];
-                    g += (chTgt[c][k] - g) * fc;         // (glides to where it's heading)
+                    if (chGlide[c] >> k & 1) g += (chTgt[c][k] - g) * fc;   // (glides to where it's heading; once there it stays put)
                     if (g > 0.00001f) { cL[k] += L * g; cR[k] += R * g; }
                 }
             }
