@@ -1,6 +1,6 @@
 // LagEffect.cpp - hold (or toggle) a hotkey to loop the last chunk of your mic.
 // Windows app with a settings window and tray icon. Settings save to LagEffect.ini.
-// Built for Discord / OBS: several outputs each playing Off / Effect only / Everything,
+// Built for Discord / OBS: several outputs each playing Off / Stutter only / Everything,
 // built-in noise gate, auto-reconnect, separate pitch/speed, light/dark theme, GitHub updater, VST3 plugins on the mic,
 // a Voice FX page (pitch shift, reverb and a Voloco-style vocoder on your live voice, set with knobs),
 // and a Mic page (AI noise suppression, noise gate, voice quality).
@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.46.0"
+#define APP_VERSION L"1.47.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1070,7 +1070,9 @@ static int Iclamp(int v, int lo, int hi) { return Imax(lo, Imin(hi, v)); }
 #define MAX_OUT   5                            // output rows
 static const int BUFFERS[] = { 32, 64, 128, 256, 512 };
 
-enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2, MODE_CLEAN = 3, MODE_APPS = 4 };   // Clean: your voice without Voice FX or the stutter
+enum { MODE_OFF = 0, MODE_EFFECT = 1, MODE_ALL = 2, MODE_CLEAN = 3, MODE_APPS = 4, MODE_ANYFX = 5, MODE_LAST = MODE_ANYFX };
+// EFFECT ("Stutter only"): just the stutter / Rewind / Repeat word. Clean: your voice without Voice FX or the stutter.
+// ANYFX ("Any effect"): silent while you talk normally; everything while any effect is on (a voice effect or the stutter).
                                                 // Apps only: just the Mixer channels sent to it (no mic, no effects, no soundboard)
 
 // Settings shared with the audio threads (plain ints/floats are safe to read on x86/x64).
@@ -3158,6 +3160,7 @@ static void FxReset()                          // audio thread only
     for (int i = 0; i < 4; i++) { apLen[i] = Imin(AP_TUNE[i] * RATE / 44100, AP_MAX); apIdx[i] = 0; }
 }
 
+static bool FxAnyOn();                          // is any voice effect switched on? (defined with the effects' list)
 static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32 frames)
 {
     gMainFrames = frames;
@@ -3238,7 +3241,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     {
         const int tb = gTalkback;
         for (int k = 0; k < MAX_OUT; k++) {
-            const int md = gRowMode[k]; const bool hasMic = md == MODE_EFFECT || md == MODE_ALL || md == MODE_CLEAN;
+            const int md = gRowMode[k]; const bool hasMic = md == MODE_EFFECT || md == MODE_ALL || md == MODE_CLEAN;   // (Any effect: only at times, so talkback adds you)
             tbT[k] = tb < 0 || tb == k ? 1.0f : 0.0f;
             tbX[k] = tb == k && !hasMic ? 1.0f : 0.0f;
         }
@@ -3346,6 +3349,8 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
 
     if (gFxResetReq) { FxReset(); gFxResetReq = false; }
     const bool fxNow = gFxOn && gFeatFx && !gFxBypass;   // A/B button held: you hear yourself without effects (and off with the feature)
+    const bool fxAny = fxNow && FxAnyOn();      // (for outputs set to "Any effect": is a voice effect switched on?)
+    static float anyG = 0;                      // ...and that output's gate: opens / closes over a few ms, so no click
     const bool   fxPitch = fxNow && gFxPitchOn;
     const bool   fxRev   = fxNow && gFxRevOn;
     const bool   fxVoc   = fxNow && gFxVocOn;
@@ -3606,7 +3611,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             if (++tp >= TEST_LEN) { gTestRec = false; gTestLen = TEST_LEN; }
             gTestPos = tp;
         }
-        // "Always hear sounds on": that output gets the sounds even when it's Off / Effect only, and the ones
+        // "Always hear sounds on": that output gets the sounds even when it's Off / Stutter only, and the ones
         // going through the voice effects even when its signal doesn't carry your (effected) voice
         auto sounds = [&](int k) {
             const bool always = hearOut == MAX_OUT + 1 || hearOut == k + 1;
@@ -3661,8 +3666,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                     if (g > 0.00001f) { cL[k] += L * g; cR[k] += R * g; }
                 }
             }
+        anyG += ((looping || spMode != SP_NONE || fxAny || diveBend != 0.0f ? 1.0f : 0.0f) - anyG) * 0.004f;   // "Any effect" outputs: open while one is on
         auto micSig = [&](int k) {               // your mic on output k (talkback can take it away, or add it)
             tbG[k] += (tbT[k] - tbG[k]) * 0.004f; tbE[k] += (tbX[k] - tbE[k]) * 0.004f;
+            if (mode[k] == MODE_ANYFX) return everything * Max(anyG * tbG[k], tbE[k]);
             return RowSignal(mode[k], effect, everything, clean) * tbG[k] + everything * tbE[k];
         };
         float m0 = soloMask && soloOut == 0 ? 0.0f : micSig(0) + sounds(0);
@@ -4118,6 +4125,11 @@ static FxGroup gFxGroups[] = {
     { L"Gender",     &gFxGenderOn,  L"fx_gender_on",   false, L"fx_gender_hotkey",  0, 2 },
 };
 #define FX_GROUPS ((int)(sizeof(gFxGroups) / sizeof(gFxGroups[0])))
+static bool FxAnyOn()                           // is any voice effect switched on? (the audio thread asks, for "Any effect" outputs)
+{
+    for (int g = 0; g < FX_GROUPS; g++) if (*gFxGroups[g].on) return true;
+    return false;
+}
 static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
 
 // Optional hotkeys that switch Voice FX on/off: slot 0 = the whole page, slot 1+g = effect group g.
@@ -4410,6 +4422,14 @@ static void ApplyPalette()
 
 static COLORREF BgColor()  { return gDark ? DK_BG : gLtBg; }
 static HBRUSH   BgBrush()  { return gBrPicture ? gBrPicture : gDark ? gBrDarkBg : gBrLightBg; }
+// A control that paints itself into its own (or an off-screen) DC: line the background picture up with the window,
+// so it shows the piece of the picture that's really behind it (not the picture's top-left corner).
+static void BgAlign(HWND h, HDC dc)
+{
+    if (!gBrPicture || !gWnd) return;
+    POINT pt = { 0, 0 }; MapWindowPoints(h, gWnd, &pt, 1);
+    SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
+}
 static HBRUSH   BgSolid()  { return gDark ? gBrDarkBg : gBrLightBg; }   // pop-up windows (not lined up with the picture)
 #define TXT_C (gDark ? DK_TEXT : gLtText)
 static COLORREF UC(int i, COLORREF def) { return gUserCol[i] != CLR_NONE ? gUserCol[i] : def; }   // your colour, or the theme's
@@ -5141,7 +5161,7 @@ static void LoadSettings()
         for (int k = 0; k < rows; k++) {
             wchar_t key[32];
             wsprintfW(key, L"out%d_device", k + 1); GetPrivateProfileStringW(L"settings", key, L"", gRowName[k], 512, gIni);
-            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? DEF_MODE0 : DEF_MODEK), 0, MODE_APPS);
+            wsprintfW(key, L"out%d_mode", k + 1);   gRowMode[k] = Iclamp(INI_INT(key, k == 0 ? DEF_MODE0 : DEF_MODEK), 0, MODE_LAST);
             wsprintfW(key, L"out%d_volume", k + 1); gRowVol[k]  = Iclamp(INI_INT(key, 100), 0, 200);
         }
     }
@@ -9857,6 +9877,7 @@ static LRESULT CALLBACK ChatMixProc(HWND h, UINT m, WPARAM w, LPARAM l)
         RECT rc; GetClientRect(h, &rc);
         {
             OffScreen os(dc, rc.right, rc.bottom); HDC d = os.dc;
+            if (GetParent(h) == gWnd) BgAlign(h, d);
             FillRect(d, &rc, GetParent(h) == gWnd ? BgBrush() : BgSolid());
             const int tw = SC(10), cy = rc.bottom / 2, x0 = tw / 2, x1 = rc.right - tw / 2;
             const int kh = Imax(SC(4), Imin(SC(8), (int)rc.bottom / 2 - 1));     // (the pan sliders are shorter)
@@ -10368,7 +10389,7 @@ static LRESULT CALLBACK FaderProc(HWND h, UINT m, WPARAM w, LPARAM l)
         HitchTimer ht(m, id);
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
         RECT rc; GetClientRect(h, &rc);
-        { OffScreen os(dc, rc.right, rc.bottom); FaderDraw(h, os.dc, rc, id); BitBlt(dc, 0, 0, rc.right, rc.bottom, os.dc, 0, 0, SRCCOPY); }
+        { OffScreen os(dc, rc.right, rc.bottom); BgAlign(h, os.dc); FaderDraw(h, os.dc, rc, id); BitBlt(dc, 0, 0, rc.right, rc.bottom, os.dc, 0, 0, SRCCOPY); }
         EndPaint(h, &ps);
         return 0;
     }
@@ -12628,7 +12649,7 @@ static const TipText gKnobTips[] = {
 static const TipText gLabelTips[] = {
     { L"Microphone:",  L"The microphone Lag Effect listens to." },
     { L"Output",       L"Where each output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers." },
-    { L"Plays",        L"What each output plays: Off, Effect only (just the stutter) or Everything (your voice plus the stutter)." },
+    { L"Plays",        L"What each output plays: Off, Stutter only, Everything (your voice plus the stutter), or Any effect (silent until an effect is on)." },
     { L"Volume %",     L"Volume of each output. 100% = unchanged." },
     { L"Loop length:", L"How much of your last words gets repeated when you press the hotkey, in milliseconds." },
     { L"Speed:",       L"How fast the loop plays through. 100% = normal; lower = slower and longer." },
@@ -12786,9 +12807,10 @@ static void AddTips()
     TipId(IDC_HIDESHARE, L"When you share your whole screen with sound, Discord records every app's audio, including what "
                          L"Lag Effect sends to VB-Cable, so people hear you twice. This locks Lag Effect's VB-Cable / VoiceMeeter "
                          L"outputs so screen shares can't record them. Discord still hears you through CABLE Output.");
-    for (int k = 0; k < MAX_OUT; k++) TipId(IDC_ROWMODE + k, L"What this output plays. Effect only: just the stutter. Everything: your voice with "
+    for (int k = 0; k < MAX_OUT; k++) TipId(IDC_ROWMODE + k, L"What this output plays. Stutter only: just the stutter. Everything: your voice with "
                                                               L"every effect. Clean voice: your voice without Voice FX or the stutter, e.g. for "
                                                               L"OBS while Discord gets the effects. Apps only: just the Mixer channels you send to it, untouched (no mic, no effects). "
+                                                              L"Any effect: silent while you talk normally, your voice with its effects whenever a voice effect or the stutter is on. "
                                                               L"The soundboard plays on all but Off and Apps only.");
     TipId(IDC_LAGPRESET, L"Ready-made settings for the stutter: Bad Wi-Fi, Frozen call, Robot glitch, Buffering, Slow-mo...");
     TipId(IDC_BEATSYNC,  L"Beat repeat: the stutter's loop length follows a tempo instead of Loop length, so it sounds musical.");
@@ -12855,16 +12877,16 @@ static void AddTips()
     for (int k = 0; k < MAX_OUT; k++) {
         TipId(IDC_ROWLBL + k,  L"An output: a device Lag Effect plays to.");
         TipId(IDC_ROWDEV + k,  L"Where this output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers.");
-        TipId(IDC_ROWMODE + k, L"Off = nothing. Effect only = just the stutter. Everything = your voice plus the stutter (what others should hear). "
+        TipId(IDC_ROWMODE + k, L"Off = nothing. Stutter only = just the stutter. Everything = your voice plus the stutter (what others should hear). "
                                L"Apps only = just the Mixer channels you send to it, untouched (no mic, no effects).");
         TipId(IDC_ROWVOL + k,  L"Volume of this output. 100% = unchanged, up to 200%.");
         TipId(IDC_ROWDEL + k,  L"Remove this output.");
     }
     TipId(IDC_ADDOUT,  L"Add another output (up to 5), e.g. VB-Cable for Discord plus your headphones to hear yourself.");
     TipId(IDC_HEARON,   L"Pick your headphones' output to always hear the soundboard, clips and text to speech there, even if it's set to "
-                        L"Off or Effect only, or the sounds go through your voice effects.");
+                        L"Off or Stutter only, or the sounds go through your voice effects.");
     TipId(IDC_HEARLBL,  L"Pick your headphones' output to always hear the soundboard, clips and text to speech there, even if it's set to "
-                        L"Off or Effect only, or the sounds go through your voice effects.");
+                        L"Off or Stutter only, or the sounds go through your voice effects.");
     TipId(IDC_VBCABLE, L"Set up VB-Cable automatically: output 1 goes to VB-Cable, output 2 to your headphones.");
     TipId(IDC_LOOP,    L"How much of your last words gets repeated when you press the hotkey, in milliseconds.");
     TipId(IDC_SPEED,   L"How fast the loop plays through. 100% = normal; lower = slower and longer.");
@@ -12978,7 +13000,7 @@ static void AddTips()
     TipId(IDC_HIDESHARE, L"When you share your whole screen with sound, Discord records every app's audio, including what "
                          L"Lag Effect sends to VB-Cable, so people hear you twice. This locks Lag Effect's VB-Cable / VoiceMeeter "
                          L"outputs so screen shares can't record them. Discord still hears you through CABLE Output. "
-                         L"Outputs to real speakers or headphones aren't locked: set those to Off or Effect only while streaming.");
+                         L"Outputs to real speakers or headphones aren't locked: set those to Off or Stutter only while streaming.");
     TipId(IDC_EXCL,     L"Takes over the mic and output 1 for the lowest delay. Other apps can't use them while it's on.");
     TipId(IDC_THEME,    L"Light, dark, or follow Windows.");
     TipId(IDC_COLORTHEME, L"The app's color: knobs, switches, tabs and a matching tint on the background. "
@@ -16117,8 +16139,9 @@ static void ShowHelp()
         L"OUTPUTS\n"
         L"Add up to 5 with \"+ Add output\". Each one plays:\n"
         L"  Off - nothing\n"
-        L"  Effect only - just the stutter, never your normal voice\n"
-        L"  Everything - your voice plus the stutter (what others should hear)\n\n"
+        L"  Stutter only - just the stutter, never your normal voice\n"
+        L"  Everything - your voice plus the stutter (what others should hear)\n"
+        L"  Any effect - silent while you talk normally; your voice with its effects while a voice effect or the stutter is on\n\n"
         L"DISCORD / GAMES\n"
         L"1. Install VB-Cable (free) and click \"Use VB-Cable\".\n"
         L"2. In Discord, set Input Device to \"CABLE Output\".\n"
@@ -16697,10 +16720,93 @@ static int WsFindOutput(const char* m)          // "n": 1-5, or "name": its name
     for (int k = 0; k < gRows; k++) { wchar_t l[32]; OutName(k, l, 32); if (!lstrcmpiW(l, w)) return k; }
     return -1;
 }
+// ---- plain-word commands ----
+// "mute toggle", "lag 2000", "channel Spotify -12 mute", "scene Gaming": the same commands without the JSON, so a
+// Streamer.bot line needs no backslashes. Turned into the JSON form here; everything after that is shared.
+struct WsTok { char t[1900]; bool quoted; };
+static bool WsIsNum(const WsTok& k) { if (k.quoted) return false; char* e = nullptr; strtod(k.t, &e); return k.t[0] && e && !*e; }
+static bool WsIsOnOff(const WsTok& k) { return !k.quoted && (!_stricmp(k.t, "on") || !_stricmp(k.t, "off") || !_stricmp(k.t, "toggle") || !_stricmp(k.t, "true") || !_stricmp(k.t, "false")); }
+static bool WsPlain(const char* m, char* out, int cap)   // false: no command in it
+{
+    static WsTok tk[24]; int n = 0;
+    const char* p = m;
+    const char* rest1 = nullptr;                // where the text after the command starts (for names / speech with spaces)
+    while (*p && n < 24) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+        if (!*p) break;
+        if (n == 1 && !rest1) rest1 = p;
+        WsTok& k = tk[n]; int len = 0; k.quoted = false;
+        if (*p == '"' || *p == '\'') {
+            const char q = *p++; k.quoted = true;
+            while (*p && *p != q && len < 1898) k.t[len++] = *p++;
+            if (*p == q) p++;
+        } else while (*p && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' && len < 1898) k.t[len++] = *p++;
+        k.t[len] = 0; n++;
+    }
+    if (!n) return false;
+    char cmd[40]; int ci = 0;
+    for (const char* q = tk[0].t; *q && ci < 39; q++) cmd[ci++] = (char)tolower((unsigned char)*q);
+    cmd[ci] = 0;
+    static char esc[3800];
+    int o = snprintf(out, cap, "{\"do\":\"%s\"", cmd);
+    auto add = [&](const char* fmt, const char* a) { if (o < cap - 1) o += snprintf(out + o, cap - o, fmt, a); if (o > cap - 1) o = cap - 1; };
+    auto addStr = [&](const char* key, const char* val) { JsonEsc(val, esc, sizeof(esc)); if (o < cap - 1) o += snprintf(out + o, cap - o, ",\"%s\":\"%s\"", key, esc); if (o > cap - 1) o = cap - 1; };
+    auto addRaw = [&](const char* key, const char* val) { if (o < cap - 1) o += snprintf(out + o, cap - o, ",\"%s\":%s", key, val); if (o > cap - 1) o = cap - 1; };
+    auto onOff = [&](const char* key, const WsTok& k) { addRaw(key, !_stricmp(k.t, "on") || !_stricmp(k.t, "true") ? "true" : !_stricmp(k.t, "off") || !_stricmp(k.t, "false") ? "false" : "\"toggle\""); };
+    auto restText = [&](char* buf, int bcap) {  // everything after the command, as typed (one pair of quotes around it is dropped)
+        buf[0] = 0; if (!rest1) return;
+        lstrcpynA(buf, rest1, bcap);
+        int l = (int)strlen(buf); while (l && (buf[l - 1] == ' ' || buf[l - 1] == '\r' || buf[l - 1] == '\n' || buf[l - 1] == '\t')) buf[--l] = 0;
+        if (l >= 2 && (buf[0] == '"' || buf[0] == '\'') && buf[l - 1] == buf[0]) { buf[l - 1] = 0; memmove(buf, buf + 1, (size_t)l - 1); }
+    };
+    static char rest[1900];
+    const bool isCh = !strcmp(cmd, "channel"), isOut = !strcmp(cmd, "output");
+    if (!strcmp(cmd, "character") || !strcmp(cmd, "profile") || !strcmp(cmd, "scene")) {   // the name: the rest of the line
+        restText(rest, sizeof(rest));
+        if (!strcmp(cmd, "scene") && n == 2 && WsIsNum(tk[1])) addRaw("n", tk[1].t); else if (rest[0]) addStr("name", rest);
+    }
+    else if (!strcmp(cmd, "tts") || !strcmp(cmd, "say")) { restText(rest, sizeof(rest)); if (rest[0]) addStr("text", rest); }
+    else if (!strcmp(cmd, "auth")) { restText(rest, sizeof(rest)); addStr("password", rest); }
+    else if (!strcmp(cmd, "lag")) { if (n > 1) { if (WsIsNum(tk[1])) addRaw("ms", tk[1].t); else if (WsIsOnOff(tk[1])) onOff("on", tk[1]); } }
+    else if (!strcmp(cmd, "pad") || !strcmp(cmd, "sound") || !strcmp(cmd, "playclip")) { if (n > 1 && WsIsNum(tk[1])) addRaw("n", tk[1].t); }
+    else if (!strcmp(cmd, "chatmix")) { if (n > 1 && WsIsNum(tk[1])) addRaw("value", tk[1].t); }
+    else if (!strcmp(cmd, "levels")) { for (int i = 1; i < n; i++) { if (WsIsNum(tk[i])) addRaw("rate", tk[i].t); else if (WsIsOnOff(tk[i])) onOff("on", tk[i]); } }
+    else if (!strcmp(cmd, "talkback")) { for (int i = 1; i < n; i++) { if (WsIsNum(tk[i])) addRaw("n", tk[i].t); else if (WsIsOnOff(tk[i])) onOff("on", tk[i]); } }
+    else if (!strcmp(cmd, "mute") || !strcmp(cmd, "fx")) { if (n > 1 && WsIsOnOff(tk[1])) onOff("on", tk[1]); }
+    else if (isCh || isOut) {                   // which one (its number, or its name: in quotes if it has spaces), then what to change
+        if (n > 1) { if (WsIsNum(tk[1])) addRaw("n", tk[1].t); else addStr("name", tk[1].t); }
+        for (int i = 2; i < n; i++) {
+            const WsTok& k = tk[i]; const WsTok* nx = i + 1 < n ? &tk[i + 1] : nullptr;
+            if (WsIsNum(k)) { addRaw(isCh ? "db" : "volume", k.t); continue; }   // a number by itself: its level
+            char w[40]; int wi = 0; for (const char* q = k.t; *q && wi < 39; q++) w[wi++] = (char)tolower((unsigned char)*q); w[wi] = 0;
+            if (!strcmp(w, "unmute")) { addRaw("mute", "false"); continue; }
+            if (!strcmp(w, "unsolo")) { addRaw("solo", "false"); continue; }
+            if (!strcmp(w, "noduck")) { addRaw("duck", "false"); continue; }
+            if (!strcmp(w, "stereo")) { addRaw("mono", "false"); continue; }
+            if (!strcmp(w, "mute") || !strcmp(w, "solo") || !strcmp(w, "duck") || !strcmp(w, "mono") || !strcmp(w, "ducksothers")) {
+                if (nx && WsIsOnOff(*nx)) { onOff(w, *nx); i++; } else addRaw(w, "true");
+                continue;
+            }
+            if (!strcmp(w, "fade")) {           // fade out / in / toggle [seconds]
+                if (nx && !nx->quoted && (!_stricmp(nx->t, "out") || !_stricmp(nx->t, "in") || !_stricmp(nx->t, "toggle"))) {
+                    addStr("fade", nx->t); i++;
+                    if (i + 1 < n && WsIsNum(tk[i + 1])) { addRaw("seconds", tk[i + 1].t); i++; }
+                } else addStr("fade", "toggle");
+                continue;
+            }
+            if (nx && WsIsNum(*nx)) { addRaw(w, nx->t); i++; continue; }   // "pan -50", "bass 3", "volume 80", "out2db -10"...
+        }
+    }
+    add("%s", "}");
+    return true;
+}
 static void WsExec(int id, const char* m)
 {
+    static char conv[4096];
+    { const char* q = m; while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
+      if (*q != '{') { if (!WsPlain(q, conv, sizeof(conv))) { WsReply(id, "", "Send a command like: mute toggle"); return; } m = conv; } }   // plain words
     char what[40] = ""; const char* p = m;
-    if (!JsonString(m, "do", &p, what, 40)) { WsReply(id, "", "Send JSON like {\"do\":\"lag\",\"ms\":2000}."); return; }
+    if (!JsonString(m, "do", &p, what, 40)) { WsReply(id, "", "Send a command like: mute toggle  (or JSON: {\"do\":\"lag\",\"ms\":2000})"); return; }
     for (char* q = what; *q; q++) *q = (char)tolower((unsigned char)*q);
     if (!strcmp(what, "auth")) {
         char pw[100] = ""; const char* pp = m; JsonString(m, "password", &pp, pw, 100);
@@ -16709,7 +16815,7 @@ static void WsExec(int id, const char* m)
         if (!WsAuthed(id) && gWsAuthedN < 32) gWsAuthed[gWsAuthedN++] = id;
         WsReply(id, what, nullptr); return;
     }
-    if (!WsAuthed(id)) { WsReply(id, what, "Send {\"do\":\"auth\",\"password\":\"...\"} first."); return; }
+    if (!WsAuthed(id)) { WsReply(id, what, "Send the password first: auth YOUR PASSWORD"); return; }
     const char* offLag = "The lag effect is off (Settings > Features).";
     const char* offFx = "Voice FX is off (Settings > Features).";
     const char* offSb = "The soundboard is off (Settings > Features).";
@@ -16960,10 +17066,10 @@ static void WsHelp()                            // Settings: how to set up Strea
         L"public class CPHInline\r\n{\r\n    public bool Execute()\r\n    {\r\n"
         L"        // the 0 is the connection's number in Websocket Clients (the first one is 0)\r\n"
         L"%ls"
-        L"        CPH.WebsocketSend(\"{\\\"do\\\":\\\"lag\\\",\\\"ms\\\":2000}\", 0);\r\n"
+        L"        CPH.WebsocketSend(\"lag 2000\", 0);   // <- the command: see \"How to use...\" in Lag Effect for the list\r\n"
         L"        return true;\r\n    }\r\n}\r\n",
         Iclamp(gWsPort, 1024, 65535),
-        gWsPass[0] ? L"        CPH.WebsocketSend(\"{\\\"do\\\":\\\"auth\\\",\\\"password\\\":\\\"YOUR PASSWORD\\\"}\", 0);   // (once per connection)\r\n" : L"");
+        gWsPass[0] ? L"        CPH.WebsocketSend(\"auth YOUR PASSWORD\", 0);   // (once per connection)\r\n" : L"");
     if (OpenClipboard(gWnd)) {
         EmptyClipboard();
         const size_t n = (wcslen(code) + 1) * sizeof(wchar_t);
@@ -16987,38 +17093,44 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"3. Actions tab > right-click > Add an action (e.g. \"Lag chat\"), and give it a trigger,\n"
         L"    like a channel point reward or a chat command.\n\n"
         L"4. In the action: right-click Sub-Actions > Core > C# > Execute C# Code. Here press \"Copy C# code\"\n"
-        L"    and paste it in. Change the message to the command you want (below), then Compile and Save.\n"
+        L"    and paste it in. Change  lag 2000  to the command you want (below), then Compile and Save.\n"
         L"    The 0 in WebsocketSend is the connection's number in Websocket Clients (the first is 0).\n\n"
         L"5. Run the action (right-click > Test Trigger). Lag Effect does it.\n\n"
-        L"MESSAGES\n"
-        L"Each one is JSON: {\"do\":\"command\", then any options}. Inside C#, put a \\ before every \" in the message, e.g.\n"
-        L"    CPH.WebsocketSend(\"{\\\"do\\\":\\\"lag\\\",\\\"ms\\\":2000}\", 0);\n\n"
-        L"    {\"do\":\"lag\",\"ms\":2000}   stutter for 2 seconds  (needs the Lag effect on)\n"
-        L"    {\"do\":\"mute\",\"on\":true}   mute; false = unmute, \"toggle\" = switch\n"
-        L"    {\"do\":\"fx\",\"on\":\"toggle\"}   Voice FX on / off  (needs Voice FX on)\n"
-        L"    {\"do\":\"character\",\"name\":\"Robot\"}   a Voice FX character\n"
-        L"    {\"do\":\"profile\",\"name\":\"Gaming\"}   or {\"do\":\"nextprofile\"}\n"
-        L"    {\"do\":\"tts\",\"text\":\"hello chat\",\"accent\":\"Scottish\"}   speak  (needs the Soundboard on)\n"
-        L"    {\"do\":\"pad\",\"n\":3}   play soundboard pad 3;  {\"do\":\"stopsounds\"}\n"
-        L"    {\"do\":\"clip\"}   save the last few seconds;  {\"do\":\"playclip\",\"n\":1}  (needs Clips on)\n"
-        L"    {\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":false,\"solo\":false,\"duck\":true}   a Mixer channel\n"
-        L"        (also \"pan\":-50 (-100 left .. 100 right), \"mono\":true, \"ducksothers\":true,\n"
-        L"         \"bass\"/\"middle\"/\"treble\":3 (dB), \"compressor\":40 (0-100), \"out2db\":-10 (its level on output 2))\n"
-        L"    {\"do\":\"output\",\"n\":2,\"mute\":true,\"volume\":80}   an output (or \"name\": what you called it)\n"
-        L"        \"fade\":\"out\" / \"in\" / \"toggle\" (with \"seconds\":5 if you like): fade it out (then muted) or in\n"
-        L"    {\"do\":\"scene\",\"name\":\"Gaming\"}   switch the Mixer to a scene;  {\"do\":\"chatmix\",\"value\":-50}  (-100 game .. 100 chat)\n"
-        L"    {\"do\":\"talkback\",\"on\":true,\"n\":2}   only output 2 hears your mic, until \"on\":false\n"
-        L"    {\"do\":\"levels\",\"on\":true,\"rate\":10}   get every channel's and output's level 10 times a second (for overlays)\n"
-        L"    {\"do\":\"start\"}  {\"do\":\"stop\"}  {\"do\":\"status\"}  {\"do\":\"ping\"}\n\n"
-        L"REPLIES AND EVENTS\n"
-        L"Every message gets a reply: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}. Lag Effect also tells Streamer.bot\n"
-        L"when things change: {\"event\":\"mute\",\"on\":true}, {\"event\":\"lag\",...}, {\"event\":\"fx\",...},\n"
-        L"{\"event\":\"profile\",\"name\":...}, {\"event\":\"running\",...}, {\"event\":\"scene\",\"name\":...},\n"
-        L"{\"event\":\"channel\",\"name\":...,\"mute\":...,\"solo\":...}, {\"event\":\"output\",\"n\":2,\"mute\":...},\n"
-        L"{\"event\":\"talking\",\"on\":true} (you started / stopped talking), {\"event\":\"talkback\",...}. Use them with the trigger\n"
-        L"Core > Websocket > Client > Websocket Client Message (the text is in %%message%%).\n\n"
-        L"PASSWORD\n"
-        L"If you set one, send {\"do\":\"auth\",\"password\":\"...\"} first after connecting (\"Copy C# code\" includes it).\n\n"
+        L"COMMANDS\n"
+        L"A command is plain words. In the C# it goes between the quotes:   CPH.WebsocketSend(\"mute toggle\", 0);\n"
+        L"Where it says on, you can write on, off or toggle. Names with spaces go in 'single quotes'.\n\n"
+        L"Mic and voice\n"
+        L"    mute on   \x2014   mute your mic (off, toggle)\n"
+        L"    lag 2000   \x2014   stutter for 2 seconds;  lag off  stops it\n"
+        L"    rewind   \x2014   the Rewind effect;  repeat  the Repeat word effect\n"
+        L"    fx on   \x2014   Voice FX on / off\n"
+        L"    character Robot   \x2014   a Voice FX character\n"
+        L"    profile Gaming   \x2014   a profile;  nextprofile  the next one\n\n"
+        L"Soundboard and clips\n"
+        L"    pad 3   \x2014   play soundboard pad 3;  stopsounds  stops them all\n"
+        L"    tts hello chat   \x2014   say it out loud\n"
+        L"    clip   \x2014   save the last few seconds;  playclip 1  plays clip 1\n\n"
+        L"Mixer\n"
+        L"    channel Spotify -12   \x2014   a channel's level in dB (by name, or its number: channel 2 -12)\n"
+        L"    channel Spotify mute   \x2014   also: unmute, solo, unsolo, duck, noduck, mono, stereo\n"
+        L"    channel Spotify fade out   \x2014   fade it out (in, toggle); add seconds:  fade out 5\n"
+        L"    channel Spotify pan -50   \x2014   also: bass 3, middle -2, treble 4, compressor 40, out2db -10\n"
+        L"    output 2 mute   \x2014   an output: mute, unmute, or its volume:  output 2 80\n"
+        L"    scene Gaming   \x2014   switch to a scene\n"
+        L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
+        L"    talkback on 2   \x2014   only output 2 hears your mic;  talkback off\n\n"
+        L"Other\n"
+        L"    start,  stop,  status,  ping\n\n"
+        L"Several changes fit in one command:   channel Spotify -12 unmute pan 0\n\n"
+        L"\x2500\x2500\x2500\x2500\x2500  ADVANCED  \x2500\x2500\x2500\x2500\x2500\n\n"
+        L"Password: if you set one, send  auth YOUR PASSWORD  first after connecting (\"Copy C# code\" includes it).\n\n"
+        L"Replies: every command gets one: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}.\n\n"
+        L"Events: Lag Effect tells Streamer.bot when things change. Use the trigger Core > Websocket > Client >\n"
+        L"Websocket Client Message; the text is in %%message%%. They look like {\"event\":\"mute\",\"on\":true}. The events:\n"
+        L"mute, lag, fx, running, profile, scene, channel, output, talking (you started / stopped talking), talkback.\n\n"
+        L"Levels for overlays:  levels on 10  sends every channel's and output's level 10 times a second;  levels off.\n\n"
+        L"JSON: the older form still works, e.g. {\"do\":\"lag\",\"ms\":2000}, and is the only way to pick a tts accent:\n"
+        L"{\"do\":\"tts\",\"text\":\"hello\",\"accent\":\"Scottish\"}. In C#, JSON needs a \\ before every \".\n\n"
         L"Only apps on this PC can connect, never websites. Untick the box above to switch it all off.",
         Iclamp(gWsPort, 1024, 65535), Iclamp(gWsPort, 1024, 65535));
     MessageBoxW(gWnd, t, L"Lag Effect - Streamer.bot", MB_OK | MB_ICONINFORMATION);
@@ -17146,7 +17258,7 @@ static void TrayMenu()
 static void CreateUI()
 {
     const DWORD COMBO = CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP;
-    const wchar_t* modeNames[] = { L"Off", L"Effect only", L"Everything", L"Clean voice", L"Apps only" };
+    const wchar_t* modeNames[] = { L"Off", L"Stutter only", L"Everything", L"Clean voice", L"Apps only", L"Any effect" };
 
     // Tabs (always visible). Drawn by DrawTab().
     gBuildPage = -1;
