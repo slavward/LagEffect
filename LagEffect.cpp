@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.47.0"
+#define APP_VERSION L"1.48.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1134,7 +1134,9 @@ static volatile bool gTapeReq = false, gDiveHeld = false, gBeatSync = false, gFx
 static volatile int  gDiveSemis = -12, gBpm = 120, gBeatDiv = 1;   // beat division: 0 = 1/4, 1 = 1/8, 2 = 1/16, 3 = 1/32
 // Mic test: 5 s of exactly what Discord hears, recorded by the audio thread, played back on your speakers.
 #define TEST_LEN (RATE * 5)
-static short gTestBuf[TEST_LEN];
+#define TEST_GAP (RATE / 3)                     // a short pause between the two halves
+static short gTestBuf[TEST_LEN * 2 + TEST_GAP]; // your mic before cleanup, the pause, then what others hear
+static short gTestOut[TEST_LEN];                // (what others hear, while recording: joined on when it's done)
 static volatile unsigned gTestPos = 0, gTestLen = 0;
 static volatile bool gTestRec = false;
 #define PADREC_LEN (RATE * 10)                  // "record a pad from your mic": up to 10 s
@@ -1274,6 +1276,34 @@ static volatile int   gNsStrength = 100;
 static volatile int   gGateMode = GATE_OFF, gGateLastMode = GATE_VOLUME;
 static volatile int   gGateThrDb = -50, gGateVoicePct = 60, gGateHoldMs = 150, gGateReleaseMs = 80, gGateRangeDb = 80;
 static volatile float gMeterPeak = 0, gMeterVad = 0;  // for the Mic tab meter (UI reads, then clears the peak)
+// 1.48.0. Which side of a stereo input is the mic (an audio interface with the mic on input 1): 0 both, 1 left, 2 right.
+static volatile int   gMicSide = 0;
+static int            gCapCh = 1;               // channels the mic device was opened with (2 when a side is picked)
+// Gate extras: look ahead (the voice is delayed 5 ms so the gate is open before a soft start gets there) and a
+// detector that ignores thumps (lows cut from what the gate listens to, not from what you hear).
+static volatile bool  gGateLook = false, gGateThump = false;
+#define GATE_LOOK_N (RATE / 200)                // 5 ms
+static float gateLa[512]; static int gateLaW = 0; static float gateLaMix = 0;
+static float gtS[2][4];                         // the detector's 150 Hz high-pass (two stages: 24 dB / octave)
+// Leveler details (Mic > Tone). The Leveler knob still sets how much of the ratio and make-up is used.
+static volatile int   gLvThrDb = -30, gLvRatio = 4, gLvAtkMs = 5, gLvRelMs = 200, gLvMakeDb = 6;
+static volatile float gLvGrDb = 0;              // how many dB the leveler is turning down now (UI reads, then clears)
+static volatile float gMicRawPk = 0, gMicInPk = 0;   // mic peak as it arrives / after Mic boost (UI reads, then clears)
+// "Set up my mic": the audio thread measures the room (1) and then your voice (2) at the gate's input.
+static volatile int   gSuPhase = 0;
+static volatile float gSuNoisePk = 0, gSuTalkPk = 0, gSuRawPk = 0;
+static volatile double gSuNoiseSq = 0; static volatile int gSuNoiseN = 0;
+static volatile int   gSuHist[96];              // talk: how many 50 ms pieces sat at each level (1 dB steps from -96)
+static double suBlkSq = 0; static int suBlkN = 0, suSkip = 0;
+// The line under the mic meter: too loud / too quiet, or what "Set up my mic" wants from you right now.
+static wchar_t gMicHint[160];
+static int     gMicHintKind = 0;                // 0 nothing, 1 too loud, 2 too quiet, 3 set-up
+static int     gSuState = 0;                    // "Set up my mic": 0 idle, 1 listening to the room, 2 to you, 3 done
+static DWORD   gSuT0 = 0;
+static unsigned gTestTotal = 0;                 // mic test: both halves and the pause between them
+static void MicExtrasToUi();
+static void MicHintTick();
+static void MicSetupTick();
 static volatile bool  gMeterGateOpen = true;
 
 // RNNoise works on 10 ms frames (480 samples at 48 kHz) and delays its output by one more frame,
@@ -1341,6 +1371,9 @@ static void MicReset()                          // audio thread / before start
     nsIdx = 0; dryW = 0; nsVad = 0;
     hpX1 = hpX2 = hpY1 = hpY2 = 0; hpFc = -1;
     lvEnv = 0;
+    memset(gateLa, 0, sizeof(gateLa)); gateLaW = 0; gateLaMix = 0;
+    memset(gtS, 0, sizeof(gtS));
+    suBlkSq = 0; suBlkN = 0;
     for (int k = 0; k < MAX_OUT; k++) limGain[k] = 1;
 }
 
@@ -3412,7 +3445,19 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const float atkCoef  = 1.0f - expf(-1.0f / (0.001f * RATE));                      // opens in ~1 ms
     const float floorLin = powf(10.0f, -gGateRangeDb / 20.0f);
     const float lvAmt    = gLevelerPct / 100.0f;
-    const float lvRatio  = 1.0f + 3.0f * lvAmt, lvMakeupDb = 6.0f * lvAmt;
+    const float lvRatio  = 1.0f + (float)(Iclamp(gLvRatio, 2, 20) - 1) * lvAmt, lvMakeupDb = (float)Iclamp(gLvMakeDb, 0, 24) * lvAmt;
+    const float lvThr    = (float)Iclamp(gLvThrDb, -60, -6);
+    const int   lvAtkMs  = Iclamp(gLvAtkMs, 1, 100), lvRelMs = Iclamp(gLvRelMs, 20, 2000);
+    const float lvAtk    = lvAtkMs == 5   ? 0.0042f : 1.0f - expf(-1.0f / (lvAtkMs * 0.001f * RATE));   // (the defaults: the
+    const float lvRel    = lvRelMs == 200 ? 0.0001f : 1.0f - expf(-1.0f / (lvRelMs * 0.001f * RATE));   //  numbers used before)
+    float lvGrMax = 0;
+    const int   inCh     = gCapCh == 2 ? 2 : 1;
+    const int   inSide   = inCh == 2 ? Iclamp(gMicSide, 0, 2) : 0;
+    const bool  gateLook = gGateLook, gateThump = gGateThump;
+    const int   suPhase  = gSuPhase;
+    float inPk = 0;
+    const bool     testRec0 = gTestRec;         // (the mic's stages can run a whole block ahead of the rest: its own counter)
+    const unsigned testP0   = gTestPos;
     float blockPeak = 0;
     float outPk[MAX_OUT] = {};
 
@@ -3420,7 +3465,15 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     for (int i = 0; i < SB_N && padsIdle; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) padsIdle = false; }
     // Your mic up to the end of the Mic tab (cleanup, then tone), one sample at a time.
     auto micPre = [&](ma_uint32 f) -> float {
-        float s = in ? in[f] * boost : 0.0f;
+        float s;
+        if (!in) s = 0.0f;
+        else if (inCh == 1) s = in[f] * boost;
+        else {                                  // a stereo input: the side picked (both = the two averaged, as a mono open does)
+            const float raw = inSide == 1 ? in[f * 2] : inSide == 2 ? in[f * 2 + 1] : (in[f * 2] + in[f * 2 + 1]) * 0.5f;
+            s = raw * boost;
+        }
+        { const float a = fabsf(s); if (a > inPk) inPk = a; }
+        if (testRec0 && testP0 + f < TEST_LEN) gTestBuf[testP0 + f] = (short)((s > 1 ? 1 : s < -1 ? -1 : s) * 32767.0f);   // mic test: before any cleanup
         muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
         s *= muteGain;
         {                                       // push-to-talk / push-to-mute (5 ms fades, no clicks)
@@ -3435,9 +3488,40 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s = nsOn ? dry + (den - dry) * nsMix : dry;
         }
         { float a = s < 0 ? -s : s; if (a > blockPeak) blockPeak = a; }
+        if (suPhase) {                          // "Set up my mic" is listening
+            const float a = fabsf(s);
+            if (suPhase == 1) {
+                if (suSkip > 0) suSkip--;       // (not the click that started it)
+                else { if (a > gSuNoisePk) gSuNoisePk = a; gSuNoiseSq = gSuNoiseSq + (double)s * s; gSuNoiseN = gSuNoiseN + 1; }
+            } else {
+                if (a > gSuTalkPk) gSuTalkPk = a;
+                suBlkSq += (double)s * s;
+                if (++suBlkN >= RATE / 20) {
+                    const float db = 10.0f * log10f((float)(suBlkSq / suBlkN) + 1e-12f);
+                    const int bin = Iclamp((int)floorf(db + 96.5f), 0, 95);
+                    gSuHist[bin] = gSuHist[bin] + 1;
+                    suBlkSq = 0; suBlkN = 0;
+                }
+            }
+        }
 
         if (gateMode != GATE_OFF) {             // noise gate: opens in 1 ms, then hold, then release
             float a = s < 0 ? -s : s;
+            if (gateThump) {                    // what the gate listens to, without the lows (150 Hz, 24 dB / octave)
+                float y = s;
+                for (int i = 0; i < 2; i++) {
+                    float* t = gtS[i];
+                    const float o = 0.98621f * y - 1.97242f * t[0] + 0.98621f * t[1] + 1.97223f * t[2] - 0.97261f * t[3];
+                    t[1] = t[0]; t[0] = y; t[3] = t[2]; t[2] = o;
+                    y = o;
+                }
+                a = y < 0 ? -y : y;
+            }
+            gateLaMix += ((gateLook ? 1.0f : 0.0f) - gateLaMix) * 0.002f;   // (switching it: a short crossfade, no click)
+            gateLa[gateLaW] = s;
+            const float old = gateLa[(gateLaW - GATE_LOOK_N) & 511];
+            gateLaW = (gateLaW + 1) & 511;
+            if (gateLaMix > 0.0001f) s = gateLaMix > 0.999f ? old : s + (old - s) * gateLaMix;
             gateEnv = a > gateEnv ? a : gateEnv * 0.99792f;          // 10 ms peak follower
             bool loud  = gateEnv > (gateHold > 0 ? thrClose : thrOpen);
             bool voice = nsVad >= voiceMin;
@@ -3448,7 +3532,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             gateGain += (target - gateGain) * (target > gateGain ? atkCoef : relCoef);
             s *= gateGain;
         } else {
-            gateGain = 1.0f; gateHold = 1;
+            gateGain = 1.0f; gateHold = 1; gateLaMix = 0;
         }
         {                                       // Mixer ducking: are you talking? (gate open, or over -34 dB)
             float a = s < 0 ? -s : s;
@@ -3464,9 +3548,11 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
 
         if (lvAmt > 0) {                        // leveler: gentle compressor above -30 dBFS + make-up gain
             float pw = s * s;
-            lvEnv += (pw - lvEnv) * (pw > lvEnv ? 0.0042f : 0.0001f);   // ~5 ms attack, ~200 ms release
+            lvEnv += (pw - lvEnv) * (pw > lvEnv ? lvAtk : lvRel);       // 5 ms attack, 200 ms release unless changed
             float lvl = 10.0f * log10f(lvEnv + 1e-12f);
-            float gdb = (lvl > -30.0f ? (-30.0f - lvl) * (1.0f - 1.0f / lvRatio) : 0.0f) + lvMakeupDb;
+            const float cut = lvl > lvThr ? (lvThr - lvl) * (1.0f - 1.0f / lvRatio) : 0.0f;
+            float gdb = cut + lvMakeupDb;
+            if (-cut > lvGrMax) lvGrMax = -cut;
             s *= powf(10.0f, gdb / 20.0f);
         }
 
@@ -3607,7 +3693,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         if (gTestRec) {                         // mic test
             float t = everything + sb; t = t > 1 ? 1 : t < -1 ? -1 : t;
             unsigned tp = gTestPos;
-            gTestBuf[tp] = (short)(t * 32767.0f);
+            gTestOut[tp] = (short)(t * 32767.0f);
             if (++tp >= TEST_LEN) { gTestRec = false; gTestLen = TEST_LEN; }
             gTestPos = tp;
         }
@@ -3723,6 +3809,9 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
     for (int k = 0; k < MAX_OUT; k++) if (gTestTone[k] > 0) gTestTone[k] = testLeft[k] > 0 ? testLeft[k] : 0;
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
+    if (inPk > gMicInPk) gMicInPk = inPk;
+    { const float r = boost > 0.0001f ? inPk / boost : 0.0f; if (r > gMicRawPk) gMicRawPk = r; if (suPhase && r > gSuRawPk) gSuRawPk = r; }
+    if (lvGrMax > gLvGrDb) gLvGrDb = lvGrMax;
     for (int k = 0; k < MAX_OUT && k < 8; k++) if (outPk[k] > gOutPeak[k]) gOutPeak[k] = outPk[k];
     for (int k = 0; k < MAX_OUT; k++) if (outPk[k] > gOutPeakMix[k]) gOutPeakMix[k] = outPk[k];
     for (int k = 0; k < MAX_OUT; k++) if (outPk[k] > gOutPkWs[k]) gOutPkWs[k] = outPk[k];
@@ -3845,6 +3934,8 @@ enum {
     IDC_VSTON0 = 4410, IDC_VSTNAME0 = 4420, IDC_VSTEDIT0 = 4430, IDC_VSTINFO0 = 4440, IDC_VSTNUM0 = 4450,   // + mic slot (VST_MIC)
     IDC_OFX0 = 4460,                            // .. +5: each output's plugins button
     IDC_VSTKEY0 = 4470,                         // .. +4: a mic plugin slot's on / off hotkey
+    IDC_MICSETUP = 4500, IDC_MICTYPE = 4501, IDC_GATELOOK = 4502, IDC_GATETHUMP = 4503, IDC_MICSIDE = 4504,   // Mic tab, 1.48.0
+    IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
     IDC_VSTRKEY0 = 4480,                        // .. +2: the same, in a channel's / output's plugins window
     IDC_PADMORE = 1100, IDC_CLIPMORE = 1110,    // + row: the "..." options button
@@ -5133,6 +5224,14 @@ static void LoadSettings()
     gRadioPreset  = Iclamp(INI_INT(L"radio_preset", 0), 0, RADIO_N - 1);
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
+    gMicSide   = Iclamp(INI_INT(L"mic_side", 0), 0, 2);
+    gGateLook  = INI_INT(L"gate_look_ahead", 0) != 0;
+    gGateThump = INI_INT(L"gate_ignore_thumps", 0) != 0;
+    gLvThrDb   = Iclamp(INI_INT(L"leveler_threshold_db", -30), -50, -10);
+    gLvRatio   = Iclamp(INI_INT(L"leveler_ratio", 4), 2, 10);
+    gLvAtkMs   = Iclamp(INI_INT(L"leveler_attack_ms", 5), 1, 50);
+    gLvRelMs   = Iclamp(INI_INT(L"leveler_release_ms", 200), 50, 1000);
+    gLvMakeDb  = Iclamp(INI_INT(L"leveler_makeup_db", 6), 0, 18);
     {
         wchar_t b[32];
         GetPrivateProfileStringW(L"settings", L"gate_threshold_db", L"", b, 32, gIni);
@@ -5872,6 +5971,9 @@ static void SaveSettings()
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
+    SaveInt(L"mic_side", gMicSide); SaveInt(L"gate_look_ahead", gGateLook); SaveInt(L"gate_ignore_thumps", gGateThump);
+    SaveInt(L"leveler_threshold_db", gLvThrDb); SaveInt(L"leveler_ratio", gLvRatio); SaveInt(L"leveler_attack_ms", gLvAtkMs);
+    SaveInt(L"leveler_release_ms", gLvRelMs); SaveInt(L"leveler_makeup_db", gLvMakeDb);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
     IniSet(L"voc_song_app", gSongApp);
     IniSet(L"voc_song_file", gSongFile);
@@ -6113,7 +6215,8 @@ static bool StartAudio(bool quiet)
 
     ma_device_config cfg = ma_device_config_init(ma_device_type_duplex);
     cfg.capture.format     = ma_format_f32;
-    cfg.capture.channels   = 1;
+    cfg.capture.channels   = gMicSide ? 2 : 1;  // (a side picked: both sides are needed to take one)
+    gCapCh                 = (int)cfg.capture.channels;
     cfg.playback.format    = ma_format_f32;
     cfg.playback.channels  = 2;
     cfg.sampleRate         = RATE;
@@ -8349,6 +8452,10 @@ static const ProfVar PROF_VARS[] = {
     { L"random_lag", nullptr, &gRandLagOn, nullptr }, { L"random_lag_every_s", &gRandLagSec, nullptr, nullptr },
     { L"fx_harm_style", &gHarmStyle, nullptr, nullptr }, { L"broadcast_voice", nullptr, &gBroadcast, nullptr },
     { L"fx_harm_mute", nullptr, &gHarmMute, nullptr },
+    { L"gate_look_ahead", nullptr, &gGateLook, nullptr }, { L"gate_ignore_thumps", nullptr, &gGateThump, nullptr },
+    { L"leveler_threshold_db", &gLvThrDb, nullptr, nullptr }, { L"leveler_ratio", &gLvRatio, nullptr, nullptr },
+    { L"leveler_attack_ms", &gLvAtkMs, nullptr, nullptr }, { L"leveler_release_ms", &gLvRelMs, nullptr, nullptr },
+    { L"leveler_makeup_db", &gLvMakeDb, nullptr, nullptr },
     { L"beat_sync", nullptr, &gBeatSync, nullptr }, { L"bpm", &gBpm, nullptr, nullptr }, { L"beat_division", &gBeatDiv, nullptr, nullptr },
 };
 
@@ -8454,6 +8561,7 @@ static void RefreshSoundUI()                    // after a profile changed lots 
     CheckDlgButton(gWnd, IDC_BROADCAST, gBroadcast ? BST_CHECKED : BST_UNCHECKED);
     SetGateMode(gGateMode);
     CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+    MicExtrasToUi();
     CheckDlgButton(gWnd, IDC_TALKON, gTalkOver ? BST_CHECKED : BST_UNCHECKED);
     CheckRadioButton(gWnd, IDC_HOLD, IDC_TOGGLE, gToggleMode ? IDC_TOGGLE : IDC_HOLD);
     CheckDlgButton(gWnd, IDC_RANDLAG, gRandLagOn ? BST_CHECKED : BST_UNCHECKED);
@@ -8590,12 +8698,15 @@ static void MicTestStart()
         return;
     }
     PrevStop();
-    gTestPos = 0; gTestLen = 0;
+    gTestPos = 0; gTestLen = 0; gTestTotal = 0;
+    memset(gTestBuf, 0, sizeof(gTestBuf));
     gTestRec = true;
 }
 
+static const wchar_t* const MICTEST_INFO = L"Mic test: talk for 5 seconds, then hear your mic before cleanup, followed by what others hear.";
 static void MicTestTick()                       // every 50 ms: countdown, then play it back
 {
+    MicSetupTick();
     static bool wasRec = false;
     static wchar_t last[48];
     if (gTestRec && !gRunning) {                // audio stopped mid-test: keep what we got
@@ -8608,8 +8719,22 @@ static void MicTestTick()                       // every 50 ms: countdown, then 
     else if (gPrevRunning && gPrevData == gTestBuf) lstrcpynW(t, L"\x25A0  Stop", 48);
     else lstrcpynW(t, L"\x25CF  Record 5 s", 48);
     if (lstrcmpW(t, last)) { lstrcpynW(last, t, 48); SetDlgItemTextW(gWnd, IDC_MICTEST, t); }
-    if (wasRec && !gTestRec && gTestLen) PrevPlay(gTestBuf, 0, gTestLen, 1.0f);   // done: hear it
+    if (wasRec && !gTestRec && gTestLen) {      // done: what others hear goes after your raw mic, then hear both
+        const unsigned n = gTestLen;
+        memset(gTestBuf + n, 0, TEST_GAP * sizeof(short));
+        memcpy(gTestBuf + n + TEST_GAP, gTestOut, n * sizeof(short));
+        gTestTotal = n * 2 + TEST_GAP;
+        PrevPlay(gTestBuf, 0, gTestTotal, 1.0f);
+    }
     wasRec = gTestRec;
+    {
+        static const wchar_t* lastInfo = nullptr;
+        const wchar_t* info = gTestRec ? L"Recording: talk now."
+                            : gPrevRunning && gPrevData == gTestBuf
+                              ? (gPrevPos < gTestLen + TEST_GAP / 2 ? L"Playing 1 of 2: your mic before cleanup." : L"Playing 2 of 2: what others hear (cleanup and effects).")
+                              : MICTEST_INFO;
+        if (info != lastInfo) { lastInfo = info; SetDlgItemTextW(gWnd, IDC_MICTESTINFO, info); }
+    }
     EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), gTestLen > 0 && !gTestRec);
     if (gPrevRunning && !gTrimWnd && gPrevPos >= gPrevEnd) PrevStop();       // finished playing
 }
@@ -10787,8 +10912,8 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKCHAT), x0, y + SC(3), nameW, SC(20));
         PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_CHATG)), x0 + nameW + gap, y, colW, SC(23));
         PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_CHATC)), x0 + nameW + gap + colW + gap, y, colW, SC(23));
-        // (These labels are right-aligned, so one that's too narrow for its text loses its *start*: each gets the
-        //  width its text needs in the font in use, and what follows it moves along.)
+        // (Each label gets the width its text needs in the font in use, and what follows it moves along. They're
+        //  left-aligned, so one that still came out too narrow would lose its end, never its start.)
         auto textW = [&](int id, int atLeast) {
             HWND c = GetDlgItem(gWnd, id);
             wchar_t t[100]; t[0] = 0; GetWindowTextW(c, t, 100);
@@ -10799,7 +10924,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
             SelectObject(dc, of); ReleaseDC(gWnd, dc);
             return Imax(atLeast, (int)sz.cx + SC(6));
         };
-        const int stepLblW = textW(IDC_MIXKEYHDR, SC(120)), fadeLblW = textW(IDC_MIXFADELBL, SC(80)), tbLblW = textW(IDC_TBHDR, SC(84));
+        const int stepLblW = textW(IDC_MIXKEYHDR, SC(120)), fadeLblW = textW(IDC_MIXFADELBL, SC(80));
         const int stx = x0 + nameW + gap + 2 * (colW + gap) + SC(8);
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKEYHDR), stx, y + SC(3), stepLblW, SC(20));
         HWND e = GetDlgItem(gWnd, IDC_MIXSTEP), u = GetDlgItem(gWnd, SPIN_UD(IDC_MIXSTEP));
@@ -10825,9 +10950,11 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_MIXKTB), x0, y + SC(3), nameW, SC(20));
         PlaceFree(GetDlgItem(gWnd, FxKeyButtonId(SLOT_TALKBACK)), x0 + nameW + gap, y, colW, SC(23));
         const int tbx = x0 + nameW + gap + colW + gap + SC(8);
-        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR), tbx, y + SC(3), tbLblW, SC(20));
-        PlaceFree(GetDlgItem(gWnd, IDC_TBOUT), tbx + tbLblW + SC(4), y, SC(150), SC(200));
-        PlaceFree(GetDlgItem(gWnd, IDC_TBHDR2), tbx + tbLblW + SC(160), y + SC(3), textW(IDC_TBHDR2, SC(110)), SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_TBOUT), tbx, y, SC(150), SC(200));
+        {                                       // the words after the list: all the room up to the box's right edge
+            const int lx = tbx + SC(158);
+            PlaceFree(GetDlgItem(gWnd, IDC_TBHDR2), lx, y + SC(3), Imax(SC(120), cx0 + cw - SC(16) - lx), SC(20));
+        }
         y += SC(25);
         // scenes: three to a row, each its name and its key
         y += SC(8);
@@ -12832,8 +12959,21 @@ static void AddTips()
                          L"Set up a Character, then hold the key to talk as it.");
     for (int g = 0; g < FX_GROUPS; g++) TipId(IDC_FXGRP_HOLD + g, L"Hold: this effect's hotkey turns it on only while you hold it, "
                                                                   L"then puts everything back when you let go.");
-    TipId(IDC_MICTEST,   L"Record 5 seconds of what Discord hears (your mic with every effect), then play it back to you.");
+    TipId(IDC_MICTEST,   L"Record 5 seconds, then hear your mic before cleanup, followed by what others hear (your mic with every effect).");
     TipId(IDC_MICPLAY,   L"Play the last mic test again.");
+    TipId(IDC_MICSETUP,  L"Listens to your room for 3 seconds and to your voice for 4, then suggests Mic boost, the noise gate and the leveler. "
+                         L"Nothing changes until you say yes. Press again to cancel.");
+    TipId(IDC_MICTYPE,   L"A starting point for the Cleanup and Tone pages for your kind of microphone. Mic boost isn't changed.");
+    TipId(IDC_GATELOOK,  L"Delays your voice by 5 ms so the gate is already open when a soft start (h, f, s) arrives. Only while the gate is on.");
+    TipId(IDC_GATETHUMP, L"The gate's volume check ignores low thumps and rumble (desk bumps, footsteps), so they don't open it. "
+                         L"Your voice's sound isn't changed.");
+    TipId(IDC_MICSIDE,   L"For a stereo input, such as an audio interface with the mic on input 1: take only that side, instead of both mixed "
+                         L"(which halves your level and adds the empty input's hiss). Restarts the audio.");
+    TipId(IDC_LVTHR,     L"The level where the leveler starts turning you down. Default -30 dB.");
+    TipId(IDC_LVRATIO,   L"How hard it turns you down above that level, with the Leveler knob at 100%. Default 4 : 1.");
+    TipId(IDC_LVATK,     L"How fast it reacts to a loud sound. Default 5 ms.");
+    TipId(IDC_LVREL,     L"How fast it lets go again. Default 200 ms.");
+    TipId(IDC_LVMAKE,    L"Gain added back after levelling, with the Leveler knob at 100%. Default 6 dB.");
     for (int b = 0; b < PAD_BANKS; b++) TipId(IDC_PADBANK0 + b, L"Soundboard pages: 8 pads each. The dot means the page has sounds. "
                                                                 L"Pad hotkeys play the pad in that spot on whichever page is showing.");
     TipId(IDC_PADBANKKEY, L"A hotkey that flips to the next soundboard page (A > B > C > D > A). Right-click to clear it.");
@@ -13614,6 +13754,7 @@ static void UpdateMeter()                       // every 50 ms: fast rise, smoot
         gOutShow[k] = v;
         if (moved && gPage == PAGE_MAIN && !gCompact) InvalidateRect(GetDlgItem(gWnd, IDC_ROWLBL + k), nullptr, FALSE);
     }
+    MicHintTick();
     float peak = gMeterPeak; gMeterPeak = 0;
     float db = peak > 0.0000316f ? 20.0f * log10f(peak) : -90.0f;
     gMeterShowDb = db > gMeterShowDb ? db : (gMeterShowDb - 2.5f > db ? gMeterShowDb - 2.5f : db);
@@ -13699,6 +13840,12 @@ static void DrawMeterTo(HDC dc, RECT rc)
     SetTextColor(dc, open && gateOn && gRunning ? RGB(40, 170, 80) : gDark ? DK_DIM : RGB(105, 105, 105));
     RECT r2 = { x1 + 10, rc.top + 27, rc.right - 14, rc.top + 45 };
     DrawTextW(dc, t2, -1, &r2, DT_SINGLELINE | DT_RIGHT | DT_VCENTER);
+    if (gMicHintKind && gMicHint[0]) {          // too loud / too quiet / set-up: a line along the bottom
+        SetTextColor(dc, gMicHintKind == 1 ? RGB(225, 75, 60) : gMicHintKind == 2 ? RGB(225, 140, 30) : ACCENT);
+        SelectObject(dc, gMicHintKind == 3 ? gFontBold : gFont);
+        RECT hr = { rc.left + 14, rc.bottom - 18, rc.right - 14, rc.bottom - 1 };
+        DrawTextW(dc, gMicHint, -1, &hr, DT_SINGLELINE | DT_LEFT | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    }
     SelectObject(dc, of);
 }
 
@@ -13728,6 +13875,184 @@ static void SetKnobVar(volatile int* var, int v)   // set a knob by the setting 
 {
     for (int i = 0; i < KNOB_N; i++)
         if (gKnobs[i].var == var) { SetKnobValue(GetDlgItem(gWnd, IDC_KNOB + i), i, v); return; }
+}
+
+// ======================= Mic tab extras (1.48.0) =======================
+// The leveler's number boxes (Mic > Tone). "Starts at" is shown without its minus sign (the label has it).
+struct LvBox { volatile int* var; int lo, hi; bool neg; };
+static const LvBox LV_BOXES[5] = { { &gLvThrDb, 10, 50, true }, { &gLvRatio, 2, 10, false }, { &gLvAtkMs, 1, 50, false },
+                                   { &gLvRelMs, 50, 1000, false }, { &gLvMakeDb, 0, 18, false } };
+static void SetTextIfChanged(HWND w, int id, const wchar_t* t);
+static void MicExtrasToUi()                     // (after a profile or an import changed them)
+{
+    CheckDlgButton(gWnd, IDC_GATELOOK,  gGateLook  ? BST_CHECKED : BST_UNCHECKED);
+    CheckDlgButton(gWnd, IDC_GATETHUMP, gGateThump ? BST_CHECKED : BST_UNCHECKED);
+    for (int i = 0; i < 5; i++) {
+        const LvBox& b = LV_BOXES[i];
+        if (GetDlgItem(gWnd, IDC_LVTHR + i)) SetDlgItemInt(gWnd, IDC_LVTHR + i, (UINT)(b.neg ? -*b.var : *b.var), FALSE);
+    }
+}
+
+static void MicHintTick()                       // every 50 ms: the line under the mic meter
+{
+    static float win[200], vadWin[200];         // the last 10 s
+    static int   wi = 0, filled = 0, clipRaw = 0, clipIn = 0;
+    const float raw = gMicRawPk; gMicRawPk = 0;
+    const float in  = gMicInPk;  gMicInPk = 0;
+    {                                           // what the leveler is doing (Mic > Tone)
+        const float gr = gLvGrDb; gLvGrDb = 0;
+        wchar_t t[48];
+        if (gLevelerPct <= 0) lstrcpynW(t, L"Leveler is off", 48);
+        else if (!gRunning || gr < 0.5f) lstrcpynW(t, L"Now: not turning down", 48);
+        else wsprintfW(t, L"Now: turning down %d dB", (int)(gr + 0.5f));
+        if (gPage == PAGE_MIC) SetTextIfChanged(gWnd, IDC_LVGR, t);
+    }
+    wchar_t h[160]; h[0] = 0; int kind = 0;
+    if (!gRunning) { filled = 0; wi = 0; clipRaw = clipIn = 0; }
+    else {
+        if (raw >= 0.985f) clipRaw = 60; else if (clipRaw > 0) clipRaw--;      // (stays up 3 s)
+        if (in >= 0.985f && raw < 0.985f) clipIn = 60; else if (clipIn > 0) clipIn--;
+        win[wi] = in > 0.00001f ? 20.0f * log10f(in) : -100.0f;
+        vadWin[wi] = gMeterVad;
+        wi = (wi + 1) % 200; if (filled < 200) filled++;
+        bool quiet = false;
+        if (filled == 200 && !gMicMuted) {      // 10 s of you talking that never got above -30 dB
+            float srt[200]; memcpy(srt, win, sizeof(srt));
+            for (int i = 1; i < 200; i++) { const float v = srt[i]; int j = i - 1; while (j >= 0 && srt[j] > v) { srt[j + 1] = srt[j]; j--; } srt[j + 1] = v; }
+            const float mx = srt[199], low = srt[40];
+            float vmax = -1; for (int i = 0; i < 200; i++) if (vadWin[i] > vmax) vmax = vadWin[i];
+            const bool talking = vmax >= 0 ? vmax > 0.8f : mx - low > 15.0f;   // (the AI's opinion when it's running)
+            quiet = talking && mx < -30.0f && mx > -70.0f;
+        }
+        if (gSuState == 1)      { kind = 3; lstrcpynW(h, L"Setting up: stay quiet for a moment, so the room can be heard.", 160); }
+        else if (gSuState == 2) { kind = 3; lstrcpynW(h, L"Setting up: now talk normally, like you would on a call.", 160); }
+        else if (clipRaw > 0)   { kind = 1; lstrcpynW(h, L"Too loud: the mic is clipping. Turn its level down in Windows sound settings.", 160); }
+        else if (clipIn > 0)    { kind = 1; lstrcpynW(h, L"Too loud: turn Mic boost down (Tone).", 160); }
+        else if (quiet)         { kind = 2; lstrcpynW(h, gMicBoostDb < 24 ? L"Too quiet: turn Mic boost up (Tone), or use Set up my mic."
+                                                                         : L"Too quiet: turn the mic's level up in Windows sound settings.", 160); }
+    }
+    if (kind != gMicHintKind || lstrcmpW(h, gMicHint)) {
+        gMicHintKind = kind; lstrcpynW(gMicHint, h, 160);
+        if (gPage == PAGE_MIC) InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+    }
+}
+
+// Mic type: a starting point for the Cleanup and Tone pages. (Mic boost is left alone: "Set up my mic" does levels.)
+struct MicPreset { const wchar_t* name; int lowCut; bool ns; int nsStrength, gate, leveler, deEss, eq[5]; };
+static const MicPreset MIC_PRESETS[] = {
+    { L"Headset mic",          100, true,  100, GATE_VOICE,  50, 30, {  0, -2, 0, 3,  2 } },
+    { L"USB condenser mic",     80, true,   80, GATE_VOICE,  40, 40, {  0, -2, 0, 1,  0 } },
+    { L"Dynamic / XLR mic",     70, false, 100, GATE_VOLUME, 40, 15, {  0, -1, 0, 3,  3 } },
+    { L"Laptop or webcam mic", 130, true,  100, GATE_VOICE,  60, 20, {  2, -3, 0, 2, -1 } },
+};
+static void MicTypeMenu()
+{
+    HWND b = GetDlgItem(gWnd, IDC_MICTYPE);
+    RECT r; GetWindowRect(b, &r);
+    HMENU m = CreatePopupMenu();
+    const int n = (int)(sizeof(MIC_PRESETS) / sizeof(MIC_PRESETS[0]));
+    for (int i = 0; i < n; i++) AppendMenuW(m, MF_STRING, 1 + i, MIC_PRESETS[i].name);
+    const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd < 1 || cmd > n) return;
+    const MicPreset& p = MIC_PRESETS[cmd - 1];
+    wchar_t msg[420];
+    wsprintfW(msg, L"Set the Cleanup and Tone pages up for a %s?\n\nThis changes noise suppression, the noise gate, low cut, the leveler, "
+                   L"de-ess and the equalizer. Mic boost stays as it is.\n\nAfterwards, \"Set up my mic\" can match the levels to your voice.", p.name);
+    if (MessageBoxW(gWnd, msg, L"Lag Effect - Mic type", MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+    gNsOn = p.ns; CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+    SetKnobVar(&gNsStrength, p.nsStrength);
+    SetGateMode(p.gate);
+    gGateLook = true; gGateThump = true;
+    SetKnobVar(&gLowCutHz, p.lowCut); SetKnobVar(&gLevelerPct, p.leveler); SetKnobVar(&gDeEss, p.deEss);
+    volatile int* eq[5] = { &gEqBass, &gEqLowMid, &gEqMid, &gEqPres, &gEqTreble };
+    for (int i = 0; i < 5; i++) SetKnobVar(eq[i], p.eq[i]);
+    MicExtrasToUi();
+    RedrawKnobs();
+}
+
+// Set up my mic: 3 s of the room, 4 s of you, then a suggestion for Mic boost, the gate and the leveler.
+static void MicSetupStart()
+{
+    if (gSuState) { gSuPhase = 0; gSuState = 0; return; }        // (pressed again: cancel)
+    if (!gRunning) { MessageBoxW(gWnd, L"Press Start on the Main tab first, then set up.", L"Lag Effect - Set up my mic", MB_ICONINFORMATION); return; }
+    if (gMicMuted) { MessageBoxW(gWnd, L"Your mic is muted. Unmute it first.", L"Lag Effect - Set up my mic", MB_ICONINFORMATION); return; }
+    gSuNoisePk = 0; gSuTalkPk = 0; gSuRawPk = 0; gSuNoiseSq = 0; gSuNoiseN = 0;
+    for (int i = 0; i < 96; i++) gSuHist[i] = 0;
+    suSkip = RATE * 4 / 10; suBlkSq = 0; suBlkN = 0;
+    gSuState = 1; gSuT0 = GetTickCount(); gSuPhase = 1;
+}
+static void MicSetupFinish()
+{
+    const wchar_t* const title = L"Lag Effect - Set up my mic";
+    const float noisePk  = gSuNoisePk > 0.00001f ? 20.0f * log10f(gSuNoisePk) : -100.0f;
+    const float noiseRms = gSuNoiseN > 0 ? 10.0f * log10f((float)(gSuNoiseSq / gSuNoiseN) + 1e-10f) : -100.0f;
+    const float talkPk   = gSuTalkPk > 0.00001f ? 20.0f * log10f(gSuTalkPk) : -100.0f;
+    if (talkPk < -70.0f) {
+        MessageBoxW(gWnd, L"No sound came from the mic. Check that the right microphone is picked on the Main tab, and that it isn't "
+                          L"muted in Windows.", title, MB_ICONWARNING);
+        return;
+    }
+    const int first = Iclamp((int)floorf(noiseRms + 6.0f + 96.5f), 0, 95);   // pieces at least 6 dB over the room = your voice
+    int nSpeech = 0; for (int i = first; i < 96; i++) nSpeech += gSuHist[i];
+    if (nSpeech < 10) {
+        MessageBoxW(gWnd, L"Your voice was hard to tell from the background. Try again, a little closer to the mic, and keep talking "
+                          L"until it's done.", title, MB_ICONWARNING);
+        return;
+    }
+    auto pct = [&](float p) {                   // the level that share of your voice sits below
+        const int want = (int)(nSpeech * p); int acc = 0;
+        for (int i = first; i < 96; i++) { acc += gSuHist[i]; if (acc > want) return (float)(i - 96); }
+        return 0.0f;
+    };
+    const float loud = pct(0.9f), soft = pct(0.3f);
+    const int   boost0 = gMicBoostDb;
+    const float want   = Min(-20.0f - loud, -4.0f - talkPk);     // your louder speech near -20 dB, peaks under -4
+    const int   boost1 = Iclamp(boost0 + (int)floorf(want + 0.5f), -12, 24);
+    const int   d      = boost1 - boost0;
+    const bool  nsNew  = !gNsOn && noiseRms + d > -55.0f;        // a noisy room: the AI cleanup helps
+    const float gap    = soft - noisePk;
+    const int   gate0  = gGateMode;
+    const int   gate1  = gap >= 6.0f ? (gate0 == GATE_OFF ? GATE_VOLUME : gate0) : GATE_VOICE;   // (noise too close: go by voice)
+    const float lift   = gap * 0.4f < 3.0f ? 3.0f : gap * 0.4f > 12.0f ? 12.0f : gap * 0.4f;
+    const int   thr1   = Iclamp((int)floorf(noisePk + d + lift + 0.5f), -90, -10);
+    const bool  setThr = gate1 == GATE_VOLUME || gate1 == GATE_BOTH;
+    const int   lev0   = gLevelerPct;
+    const int   lev1   = Iclamp(((int)(20.0f + (loud - soft - 6.0f) * 5.0f) + 2) / 5 * 5, 20, 70);
+    const bool  clipped = gSuRawPk >= 0.985f;
+    static const wchar_t* const gateNames[] = { L"Off", L"Volume", L"Voice", L"Volume + voice" };
+    wchar_t msg[900], line[200];
+    wsprintfW(msg, L"What was heard:\n    The room: about %d dB\n    Your voice: about %d dB\n\nSuggested:\n    Mic boost: %d dB  \x2192  %d dB\n",
+              (int)floorf(noiseRms + 0.5f), (int)floorf(loud + 0.5f), boost0, boost1);
+    if (setThr) wsprintfW(line, L"    Noise gate: %s  \x2192  %s, threshold %d dB\n", gateNames[gate0], gateNames[gate1], thr1);
+    else        wsprintfW(line, L"    Noise gate: %s  \x2192  %s (the room is close to your voice's level)\n", gateNames[gate0], gateNames[gate1]);
+    lstrcatW(msg, line);
+    if (lev0 > 0) wsprintfW(line, L"    Leveler: %d%%  \x2192  %d%%\n", lev0, lev1); else wsprintfW(line, L"    Leveler: Off  \x2192  %d%%\n", lev1);
+    lstrcatW(msg, line);
+    if (nsNew) lstrcatW(msg, L"    Noise suppression: Off  \x2192  On (the room is noisy)\n");
+    if (clipped) lstrcatW(msg, L"\nYour mic clipped while you talked: turn its level down in Windows sound settings, then run this again.\n");
+    lstrcatW(msg, L"\nUse these settings?");
+    if (MessageBoxW(gWnd, msg, title, MB_ICONQUESTION | MB_YESNO) != IDYES) return;
+    SetKnobVar(&gMicBoostDb, boost1);
+    if (nsNew) { gNsOn = true; CheckDlgButton(gWnd, IDC_NSON, BST_CHECKED); }
+    SetGateMode(gate1);
+    if (setThr) SetKnobVar(&gGateThrDb, thr1);
+    SetKnobVar(&gLevelerPct, lev1);
+    RedrawKnobs();
+}
+static void MicSetupTick()                      // every 50 ms
+{
+    static wchar_t last[40];
+    wchar_t t[40];
+    const DWORD el = GetTickCount() - gSuT0;
+    if (gSuState && gSuState < 3 && !gRunning) { gSuPhase = 0; gSuState = 0; }   // (audio stopped: forget it)
+    if (gSuState == 1 && el >= 3000) { gSuState = 2; gSuT0 = GetTickCount(); gSuPhase = 2; }
+    else if (gSuState == 2 && el >= 4000) { gSuPhase = 0; gSuState = 3; }        // (one more tick: the audio thread finishes its block)
+    else if (gSuState == 3) { gSuState = 0; SetDlgItemTextW(gWnd, IDC_MICSETUP, L"Set up my mic"); lstrcpynW(last, L"Set up my mic", 40); MicSetupFinish(); return; }
+    if (gSuState == 1)      wsprintfW(t, L"Stay quiet... %d", (int)(3000 - Imin(3000, (int)(GetTickCount() - gSuT0))) / 1000 + 1);
+    else if (gSuState == 2) wsprintfW(t, L"Talk now... %d", (int)(4000 - Imin(4000, (int)(GetTickCount() - gSuT0))) / 1000 + 1);
+    else lstrcpynW(t, L"Set up my mic", 40);
+    if (lstrcmpW(t, last)) { lstrcpynW(last, t, 40); SetDlgItemTextW(gWnd, IDC_MICSETUP, t); }
 }
 
 static void ApplyStyleKnobs(int g)              // a style's suggested knob values
@@ -16116,7 +16441,9 @@ static void ShowHelp()
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
         L"the meter's level when you're quiet), on Voice (AI speech detection) or both. Low cut removes rumble, "
-        L"Leveler evens out your volume.\n\n"
+        L"Leveler evens out your volume.\n"
+        L"Set up my mic listens to your room and your voice and suggests the levels; Mic type gives a starting point for your "
+        L"kind of microphone. The mic test plays your mic before cleanup, then what others hear.\n\n"
         L"VOICE FX\n"
         L"Flip the switch at the top, then tick the effects you want. Drag a knob up or down, scroll it, "
         L"or use the arrow keys (hold Shift for fine steps). Double-click a knob to reset it.\n"
@@ -17372,7 +17699,7 @@ static void CreateUI()
     // ---------------- Mic page ----------------
     // Live meter, then AI noise suppression, noise gate and voice quality sections.
     gBuildPage = PAGE_MIC;
-    Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 56, 532, 52, IDC_METER);
+    Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 48, 532, 62, IDC_METER);   // (the bottom line: too loud / too quiet)
     Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 90, 28, IDC_MICSUB0);
     Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 108, 116, 90, 28, IDC_MICSUB1);
     gBuildFeat = FEAT_VST;                      // (Settings > Features > Plugins: this sub-tab only exists while it's on)
@@ -17431,7 +17758,10 @@ static void CreateUI()
         for (const wchar_t* n : gateNames) SendMessageW(gm, CB_ADDSTRING, 0, (LPARAM)n);
         SendMessageW(gm, CB_SETCURSEL, gGateMode, 0);
         SendMessageW(gm, CB_SETDROPPEDWIDTH, 130, 0);
-        Ctl(L"STATIC", L"Hover any knob for help.", 0, 430, y + 70, 104, 36, IDC_HDR);
+        Ctl(L"BUTTON", L"Look ahead", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 66, 104, 20, IDC_GATELOOK);
+        Ctl(L"BUTTON", L"Ignore thumps", BS_AUTOCHECKBOX | WS_TABSTOP, 430, y + 88, 104, 20, IDC_GATETHUMP);
+        CheckDlgButton(gWnd, IDC_GATELOOK,  gGateLook  ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(gWnd, IDC_GATETHUMP, gGateThump ? BST_CHECKED : BST_UNCHECKED);
 
         y += MIC_STEP;                          // push-to-talk (Cleanup sub-tab)
         AddSection(14, y, 532, 92, L"Push-to-talk");
@@ -17469,14 +17799,42 @@ static void CreateUI()
         }
         Ctl(L"BUTTON", L"Flat", WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 26, IDC_EQRESET);
         Ctl(L"STATIC", L"Bass 100 Hz, low mid 400, mid 1.2k, presence 3.5k, treble 8k.", 0, 432, y + 50, 104, 60, IDC_HDR);
+
+        y += MIC_STEP;                          // leveler details, and which side of a stereo input is the mic
+        AddSection(14, y, 384, 94, L"Leveler details");
+        Ctl(L"STATIC", L"Starts at  \x2212", 0, 30, y + 21, 70, 18, -1);
+        Spin(IDC_LVTHR, 102, y + 18, 52, 10, 50, -gLvThrDb);
+        Ctl(L"STATIC", L"dB", 0, 158, y + 21, 30, 18, -1);
+        Ctl(L"STATIC", L"Ratio", 0, 204, y + 21, 56, 18, -1);
+        Spin(IDC_LVRATIO, 262, y + 18, 52, 2, 10, gLvRatio);
+        Ctl(L"STATIC", L": 1", 0, 318, y + 21, 30, 18, -1);
+        Ctl(L"STATIC", L"Attack", 0, 30, y + 45, 70, 18, -1);
+        Spin(IDC_LVATK, 102, y + 42, 52, 1, 50, gLvAtkMs);
+        Ctl(L"STATIC", L"ms", 0, 158, y + 45, 30, 18, -1);
+        Ctl(L"STATIC", L"Release", 0, 204, y + 45, 56, 18, -1);
+        Spin(IDC_LVREL, 262, y + 42, 52, 50, 1000, gLvRelMs);
+        Ctl(L"STATIC", L"ms", 0, 318, y + 45, 30, 18, -1);
+        Ctl(L"STATIC", L"Make-up", 0, 30, y + 69, 70, 18, -1);
+        Spin(IDC_LVMAKE, 102, y + 66, 52, 0, 18, gLvMakeDb);
+        Ctl(L"STATIC", L"dB", 0, 158, y + 69, 30, 18, -1);
+        Ctl(L"STATIC", L"", SS_NOPREFIX, 204, y + 69, 186, 18, IDC_LVGR);
+        AddSection(406, y, 140, 94, L"Mic input");
+        {
+            HWND sd = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 416, y + 20, 120, 200, IDC_MICSIDE);
+            const wchar_t* sides[] = { L"Both sides", L"Left only", L"Right only" };
+            for (const wchar_t* n : sides) SendMessageW(sd, CB_ADDSTRING, 0, (LPARAM)n);
+            SendMessageW(sd, CB_SETCURSEL, gMicSide, 0);
+            Ctl(L"STATIC", L"Mic on one input of an audio interface? Pick its side.", 0, 416, y + 50, 124, 40, IDC_HDR);
+        }
         gBuildSub = -1;
     }
     gBuildSub = -1;
     Ctl(L"BUTTON", L"\x25CF  Record 5 s", WS_TABSTOP | WS_GROUP, 14, 556, 128, 30, IDC_MICTEST);
     Ctl(L"BUTTON", L"\x25B6  Play again", WS_TABSTOP, 148, 556, 110, 30, IDC_MICPLAY);
     EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), FALSE);
-    Ctl(L"STATIC", L"Mic test: talk for 5 seconds, then hear exactly what Discord hears (with all your effects), "
-                   L"on your speakers or headphones.", 0, 268, 556, 278, 32, IDC_HDR);
+    Ctl(L"STATIC", MICTEST_INFO, 0, 268, 556, 278, 32, IDC_MICTESTINFO);
+    Ctl(L"BUTTON", L"Set up my mic", WS_TABSTOP | WS_GROUP, 318, 116, 112, 28, IDC_MICSETUP);
+    Ctl(L"BUTTON", L"Mic type  \x25BE", WS_TABSTOP, 434, 116, 112, 28, IDC_MICTYPE);
 
     // ---------------- Voice FX page ----------------
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
@@ -18049,17 +18407,17 @@ static void CreateUI()
             Ctl(L"BUTTON", t, WS_TABSTOP, 30, 124, 58, 24, FxKeyButtonId(sl));
         }
         for (int c = 0; c < CH_MAX; c++) Ctl(L"BUTTON", gCh[c].holdTalk ? L"Talk" : L"Mute", BS_OWNERDRAW | WS_TABSTOP, 470, 124, 58, 24, IDC_MIXHOLDMODE0 + c);
-        Ctl(L"STATIC", L"Volume keys step:", SS_RIGHT, 30, 540, 120, 20, IDC_MIXKEYHDR);
+        Ctl(L"STATIC", L"Volume keys step:", SS_NOPREFIX, 30, 540, 120, 20, IDC_MIXKEYHDR);
         Spin(IDC_MIXSTEP, 196, 537, 56, 1, 10, gMixStep);
         Ctl(L"STATIC", L"dB", 0, 258, 540, 30, 20, IDC_MIXSTEPDB);
-        Ctl(L"STATIC", L"Fades take:", SS_RIGHT, 300, 540, 80, 20, IDC_MIXFADELBL);
+        Ctl(L"STATIC", L"Fades take:", SS_NOPREFIX, 300, 540, 80, 20, IDC_MIXFADELBL);
         Spin(IDC_MIXFADE, 384, 537, 56, 1, 30, gMixFadeSecs);
         Ctl(L"STATIC", L"s", 0, 444, 540, 20, 20, IDC_MIXFADES);
         Ctl(L"STATIC", L"Talkback", 0, 30, 500, 90, 18, IDC_MIXKTB);
-        Ctl(L"STATIC", L"Hold it: only", SS_RIGHT, 200, 500, 90, 18, IDC_TBHDR);
-        HWND tb = Ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 300, 497, 140, 200, IDC_TBOUT);
+        // (No label in front of the list any more: one there kept losing its start. All the words come after it.)
+        HWND tb = Ctl(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 200, 497, 140, 200, IDC_TBOUT);
         SendMessageW(tb, CB_SETDROPPEDWIDTH, 240, 0);
-        Ctl(L"STATIC", L"hears your mic", 0, 446, 500, 100, 18, IDC_TBHDR2);
+        Ctl(L"STATIC", L"is the only output that hears your mic while you hold the key", SS_NOPREFIX | SS_ENDELLIPSIS, 346, 500, 200, 18, IDC_TBHDR2);
         TalkbackFill();
     }
     gBuildSub = -1;
@@ -18425,7 +18783,23 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) { if (gPrevRunning && gPrevData == gTestBuf) PrevStop(); else if (!gTestRec) MicTestStart(); }
         return;
     }
-    if (id == IDC_MICPLAY)     { if (code == BN_CLICKED && gTestLen) PrevPlay(gTestBuf, 0, gTestLen, 1.0f); return; }
+    if (id == IDC_MICPLAY)     { if (code == BN_CLICKED && gTestTotal) PrevPlay(gTestBuf, 0, gTestTotal, 1.0f); return; }
+    if (id == IDC_MICSETUP)    { if (code == BN_CLICKED) MicSetupStart(); return; }
+    if (id == IDC_MICTYPE)     { if (code == BN_CLICKED) MicTypeMenu(); return; }
+    if (id == IDC_GATELOOK)    { gGateLook = Checked(id); return; }
+    if (id == IDC_GATETHUMP)   { gGateThump = Checked(id); return; }
+    if (id == IDC_MICSIDE)     {
+        if (code == CBN_SELCHANGE) { gMicSide = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 2); RestartIfRunning(); }
+        return;
+    }
+    if (id >= IDC_LVTHR && id <= IDC_LVMAKE) {  // the leveler's number boxes
+        if (!gUiReady) return;
+        const LvBox& b = LV_BOXES[id - IDC_LVTHR];
+        BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok && v >= b.lo && v <= b.hi) *b.var = b.neg ? -v : v;
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)(b.neg ? -*b.var : *b.var), FALSE);
+        return;
+    }
     if (id == IDC_PROFSAVE)    { if (code == BN_CLICKED) ProfileSaveClicked(); return; }
     if (id == IDC_PROFDEL)     { if (code == BN_CLICKED) ProfileDeleteClicked(); return; }
     if (id == IDC_PROFKEY)     { if (code == BN_CLICKED && gProfSel >= 0) BeginKeyCapture(gFxKeys[SLOT_PROF0 + gProfSel], id); return; }
