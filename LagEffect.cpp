@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.48.0"
+#define APP_VERSION L"1.49.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1301,6 +1301,102 @@ static int     gMicHintKind = 0;                // 0 nothing, 1 too loud, 2 too 
 static int     gSuState = 0;                    // "Set up my mic": 0 idle, 1 listening to the room, 2 to you, 3 done
 static DWORD   gSuT0 = 0;
 static unsigned gTestTotal = 0;                 // mic test: both halves and the pause between them
+
+// ---- Remove whine (1.49.0): narrow cuts at steady tones the mic picks up (USB / electrical whine) ----
+// "Find" records 2 s of the mic while you're quiet; the window's thread looks for tones that stand out of the
+// noise around them and hands their frequencies to the audio thread, which cuts each with a narrow notch.
+#define WHINE_MAX 6
+#define WH_REC    (RATE * 2)
+#define WH_FFT    16384
+static volatile bool gWhineOn = false;
+static volatile int  gWhineHz10[WHINE_MAX];     // tenths of a Hz; 0 = unused
+static volatile int  gWhineGen = 0;             // goes up when the list changes (the audio thread then sets its filters up)
+static float whB0[WHINE_MAX], whB1[WHINE_MAX], whA2[WHINE_MAX], whZ[WHINE_MAX][4];
+static int   whN = 0, whGenSeen = -1;
+static float gWhBuf[WH_REC];
+static volatile int  gWhPos = 0;
+static volatile bool gWhRec = false;
+static int   gWhState = 0;                      // (window) 1 = recording for "Find"
+static void WhineSetup()                        // audio thread: a notch per tone, about 1/30 of its frequency wide
+{
+    whGenSeen = gWhineGen; whN = 0;
+    for (int i = 0; i < WHINE_MAX; i++) {
+        const double hz = gWhineHz10[i] / 10.0;
+        if (hz < 100.0 || hz > RATE * 0.45) continue;
+        const double w = 2.0 * 3.141592653589793 * hz / RATE, al = sin(w) / (2.0 * 30.0), a0 = 1.0 + al;
+        whB0[whN] = (float)(1.0 / a0); whB1[whN] = (float)(-2.0 * cos(w) / a0); whA2[whN] = (float)((1.0 - al) / a0);
+        whN++;
+    }
+    memset(whZ, 0, sizeof(whZ));
+}
+static void WhFft(float* re, float* im, int n)  // in place, n a power of two
+{
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) { float t = re[i]; re[i] = re[j]; re[j] = t; t = im[i]; im[i] = im[j]; im[j] = t; }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        const double ang = -2.0 * 3.141592653589793 / len, wr = cos(ang), wi = sin(ang);
+        for (int i = 0; i < n; i += len) {
+            double cr = 1.0, ci = 0.0;
+            for (int k = 0; k < len / 2; k++) {
+                const int a = i + k, b = a + len / 2;
+                const float xr = (float)(re[b] * cr - im[b] * ci), xi = (float)(re[b] * ci + im[b] * cr);
+                re[b] = re[a] - xr; im[b] = im[a] - xi; re[a] += xr; im[a] += xi;
+                const double nr = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = nr;
+            }
+        }
+    }
+}
+// Steady tones in x (n samples of a quiet mic): up to maxOut, strongest first. A tone = a peak at least 12 dB over the
+// middle level of the 240 Hz around it, between 200 Hz and 20 kHz. *floorDb: the recording's overall level.
+static int WhineFind(const float* x, int n, int* hz10, int* overDb, int maxOut, float* floorDb)
+{
+    static float re[WH_FFT], im[WH_FFT], db[WH_FFT / 2 + 1];
+    static double pw[WH_FFT / 2 + 1];
+    const int half = WH_FFT / 2;
+    for (int i = 0; i <= half; i++) pw[i] = 0;
+    int frames = 0; double tot = 0;
+    for (int at = 0; at + WH_FFT <= n; at += WH_FFT / 2, frames++) {
+        for (int i = 0; i < WH_FFT; i++) {
+            re[i] = x[at + i] * (0.5f - 0.5f * cosf(2.0f * 3.14159265f * i / WH_FFT)); im[i] = 0;
+            tot += (double)x[at + i] * x[at + i];
+        }
+        WhFft(re, im, WH_FFT);
+        for (int i = 0; i <= half; i++) pw[i] += (double)re[i] * re[i] + (double)im[i] * im[i];
+    }
+    if (!frames) return 0;
+    if (floorDb) *floorDb = (float)(10.0 * log10(tot / ((double)frames * WH_FFT) + 1e-20));
+    for (int i = 0; i <= half; i++) db[i] = (float)(10.0 * log10(pw[i] / frames * (16.0 / ((double)WH_FFT * WH_FFT)) + 1e-20));
+    const int lo = (int)(200.0 * WH_FFT / RATE), hi = Imin(half - 42, (int)(20000.0 * WH_FFT / RATE)), W = 40;
+    static float over[WH_FFT / 2 + 1];
+    for (int i = lo; i <= hi; i++) {
+        over[i] = 0;
+        if (!(db[i] > db[i - 1] && db[i] >= db[i + 1])) continue;       // not a peak
+        float srt[2 * 40 + 1]; int m = 0;
+        for (int k = i - W; k <= i + W; k++) {                          // the middle value around it
+            const float v = db[k]; int j = m++ - 1;
+            while (j >= 0 && srt[j] > v) { srt[j + 1] = srt[j]; j--; }
+            srt[j + 1] = v;
+        }
+        over[i] = db[i] - srt[W];
+    }
+    int found = 0;
+    while (found < maxOut) {
+        int best = -1;
+        for (int i = lo; i <= hi; i++) if (over[i] >= 12.0f && (best < 0 || over[i] > over[best])) best = i;
+        if (best < 0) break;
+        const float a = db[best - 1], b = db[best], c = db[best + 1];
+        const float den = a - 2 * b + c, d = den < -1e-6f ? 0.5f * (a - c) / den : 0.0f;   // (between two points of the spectrum)
+        hz10[found] = (int)(((double)best + d) * RATE / WH_FFT * 10.0 + 0.5);
+        overDb[found] = (int)(over[best] + 0.5f);
+        found++;
+        for (int k = Imax(lo, best - 12); k <= Imin(hi, best + 12); k++) over[k] = 0;   // (its skirts aren't another tone)
+    }
+    return found;
+}
 static void MicExtrasToUi();
 static void MicHintTick();
 static void MicSetupTick();
@@ -3456,6 +3552,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     const bool  gateLook = gGateLook, gateThump = gGateThump;
     const int   suPhase  = gSuPhase;
     float inPk = 0;
+    if (gWhineGen != whGenSeen) WhineSetup();
+    const int      whCnt   = gWhineOn ? whN : 0;
+    const bool     whRec0  = gWhRec;            // "Find the whine" is recording
+    const int      whP0    = gWhPos;
     const bool     testRec0 = gTestRec;         // (the mic's stages can run a whole block ahead of the rest: its own counter)
     const unsigned testP0   = gTestPos;
     float blockPeak = 0;
@@ -3473,6 +3573,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s = raw * boost;
         }
         { const float a = fabsf(s); if (a > inPk) inPk = a; }
+        if (whRec0 && whP0 + (int)f < WH_REC) gWhBuf[whP0 + f] = s;
         if (testRec0 && testP0 + f < TEST_LEN) gTestBuf[testP0 + f] = (short)((s > 1 ? 1 : s < -1 ? -1 : s) * 32767.0f);   // mic test: before any cleanup
         muteGain += ((gMicMuted ? 0.0f : 1.0f) - muteGain) * 0.004f;   // ~5 ms fade
         s *= muteGain;
@@ -3482,6 +3583,12 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             s *= pttGain;
         }
         if (lowCut) s = LowCut(s);
+        for (int i = 0; i < whCnt; i++) {       // Remove whine: a narrow cut at each tone found
+            float* z = whZ[i];
+            const float y = whB0[i] * s + whB1[i] * z[0] + whB0[i] * z[1] - whB1[i] * z[2] - whA2[i] * z[3];
+            z[1] = z[0]; z[0] = s; z[3] = z[2]; z[2] = y;
+            s = y;
+        }
 
         if (nsStage) {
             float dry, den = NoiseStage(s, &dry);
@@ -3810,6 +3917,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     for (int k = 0; k < MAX_OUT; k++) if (gTestTone[k] > 0) gTestTone[k] = testLeft[k] > 0 ? testLeft[k] : 0;
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
     if (inPk > gMicInPk) gMicInPk = inPk;
+    if (whRec0) { const int np = whP0 + (int)frames; gWhPos = np; if (np >= WH_REC) gWhRec = false; }
     { const float r = boost > 0.0001f ? inPk / boost : 0.0f; if (r > gMicRawPk) gMicRawPk = r; if (suPhase && r > gSuRawPk) gSuRawPk = r; }
     if (lvGrMax > gLvGrDb) gLvGrDb = lvGrMax;
     for (int k = 0; k < MAX_OUT && k < 8; k++) if (outPk[k] > gOutPeak[k]) gOutPeak[k] = outPk[k];
@@ -3935,6 +4043,7 @@ enum {
     IDC_OFX0 = 4460,                            // .. +5: each output's plugins button
     IDC_VSTKEY0 = 4470,                         // .. +4: a mic plugin slot's on / off hotkey
     IDC_MICSETUP = 4500, IDC_MICTYPE = 4501, IDC_GATELOOK = 4502, IDC_GATETHUMP = 4503, IDC_MICSIDE = 4504,   // Mic tab, 1.48.0
+    IDC_WHINE = 4511,                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
     IDC_VSTRKEY0 = 4480,                        // .. +2: the same, in a channel's / output's plugins window
@@ -5225,6 +5334,9 @@ static void LoadSettings()
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
     gMicSide   = Iclamp(INI_INT(L"mic_side", 0), 0, 2);
+    gWhineOn   = INI_INT(L"whine_on", 0) != 0;
+    for (int i = 0; i < WHINE_MAX; i++) { wchar_t k[24]; wsprintfW(k, L"whine_hz%d", i + 1); gWhineHz10[i] = Iclamp(INI_INT(k, 0), 0, 216000); }
+    gWhineGen = gWhineGen + 1;
     gGateLook  = INI_INT(L"gate_look_ahead", 0) != 0;
     gGateThump = INI_INT(L"gate_ignore_thumps", 0) != 0;
     gLvThrDb   = Iclamp(INI_INT(L"leveler_threshold_db", -30), -50, -10);
@@ -5971,6 +6083,8 @@ static void SaveSettings()
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
+    SaveInt(L"whine_on", gWhineOn);
+    for (int i = 0; i < WHINE_MAX; i++) { wchar_t k[24]; wsprintfW(k, L"whine_hz%d", i + 1); SaveInt(k, gWhineHz10[i]); }
     SaveInt(L"mic_side", gMicSide); SaveInt(L"gate_look_ahead", gGateLook); SaveInt(L"gate_ignore_thumps", gGateThump);
     SaveInt(L"leveler_threshold_db", gLvThrDb); SaveInt(L"leveler_ratio", gLvRatio); SaveInt(L"leveler_attack_ms", gLvAtkMs);
     SaveInt(L"leveler_release_ms", gLvRelMs); SaveInt(L"leveler_makeup_db", gLvMakeDb);
@@ -12963,6 +13077,8 @@ static void AddTips()
     TipId(IDC_MICPLAY,   L"Play the last mic test again.");
     TipId(IDC_MICSETUP,  L"Listens to your room for 3 seconds and to your voice for 4, then suggests Mic boost, the noise gate and the leveler. "
                          L"Nothing changes until you say yes. Press again to cancel.");
+    TipId(IDC_WHINE,     L"For a steady high-pitched tone from the mic (USB or electrical whine). Listens for 2 seconds while you're quiet, "
+                         L"finds the tone's exact pitch and cuts only that, so your voice isn't changed. Works with or without noise suppression.");
     TipId(IDC_MICTYPE,   L"A starting point for the Cleanup and Tone pages for your kind of microphone. Mic boost isn't changed.");
     TipId(IDC_GATELOOK,  L"Delays your voice by 5 ms so the gate is already open when a soft start (h, f, s) arrives. Only while the gate is on.");
     TipId(IDC_GATETHUMP, L"The gate's volume check ignores low thumps and rumble (desk bumps, footsteps), so they don't open it. "
@@ -13926,6 +14042,7 @@ static void MicHintTick()                       // every 50 ms: the line under t
         }
         if (gSuState == 1)      { kind = 3; lstrcpynW(h, L"Setting up: stay quiet for a moment, so the room can be heard.", 160); }
         else if (gSuState == 2) { kind = 3; lstrcpynW(h, L"Setting up: now talk normally, like you would on a call.", 160); }
+        else if (gWhState == 1) { kind = 3; lstrcpynW(h, L"Finding the whine: stay quiet for 2 seconds.", 160); }
         else if (clipRaw > 0)   { kind = 1; lstrcpynW(h, L"Too loud: the mic is clipping. Turn its level down in Windows sound settings.", 160); }
         else if (clipIn > 0)    { kind = 1; lstrcpynW(h, L"Too loud: turn Mic boost down (Tone).", 160); }
         else if (quiet)         { kind = 2; lstrcpynW(h, gMicBoostDb < 24 ? L"Too quiet: turn Mic boost up (Tone), or use Set up my mic."
@@ -14040,8 +14157,79 @@ static void MicSetupFinish()
     SetKnobVar(&gLevelerPct, lev1);
     RedrawKnobs();
 }
+// Remove whine: its button (what it's doing now), its menu, and the search.
+static int WhineCount() { int n = 0; for (int i = 0; i < WHINE_MAX; i++) if (gWhineHz10[i] > 0) n++; return n; }
+static void WhineButton()
+{
+    wchar_t t[40]; const int n = WhineCount();
+    if (gWhState == 1) lstrcpynW(t, L"Stay quiet...", 40);
+    else if (!n) lstrcpynW(t, L"Remove whine...", 40);
+    else if (gWhineOn) wsprintfW(t, n == 1 ? L"Whine: 1 tone cut" : L"Whine: %d tones cut", n);
+    else lstrcpynW(t, L"Whine: off", 40);
+    SetTextIfChanged(gWnd, IDC_WHINE, t);
+}
+static void WhineMenu()
+{
+    if (gWhState == 1) return;
+    HWND b = GetDlgItem(gWnd, IDC_WHINE);
+    RECT r; GetWindowRect(b, &r);
+    HMENU m = CreatePopupMenu();
+    const int n = WhineCount();
+    AppendMenuW(m, MF_STRING, 1, n ? L"Find it again  (stay quiet for 2 seconds)" : L"Find the whine  (stay quiet for 2 seconds)");
+    if (n) {
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING | (gWhineOn ? MF_CHECKED : 0), 2, L"Cut the tones found");
+        for (int i = 0; i < WHINE_MAX; i++) if (gWhineHz10[i] > 0) {
+            wchar_t t[40]; wsprintfW(t, L"    %d Hz", (gWhineHz10[i] + 5) / 10);
+            AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t);
+        }
+        AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(m, MF_STRING, 3, L"Forget them");
+    }
+    const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == 1) {
+        if (!gRunning) { MessageBoxW(gWnd, L"Press Start on the Main tab first.", L"Lag Effect - Remove whine", MB_ICONINFORMATION); return; }
+        gWhPos = 0; gWhRec = true; gWhState = 1;
+    }
+    if (cmd == 2) gWhineOn = !gWhineOn;
+    if (cmd == 3) { for (int i = 0; i < WHINE_MAX; i++) gWhineHz10[i] = 0; gWhineOn = false; gWhineGen = gWhineGen + 1; }
+    WhineButton();
+}
+static void WhineTick()                         // every 50 ms
+{
+    if (gWhState != 1) return;
+    if (!gRunning) { gWhRec = false; gWhState = 0; WhineButton(); return; }
+    if (gWhRec) return;                         // still recording
+    gWhState = 0;
+    const wchar_t* const title = L"Lag Effect - Remove whine";
+    int hz[WHINE_MAX], over[WHINE_MAX]; float level = -200;
+    const int n = WhineFind(gWhBuf, WH_REC, hz, over, WHINE_MAX, &level);
+    if (level < -110.0f) {
+        WhineButton();
+        MessageBoxW(gWnd, L"No sound came from the mic at all, so there was nothing to look at.", title, MB_ICONWARNING);
+        return;
+    }
+    if (!n) {
+        WhineButton();
+        MessageBoxW(gWnd, L"No steady tone stood out. The noise is probably a hiss or a rough buzz rather than one pitch: "
+                          L"Noise suppression (above) is the tool for that.\n\nIf you talked or something made a sound, try again in silence.",
+                    title, MB_ICONINFORMATION);
+        return;
+    }
+    for (int i = 0; i < WHINE_MAX; i++) gWhineHz10[i] = i < n ? hz[i] : 0;
+    gWhineOn = true; gWhineGen = gWhineGen + 1;
+    WhineButton();
+    wchar_t msg[700], line[80];
+    lstrcpynW(msg, n == 1 ? L"Found one steady tone, and it's now being cut:\n\n" : L"Found these steady tones, and they're now being cut:\n\n", 700);
+    for (int i = 0; i < n; i++) { wsprintfW(line, L"    %d Hz  (%d dB over the noise around it)\n", (hz[i] + 5) / 10, over[i]); lstrcatW(msg, line); }
+    lstrcatW(msg, n == WHINE_MAX ? L"\nThat's as many as can be cut, so there may be more: Noise suppression helps with the rest.\n" : L"");
+    lstrcatW(msg, L"\nRun the mic test to hear the difference. If you weren't quiet, press Remove whine and find it again.");
+    MessageBoxW(gWnd, msg, title, MB_ICONINFORMATION);
+}
 static void MicSetupTick()                      // every 50 ms
 {
+    WhineTick();
     static wchar_t last[40];
     wchar_t t[40];
     const DWORD el = GetTickCount() - gSuT0;
@@ -16442,6 +16630,7 @@ static void ShowHelp()
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
         L"the meter's level when you're quiet), on Voice (AI speech detection) or both. Low cut removes rumble, "
         L"Leveler evens out your volume.\n"
+        L"Remove whine finds a steady electrical tone on your mic and cuts just that pitch.\n"
         L"Set up my mic listens to your room and your voice and suggests the levels; Mic type gives a starting point for your "
         L"kind of microphone. The mic test plays your mic before cleanup, then what others hear.\n\n"
         L"VOICE FX\n"
@@ -17743,6 +17932,8 @@ static void CreateUI()
                        L"and keeps your voice. Uses RNNoise. Adds about 20 ms of delay.", 0, 134, y + 24, 284, 74, IDC_HDR);
         Ctl(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 430, y + 16, 100, 20, IDC_NSON);
         CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
+        Ctl(L"BUTTON", L"Remove whine...", WS_TABSTOP, 428, y + 46, 108, 26, IDC_WHINE);   // (a steady electrical tone: its own narrow cuts)
+        WhineButton();
 
         y += MIC_STEP;                          // noise gate
         AddSection(14, y, 532, MIC_H, L"Noise gate");
@@ -18785,6 +18976,7 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_MICPLAY)     { if (code == BN_CLICKED && gTestTotal) PrevPlay(gTestBuf, 0, gTestTotal, 1.0f); return; }
     if (id == IDC_MICSETUP)    { if (code == BN_CLICKED) MicSetupStart(); return; }
+    if (id == IDC_WHINE)       { if (code == BN_CLICKED) WhineMenu(); return; }
     if (id == IDC_MICTYPE)     { if (code == BN_CLICKED) MicTypeMenu(); return; }
     if (id == IDC_GATELOOK)    { gGateLook = Checked(id); return; }
     if (id == IDC_GATETHUMP)   { gGateThump = Checked(id); return; }
