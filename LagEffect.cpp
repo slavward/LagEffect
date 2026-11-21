@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.55.0"
+#define APP_VERSION L"1.56.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1283,7 +1283,7 @@ static void NoPowerThrottling() {}
 static void DelayMeasure(); static void DelayTip(); static int DelayTotalMs(); static void DropTick(); static void DropExplain();
 static void ShortDevName(const wchar_t* full, wchar_t* out, int cap); static void DevTipUpdate(int id);
 static void BugInfoCopy(); static void BackupsMenu(); static void BackupOnNewVersion(); static bool BackupMake(const wchar_t* why);
-static void SafeExplain();
+static void CalloutHide(); static void SafeExplain();
 // Remote control (Streamer.bot & co.): a WebSocket server on this PC only, and only while it's switched on.
 static bool    gWsOn = false;
 static int     gWsPort = 7600;
@@ -3921,6 +3921,326 @@ struct DropWatch {                              // times one block of the main c
 struct DropWatch { DropWatch(ma_device*, ma_uint32) {} };
 #endif
 
+// ======================= 1.56.0: Looper and Beatbox to drums (Soundboard tab): the audio side =======================
+// Looper: layers of what Discord hears from you (voice + sounds, or your voice only), played on every output that
+// gets sounds. The first layer's length is the loop's. Each later layer ("layering") is its own: undo takes it off.
+#define LP_LAYERS 8
+#define LP_MAXSEC 20
+#define LP_MAXF   (LP_MAXSEC * RATE)
+#define LP_FADE   240                            // 5 ms ramps: a layer's start and end, stop / play, mute, undo
+enum { LP_EMPTY = 0, LP_REC = 1, LP_PLAY = 2, LP_DUB = 3, LP_STOP = 4 };
+enum { LPC_REC = 1, LPC_PLAY = 2, LPC_UNDO = 4, LPC_CLEAR = 8 };
+static std::atomic<float*>   gLpMem{ nullptr };  // LP_LAYERS x LP_MAXF (the window makes it the first time you record; kept)
+static std::atomic<unsigned> gLpCmd{ 0 };        // buttons / keys waiting for the audio thread (LPC_ bits)
+static std::atomic<unsigned> gLpMute{ 0 };       // layers you muted (bit per layer)
+static std::atomic<int>      gLpVolPct{ 100 };
+static std::atomic<bool>     gLpVoiceOnly{ false };   // record your voice only (else your voice + sounds)
+static std::atomic<int>      gLpLatF{ 0 };       // a layer is written this many frames earlier: you heard the loop that late
+// What the window shows (the audio thread writes these every block)
+static std::atomic<int>  gLpState{ LP_EMPTY }, gLpLen{ 0 }, gLpPos{ 0 }, gLpLayers{ 0 };
+static std::atomic<bool> gLpFull{ false };       // a 9th layer was asked for
+struct LoopCore {
+    int   state = LP_EMPTY, len = 0, pos = 0;
+    int   n = 0;                                 // layers finished (0..n-1); the one being recorded is `cur`
+    int   cur = -1, wpos = 0;                    // recording: which layer, and where it writes
+    int   start[LP_LAYERS] = {}, cover[LP_LAYERS] = {};   // where each layer's sound starts, and how much of the loop it covers
+    bool  gone[LP_LAYERS] = {};                  // undone: fading out, then dropped
+    float lg[LP_LAYERS] = {};                    // each layer's gain now (glides)
+    float recG = 0, recT = 0;                    // recording ramp (in / out of a layer)
+    bool  ending = false;                        // a layer ramping out: finished when recG reaches 0
+    float outG = 0, outT = 0;                    // playing ramp (stop / play / clear)
+    bool  clearing = false;
+};
+static inline float* LpLayer(float* mem, int i) { return mem + (size_t)i * LP_MAXF; }
+static void LoopReset(LoopCore& L) { L = LoopCore(); }
+static void LoopFinishFirst(LoopCore& L, float* mem)   // the first layer ends: its length is the loop's
+{
+    const int len = L.pos;
+    if (len < RATE / 4) { LoopReset(L); return; }      // under a quarter of a second: nothing kept
+    float* a = LpLayer(mem, 0);
+    const int f = Imin(LP_FADE, len / 4);
+    for (int i = 0; i < f; i++) { const float g = (float)i / (float)f; a[i] *= g; a[len - 1 - i] *= g; }   // no click at the seam
+    L.len = len; L.start[0] = 0; L.cover[0] = len; L.gone[0] = false; L.lg[0] = 1;
+    L.n = 1; L.cur = -1; L.recG = L.recT = 0; L.ending = false;
+    L.pos = 0; L.state = LP_PLAY; L.outG = L.outT = 1;
+}
+static void LoopEndLayer(LoopCore& L)          // a layer being recorded is done (or ramping out): it joins the others
+{
+    if (L.cur < 0) return;
+    if (L.cover[L.cur] > 0) { L.n = L.cur + 1; L.gone[L.cur] = false; } // (nothing recorded: no layer)
+    L.cur = -1; L.recG = L.recT = 0; L.ending = false;
+}
+static void LoopCmd(LoopCore& L, float* mem, unsigned cmd, int latF)
+{
+    if (!mem) { if (cmd & LPC_CLEAR) LoopReset(L); return; }
+    if (cmd & LPC_CLEAR) {
+        if (L.state == LP_REC || L.n == 0) LoopReset(L);
+        else { L.clearing = true; L.outT = 0; if (L.cur >= 0) { L.cur = -1; L.recG = L.recT = 0; L.ending = false; } }
+        return;
+    }
+    if (L.clearing) return;
+    if (cmd & LPC_UNDO) {
+        if (L.state == LP_REC) LoopReset(L);
+        else if (L.cur >= 0) {                  // the layer you're recording: thrown away
+            const int c = L.cur;
+            L.cur = -1; L.recG = L.recT = 0; L.ending = false;
+            if (L.cover[c] > 0) { L.n = c + 1; L.gone[c] = true; }   // (already heard on a later pass: fade it out)
+            if (L.state == LP_DUB) L.state = LP_PLAY;
+        } else {
+            int top = L.n - 1; while (top >= 0 && L.gone[top]) top--;
+            if (top >= 0) {
+                if (top == 0) { L.clearing = true; L.outT = 0; }   // the first layer: the whole loop goes
+                else L.gone[top] = true;
+            }
+        }
+    }
+    if (cmd & LPC_REC) {
+        switch (L.state) {
+        case LP_EMPTY: LoopReset(L); L.state = LP_REC; L.cur = 0; L.pos = 0; L.recG = L.recT = 1; break;
+        case LP_REC:   LoopFinishFirst(L, mem); break;
+        case LP_STOP:  if (L.n > 0) { L.state = LP_PLAY; L.pos = 0; L.outT = 1; } break;   // (then it's playing: press again to add a layer)
+        case LP_PLAY: {
+            if (L.cur >= 0) LoopEndLayer(L);    // (the last layer was still ramping out: it's done now)
+            int used = L.n; while (used > 0 && L.gone[used - 1]) used--;   // (a layer still fading out after undo: its place is reused)
+            if (used >= LP_LAYERS) { gLpFull.store(true, std::memory_order_relaxed); break; }
+            L.n = used;
+            const int c = used;
+            L.cur = c; L.gone[c] = false; L.lg[c] = 1; L.cover[c] = 0;
+            int w = L.pos - (latF % L.len); if (w < 0) w += L.len;
+            L.wpos = L.start[c] = w;
+            L.recG = 0; L.recT = 1; L.ending = false;
+            L.state = LP_DUB;
+            break;
+        }
+        case LP_DUB: L.ending = true; L.recT = 0; L.state = LP_PLAY; break;
+        }
+    }
+    if (cmd & LPC_PLAY) {
+        if (L.state == LP_REC) { LoopFinishFirst(L, mem); if (L.state == LP_PLAY) { L.state = LP_STOP; L.outT = 0; } }
+        else if (L.state == LP_PLAY || L.state == LP_DUB) {
+            if (L.state == LP_DUB) { L.ending = true; L.recT = 0; }
+            L.state = LP_STOP; L.outT = 0;
+        } else if (L.state == LP_STOP && L.n > 0) { L.state = LP_PLAY; L.pos = 0; L.outG = 0; L.outT = 1; }
+    }
+}
+// One frame: `in` is what's being recorded, returns what the loop plays. mute: layer bits; vol: loop volume.
+static inline float LoopRun(LoopCore& L, float* mem, float in, unsigned mute, float vol)
+{
+    static const float step = 1.0f / LP_FADE;
+    if (L.state == LP_EMPTY) return 0.0f;
+    if (L.state == LP_REC) {                    // the first layer: written straight; its ends are smoothed when it's closed
+        LpLayer(mem, 0)[L.pos] = in;
+        if (++L.pos >= LP_MAXF) LoopFinishFirst(L, mem);
+        return 0.0f;
+    }
+    const int len = L.len, pos = L.pos;
+    float o = 0.0f;
+    if (L.outG > 0.0f || L.outT > 0.0f) {
+        const int count = L.cur >= 0 ? L.cur + 1 : L.n;
+        for (int i = 0; i < count; i++) {
+            const float t = (L.gone[i] || (mute >> i & 1)) ? 0.0f : 1.0f;
+            float& g = L.lg[i];
+            if (g != t) { g += t > g ? step * 2 : -step * 2; if (g < 0) g = 0; if (g > 1) g = 1; }
+            if (g <= 0.0f) continue;
+            const int c = L.cover[i];
+            if (c < len) { int d = pos - L.start[i]; if (d < 0) d += len; if (d >= c) continue; }   // (not recorded there yet)
+            o += LpLayer(mem, i)[pos] * g;
+        }
+        if (L.n > 0 && L.gone[L.n - 1] && L.lg[L.n - 1] <= 0.0f && L.cur < 0) {   // an undone layer has faded out: dropped
+            L.n--; L.gone[L.n] = false;
+            while (L.n > 0 && L.gone[L.n - 1] && L.lg[L.n - 1] <= 0.0f) { L.n--; L.gone[L.n] = false; }
+        }
+    }
+    if (L.cur >= 0) {                           // layering: write (first time round) or add (after that), a little behind
+        if (L.recG != L.recT) { L.recG += L.recT > L.recG ? step : -step; if (L.recG < 0) L.recG = 0; if (L.recG > 1) L.recG = 1; }
+        float* b = LpLayer(mem, L.cur);
+        const int c = L.cur, wi = L.wpos;
+        if (L.cover[c] < len) { b[wi] = in * L.recG; L.cover[c]++; }
+        else b[wi] += in * L.recG;
+        L.wpos = wi + 1 >= len ? 0 : wi + 1;
+        if (L.ending && L.recG <= 0.0f) LoopEndLayer(L);
+    }
+    if (L.outG != L.outT) { L.outG += L.outT > L.outG ? step : -step; if (L.outG < 0) L.outG = 0; if (L.outG > 1) L.outG = 1; }
+    const float y = o * L.outG * vol;
+    if (L.clearing && L.outG <= 0.0f) { LoopReset(L); return y; }
+    if (L.state == LP_STOP && L.outG <= 0.0f && L.cur < 0) L.pos = 0;   // stopped: waits at the start
+    else L.pos = pos + 1 >= len ? 0 : pos + 1;
+    return y;
+}
+
+// Beatbox to drums: your kick ("b", "boo"), snare ("pf", "k", "psh") and hi-hat ("ts", "t") mouth sounds are
+// told apart by how their sound spreads over 4 bands in the first 8 ms, and each plays a drum.
+#define BB_VOICES 8
+#define BB_WIN    384                            // 8 ms looked at after a hit starts (that's the drums' delay)
+#define BB_TEACH  4                              // hits to learn a sound from
+enum { BB_KICK = 0, BB_SNARE = 1, BB_HAT = 2, BB_SOUNDS = 3 };
+static std::atomic<bool> gBbOn{ false };
+static std::atomic<int>  gBbMode{ 0 };           // 0 drums with your voice, 1 drums only (your voice is muted while it's on)
+static std::atomic<int>  gBbKit{ 0 };            // 0 Punchy, 1 Boom (808-style), 2 Lo-fi
+static std::atomic<int>  gBbSens{ 5 };           // 1..10
+static std::atomic<int>  gBbVolPct{ 100 };
+// Share of a hit's sound under 250 Hz, 250-1500, 1500-5000 and over 5000 Hz:
+#define BB_DEFAULTS { { 0.85f, 0.12f, 0.02f, 0.01f },   /* kick: a low thump */ \
+                      { 0.18f, 0.32f, 0.32f, 0.18f },   /* snare: a burst spread across the middle */ \
+                      { 0.01f, 0.04f, 0.18f, 0.77f } }  /* hi-hat: hiss up high */
+static const float BB_DEFAULT[BB_SOUNDS][4] = BB_DEFAULTS;
+static float gBbCent[BB_SOUNDS][4] = BB_DEFAULTS;   // what each sound looks like now (the defaults, or taught)
+static std::atomic<unsigned> gBbCentGen{ 0 };    // bumped when the window changes them
+static std::atomic<unsigned> gBbHits[BB_SOUNDS]; // hits so far (the window lights them up)
+static std::atomic<int>  gBbTeach{ -1 };         // teaching this sound: its next hits are collected here
+static float gBbTeachF[BB_TEACH][4];
+static std::atomic<int>  gBbTeachN{ 0 };
+struct BbVoice { int type = -1, t = 0; float vel = 0, a1 = 0, a2 = 0, fe = 0, ph = 0, h1 = 0, h2 = 0, l1 = 0; bool choke = false; };
+struct BbKitDef {
+    float kF0, kF1, kFT, kAT, kClick, kGain;     // kick: pitch from F0 to F1 (time FT), decay AT (s), click, level
+    float sTone, sToneT, sNoiseT, sHp, sLp, sGain;   // snare: tone (Hz, decay), noise (decay, high-pass, low-pass), level
+    float hHp, hT, hGain;                        // hi-hat: high-pass, decay, level
+    int   crush;                                 // lo-fi: hold every n-th sample and fewer bits
+};
+static const BbKitDef BB_KITS[3] = {
+    { 170, 52, 0.035f, 0.28f, 0.5f, 0.95f,   190, 0.06f, 0.13f,  900, 7000, 0.75f,   7000, 0.035f, 0.42f,  0 },   // Punchy
+    { 115, 46, 0.060f, 0.75f, 0.15f, 1.0f,   175, 0.10f, 0.18f, 1500, 9000, 0.70f,   8000, 0.060f, 0.38f,  0 },   // Boom
+    { 190, 58, 0.030f, 0.22f, 0.6f, 0.9f,    200, 0.05f, 0.10f, 1000, 5000, 0.75f,   6000, 0.030f, 0.40f,  4 },   // Lo-fi
+};
+struct BbCore {
+    float lp1 = 0, lp2 = 0, lp3 = 0;             // band splits (250 / 1500 / 5000 Hz)
+    float ef = 0, es = 0;                        // fast / slow level
+    int   refr = 0, win = 0;                     // after a hit: quiet time, and samples still being looked at
+    float acc[4] = {}, pk = 0;
+    float cent[BB_SOUNDS][4] = {}; unsigned centGen = ~0u;
+    BbVoice v[BB_VOICES];
+    float voiceG = 1;                            // your voice (drums only: muted)
+    unsigned rng = 0x9E3779B9u;
+    float hold = 0; int holdN = 0;               // lo-fi
+    bool  busy() const { for (int i = 0; i < BB_VOICES; i++) if (v[i].type >= 0) return true; return voiceG < 1.0f || win > 0; }
+};
+static inline float BbNoise(BbCore& B) { B.rng ^= B.rng << 13; B.rng ^= B.rng >> 17; B.rng ^= B.rng << 5; return (float)(int)B.rng * (1.0f / 2147483648.0f); }
+static int BbClassify(const float* f, const float cent[BB_SOUNDS][4])
+{
+    int best = 0; float bd = 1e9f;
+    for (int c = 0; c < BB_SOUNDS; c++) {
+        float d = 0; for (int i = 0; i < 4; i++) { const float e = f[i] - cent[c][i]; d += e * e; }
+        if (d < bd) { bd = d; best = c; }
+    }
+    return best;
+}
+static inline float BbSin(float x)              // sine of 0..2pi, cheap (within 0.1%: plenty for drums)
+{
+    x = x > 3.14159265f ? x - 6.2831853f : x;
+    float y = 1.27323954f * x - 0.405284735f * x * fabsf(x);
+    return 0.225f * (y * fabsf(y) - y) + y;
+}
+static void BbStart(BbCore& B, int type, float vel)
+{
+    for (int i = 0; i < BB_VOICES; i++) if (B.v[i].type == type) B.v[i].choke = true;   // a new kick stops the last one (like a drum machine)
+    int k = 0;
+    for (int i = 0; i < BB_VOICES; i++) { if (B.v[i].type < 0) { k = i; break; } if (B.v[i].t > B.v[k].t) k = i; }   // free, or the oldest
+    BbVoice& v = B.v[k]; v = BbVoice(); v.type = type; v.vel = vel; v.a1 = v.a2 = 1; v.fe = 1;
+}
+// One frame: x = your mic (after cleanup, before effects). Returns the drums; sets B.voiceG.
+static inline float BbRun(BbCore& B, float x, bool on, int mode, int kit, int sens, float vol)
+{
+    static const float a250 = 1.0f - expf(-6.2831853f * 250.0f / RATE), a1500 = 1.0f - expf(-6.2831853f * 1500.0f / RATE),
+                       a5000 = 1.0f - expf(-6.2831853f * 5000.0f / RATE);
+    static const float fAtk = 1.0f - expf(-1.0f / (0.0005f * RATE)), fRel = 1.0f - expf(-1.0f / (0.010f * RATE));
+    static const float sAtk = 1.0f - expf(-1.0f / (0.050f * RATE)), sRel = 1.0f - expf(-1.0f / (0.150f * RATE));
+    B.voiceG += ((on && mode == 1 ? 0.0f : 1.0f) - B.voiceG) * 0.004f;
+    if (B.voiceG > 0.9999f) B.voiceG = 1.0f; else if (B.voiceG < 0.0001f) B.voiceG = 0.0f;
+    if (on) {
+        B.lp1 += (x - B.lp1) * a250; B.lp2 += (x - B.lp2) * a1500; B.lp3 += (x - B.lp3) * a5000;
+        const float ax = fabsf(x);
+        B.ef += (ax - B.ef) * (ax > B.ef ? fAtk : fRel);
+        B.es += (ax - B.es) * (ax > B.es ? sAtk : sRel);
+        if (B.refr > 0) B.refr--;
+        if (B.win > 0) {                        // looking at a hit
+            const float b0 = B.lp1, b1 = B.lp2 - B.lp1, b2 = B.lp3 - B.lp2, b3 = x - B.lp3;
+            B.acc[0] += b0 * b0; B.acc[1] += b1 * b1; B.acc[2] += b2 * b2; B.acc[3] += b3 * b3;
+            if (ax > B.pk) B.pk = ax;
+            if (--B.win == 0) {
+                const float tot = B.acc[0] + B.acc[1] + B.acc[2] + B.acc[3];
+                if (tot > 1e-9f) {
+                    float f[4]; for (int i = 0; i < 4; i++) f[i] = B.acc[i] / tot;
+                    const unsigned gen = gBbCentGen.load(std::memory_order_acquire);
+                    if (gen != B.centGen) { B.centGen = gen; for (int c = 0; c < BB_SOUNDS; c++) for (int i = 0; i < 4; i++) B.cent[c][i] = gBbCent[c][i]; }
+                    int type = BbClassify(f, B.cent);
+                    const int teach = gBbTeach.load(std::memory_order_relaxed);
+                    if (teach >= 0 && teach < BB_SOUNDS) {   // being taught: collect it, and play the sound being taught
+                        const int n = gBbTeachN.load(std::memory_order_relaxed);
+                        if (n < BB_TEACH) { for (int i = 0; i < 4; i++) gBbTeachF[n][i] = f[i]; gBbTeachN.store(n + 1, std::memory_order_release); }
+                        type = teach;
+                    }
+                    const float db = 20.0f * log10f(B.pk + 1e-9f);
+                    float vel = (db + 40.0f) / 34.0f; vel = vel < 0.35f ? 0.35f : vel > 1.0f ? 1.0f : vel;
+                    BbStart(B, type, vel);
+                    gBbHits[type].fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        } else if (B.refr == 0) {               // a new hit: much louder than just before, and loud enough
+            const int s = sens < 1 ? 1 : sens > 10 ? 10 : sens;
+            const float ratio = 4.0f - (s - 1) * (2.4f / 9.0f);        // 4 .. 1.6
+            const float floor = powf(10.0f, (-30.0f - (s - 1) * (20.0f / 9.0f)) / 20.0f);   // -30 .. -50 dBFS
+            if (B.ef > floor && B.ef > B.es * ratio) {
+                B.win = BB_WIN; B.refr = (int)(0.060f * RATE); B.pk = 0;
+                B.acc[0] = B.acc[1] = B.acc[2] = B.acc[3] = 0;
+            }
+        }
+    } else { B.win = 0; B.ef = B.es = 0; }
+    float out = 0.0f;
+    const int ki = kit < 0 ? 0 : kit > 2 ? 2 : kit;
+    const BbKitDef& K = BB_KITS[ki];
+    struct Co { float kFd, kAd, sHpA, sLpA, sTd, sNd, hHpA, hd, kPh, sPh, click; };
+    static Co co[3]; static bool coInit = false;   // (worked out once, not per sample)
+    if (!coInit) {
+        for (int k = 0; k < 3; k++) {
+            const BbKitDef& d = BB_KITS[k]; Co& c = co[k];
+            c.kFd = expf(-1.0f / (d.kFT * RATE)); c.kAd = expf(-1.0f / (d.kAT * RATE));
+            c.sHpA = 1.0f - expf(-6.2831853f * d.sHp / RATE); c.sLpA = 1.0f - expf(-6.2831853f * d.sLp / RATE);
+            c.sTd = expf(-1.0f / (d.sToneT * RATE)); c.sNd = expf(-1.0f / (d.sNoiseT * RATE));
+            c.hHpA = 1.0f - expf(-6.2831853f * d.hHp / RATE); c.hd = expf(-1.0f / (d.hT * RATE));
+            c.kPh = 6.2831853f / RATE; c.sPh = 6.2831853f * d.sTone / RATE; c.click = 0.002f * RATE;
+        }
+        coInit = true;
+    }
+    const Co& C = co[ki];
+    for (int i = 0; i < BB_VOICES; i++) {
+        BbVoice& v = B.v[i];
+        if (v.type < 0) continue;
+        float y; bool done;
+        if (v.type == BB_KICK) {
+            v.ph += C.kPh * (K.kF1 + (K.kF0 - K.kF1) * v.fe); if (v.ph > 6.2831853f) v.ph -= 6.2831853f;
+            v.fe *= C.kFd;
+            y = BbSin(v.ph) * v.a1;
+            if (v.t < C.click) y += BbNoise(B) * K.kClick * (1.0f - (float)v.t / C.click);
+            v.a1 *= C.kAd;
+            y *= K.kGain; done = v.a1 < 1e-3f;
+        } else if (v.type == BB_SNARE) {
+            v.ph += C.sPh; if (v.ph > 6.2831853f) v.ph -= 6.2831853f;
+            const float n = BbNoise(B);
+            v.h1 += (n - v.h1) * C.sHpA; const float hp = n - v.h1;
+            v.l1 += (hp - v.l1) * C.sLpA;
+            y = (BbSin(v.ph) * v.a1 * 0.45f + v.l1 * v.a2 * 1.6f) * K.sGain;
+            v.a1 *= C.sTd; v.a2 *= C.sNd;
+            done = v.a1 < 1e-3f && v.a2 < 1e-3f;
+        } else {
+            const float n = BbNoise(B);
+            v.h1 += (n - v.h1) * C.hHpA; const float s1 = n - v.h1;
+            v.h2 += (s1 - v.h2) * C.hHpA; const float s2 = s1 - v.h2;
+            y = s2 * v.a1 * K.hGain * 1.8f;
+            v.a1 *= C.hd;
+            done = v.a1 < 1e-3f;
+        }
+        if (v.choke) { v.a1 *= 0.995f; v.a2 *= 0.995f; }   // (stopped by the next one of its kind: gone in ~3 ms, no click)
+        out += y * v.vel;
+        v.t++;
+        if (done) v.type = -1;
+    }
+    if (K.crush > 1) {                          // lo-fi: a lower sample rate and fewer bits
+        if (B.holdN <= 0) { B.hold = floorf(out * 32.0f + 0.5f) / 32.0f; B.holdN = K.crush; }
+        B.holdN--; out = B.hold;
+    }
+    return out * vol;
+}
+
 static void AudioCallback(ma_device* dev, void* output, const void* input, ma_uint32 frames)
 {
     DropWatch dropWatch(dev, frames);
@@ -4416,6 +4736,18 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         for (int k = 0; k < MAX_OUT; k++) outVst[k] = (k == 0 || on[k]) && VstRangeOn(VST_OUT0 + k * VST_PER, VST_PER);
     }
     const unsigned rcdW0 = rcdOut > 0 ? w[rcdOut] : 0;   // Recorder, an output: where this block starts in its ring
+    // Looper and Beatbox to drums (Soundboard tab, 1.56.0): only while in use (otherwise nothing below changes)
+    static LoopCore lp; static BbCore bb;
+    float* const lpMem = gLpMem.load(std::memory_order_acquire);
+    if (const unsigned lc = gLpCmd.exchange(0)) LoopCmd(lp, lpMem, lc, gLpLatF.load(std::memory_order_relaxed));
+    const bool lpRun = gFeatSound && lpMem && lp.state != LP_EMPTY;
+    const unsigned lpMute = gLpMute.load(std::memory_order_relaxed);
+    const float lpVol = gLpVolPct.load(std::memory_order_relaxed) / 100.0f;
+    const bool lpVoice = gLpVoiceOnly.load(std::memory_order_relaxed);
+    const bool bbOn = gFeatSound && gBbOn.load(std::memory_order_relaxed);
+    const bool bbRun = bbOn || bb.busy();
+    const int bbMode = gBbMode.load(std::memory_order_relaxed), bbKit = gBbKit.load(std::memory_order_relaxed), bbSens = gBbSens.load(std::memory_order_relaxed);
+    const float bbVol = gBbVolPct.load(std::memory_order_relaxed) / 100.0f;
     // The first half of a sample: the soundboard, your mic, and the voice effects on it.
     auto front = [&](ma_uint32 f, float& sb, float& sbFx, float& clean) -> float {
         sbFx = 0; int padsOn = 0;
@@ -4473,6 +4805,10 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             duckGain = gVstPadDuck[f]; chDuck = gVstDuck[f]; chDuckAll = gVstDuckAll[f];   // (these still glide per sample)
         }
         else s = front(f, sb, sbFx, clean);
+        if (bbRun) {                            // beatbox: your mouth sounds play drums (and "drums only" mutes your voice)
+            sb += BbRun(bb, clean, bbOn, bbMode, bbKit, bbSens, bbVol);
+            if (bb.voiceG < 1.0f) { s *= bb.voiceG; clean *= bb.voiceG; }
+        }
 
         float effect = 0.0f, everything;
         if (looping) {
@@ -4511,6 +4847,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         }
 
         if (duckGain < 0.999f) { everything *= duckGain; effect *= duckGain; clean *= duckGain; }
+        if (lpRun) sb += LoopRun(lp, lpMem, lpVoice ? everything : everything + sb, lpMute, lpVol);   // looper: records, then plays with the sounds
         if (f < rcdN) {                         // Recorder: your voice (as others hear it) / the sounds, as tracks
             if (rcdVoice >= 0) { rcdBuf[rcdVoice][f * 2] = everything; rcdBuf[rcdVoice][f * 2 + 1] = everything; }
             if (rcdSb >= 0) { rcdBuf[rcdSb][f * 2] = sb; rcdBuf[rcdSb][f * 2 + 1] = sb; }
@@ -4635,6 +4972,11 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             { float a = Max(fabsf(kL), fabsf(kR)); if (a > outPk[k]) outPk[k] = a; }
             w[k]++;
         }
+    }
+    {                                           // the looper, for the window
+        int layers = lp.cur >= 0 ? lp.cur + 1 : lp.n; for (int i = 0; i < lp.n && i < LP_LAYERS; i++) if (lp.gone[i]) layers--;
+        gLpState.store(lp.clearing ? LP_EMPTY : lp.state, std::memory_order_relaxed); gLpLen.store(lp.state == LP_REC ? lp.pos : lp.len, std::memory_order_relaxed);
+        gLpPos.store(lp.pos, std::memory_order_relaxed); gLpLayers.store(lp.state == LP_EMPTY ? 0 : Imax(layers, lp.state == LP_REC ? 1 : 0), std::memory_order_relaxed);
     }
     for (int k = 0; k < MAX_OUT; k++) {         // outputs with plugins: the block through them, then volume, limiter and out as usual
         if (!outVst[k]) continue;
@@ -4814,6 +5156,12 @@ enum {
     IDC_RCDBTN = 4523,                          // ... and its Recorder button (1.52.0)
     IDC_BUGINFO = 4550, IDC_BACKUPS = 4551,     // Settings > General: Copy bug report info, Backups... (1.53.0)
     IDC_SYNPICK = 4552, IDC_SYNNAME, IDC_SYNEDIT, IDC_SYNNOTES, IDC_SYNOCT, IDC_SYNNOTE,   // Voice FX > Tune > Synth plugin (1.55.0)
+    IDC_SBSUB0 = 4560, IDC_SBSUB1, IDC_SBSUB2,  // Soundboard sub-tabs (1.56.0): consecutive
+    IDC_LPVIEW = 4563, IDC_LPREC, IDC_LPPLAY, IDC_LPUNDO, IDC_LPCLEAR, IDC_LPKREC, IDC_LPKPLAY, IDC_LPKUNDO, IDC_LPKCLEAR,   // Soundboard > Looper
+    IDC_LPSRC, IDC_LPVOL, IDC_LPSYNC, IDC_LPHINT,
+    IDC_LPLAYER0 = 4580,                        // .. +8: the looper's layers (click: mute)
+    IDC_BBON = 4590, IDC_BBKEY, IDC_BBMODE, IDC_BBKIT, IDC_BBSENS, IDC_BBVOL, IDC_BBVIEW,   // Soundboard > Beatbox
+    IDC_BBTEACH0, IDC_BBTEACH1, IDC_BBTEACH2, IDC_BBFORGET, IDC_BBSTAT, IDC_BBHINT,
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5075,6 +5423,13 @@ static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume
 static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : -1; }
 static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features
+static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox
+static const wchar_t* SB_SUB_NAMES[3] = { L"Pads", L"Looper", L"Beatbox" };
+static bool gLpSync = true;                     // Looper: line layers up with what you heard (moved earlier by the delay)
+static unsigned gBbTaught = 0;                  // Beatbox: sounds you taught it (bits: kick, snare, hi-hat)
+static const wchar_t* BB_KEYS[BB_SOUNDS] = { L"beatbox_sound_kick", L"beatbox_sound_snare", L"beatbox_sound_hihat" };
+static void LoopBbSave(); static void LoopTick(bool force = false); static void BbTick(); static void BbStatus();
+static void DrawLoopView(DRAWITEMSTRUCT* d); static void DrawBbView(DRAWITEMSTRUCT* d);
 static FxGroup gFxGroups[] = {
     { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
     { L"Reverb",     &gFxRevOn,     L"fx_reverb_on",   true,  L"fx_reverb_hotkey",  3, 0 },
@@ -5135,7 +5490,13 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_VST0    MIX_SLOT_END                // then one per plugin slot: switches that plugin on / off
 #define SLOT_VST_END (SLOT_VST0 + VST_SLOTS)
 #define SLOT_RECORD  SLOT_VST_END                // Recorder: start / stop (1.52.0; keys are saved by name, so slots can be added)
-#define KEY_SLOTS    (SLOT_RECORD + 1)
+#define SLOT_LPREC   (SLOT_RECORD + 1)           // Soundboard > Looper (1.56.0): record / add a layer
+#define SLOT_LPPLAY  (SLOT_RECORD + 2)           //   stop / play
+#define SLOT_LPUNDO  (SLOT_RECORD + 3)           //   undo the last layer
+#define SLOT_LPCLEAR (SLOT_RECORD + 4)           //   clear
+#define SLOT_BEATBOX (SLOT_RECORD + 5)           // Soundboard > Beatbox: drums on / off
+#define SLOT_NEW0    SLOT_LPREC                  // (slots after the plugins' and the recorder's)
+#define KEY_SLOTS    (SLOT_BEATBOX + 1)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -5830,6 +6191,11 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 static const wchar_t* FxKeyIniName(int slot)
 {
     if (slot == SLOT_RECORD) return L"recorder_hotkey";
+    if (slot == SLOT_LPREC)   return L"looper_record_hotkey";
+    if (slot == SLOT_LPPLAY)  return L"looper_play_hotkey";
+    if (slot == SLOT_LPUNDO)  return L"looper_undo_hotkey";
+    if (slot == SLOT_LPCLEAR) return L"looper_clear_hotkey";
+    if (slot == SLOT_BEATBOX) return L"beatbox_hotkey";
     if (slot >= SLOT_VST0) {                    // "plugin3_key"
         static wchar_t vn[VST_SLOTS][20];
         wchar_t* n = vn[slot - SLOT_VST0];
@@ -6145,6 +6511,7 @@ static void LoadSettings()
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
     gHarmMute = INI_INT(L"fx_harm_mute", 0) != 0;
     gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 3);
+    gSbSub     = Iclamp(INI_INT(L"sound_subtab", 0), 0, 2);
     if (gMicSub == 2 && !gFeatVst) gMicSub = 0;
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
     gChoStyle  = Iclamp(INI_INT(L"fx_chorus_style", 0), 0, CHO_N - 1);
@@ -6157,6 +6524,22 @@ static void LoadSettings()
     gClipReplace  = INI_INT(L"clip_replace_oldest", 1) != 0;
     gPadChoke     = INI_INT(L"pads_one_at_a_time", 0) != 0;
     gPadDuck      = INI_INT(L"pads_duck_voice", 0) != 0;
+    gLpVolPct     = Iclamp(INI_INT(L"looper_volume", 100), 0, 200);   // Soundboard > Looper / Beatbox (1.56.0)
+    gLpVoiceOnly  = INI_INT(L"looper_voice_only", 0) != 0;
+    gLpSync       = INI_INT(L"looper_line_up", 1) != 0;
+    gBbMode       = Iclamp(INI_INT(L"beatbox_mode", 0), 0, 1);
+    gBbKit        = Iclamp(INI_INT(L"beatbox_kit", 0), 0, 2);
+    gBbSens       = Iclamp(INI_INT(L"beatbox_sensitivity", 5), 1, 10);
+    gBbVolPct     = Iclamp(INI_INT(L"beatbox_volume", 100), 0, 200);
+    gBbTaught     = (unsigned)INI_INT(L"beatbox_taught", 0) & 7u;
+    for (int c = 0; c < BB_SOUNDS; c++) {       // sounds you taught it: "kick 0.80,0.15,0.03,0.02"
+        for (int i = 0; i < 4; i++) gBbCent[c][i] = BB_DEFAULT[c][i];
+        if (!(gBbTaught >> c & 1)) continue;
+        wchar_t v[96]; GetPrivateProfileStringW(L"settings", BB_KEYS[c], L"", v, 96, gIni);
+        float f[4]; if (swscanf(v, L"%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3]) == 4) for (int i = 0; i < 4; i++) gBbCent[c][i] = fmaxf(0.0f, fminf(1.0f, f[i]));
+        else gBbTaught &= ~(1u << c);
+    }
+    gBbCentGen.fetch_add(1, std::memory_order_release);
     gHearOut      = Iclamp(INI_INT(L"always_hear_sounds_on", 0), 0, MAX_OUT + 1);
     gClipStampNext = (unsigned)Imax(1, INI_INT(L"clip_stamp_next", 1));
     for (int i = 0; i < PAD_N; i++) {
@@ -7057,6 +7440,8 @@ static void SaveSettings()
     SaveInt(L"broadcast_voice", gBroadcast);
     SaveInt(L"fx_harm_mute", gHarmMute);
     SaveInt(L"mic_subtab", gMicSub);
+    SaveInt(L"sound_subtab", gSbSub);
+    LoopBbSave();
     SaveInt(L"fx_dist_style", gDistStyle);
     SaveInt(L"fx_chorus_style", gChoStyle);
     SaveInt(L"fx_muffle_style", gMufStyle);
@@ -8699,6 +9084,8 @@ static void PadTick()                           // every 50 ms: redraw pads that
     }
     ClipTick();
     MicTestTick();
+    LoopTick();
+    BbTick();
     OverlayUpdate();
     AutoProfileTick();
     static int lastRunning = -1;                // hint line: remind to press Start
@@ -10122,6 +10509,11 @@ static void HotkeyBeep(bool on)
 static void SlotName(int slot, wchar_t* out, int cap)
 {
     if (slot == SLOT_RECORD) { lstrcpynW(out, L"starting / stopping the recorder", cap); return; }
+    if (slot == SLOT_LPREC)   { lstrcpynW(out, L"Looper: record / add a layer", cap); return; }
+    if (slot == SLOT_LPPLAY)  { lstrcpynW(out, L"Looper: stop / play", cap); return; }
+    if (slot == SLOT_LPUNDO)  { lstrcpynW(out, L"Looper: undo the last layer", cap); return; }
+    if (slot == SLOT_LPCLEAR) { lstrcpynW(out, L"Looper: clear", cap); return; }
+    if (slot == SLOT_BEATBOX) { lstrcpynW(out, L"Beatbox drums on / off", cap); return; }
     if (slot >= SLOT_VST0) { lstrcpynW(out, L"switching a plugin on / off", cap); return; }
     if (slot == 0) lstrcpynW(out, L"Voice effects", cap);
     else if (slot < FX_KEY_SLOTS) wsprintfW(out, L"%s (Voice FX)", gFxGroups[slot - 1].title);
@@ -13400,7 +13792,7 @@ static bool CondOn(int c) { return c == 0 || (c == 2) == (gVocStyle == VOC_PLUGI
 static bool SectionShown(const Section& s)
 {
     if (gCompact || (s.page >= 0 && s.page != gPage) || !CondOn(s.cond)) return false;
-    return s.sub < 0 || s.sub == (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub);
+    return s.sub < 0 || s.sub == (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : s.page == PAGE_SOUND ? gSbSub : gFxSub);
 }
 static RECT SectionRect(const Section& s)
 {
@@ -13978,7 +14370,7 @@ static void AddTips()
     TipId(IDC_TAB0 + PAGE_MAIN,     L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
     TipId(IDC_TAB0 + PAGE_MIC,      L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
     TipId(IDC_TAB0 + PAGE_FX,       L"Pitch, reverb, the vocoder (auto-tune and harmonies) and radio/phone/megaphone effects on your live voice.");
-    TipId(IDC_TAB0 + PAGE_SOUND,    L"Soundboard: 8 pads of short sounds on hotkeys, played to Discord and your outputs.");
+    TipId(IDC_TAB0 + PAGE_SOUND,    L"Soundboard: pads of short sounds on hotkeys, a looper and beatbox drums, played to Discord and your outputs.");
     TipId(IDC_TAB0 + PAGE_CLIPS,    L"Instant replay: save the last few seconds as a clip, trim it, and play it back on a hotkey.");
     TipId(IDC_TAB0 + PAGE_SETTINGS, L"Latency, theme, updates and where settings are saved.");
     for (int k = 0; k < MAX_OUT; k++) {
@@ -14055,6 +14447,30 @@ static void AddTips()
         TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
     }
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
+    TipId(IDC_SBSUB0, L"Pads: sounds on hotkeys, and text to speech.");
+    TipId(IDC_SBSUB1, L"Looper: record a few seconds, it plays round and round; add layers on top.");
+    TipId(IDC_SBSUB2, L"Beatbox to drums: your mouth sounds play a drum kit.");
+    TipId(IDC_LPREC,   L"Empty: start recording. Recording: close the loop, it plays. Playing: add a layer on top (press again to finish it).");
+    TipId(IDC_LPPLAY,  L"Stop the loop (it waits at the start), or play it again from the start.");
+    TipId(IDC_LPUNDO,  L"Take the last layer off (or throw away the one you're recording). Undoing the first layer clears the loop.");
+    TipId(IDC_LPCLEAR, L"Throw the whole loop away.");
+    for (int i = 0; i < 4; i++) TipId(IDC_LPKREC + i, L"A hotkey for the button above (click, then press keys; right-click clears it).");
+    for (int i = 0; i < LP_LAYERS; i++) TipId(IDC_LPLAYER0 + i, L"A layer of the loop: click to mute it, click again to bring it back.");
+    TipId(IDC_LPSRC,  L"What the looper records: what Discord hears from you (your voice with its effects, pads, beatbox drums), or just your voice.");
+    TipId(IDC_LPVOL,  L"How loud the loop plays, % (100 = as recorded).");
+    TipId(IDC_LPSYNC, L"You hear the loop a little late (the sound card's delay) and sing along to that. On: each layer is moved "
+                      L"earlier by that much, so it lands where you meant it.");
+    TipId(IDC_BBON,   L"Drums on: your beatbox sounds play drums. Turn it off to talk normally again.");
+    TipId(IDC_BBKEY,  L"A hotkey that switches the drums on and off (right-click clears it).");
+    TipId(IDC_BBMODE, L"With your voice: you're heard too, the drums on top. Drums only: your voice is muted while the drums are on, so only the drums are heard.");
+    TipId(IDC_BBKIT,  L"Punchy: tight and bright. Boom: long 808-style kick. Lo-fi: crunchy and grainy.");
+    TipId(IDC_BBSENS, L"How easily a sound counts as a hit, 1-10. Higher: softer sounds play drums too. Lower: only clear, loud ones.");
+    TipId(IDC_BBVOL,  L"How loud the drums are, % (100 = normal).");
+    TipId(IDC_BBVIEW, L"Lights up for each drum your sounds play, with how many so far.");
+    TipId(IDC_BBTEACH0, L"Then make your kick sound 4 times: from then on, sounds like it play the kick.");
+    TipId(IDC_BBTEACH1, L"Then make your snare sound 4 times: from then on, sounds like it play the snare.");
+    TipId(IDC_BBTEACH2, L"Then make your hi-hat sound 4 times: from then on, sounds like it play the hi-hat.");
+    TipId(IDC_BBFORGET, L"Forget what it was taught: back to the built-in kick, snare and hi-hat sounds.");
     TipId(IDC_SETSUB0, L"Profiles, latency, updates, screen share, shortcuts and the window.");
     TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
     TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
@@ -14390,24 +14806,25 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
 static const wchar_t* MIC_SUB_NAMES[4] = { L"Cleanup", L"Tone", L"Plugins", L"Volume" };
 static const wchar_t* SET_SUB_NAMES[4] = { L"General", L"Look", L"Pictures", L"Features" };
-static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic and Settings sub-tabs
+static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic, Settings and Soundboard sub-tabs
 {
-    const bool set = (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB3;
-    const bool mic = !set && MicSubOf((int)d->CtlID) >= 0;
-    int t = mic ? MicSubOf((int)d->CtlID) : (int)d->CtlID - (set ? IDC_SETSUB0 : IDC_FXSUB0);
+    const bool sbs = (int)d->CtlID >= IDC_SBSUB0 && (int)d->CtlID <= IDC_SBSUB2;
+    const bool set = !sbs && (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB3;
+    const bool mic = !set && !sbs && MicSubOf((int)d->CtlID) >= 0;
+    int t = sbs ? (int)d->CtlID - IDC_SBSUB0 : mic ? MicSubOf((int)d->CtlID) : (int)d->CtlID - (set ? IDC_SETSUB0 : IDC_FXSUB0);
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
-    bool active = t == (set ? gSetSub : mic ? gMicSub : gFxSub);
+    bool active = t == (sbs ? gSbSub : set ? gSetSub : mic ? gMicSub : gFxSub);
     int on = 0;
-    if (!mic && !set) for (int g = 0; g < FX_GROUPS; g++) if (gFxGroups[g].sub == t && *gFxGroups[g].on && gFxOn) on++;
+    if (!mic && !set && !sbs) for (int g = 0; g < FX_GROUPS; g++) if (gFxGroups[g].sub == t && *gFxGroups[g].on && gFxOn) on++;
     HBRUSH b = CreateSolidBrush(active ? TAB_C : gDark ? DK_CTL : LT_CARD);
     HPEN   p = CreatePen(PS_SOLID, 1, active ? TAB_C : gDark ? DK_SECTION : LT_BORDER);
     HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 14, 14);
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
     wchar_t text[32];
-    const wchar_t* nm = set ? SET_SUB_NAMES[t] : mic ? MIC_SUB_NAMES[t] : FX_SUB_NAMES[t];
+    const wchar_t* nm = sbs ? SB_SUB_NAMES[t] : set ? SET_SUB_NAMES[t] : mic ? MIC_SUB_NAMES[t] : FX_SUB_NAMES[t];
     if (on) wsprintfW(text, L"%s %d", nm, on); else lstrcpynW(text, nm, 32);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, active ? RGB(255, 255, 255) : TXT_C);
@@ -14862,6 +15279,7 @@ static void MixHoldTick()                       // (every poll) each channel's h
 
 static void VstKeyEdge(int k, bool pressed, bool released);   // (plugins: defined with them)
 static void RcdToggle();
+static void LoopKey(int slot); static void BbSetOn(bool on, bool fromKey);   // (Soundboard > Looper / Beatbox)
 static void PollFxKeys()
 {
     BYTE cache[256] = {};
@@ -14870,7 +15288,8 @@ static void PollFxKeys()
                          (((slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) || slot == SLOT_PADBANK) && !gFeatSound) ||
                          ((slot == SLOT_CLIPNOW || (slot >= SLOT_CLIP0 && slot < SLOT_CLIP0 + CLIPS)) && !gFeatClips) ||
                          ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag) ||
-                         (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst);
+                         (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst) ||
+                         (slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX && !gFeatSound);
         if (off) { gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
@@ -14880,6 +15299,8 @@ static void PollFxKeys()
             continue;
         }
         if (slot == SLOT_RECORD) { if (pressed) RcdToggle(); continue; }   // the recorder
+        if (slot >= SLOT_LPREC && slot <= SLOT_LPCLEAR) { if (pressed) LoopKey(slot); continue; }   // the looper
+        if (slot == SLOT_BEATBOX) { if (pressed) BbSetOn(!gBbOn.load(), true); continue; }
         if (slot >= SLOT_VST0) { if (pressed || released) VstKeyEdge(slot - SLOT_VST0, pressed, released); continue; }   // a plugin on / off
         if (slot >= SLOT_MIX0) { MixKey(slot, down, pressed, released); continue; }   // the Mixer's
         if (slot == SLOT_DIVE) { gDiveHeld = down; continue; }   // hold to bend
@@ -15798,7 +16219,7 @@ static void Layout()
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
         bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat))
                 && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gPaged[i].page == PAGE_SETTINGS ? gSetSub
-                                                         : gPaged[i].page == PAGE_MIXER ? gMixSub : gFxSub));
+                                                         : gPaged[i].page == PAGE_MIXER ? gMixSub : gPaged[i].page == PAGE_SOUND ? gSbSub : gFxSub));
         vis = vis && CondOn(gPaged[i].cond);
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
@@ -15909,6 +16330,7 @@ static void SetPage(int page)
     if (page < 0 || page >= TAB_COUNT || page == gPage || !PageOn(page)) return;
     HWND focus = GetFocus();
     gPage = page;
+    CalloutHide();
     Layout();
     if (!focus || !IsWindowVisible(focus)) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + page));
 }
@@ -18046,6 +18468,13 @@ static void ShowHelp()
         L"SOUNDBOARD OPTIONS\n"
         L"Each pad's ... button: play mode (one-shot, loop, hold-to-play, toggle), speed, pitch, fade in/out, name, colour, "
         L"and Record from my mic. Below the pads: one sound at a time, lower my voice while a pad plays, load a folder.\n\n"
+        L"LOOPER (Soundboard tab)\n"
+        L"Press Record, sing or play something, press it again: it plays round and round on every output that gets sounds. "
+        L"Press Record while it plays to add a layer, again to finish it. Undo takes the last layer off; click a layer's number to mute it. "
+        L"Up to 8 layers and 20 seconds. Each button can have a hotkey.\n\n"
+        L"BEATBOX TO DRUMS (Soundboard tab)\n"
+        L"Tick Drums on and beatbox: kick (\"b\"), snare (\"pf\", \"k\") and hi-hat (\"ts\") sounds play a drum kit, about 8 ms after you. "
+        L"Drums only mutes your voice while it's on. If a sound plays the wrong drum, Teach it your sounds.\n\n"
         L"CLIPS (INSTANT REPLAY)\n"
         L"Lag Effect keeps the last few seconds of your voice, PC sound or just Discord (pick in Record) in memory. Press Clip it (or its hotkey) "
         L"to save them as a clip. Trim lets you listen back privately, cut the start and end, and undo. "
@@ -18070,17 +18499,19 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 {
     wchar_t k[100];
     ComboName(gFxKeys[slot], MAX_KEYS, k, 100);
-    if (!k[0]) lstrcpynW(k, slot >= SLOT_VST0 ? L"Set key" : slot >= SLOT_MIX0 ? L"Set" : L"Set hotkey", 100);   // (the recorder's too)
+    if (!k[0]) lstrcpynW(k, slot >= SLOT_NEW0 ? L"Set hotkey" : slot >= SLOT_VST0 ? L"Set key" : slot >= SLOT_MIX0 ? L"Set" : L"Set hotkey", 100);   // (the recorder's too)
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
                        : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
                        : slot >= SLOT_PROF0 && slot < SLOT_MIX0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
-                       : slot == SLOT_DIVE ? L"Pitch dive (hold): " : slot == SLOT_PTT ? L"Key: " : L"";
+                       : slot == SLOT_DIVE ? L"Pitch dive (hold): " : slot == SLOT_PTT || slot >= SLOT_NEW0 ? L"Key: " : L"";
     wsprintfW(buf, L"%s%s", pre, k);
 }
 
 static int FxKeyButtonId(int slot)
 {
     if (slot == SLOT_RECORD) return 4545;       // (IDC_RCD_KEY, in the Recorder window)
+    if (slot >= SLOT_LPREC && slot <= SLOT_LPCLEAR) return IDC_LPKREC + (slot - SLOT_LPREC);
+    if (slot == SLOT_BEATBOX) return IDC_BBKEY;
     if (slot >= SLOT_VST0) {                    // a plugin slot: on the Mic tab, or in the open channel / output plugins window
         const int k = slot - SLOT_VST0;
         if (k < VST_MIC) return IDC_VSTKEY0 + k;
@@ -19131,6 +19562,7 @@ static const wchar_t* SubName(int page, int sub)
     if (page == PAGE_MIC && sub < 4) return MIC_SUB_NAMES[sub];
     if (page == PAGE_FX && sub < FX_SUBS) return FX_SUB_NAMES[sub];
     if (page == PAGE_SETTINGS && sub < 4) return SET_SUB_NAMES[sub];
+    if (page == PAGE_SOUND && sub < 3) return SB_SUB_NAMES[sub];
     if (page == PAGE_MIXER && sub == 1) return L"Hotkeys";
     return nullptr;
 }
@@ -19146,50 +19578,176 @@ static void LocText(int page, int sub, int sec, wchar_t* out, int cap)   // "Mic
     }
 }
 
-// ---- a short blinking frame around what you went to ----
-static HWND gFlashWnd = nullptr; static int gFlashN = 0;
-static LRESULT CALLBACK FlashProc(HWND h, UINT m, WPARAM w, LPARAM l)
+// ---- 1.56.0: a pop-up beside what you went to (it replaced a blinking frame): what it is, or what to do there ----
+enum { CO_NONE = 0, CO_BUFFER = 1 };            // the main button's action: none / set the buffer to list item `arg`
+static HWND gCoWnd = nullptr, gCoTarget = nullptr;
+static wchar_t gCoTitle[96], gCoBody[700], gCoBtnText[32];
+static int gCoAct = CO_NONE, gCoArg = 0, gCoLeft = 0, gCoSide = 0;   // gCoLeft: 250 ms ticks until it closes; side: 0 target left, 1 right, 2 above
+static RECT gCoBtn[3];                          // the main button, "Not now", the × (client coordinates; empty = none)
+static bool CalloutUp() { return gCoWnd && IsWindowVisible(gCoWnd); }
+static void CalloutHide()
+{
+    if (CalloutUp()) { KillTimer(gCoWnd, 1); ShowWindow(gCoWnd, SW_HIDE); }
+    gCoTarget = nullptr;
+}
+static void CalloutDo()                         // the main button
+{
+    const int act = gCoAct, arg = gCoArg;
+    CalloutHide();
+    if (act == CO_BUFFER) {
+        HWND b = GetDlgItem(gWnd, IDC_BUFFER);
+        if (!b || arg < 0 || arg >= (int)(sizeof(BUFFERS) / sizeof(BUFFERS[0]))) return;
+        SendMessageW(b, CB_SETCURSEL, arg, 0);
+        SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(IDC_BUFFER, CBN_SELCHANGE), (LPARAM)b);
+        wchar_t t[64]; wsprintfW(t, L"Buffer: %d", BUFFERS[arg]); ShowOsd(t, true);
+    }
+}
+// Sizes everything for the current text; returns the window size.
+static SIZE CalloutLayout(HDC dc)
+{
+    const int W = SC(280), pad = SC(12), x0 = gCoSide == 0 ? SC(4) : 0;   // (room for the strip on the side facing the setting)
+    const int y0 = gCoSide == 2 ? SC(4) : 0, inner = W - 2 * pad - x0;
+    HGDIOBJ of = SelectObject(dc, gFontBold);
+    RECT tr = { 0, 0, inner - SC(18), 0 };      // (the × sits right of the title)
+    DrawTextW(dc, gCoTitle, -1, &tr, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, gFont);
+    RECT br = { 0, 0, inner, 0 };
+    if (gCoBody[0]) DrawTextW(dc, gCoBody, -1, &br, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    int y = y0 + pad + (tr.bottom - tr.top);
+    if (gCoBody[0]) y += SC(6) + (br.bottom - br.top);
+    SetRectEmpty(&gCoBtn[0]); SetRectEmpty(&gCoBtn[1]);
+    gCoBtn[2] = { W - (gCoSide == 1 ? SC(4) : 0) - pad - SC(16), y0 + pad - SC(2), W - (gCoSide == 1 ? SC(4) : 0) - pad + SC(2), y0 + pad + SC(16) };
+    if (gCoAct != CO_NONE) {
+        y += SC(10);
+        SIZE a, b; GetTextExtentPoint32W(dc, gCoBtnText, lstrlenW(gCoBtnText), &a); GetTextExtentPoint32W(dc, L"Not now", 7, &b);
+        const int bh = SC(26), aw = a.cx + SC(24), bw = b.cx + SC(24);
+        gCoBtn[0] = { x0 + pad, y, x0 + pad + aw, y + bh };
+        gCoBtn[1] = { gCoBtn[0].right + SC(8), y, gCoBtn[0].right + SC(8) + bw, y + bh };
+        y += bh;
+    }
+    SelectObject(dc, of);
+    SIZE sz = { W, y + pad + (gCoSide == 2 ? 0 : 0) };
+    return sz;
+}
+static LRESULT CALLBACK CalloutProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
-    case WM_NCHITTEST: return HTTRANSPARENT;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); HBRUSH b = CreateSolidBrush(ACCENT); FillRect((HDC)w, &rc, b); DeleteObject(b); return 1; }
-    case WM_TIMER:
-        if (++gFlashN >= 7) { KillTimer(h, 1); ShowWindow(h, SW_HIDE); }
-        else ShowWindow(h, gFlashN % 2 ? SW_HIDE : SW_SHOWNOACTIVATE);
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HDC md = CreateCompatibleDC(dc); HBITMAP bm = CreateCompatibleBitmap(dc, rc.right, rc.bottom); HGDIOBJ obm = SelectObject(md, bm);
+        const COLORREF bg = gDark ? DK_CTL : LT_CARD, dim = gDark ? DK_DIM : gLtDim;
+        HBRUSH b = CreateSolidBrush(bg); FillRect(md, &rc, b); DeleteObject(b);
+        HBRUSH ab = CreateSolidBrush(ACCENT);   // a steady strip in your accent on the side facing the setting (no blinking)
+        RECT strip = rc;
+        if (gCoSide == 0) strip.right = SC(4); else if (gCoSide == 1) strip.left = rc.right - SC(4); else strip.bottom = SC(4);
+        FillRect(md, &strip, ab);
+        HBRUSH fb = CreateSolidBrush(gDark ? DK_BORDER : LT_BORDER); FrameRect(md, &rc, fb); DeleteObject(fb);
+        const int pad = SC(12), x0 = gCoSide == 0 ? SC(4) : 0, y0 = gCoSide == 2 ? SC(4) : 0;
+        const int inner = rc.right - 2 * pad - x0 - (gCoSide == 1 ? SC(4) : 0);
+        SetBkMode(md, TRANSPARENT);
+        HGDIOBJ of = SelectObject(md, gFontBold);
+        SetTextColor(md, TXT_C);
+        RECT tr = { x0 + pad, y0 + pad, x0 + pad + inner - SC(18), rc.bottom };
+        DrawTextW(md, gCoTitle, -1, &tr, DT_WORDBREAK | DT_NOPREFIX);
+        RECT tc = tr; DrawTextW(md, gCoTitle, -1, &tc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(md, gFont);
+        SetTextColor(md, dim);
+        DrawTextW(md, L"×", 1, &gCoBtn[2], DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        if (gCoBody[0]) {
+            SetTextColor(md, TXT_C);
+            RECT br = { x0 + pad, tc.bottom + SC(6), x0 + pad + inner, rc.bottom };
+            DrawTextW(md, gCoBody, -1, &br, DT_WORDBREAK | DT_NOPREFIX);
+        }
+        if (!IsRectEmpty(&gCoBtn[0])) {
+            const int lum = (GetRValue(ACCENT) * 299 + GetGValue(ACCENT) * 587 + GetBValue(ACCENT) * 114) / 1000;
+            HGDIOBJ obr = SelectObject(md, ab); HPEN np = CreatePen(PS_SOLID, 1, ACCENT); HGDIOBJ op = SelectObject(md, np);
+            RoundRect(md, gCoBtn[0].left, gCoBtn[0].top, gCoBtn[0].right, gCoBtn[0].bottom, SC(8), SC(8));
+            SetTextColor(md, lum > 150 ? RGB(20, 20, 20) : RGB(255, 255, 255));
+            DrawTextW(md, gCoBtnText, -1, &gCoBtn[0], DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+            HBRUSH nb = CreateSolidBrush(bg); HPEN bp = CreatePen(PS_SOLID, 1, gDark ? DK_BORDER : LT_BORDER);
+            SelectObject(md, nb); SelectObject(md, bp);
+            RoundRect(md, gCoBtn[1].left, gCoBtn[1].top, gCoBtn[1].right, gCoBtn[1].bottom, SC(8), SC(8));
+            SetTextColor(md, TXT_C);
+            DrawTextW(md, L"Not now", 7, &gCoBtn[1], DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+            SelectObject(md, obr); SelectObject(md, op); DeleteObject(np); DeleteObject(nb); DeleteObject(bp);
+        }
+        DeleteObject(ab);
+        SelectObject(md, of);
+        BitBlt(dc, 0, 0, rc.right, rc.bottom, md, 0, 0, SRCCOPY);
+        SelectObject(md, obm); DeleteObject(bm); DeleteDC(md);
+        EndPaint(h, &ps);
         return 0;
+    }
+    case WM_SETCURSOR: {
+        POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
+        for (int i = 0; i < 3; i++) if (PtInRect(&gCoBtn[i], p)) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+        SetCursor(LoadCursor(nullptr, IDC_ARROW)); return TRUE;
+    }
+    case WM_LBUTTONUP: {
+        POINT p = { (short)LOWORD(l), (short)HIWORD(l) };
+        if (PtInRect(&gCoBtn[0], p)) CalloutDo();
+        else if (PtInRect(&gCoBtn[1], p) || PtInRect(&gCoBtn[2], p)) CalloutHide();
+        return 0;
+    }
+    case WM_TIMER: {
+        if (!gCoTarget || !IsWindowVisible(gCoTarget) || !IsWindowVisible(gWnd) || IsIconic(gWnd)) { CalloutHide(); return 0; }
+        POINT p; GetCursorPos(&p); RECT wr; GetWindowRect(h, &wr);
+        if (PtInRect(&wr, p)) return 0;         // (not while you're reading it with the mouse on it)
+        if (--gCoLeft <= 0) CalloutHide();
+        return 0;
+    }
     }
     return DefWindowProcW(h, m, w, l);
 }
-static void FlashRect(RECT r)                   // screen coordinates
+// Shows the pop-up beside `target`. title / body: nullptr = the control's own text / tooltip; body L"" = none.
+static void CalloutShow(HWND target, const wchar_t* title, const wchar_t* body, int act = CO_NONE, int arg = 0, const wchar_t* btn = nullptr)
 {
+    if (!target || !IsWindowVisible(target)) return;
     static bool reg = false;
-    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = FlashProc; wc.hInstance = gInst; wc.lpszClassName = L"LagFlash"; RegisterClassW(&wc); reg = true; }
-    InflateRect(&r, SC(4), SC(3));
-    const int w = r.right - r.left, h = r.bottom - r.top, t = Imax(2, SC(3));
-    if (!gFlashWnd) gFlashWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"LagFlash", L"", WS_POPUP,
-                                                0, 0, 1, 1, gWnd, nullptr, gInst, nullptr);
-    if (!gFlashWnd) return;
-    SetWindowPos(gFlashWnd, HWND_TOP, r.left, r.top, w, h, SWP_NOACTIVATE);
-    HRGN outer = CreateRectRgn(0, 0, w, h), inner = CreateRectRgn(t, t, w - t, h - t);
-    CombineRgn(outer, outer, inner, RGN_DIFF); DeleteObject(inner);
-    SetWindowRgn(gFlashWnd, outer, TRUE);      // (the window owns the region now)
-    InvalidateRect(gFlashWnd, nullptr, TRUE);
-    gFlashN = 0;
-    ShowWindow(gFlashWnd, SW_SHOWNOACTIVATE);
-    SetTimer(gFlashWnd, 1, 220, nullptr);
-}
-static void FlashCtl(HWND c)
-{
-    if (!c || !IsWindowVisible(c)) return;
-    RECT r; GetWindowRect(c, &r);
-    const int di = DesignOf(c);
-    if (di >= 0 && gDesign[di].combo) r.bottom = r.top + SC(24);   // (a dropdown: just its box, not its list)
-    FlashRect(r);
+    if (!reg) {
+        WNDCLASSW wc = {}; wc.lpfnWndProc = CalloutProc; wc.hInstance = gInst; wc.lpszClassName = L"LagCallout";
+        wc.style = CS_DROPSHADOW; wc.hCursor = LoadCursor(nullptr, IDC_ARROW); RegisterClassW(&wc); reg = true;
+    }
+    if (!gCoWnd) gCoWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"LagCallout", L"", WS_POPUP, 0, 0, 1, 1, gWnd, nullptr, gInst, nullptr);
+    if (!gCoWnd) return;
+    gCoTarget = target; gCoAct = act; gCoArg = arg;
+    lstrcpynW(gCoBtnText, btn ? btn : L"Set it", 32);
+    if (title) lstrcpynW(gCoTitle, title, 96); else GetWindowTextW(target, gCoTitle, 96);
+    if (body) lstrcpynW(gCoBody, body, 700);
+    else {                                      // its tooltip
+        gCoBody[0] = 0;
+        if (gTip) {
+            TTTOOLINFOW ti = {}; ti.cbSize = sizeof(ti); ti.hwnd = gWnd; ti.uId = (UINT_PTR)target; ti.lpszText = gCoBody;
+            SendMessageW(gTip, TTM_GETTEXTW, 700, (LPARAM)&ti);
+        }
+    }
+    if (!gCoTitle[0] && !gCoBody[0]) { CalloutHide(); return; }
+    RECT t; GetWindowRect(target, &t);
+    const int di = DesignOf(target);
+    if (di >= 0 && gDesign[di].combo) t.bottom = t.top + SC(24);   // (a dropdown: just its box, not its list)
+    MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(MonitorFromWindow(gWnd, MONITOR_DEFAULTTONEAREST), &mi);
+    const RECT wa = mi.rcWork; const int gap = SC(10);
+    HDC dc = GetDC(gCoWnd);
+    gCoSide = 0; SIZE sz = CalloutLayout(dc);
+    int x = t.right + gap, y = (t.top + t.bottom) / 2 - sz.cy / 2;
+    if (x + sz.cx > wa.right) {                 // no room on the right: on the left
+        gCoSide = 1; sz = CalloutLayout(dc); x = t.left - gap - sz.cx;
+        if (x < wa.left) { gCoSide = 2; sz = CalloutLayout(dc); x = t.left; y = t.bottom + gap; }   // nor there: below
+    }
+    ReleaseDC(gCoWnd, dc);
+    x = Imax((int)wa.left, Imin(x, (int)wa.right - sz.cx));
+    y = Imax((int)wa.top, Imin(y, (int)wa.bottom - sz.cy));
+    gCoLeft = act != CO_NONE ? 80 : 32;         // 20 s with a choice to make, else 8 s
+    SetWindowPos(gCoWnd, HWND_TOP, x, y, sz.cx, sz.cy, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(gCoWnd, nullptr, FALSE);
+    SetTimer(gCoWnd, 1, 250, nullptr);
 }
 
 // Go to a page (and sub-tab), then point at a control. A page whose feature is off: Settings > Features instead.
-static void GoTo(int page, int sub, HWND target)
+static void GoTo(int page, int sub, HWND target, const wchar_t* title = nullptr, const wchar_t* body = nullptr, int act = CO_NONE, int arg = 0)
 {
     if (page < 0 || page >= TAB_COUNT) return;
     if (!PageOn(page)) {
@@ -19198,12 +19756,14 @@ static void GoTo(int page, int sub, HWND target)
         MessageBoxW(gWnd, msg, L"Lag Effect", MB_ICONINFORMATION);
         page = PAGE_SETTINGS; sub = 3; target = nullptr;
     }
+    CalloutHide();
     if (gCompact) SetCompact(false);
     SetPage(page);
     if (sub >= 0) {
         int id = 0;
         if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : IDC_MICSUB3;
         if (page == PAGE_SETTINGS && sub <= 3) id = IDC_SETSUB0 + sub;
+        if (page == PAGE_SOUND && sub <= 2) id = IDC_SBSUB0 + sub;
         if (page == PAGE_MIXER && sub != gMixSub) id = IDC_MIXKEYSBTN;
         if (page == PAGE_FX && sub < FX_SUBS) SetFxSub(sub);
         HWND b = id ? GetDlgItem(gWnd, id) : nullptr;
@@ -19217,7 +19777,7 @@ static void GoTo(int page, int sub, HWND target)
             SendMessageW(target, WM_UPDATEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
             InvalidateRect(target, nullptr, TRUE);
         }
-        FlashCtl(target);
+        CalloutShow(target, title, body, act, arg);
     }
 }
 
@@ -19374,8 +19934,26 @@ static void DropExplain()
              late > busy ? late : busy, (late > busy ? late : busy) == 1 ? L"" : L"s", late, busy, wait, work,
              gDropDry.load(), gDropDry.load() == 1 ? L"" : L"s", bufMs);
     lstrcatW(msg, t);
-    if (MessageBoxW(gWnd, msg, L"Lag Effect - Audio dropouts", MB_ICONINFORMATION | MB_OKCANCEL) == IDOK)
-        GoTo(PAGE_SETTINGS, 0, GetDlgItem(gWnd, IDC_BUFFER));
+    if (MessageBoxW(gWnd, msg, L"Lag Effect - Audio dropouts", MB_ICONINFORMATION | MB_OKCANCEL) != IDOK) return;
+    // The Latency setting, with what to pick (1.56.0): the next size up and roughly what it costs in delay.
+    const int nb = (int)(sizeof(BUFFERS) / sizeof(BUFFERS[0]));
+    wchar_t title[96], body[600];
+    if (gBufIdx + 1 < nb) {
+        const int per = gRunning ? Imax(1, (int)gDev.playback.internalPeriods) : 3;   // (the capture side, our block and every playback period grow)
+        const int addMs = (int)((BUFFERS[gBufIdx + 1] - BUFFERS[gBufIdx]) * (2 + per) * 1000.0f / RATE + 0.5f);
+        swprintf(title, 96, L"Try %d here", BUFFERS[gBufIdx + 1]);
+        if (gDropRecentMain > 0)
+            swprintf(body, 600, L"A bigger buffer rides over short hold-ups, so you get fewer dropouts. Your voice gets about %d ms more delay.", addMs);
+        else
+            swprintf(body, 600, L"Outputs usually sort this out by themselves within a minute. If they don't, a bigger buffer gives them more room: "
+                                L"about %d ms more delay.", addMs);
+        GoTo(PAGE_SETTINGS, 0, GetDlgItem(gWnd, IDC_BUFFER), title, body, CO_BUFFER, gBufIdx + 1);
+    } else {
+        lstrcpyW(title, L"This is already the biggest buffer");
+        lstrcpyW(body, L"If it keeps happening, something else is holding Windows up. LatencyMon (free) shows which driver; "
+                       L"Copy bug report info shows the hours it happens at.");
+        GoTo(PAGE_SETTINGS, 0, GetDlgItem(gWnd, IDC_BUFFER), title, body);
+    }
 }
 
 // ---- the delay your voice gets on its way out ----
@@ -19586,6 +20164,12 @@ static void BugInfoBuild(wchar_t* o, int cap)
         }
     }
     BugAdd(o, cap, L"Recorder: %ls", gRcd ? L"recording" : L"idle");
+    {
+        static const wchar_t* LS[5] = { L"empty", L"recording", L"playing", L"adding a layer", L"stopped" };
+        BugAdd(o, cap, L"Looper: %ls, %d layer(s), %d ms; beatbox %ls (mode %d, kit %d, sensitivity %d, volume %d, taught %u)",
+               LS[Iclamp(gLpState.load(), 0, 4)], gLpLayers.load(), (int)(gLpLen.load() * 1000LL / RATE), gBbOn.load() ? L"on" : L"off",
+               gBbMode.load(), gBbKit.load(), gBbSens.load(), gBbVolPct.load(), gBbTaught);
+    }
     BugAdd(o, cap, L"Silence alarm: %ls%ls%ls (outputs 0x%x)", gSilMain ? L"audio stopped " : L"", gSilMic ? L"mic silent " : L"",
         !gSilMain && !gSilMic && !gSilOut ? L"nothing" : L"", gSilOut);
 }
@@ -19745,6 +20329,12 @@ static int ChipsBuild(Chip* c)
         int live = 0; for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0] && gVstUi[k].want) live++;
         if (live) { wchar_t t[32]; wsprintfW(t, live == 1 ? L"1 mic plugin" : L"%d mic plugins", live); add(t, 0, PAGE_MIC, 2); }
     }
+    if (gFeatSound) {                           // Soundboard > Looper / Beatbox (1.56.0)
+        const int ls = gLpState.load();
+        if (ls == LP_REC || ls == LP_DUB) add(L"\x25CF Looper", 1, PAGE_SOUND, 1);
+        else if (ls == LP_PLAY) add(L"Looper", 0, PAGE_SOUND, 1);
+        if (gBbOn.load()) add(gBbMode.load() == 1 ? L"Drums only" : L"Beatbox", gBbMode.load() == 1 ? 1 : 0, PAGE_SOUND, 2);
+    }
     return n;
 }
 static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
@@ -19882,6 +20472,7 @@ static void SrchBuild()                         // (again each time the box gets
     gSrchN = 0;
     for (int t = 0; t < TAB_COUNT; t++) SrchAdd(PAGE_NAMES[t], GetDlgItem(gWnd, IDC_TAB0 + t), t, -1, -1, 0, SK_TAB);
     for (int s = 0; s < 4; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : 0, SK_SUB);
+    for (int s = 0; s < 3; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
     for (int s = 0; s < FX_SUBS; s++) SrchAdd(FX_SUB_NAMES[s], nullptr, PAGE_FX, s, -1, 0, SK_SUB);
     for (int s = 0; s < 4; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
     SrchAdd(L"Mixer hotkeys", nullptr, PAGE_MIXER, 1, -1, 0, SK_SUB);
@@ -19936,11 +20527,11 @@ static void SearchPick(int r)
     }
     HWND target = it.h;
     if (it.kind == SK_TAB) target = nullptr;
-    GoTo(it.page, it.sub, target);
+    GoTo(it.page, it.sub, target, it.name);
     if (it.kind == SK_SEC) {                    // a section: point at the first thing showing in it
         AssignSections();
         for (int i = 0; i < gDesignN; i++)
-            if (gDesign[i].sec == it.sec && IsWindowVisible(gDesign[i].h)) { FlashCtl(gDesign[i].h); break; }
+            if (gDesign[i].sec == it.sec && IsWindowVisible(gDesign[i].h)) { CalloutShow(gDesign[i].h, it.name, it.loc); break; }
     }
     if (it.kind == SK_SUB || it.kind == SK_TAB) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + it.page));
 }
@@ -20216,7 +20807,10 @@ static void KeysListShow()
     if (gKeysGo >= 0 && gKeysGo < gKeyRowN) {
         const KeyRow r = gKeyRows[gKeysGo];
         if (r.page == -2) RcdShow();
-        else if (r.page >= 0) GoTo(r.page, r.sub, r.btn);
+        else if (r.page >= 0) {
+            wchar_t b[96]; swprintf(b, 96, L"Hotkey: %ls", r.key);
+            GoTo(r.page, r.sub, r.btn, r.what, b);
+        }
     }
 }
 
@@ -20267,6 +20861,227 @@ static void CutTextReport()
     if (!n) wsprintfW(msg, L"Everything on this page fits (font %s, UI size %d%%).", gFontName, gUiScale);
     else wsprintfW(msg, L"Text on this page that doesn't fully fit (font %s, UI size %d%%):\n\n%s\nA screenshot of this helps fix it.", gFontName, gUiScale, out);
     MessageBoxW(gWnd, msg, L"Lag Effect - Text that doesn't fit", n ? MB_ICONWARNING : MB_ICONINFORMATION);
+}
+
+// ======================= 1.56.0: Looper and Beatbox to drums: the window side =======================
+static void LoopPress(unsigned cmd)             // a looper button (or its hotkey): the audio thread does it on its next block
+{
+    if (!gFeatSound) return;
+    if (!gRunning) { ShowOsd(L"Looper: start the audio first", false); return; }
+    if ((cmd & LPC_REC) && !gLpMem.load()) {    // the first time: room for 8 layers of 20 s (about 31 MB), kept until you quit
+        float* m = (float*)calloc((size_t)LP_LAYERS * LP_MAXF, sizeof(float));
+        if (!m) { MessageBoxW(gWnd, L"There isn't enough free memory for the looper (it needs about 31 MB).", L"Lag Effect - Looper", MB_ICONWARNING); return; }
+        gLpMem.store(m, std::memory_order_release);
+    }
+    gLpCmd.fetch_or(cmd);
+    LoopTick(true);
+}
+static void LoopKey(int slot)                   // its hotkeys: the same, with a pop-up saying what happens
+{
+    if (!gRunning) { ShowOsd(L"Looper: start the audio first", false); return; }
+    const int st = gLpState.load();
+    const wchar_t* t = nullptr;
+    if (slot == SLOT_LPREC) { LoopPress(LPC_REC); t = st == LP_EMPTY ? L"Looper: recording" : st == LP_REC ? L"Looper: playing"
+                                                    : st == LP_PLAY ? L"Looper: adding a layer" : st == LP_DUB ? L"Looper: layer added" : L"Looper: playing"; }
+    else if (slot == SLOT_LPPLAY) { if (st == LP_EMPTY) return; LoopPress(LPC_PLAY); t = st == LP_STOP ? L"Looper: playing" : L"Looper: stopped"; }
+    else if (slot == SLOT_LPUNDO) { if (st == LP_EMPTY) return; LoopPress(LPC_UNDO); t = L"Looper: last layer off"; }
+    else if (slot == SLOT_LPCLEAR) { if (st == LP_EMPTY) return; LoopPress(LPC_CLEAR); t = L"Looper: cleared"; }
+    if (t) ShowOsd(t, slot == SLOT_LPREC || (slot == SLOT_LPPLAY && st == LP_STOP));
+}
+static void LoopTick(bool force)                // every 50 ms (and right after a button): the delay to line layers up, the window
+{
+    static int lastState = -1, lastLayers = -1, lastMs = -1; static unsigned lastMute = ~0u;
+    const int latMs = gRunning ? (int)(gDevDelayMs + 0.5f) : 0;
+    gLpLatF.store(gLpSync ? latMs * RATE / 1000 : 0, std::memory_order_relaxed);
+    if (gLpFull.exchange(false)) ShowOsd(L"Looper: 8 layers is the most", false);
+    const int st = gLpState.load(), ly = gLpLayers.load();
+    unsigned mu = gLpMute.load();
+    if (ly < LP_LAYERS && (mu >> ly)) { mu &= (1u << ly) - 1; gLpMute.store(mu); }   // (a layer that's gone isn't muted when its place is reused)
+    if (gPage != PAGE_SOUND || gSbSub != 1 || gCompact) { lastState = -1; return; }
+    if (st != LP_EMPTY || force) InvalidateRect(GetDlgItem(gWnd, IDC_LPVIEW), nullptr, FALSE);
+    if (latMs != lastMs) {
+        lastMs = latMs;
+        wchar_t t[96];
+        if (latMs > 0) swprintf(t, 96, L"Line layers up with the loop you heard (moves them %d ms earlier)", latMs);
+        else lstrcpyW(t, L"Line layers up with the loop you heard");
+        SetTextIfChanged(gWnd, IDC_LPSYNC, t);
+    }
+    if (st == lastState && ly == lastLayers && mu == lastMute && !force) return;
+    if (st != lastState || force) InvalidateRect(GetDlgItem(gWnd, IDC_LPVIEW), nullptr, FALSE);
+    lastState = st; lastLayers = ly; lastMute = mu;
+    SetTextIfChanged(gWnd, IDC_LPREC, st == LP_EMPTY ? L"Record" : st == LP_REC ? L"Finish the loop" : st == LP_DUB ? L"Finish the layer"
+                                    : st == LP_STOP ? L"Play" : L"Add a layer");
+    SetTextIfChanged(gWnd, IDC_LPPLAY, st == LP_STOP ? L"Play" : L"Stop");
+    EnableWindow(GetDlgItem(gWnd, IDC_LPPLAY), st != LP_EMPTY);
+    EnableWindow(GetDlgItem(gWnd, IDC_LPUNDO), st != LP_EMPTY);
+    EnableWindow(GetDlgItem(gWnd, IDC_LPCLEAR), st != LP_EMPTY);
+    for (int i = 0; i < LP_LAYERS; i++) {
+        HWND b = GetDlgItem(gWnd, IDC_LPLAYER0 + i);
+        if (!b) continue;
+        const bool has = i < ly && st != LP_REC;
+        if ((IsWindowEnabled(b) != FALSE) != has) EnableWindow(b, has);
+        InvalidateRect(b, nullptr, FALSE);
+    }
+}
+static void DrawLoopView(DRAWITEMSTRUCT* d)     // what the looper is doing, and where in the loop it is
+{
+    const RECT rc = d->rcItem; const int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    HDC md = CreateCompatibleDC(d->hDC); HBITMAP bm = CreateCompatibleBitmap(d->hDC, W, H); HGDIOBJ obm = SelectObject(md, bm);
+    RECT r = { 0, 0, W, H };
+    BgAlign(d->hwndItem, md); FillRect(md, &r, BgBrush());
+    const COLORREF card = gDark ? DK_CTL : LT_CARD, edge = gDark ? DK_SECTION : LT_BORDER, red = RGB(215, 60, 60);
+    { HBRUSH b = CreateSolidBrush(card); HPEN p = CreatePen(PS_SOLID, 1, edge); HGDIOBJ ob = SelectObject(md, b), op = SelectObject(md, p);
+      RoundRect(md, 0, 0, W, H, SC(10), SC(10)); SelectObject(md, ob); SelectObject(md, op); DeleteObject(b); DeleteObject(p); }
+    const int st = gLpState.load(), len = gLpLen.load(), pos = gLpPos.load(), ly = gLpLayers.load();
+    wchar_t t[160];
+    if (!gRunning && st == LP_EMPTY) lstrcpyW(t, L"The audio is off: press Start on the Main tab first.");
+    else if (st == LP_EMPTY) lstrcpyW(t, L"Press Record, then sing or play something. Press it again to close the loop.");
+    else if (st == LP_REC) swprintf(t, 160, L"\x25CF Recording  %.1f s   (up to %d s: press Record again to close the loop)", len / (double)RATE, LP_MAXSEC);
+    else if (st == LP_DUB) swprintf(t, 160, L"\x25CF Adding layer %d: sing or play over the loop, then press Record again", ly);
+    else if (st == LP_STOP) swprintf(t, 160, L"Stopped   %d layer%ls, %.1f s", ly, ly == 1 ? L"" : L"s", len / (double)RATE);
+    else swprintf(t, 160, L"Playing   %d layer%ls, %.1f s loop", ly, ly == 1 ? L"" : L"s", len / (double)RATE);
+    SetBkMode(md, TRANSPARENT);
+    SetTextColor(md, st == LP_REC || st == LP_DUB ? red : TXT_C);
+    HGDIOBJ of = SelectObject(md, st == LP_EMPTY ? gFont : gFontBold);
+    RECT tr = { SC(12), SC(6), W - SC(12), SC(28) };
+    DrawTextW(md, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX);
+    SelectObject(md, of);
+    // the bar: how far through the loop (or how long the first layer is so far, out of 20 s)
+    const RECT bar = { SC(12), H - SC(20), W - SC(12), H - SC(10) };
+    { HBRUSH b = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(md, &bar, b); DeleteObject(b); }
+    double frac = st == LP_REC ? len / (double)LP_MAXF : (st != LP_EMPTY && len > 0) ? pos / (double)len : 0;
+    if (frac > 1) frac = 1;
+    if (frac > 0) {
+        RECT f = bar; f.right = bar.left + (int)((bar.right - bar.left) * frac);
+        HBRUSH b = CreateSolidBrush(st == LP_REC || st == LP_DUB ? red : st == LP_STOP ? (gDark ? DK_DIM : gLtDim) : ACCENT); FillRect(md, &f, b); DeleteObject(b);
+    }
+    if (st != LP_EMPTY && st != LP_REC) {      // quarter marks, to keep time by
+        HPEN p = CreatePen(PS_SOLID, 1, card); HGDIOBJ op = SelectObject(md, p);
+        for (int q = 1; q < 4; q++) { const int x = bar.left + (bar.right - bar.left) * q / 4; MoveToEx(md, x, bar.top, nullptr); LineTo(md, x, bar.bottom); }
+        SelectObject(md, op); DeleteObject(p);
+    }
+    BitBlt(d->hDC, rc.left, rc.top, W, H, md, 0, 0, SRCCOPY);
+    SelectObject(md, obm); DeleteObject(bm); DeleteDC(md);
+}
+
+static DWORD gBbFlashT[BB_SOUNDS];             // when each drum last played (the lights)
+static void BbStatus()                          // the line under Teach: what it's doing / what it knows
+{
+    if (!gWnd || !GetDlgItem(gWnd, IDC_BBSTAT)) return;
+    static const wchar_t* NM[BB_SOUNDS] = { L"kick", L"snare", L"hi-hat" };
+    wchar_t t[160];
+    const int teach = gBbTeach.load();
+    if (teach >= 0) {
+        const int left = BB_TEACH - gBbTeachN.load();
+        swprintf(t, 160, L"Make your %ls sound %d more time%ls... (click its button again to stop)", NM[teach], left, left == 1 ? L"" : L"s");
+    } else if (!gBbTaught) lstrcpyW(t, L"Using the built-in kick, snare and hi-hat sounds.");
+    else {
+        wchar_t list[64] = L"";
+        for (int c = 0; c < BB_SOUNDS; c++) if (gBbTaught >> c & 1) { if (list[0]) lstrcatW(list, L", "); lstrcatW(list, NM[c]); }
+        swprintf(t, 160, L"Taught your own: %ls.", list);
+    }
+    SetTextIfChanged(gWnd, IDC_BBSTAT, t);
+    for (int c = 0; c < BB_SOUNDS; c++) {
+        wchar_t b[32]; swprintf(b, 32, teach == c ? L"Stop teaching" : L"Teach %ls", NM[c]);
+        SetTextIfChanged(gWnd, IDC_BBTEACH0 + c, b);
+    }
+}
+static void BbSetOn(bool on, bool fromKey)
+{
+    if (!gFeatSound) return;
+    gBbOn = on;
+    if (!on && gBbTeach.load() >= 0) { gBbTeach = -1; BbStatus(); }
+    if (gWnd) CheckDlgButton(gWnd, IDC_BBON, on ? BST_CHECKED : BST_UNCHECKED);
+    if (fromKey) ShowOsd(on ? (gBbMode.load() == 1 ? L"Beatbox: drums only" : L"Beatbox drums on") : L"Beatbox drums off", on);
+}
+static void BbTeach(int c)
+{
+    if (gBbTeach.load() == c) { gBbTeach = -1; BbStatus(); return; }   // (its button again: stop)
+    if (!gRunning) { MessageBoxW(gWnd, L"The audio is off: press Start on the Main tab, then teach it.", L"Lag Effect - Beatbox", MB_ICONINFORMATION); return; }
+    if (!gBbOn.load()) BbSetOn(true, false);   // (it listens only while the drums are on)
+    gBbTeachN = 0; gBbTeach = c;
+    BbStatus();
+}
+static void LoopBbSave()                        // (SaveSettings)
+{
+    SaveInt(L"looper_volume", gLpVolPct.load()); SaveInt(L"looper_voice_only", gLpVoiceOnly.load()); SaveInt(L"looper_line_up", gLpSync);
+    SaveInt(L"beatbox_mode", gBbMode.load()); SaveInt(L"beatbox_kit", gBbKit.load()); SaveInt(L"beatbox_sensitivity", gBbSens.load());
+    SaveInt(L"beatbox_volume", gBbVolPct.load()); SaveInt(L"beatbox_taught", (int)gBbTaught);
+    for (int c = 0; c < BB_SOUNDS; c++) {
+        wchar_t v[96] = L"";
+        if (gBbTaught >> c & 1) swprintf(v, 96, L"%.3f,%.3f,%.3f,%.3f", gBbCent[c][0], gBbCent[c][1], gBbCent[c][2], gBbCent[c][3]);
+        IniSet(BB_KEYS[c], v);
+    }
+}
+static void BbForget()
+{
+    gBbTeach = -1;
+    for (int c = 0; c < BB_SOUNDS; c++) for (int i = 0; i < 4; i++) gBbCent[c][i] = BB_DEFAULT[c][i];
+    gBbTaught = 0;
+    gBbCentGen.fetch_add(1, std::memory_order_release);
+    LoopBbSave();
+    BbStatus();
+}
+static void BbTick()                            // every 50 ms: a finished lesson, the lights
+{
+    static unsigned last[BB_SOUNDS]; static int lastLeft = -1;
+    const int teach = gBbTeach.load();
+    if (teach >= 0 && gBbTeachN.load(std::memory_order_acquire) >= BB_TEACH) {   // 4 hits: that's what this sound looks like now
+        float m[4] = {};
+        for (int n = 0; n < BB_TEACH; n++) for (int i = 0; i < 4; i++) m[i] += gBbTeachF[n][i] / BB_TEACH;
+        for (int i = 0; i < 4; i++) gBbCent[teach][i] = m[i];
+        gBbTaught |= 1u << teach;
+        gBbCentGen.fetch_add(1, std::memory_order_release);
+        gBbTeach = -1;
+        LoopBbSave();
+        BbStatus();
+        static const wchar_t* DONE[BB_SOUNDS] = { L"Beatbox: kick learned", L"Beatbox: snare learned", L"Beatbox: hi-hat learned" };
+        ShowOsd(DONE[teach], true);
+    }
+    const int left = teach >= 0 ? BB_TEACH - gBbTeachN.load() : -1;
+    if (left != lastLeft) { lastLeft = left; BbStatus(); }
+    bool redraw = false;
+    const DWORD now = GetTickCount();
+    for (int c = 0; c < BB_SOUNDS; c++) {
+        const unsigned h = gBbHits[c].load();
+        if (h != last[c]) { last[c] = h; gBbFlashT[c] = now; redraw = true; }
+        if (now - gBbFlashT[c] < 300) redraw = true;   // (fading back)
+    }
+    static bool wasLit = false;
+    if (redraw || wasLit) {
+        wasLit = redraw;
+        if (gPage == PAGE_SOUND && gSbSub == 2 && !gCompact) InvalidateRect(GetDlgItem(gWnd, IDC_BBVIEW), nullptr, FALSE);
+    }
+}
+static void DrawBbView(DRAWITEMSTRUCT* d)       // a light per drum: lit when your sound plays it, with how many so far
+{
+    const RECT rc = d->rcItem; const int W = rc.right - rc.left, H = rc.bottom - rc.top;
+    HDC md = CreateCompatibleDC(d->hDC); HBITMAP bm = CreateCompatibleBitmap(d->hDC, W, H); HGDIOBJ obm = SelectObject(md, bm);
+    RECT r = { 0, 0, W, H };
+    BgAlign(d->hwndItem, md); FillRect(md, &r, BgBrush());
+    static const wchar_t* NM[BB_SOUNDS] = { L"Kick", L"Snare", L"Hi-hat" };
+    const COLORREF off = gDark ? DK_CTL : LT_CARD, edge = gDark ? DK_SECTION : LT_BORDER;
+    const DWORD now = GetTickCount();
+    const int cw = W / BB_SOUNDS, dia = Imin(cw - SC(16), H - SC(34));
+    SetBkMode(md, TRANSPARENT);
+    for (int c = 0; c < BB_SOUNDS; c++) {
+        const DWORD age = now - gBbFlashT[c];
+        const float lit = gBbFlashT[c] && age < 300 ? 1.0f - age / 300.0f : 0.0f;
+        const COLORREF col = Mix(off, ACCENT, lit);
+        const int cx = c * cw + cw / 2, top = SC(2);
+        HBRUSH b = CreateSolidBrush(col); HPEN p = CreatePen(PS_SOLID, 1, lit > 0 ? ACCENT : edge);
+        HGDIOBJ ob = SelectObject(md, b), op = SelectObject(md, p);
+        Ellipse(md, cx - dia / 2, top, cx + dia / 2, top + dia);
+        SelectObject(md, ob); SelectObject(md, op); DeleteObject(b); DeleteObject(p);
+        wchar_t t[32]; swprintf(t, 32, L"%ls  %u", NM[c], gBbHits[c].load());
+        SetTextColor(md, TXT_C);
+        HGDIOBJ of = SelectObject(md, gFont);
+        RECT tr = { c * cw, top + dia + SC(4), (c + 1) * cw, H };
+        DrawTextW(md, t, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_TOP | DT_NOPREFIX);
+        SelectObject(md, of);
+    }
+    BitBlt(d->hDC, rc.left, rc.top, W, H, md, 0, 0, SRCCOPY);
+    SelectObject(md, obm); DeleteObject(bm); DeleteDC(md);
 }
 
 // ======================= Recorder (1.52.0): the window, start / stop, MP3 copies =======================
@@ -21108,12 +21923,15 @@ static void CreateUI()
     // ---------------- Soundboard page ----------------
     // Pages A-D of 8 pads each, text to speech, and playback options.
     gBuildPage = PAGE_SOUND;
-    Ctl(L"STATIC", L"Page:", 0, 16, 63, 40, 20, -1);
-    for (int b2 = 0; b2 < PAD_BANKS; b2++)
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 58 + b2 * 48, 58, 44, 28, IDC_PADBANK0 + b2);
+    Ctl(L"BUTTON", L"Pads", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 58, 76, 28, IDC_SBSUB0);   // sub-tabs (1.56.0)
+    Ctl(L"BUTTON", L"Looper", BS_OWNERDRAW | WS_TABSTOP, 94, 58, 76, 28, IDC_SBSUB1);
+    Ctl(L"BUTTON", L"Beatbox", BS_OWNERDRAW | WS_TABSTOP, 174, 58, 76, 28, IDC_SBSUB2);
+    gBuildSub = 0;                              // Pads
+    for (int b2 = 0; b2 < PAD_BANKS; b2++)      // pages A-D (beside the sub-tabs since 1.56.0)
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 266 + b2 * 36, 58, 32, 28, IDC_PADBANK0 + b2);
     {
         wchar_t kn[120]; FxKeyButtonText(SLOT_PADBANK, kn, 120);
-        Ctl(L"BUTTON", kn, WS_TABSTOP | WS_GROUP, 290, 58, 256, 28, IDC_PADBANKKEY);
+        Ctl(L"BUTTON", kn, WS_TABSTOP | WS_GROUP, 414, 58, 132, 28, IDC_PADBANKKEY);
     }
     AddSection(14, 98, 532, 326, L"Pads");
     Ctl(L"STATIC", L"Sound", 0, 30, 112, 120, 16, IDC_HDR);
@@ -21164,6 +21982,77 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Lower my voice while a pad plays", BS_AUTOCHECKBOX | WS_TABSTOP, 186, 557, 230, 20, IDC_PADDUCK);
     CheckDlgButton(gWnd, IDC_PADDUCK, gPadDuck ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Load folder...", WS_TABSTOP, 424, 553, 106, 26, IDC_PADFOLDER);
+    // ---- Looper (1.56.0) ----
+    gBuildSub = 1;
+    AddSection(14, 98, 532, 244, L"Looper");
+    Ctl(L"STATIC", L"Record a few seconds and it plays round and round, on every output that gets sounds. "
+                   L"Add layers on top while it plays: beats, harmonies, a whole choir of you.", 0, 30, 118, 500, 34, IDC_LPHINT);
+    Ctl(L"STATIC", L"", SS_OWNERDRAW, 30, 156, 500, 56, IDC_LPVIEW);
+    Ctl(L"BUTTON", L"Record", WS_TABSTOP | WS_GROUP, 30, 222, 140, 30, IDC_LPREC);
+    Ctl(L"BUTTON", L"Stop", WS_TABSTOP, 176, 222, 110, 30, IDC_LPPLAY);
+    Ctl(L"BUTTON", L"Undo layer", WS_TABSTOP, 292, 222, 110, 30, IDC_LPUNDO);
+    Ctl(L"BUTTON", L"Clear", WS_TABSTOP, 408, 222, 122, 30, IDC_LPCLEAR);
+    {
+        static const int kx[4] = { 30, 176, 292, 408 }, kw[4] = { 140, 110, 110, 122 };
+        for (int i = 0; i < 4; i++) { wchar_t kn[120]; FxKeyButtonText(SLOT_LPREC + i, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, kx[i], 256, kw[i], 26, IDC_LPKREC + i); }
+    }
+    Ctl(L"STATIC", L"Layers:", 0, 30, 302, 56, 20, -1);
+    for (int i = 0; i < LP_LAYERS; i++) {
+        wchar_t num[4]; wsprintfW(num, L"%d", i + 1);
+        HWND b = Ctl(L"BUTTON", num, BS_OWNERDRAW | WS_TABSTOP, 88 + i * 54, 297, 48, 28, IDC_LPLAYER0 + i);
+        EnableWindow(b, FALSE);
+    }
+    AddSection(14, 354, 532, 150, L"Looper settings");
+    Ctl(L"STATIC", L"Records:", 0, 30, 380, 86, 20, -1);
+    {
+        HWND c = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 120, 376, 290, 200, IDC_LPSRC);
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"What Discord hears from you (voice + sounds)");
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Your voice only");
+        SendMessageW(c, CB_SETCURSEL, gLpVoiceOnly ? 1 : 0, 0);
+    }
+    Ctl(L"STATIC", L"Volume:", 0, 30, 414, 86, 20, -1);
+    Spin(IDC_LPVOL, 120, 411, 64, 0, 200, gLpVolPct.load());
+    Ctl(L"STATIC", L"%", 0, 190, 414, 16, 20, -1);
+    Ctl(L"BUTTON", L"Line layers up with the loop you heard", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 446, 500, 20, IDC_LPSYNC);
+    CheckDlgButton(gWnd, IDC_LPSYNC, gLpSync ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"STATIC", L"Up to 8 layers and 20 seconds. The Recorder's Sounds track has the loop too.", 0, 30, 476, 500, 16, IDC_HDR);
+    // ---- Beatbox to drums (1.56.0) ----
+    gBuildSub = 2;
+    AddSection(14, 98, 532, 236, L"Beatbox to drums");
+    Ctl(L"STATIC", L"Beatbox into your mic: your kick (\"b\"), snare (\"pf\", \"k\") and hi-hat (\"ts\") sounds play real drums, "
+                   L"on every output that gets sounds. The Looper can record them.", 0, 30, 118, 500, 34, IDC_BBHINT);
+    Ctl(L"BUTTON", L"Drums on", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 162, 110, 22, IDC_BBON);
+    { wchar_t kn[120]; FxKeyButtonText(SLOT_BEATBOX, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 146, 159, 180, 28, IDC_BBKEY); }
+    Ctl(L"STATIC", L"Mode:", 0, 30, 202, 86, 20, -1);
+    {
+        HWND c = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 120, 198, 260, 200, IDC_BBMODE);
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Drums with your voice");
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Drums only (your voice is muted)");
+        SendMessageW(c, CB_SETCURSEL, gBbMode.load(), 0);
+    }
+    Ctl(L"STATIC", L"Kit:", 0, 30, 236, 86, 20, -1);
+    {
+        HWND c = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 120, 232, 160, 200, IDC_BBKIT);
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Punchy");
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Boom (808)");
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)L"Lo-fi");
+        SendMessageW(c, CB_SETCURSEL, gBbKit.load(), 0);
+    }
+    Ctl(L"STATIC", L"Sensitivity:", 0, 30, 270, 86, 20, -1);
+    Spin(IDC_BBSENS, 120, 267, 56, 1, 10, gBbSens.load());
+    Ctl(L"STATIC", L"Volume:", 0, 30, 302, 86, 20, -1);
+    Spin(IDC_BBVOL, 120, 299, 64, 0, 200, gBbVolPct.load());
+    Ctl(L"STATIC", L"%", 0, 190, 302, 16, 20, -1);
+    Ctl(L"STATIC", L"", SS_OWNERDRAW, 300, 236, 230, 86, IDC_BBVIEW);
+    AddSection(14, 346, 532, 130, L"Teach it your sounds");
+    Ctl(L"STATIC", L"Mouths differ. If a sound plays the wrong drum, teach it: press a button, then make that sound 4 times.",
+        0, 30, 366, 500, 34, IDC_HDR);
+    Ctl(L"BUTTON", L"Teach kick", WS_TABSTOP | WS_GROUP, 30, 404, 120, 30, IDC_BBTEACH0);
+    Ctl(L"BUTTON", L"Teach snare", WS_TABSTOP, 156, 404, 120, 30, IDC_BBTEACH1);
+    Ctl(L"BUTTON", L"Teach hi-hat", WS_TABSTOP, 282, 404, 120, 30, IDC_BBTEACH2);
+    Ctl(L"BUTTON", L"Forget", WS_TABSTOP, 408, 404, 122, 30, IDC_BBFORGET);
+    Ctl(L"STATIC", L"", SS_NOPREFIX, 30, 444, 500, 20, IDC_BBSTAT);
+    gBuildSub = -1;
 
     // ---------------- Clips page ----------------
     gBuildPage = PAGE_CLIPS;
@@ -21311,7 +22200,7 @@ static void CreateUI()
         struct { int id; const wchar_t* name; const wchar_t* what; bool on; } f[] = {
             { IDC_FEATLAG,   L"Lag effect", L"Hold a hotkey to stutter your voice. Its settings are on the Main tab.", gFeatLag },
             { IDC_FEATFX,    L"Voice FX", L"Effects for your live voice, characters and Vocode to song. Adds a tab.", gFeatFx },
-            { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, and text to speech. Adds a tab.", gFeatSound },
+            { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, text to speech, a looper and beatbox drums. Adds a tab.", gFeatSound },
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
             { IDC_FEATVST,   L"Plugins (VST3, CLAP)", L"VST3 and CLAP effect plugins on your mic (Mic > Plugins), Mixer channels and outputs.", gFeatVst },
         };
@@ -21579,7 +22468,7 @@ static LRESULT CtlColor(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     HDC dc = (HDC)w;
     int  cid    = GetDlgCtrlID((HWND)l);
-    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_SONGHINT || cid == IDC_SONGNOTE || cid == IDC_SYNNAME || cid == IDC_SYNNOTE || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
+    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_SONGHINT || cid == IDC_SONGNOTE || cid == IDC_SYNNAME || cid == IDC_SYNNOTE || cid == IDC_LPHINT || cid == IDC_BBHINT || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
                             : cid == IDT_HINT;  // dim helper text
     bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
     if (gBrPicture && !field && h == gWnd) {    // background picture: text sits on the picture, lined up with it
@@ -21653,7 +22542,8 @@ static void PaintWindow(HDC dc)
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
         if (s.page >= 0 && s.page != gPage) continue;
-        if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : s.page == PAGE_MIXER ? gMixSub : gFxSub)) continue;
+        if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : s.page == PAGE_MIXER ? gMixSub
+                                    : s.page == PAGE_SOUND ? gSbSub : gFxSub)) continue;
         if (gCompact) continue;
         if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
         if (!CondOn(s.cond)) continue;          // (Synth plugin / Vocode to song: one or the other in the same place)
@@ -21769,6 +22659,33 @@ static void OnCommand(int id, int code)
     }
     if (id >= IDC_PADBANK0 && id < IDC_PADBANK0 + PAD_BANKS) { if (code == BN_CLICKED) SetPadBank(id - IDC_PADBANK0); return; }
     if (id == IDC_PADBANKKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PADBANK], id); return; }
+    // Soundboard > Looper / Beatbox (1.56.0)
+    if (id == IDC_LPREC)   { if (code == BN_CLICKED) LoopPress(LPC_REC); return; }
+    if (id == IDC_LPPLAY)  { if (code == BN_CLICKED) LoopPress(LPC_PLAY); return; }
+    if (id == IDC_LPUNDO)  { if (code == BN_CLICKED) LoopPress(LPC_UNDO); return; }
+    if (id == IDC_LPCLEAR) { if (code == BN_CLICKED) LoopPress(LPC_CLEAR); return; }
+    if (id >= IDC_LPKREC && id <= IDC_LPKCLEAR) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_LPREC + id - IDC_LPKREC], id); return; }
+    if (id >= IDC_LPLAYER0 && id < IDC_LPLAYER0 + LP_LAYERS) {
+        if (code == BN_CLICKED) { gLpMute.fetch_xor(1u << (id - IDC_LPLAYER0)); InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE); }
+        return;
+    }
+    if (id == IDC_LPSRC)  { if (code == CBN_SELCHANGE) gLpVoiceOnly = SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) == 1; return; }
+    if (id == IDC_LPSYNC) { gLpSync = Checked(id); return; }
+    if (id == IDC_BBON)   { if (code == BN_CLICKED) BbSetOn(Checked(id), false); return; }
+    if (id == IDC_BBKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_BEATBOX], id); return; }
+    if (id == IDC_BBMODE) { if (code == CBN_SELCHANGE) gBbMode = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 1); return; }
+    if (id == IDC_BBKIT)  { if (code == CBN_SELCHANGE) gBbKit = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 2); return; }
+    if (id == IDC_LPVOL || id == IDC_BBSENS || id == IDC_BBVOL) {
+        if (!gUiReady) return;
+        std::atomic<int>& var = id == IDC_LPVOL ? gLpVolPct : id == IDC_BBSENS ? gBbSens : gBbVolPct;
+        const int lo = id == IDC_BBSENS ? 1 : 0, hi = id == IDC_BBSENS ? 10 : 200;
+        BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) var = Iclamp(v, lo, hi);
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)var.load(), FALSE);
+        return;
+    }
+    if (id >= IDC_BBTEACH0 && id <= IDC_BBTEACH2) { if (code == BN_CLICKED) BbTeach(id - IDC_BBTEACH0); return; }
+    if (id == IDC_BBFORGET) { if (code == BN_CLICKED) BbForget(); return; }
     if (id == IDC_REWINDKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REWIND], id); return; }
     if (id == IDC_REPEATKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_REPEAT], id); return; }
     if (id == IDC_RANDLAG)    { gRandLagOn = Checked(id); return; }
@@ -22003,6 +22920,15 @@ static void OnCommand(int id, int code)
     if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
     if (id == IDC_CLIPHIST)    { if (code == BN_CLICKED) ClipHistory(GetDlgItem(gWnd, id)); return; }
     if (id == IDC_PADFOLDER)   { if (code == BN_CLICKED) PadLoadFolder(); return; }
+    if (id >= IDC_SBSUB0 && id <= IDC_SBSUB2) {   // Soundboard: Pads / Looper / Beatbox
+        if (code == BN_CLICKED && gSbSub != id - IDC_SBSUB0) {
+            gSbSub = id - IDC_SBSUB0; Layout();
+            for (int k = IDC_SBSUB0; k <= IDC_SBSUB2; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
+            if (gSbSub == 1) LoopTick(true);
+            if (gSbSub == 2) BbStatus();
+        }
+        return;
+    }
     if (id >= IDC_SETSUB0 && id <= IDC_SETSUB3) {
         if (code == BN_CLICKED && gSetSub != id - IDC_SETSUB0) {
             gSetSub = id - IDC_SETSUB0; Layout();
@@ -22630,9 +23556,13 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
     if (w == IDC_SONGBTN) { DrawSongButton(d); return true; }
     if (w == IDC_SONGMETER) { DrawVMeter2(d, gSongMeter, -1.0f, SongModeOn() && gRunning, 0, 0, gSongMeter >= 0.99f); return true; }
-    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || MicSubOf((int)w) >= 0 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3)) {
+    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || MicSubOf((int)w) >= 0 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3) ||
+        (w >= IDC_SBSUB0 && w <= IDC_SBSUB2)) {
         DrawFxSub(d); return true;
     }
+    if (w == IDC_LPVIEW) { DrawLoopView(d); return true; }
+    if (w >= IDC_LPLAYER0 && w < IDC_LPLAYER0 + LP_LAYERS) { DrawToggle(d, IsWindowEnabled(d->hwndItem) && !(gLpMute.load() >> (w - IDC_LPLAYER0) & 1), false); return true; }
+    if (w == IDC_BBVIEW) { DrawBbView(d); return true; }
     if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch(d); return true; }
     if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank(d); return true; }
     if (w >= IDC_CLIPBANK0 && w < IDC_CLIPBANK0 + CLIP_BANKS) { DrawClipBank(d); return true; }
@@ -22887,10 +23817,10 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_MOVE:
         EdFollow();                             // the move-things-around layer stays over the window
-        SearchHide();
+        SearchHide(); CalloutHide();
         break;
     case WM_ACTIVATE:
-        if (LOWORD(w) == WA_INACTIVE) SearchHide();   // (the search list belongs to the window: not over other apps)
+        if (LOWORD(w) == WA_INACTIVE) { SearchHide(); CalloutHide(); }   // (the search list belongs to the window: not over other apps)
         break;
     case WM_COPYDATA: {                         // command-line control from another LagEffect.exe (if allowed)
         const COPYDATASTRUCT* cd = (const COPYDATASTRUCT*)l;
@@ -22983,6 +23913,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_REWINDKEY)  { ClearFxKey(SLOT_REWIND); return 0; }
         if (id == IDC_PROFNEXTKEY) { ClearFxKey(SLOT_PROFNEXT); return 0; }
         if (id == IDC_PTTKEY)      { ClearFxKey(SLOT_PTT); return 0; }
+        if (id >= IDC_LPKREC && id <= IDC_LPKCLEAR) { ClearFxKey(SLOT_LPREC + id - IDC_LPKREC); return 0; }
+        if (id == IDC_BBKEY)       { ClearFxKey(SLOT_BEATBOX); return 0; }
         if (id >= IDC_MIXKEY0 && id < IDC_MIXKEY0 + (MIX_SLOT_END - SLOT_MIX0)) { ClearFxKey(SLOT_MIX0 + id - IDC_MIXKEY0); return 0; }
         if (id >= IDC_VSTKEY0 && id < IDC_VSTKEY0 + VST_MIC) { ClearFxKey(SLOT_VST0 + id - IDC_VSTKEY0); return 0; }
         if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) { gUserCol[id - IDC_COLSW0] = CLR_NONE; ApplyTheme(); return 0; }
@@ -23236,6 +24168,11 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
     };
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (CalloutUp()) {                      // the pop-up beside a setting: a click anywhere else or Esc closes it
+            const UINT mm = msg.message;
+            if ((mm == WM_LBUTTONDOWN || mm == WM_RBUTTONDOWN || mm == WM_NCLBUTTONDOWN || mm == WM_NCRBUTTONDOWN) && msg.hwnd != gCoWnd) CalloutHide();
+            else if (mm == WM_KEYDOWN && msg.wParam == VK_ESCAPE) { CalloutHide(); continue; }
+        }
         if ((msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
             if (gKbdNav) setKbdNav(false);
             else SendMessageW(h, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);   // (Windows can turn focus boxes back on,
