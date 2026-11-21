@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.51.1"
+#define APP_VERSION L"1.52.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -3304,9 +3304,267 @@ static void FxReset()                          // audio thread only
 }
 
 static bool FxAnyOn();                          // is any voice effect switched on? (defined with the effects' list)
+// ======================= Recorder (1.52.0): the core =======================
+// While recording, the audio thread copies each block into a ring per track (nothing else: no files, no waiting).
+// A writer thread empties the rings into WAV files. If the disk falls so far behind that a ring is full, that
+// block is dropped and the writer puts the same length of silence in its place, so every track keeps its timing
+// (separate tracks stay in line with each other). Each file's header is brought up to date every second, so a
+// crash leaves a file that plays up to that point; before 2 GB a file goes on in "(part 2)", and so on.
+#define RCD_MAXT     10                         // tracks: your voice, sounds, 8 Mixer channels
+#define RCD_RING     (RATE * 16)                // 16 s per track
+#define RCD_BLOCK    8192                       // the most frames one audio block can hand over at once
+#define RCD_GAPQ     16
+static unsigned gRcdSplitBytes = 0x7F000000u;   // a new part before this (2 GB, for programs that can't read more)
+struct RcdTrack {
+    float*   ring = nullptr;                    // RCD_RING stereo frames
+    std::atomic<unsigned> w{0}, r{0};           // frames written (audio thread) / read (writer)
+    unsigned gapPos[RCD_GAPQ] = {}, gapLen[RCD_GAPQ] = {};   // silence to put in at a frame position (dropped blocks)
+    std::atomic<unsigned> gapW{0}, gapR{0};
+    unsigned pendPos = 0, pendLen = 0;          // (audio thread) a gap not handed over yet: the ring is still full
+    FILE*    f = nullptr;
+    wchar_t  base[MAX_PATH] = L"";              // the file's path without ".wav"
+    int      part = 1;
+    unsigned dataBytes = 0;                     // in the file being written
+    std::atomic<float> peak{0};                 // (for the window's level)
+};
+enum { RK_OUT = 0, RK_VOICE, RK_SOUNDS, RK_CH };   // what a track records: an output / your voice / the sounds / a Mixer channel
+struct RcdState {
+    int      kind[RCD_MAXT] = {}, arg[RCD_MAXT] = {};
+    int      n = 0, fmt = 0;                    // fmt 0: 16-bit PCM, 1: 32-bit float
+    RcdTrack t[RCD_MAXT];
+    std::atomic<bool> run{false};               // the writer keeps going while this is set (and until the rings are empty)
+    std::atomic<unsigned long long> written{0}; // frames written to track 0's file(s), silence included
+    std::atomic<unsigned long long> bytes{0};   // all files together
+    std::atomic<unsigned long long> silence{0}; // frames of silence put in for dropped blocks (track 0)
+    std::atomic<bool> failed{false};            // a file couldn't be made or written (disk full?)
+    wchar_t  failMsg[160] = L"";
+    wchar_t  files[RCD_MAXT * 4][MAX_PATH];     // every file made (parts included), for the MP3 copies
+    int      nFiles = 0;
+    void*    th = nullptr;                      // the writer thread
+};
+#ifdef _WIN32
+static void RcdSleep(int ms) { Sleep((DWORD)ms); }
+static unsigned long long RcdMs() { return GetTickCount64(); }
+#else
+static void RcdSleep(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
+static unsigned long long RcdMs() { return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+#endif
+static std::atomic<RcdState*> gRcdLive{nullptr};   // non-null while the audio thread should hand blocks over
+static std::atomic<unsigned> gRcdCbSeq{0};      // audio blocks started (stopping waits for one more: then nobody holds the old one)
+static RcdState* gRcd = nullptr;                // the recording running (window thread's view)
+static unsigned long long gRcdT0 = 0;           // when it started (ms)
+static int     gRcdWhat = 0;                    // (the window's choices) 0..MAX_OUT-1: that output; MAX_OUT: separate tracks
+static int     gRcdFmt = 0;                     // 0: WAV 16-bit, 1: WAV 32-bit float, 2: WAV 16-bit + an MP3 copy
+static wchar_t gRcdDir[MAX_PATH] = L"";         // where recordings go ("" = Documents\Lag Effect recordings)
+
+static FILE* RcdFopen(const wchar_t* path)
+{
+#ifdef _WIN32
+    return _wfopen(path, L"w+b");
+#else
+    char p[MAX_PATH * 4]; size_t n = 0;
+    for (const wchar_t* s = path; *s && n < sizeof(p) - 4; s++) {   // (UTF-8, for testing off Windows)
+        const unsigned c = (unsigned)*s;
+        if (c < 0x80) p[n++] = (char)c;
+        else if (c < 0x800) { p[n++] = (char)(0xC0 | c >> 6); p[n++] = (char)(0x80 | (c & 63)); }
+        else { p[n++] = (char)(0xE0 | c >> 12); p[n++] = (char)(0x80 | (c >> 6 & 63)); p[n++] = (char)(0x80 | (c & 63)); }
+    }
+    p[n] = 0;
+    return fopen(p, "w+b");
+#endif
+}
+static void RcdHeader(FILE* f, int fmt, unsigned dataBytes)     // at the file's start; the file position is kept
+{
+    const long here = ftell(f);
+    const unsigned bits = fmt ? 32 : 16, block = 2 * bits / 8;
+    unsigned char h[64]; unsigned n = 0;
+    auto u32 = [&](unsigned v) { h[n++] = (unsigned char)v; h[n++] = (unsigned char)(v >> 8); h[n++] = (unsigned char)(v >> 16); h[n++] = (unsigned char)(v >> 24); };
+    auto u16 = [&](unsigned v) { h[n++] = (unsigned char)v; h[n++] = (unsigned char)(v >> 8); };
+    auto tag = [&](const char* s) { memcpy(h + n, s, 4); n += 4; };
+    const unsigned extra = fmt ? 12 : 0;        // (float files carry a "fact" chunk)
+    tag("RIFF"); u32(36 + extra + dataBytes); tag("WAVE");
+    tag("fmt "); u32(16); u16(fmt ? 3 : 1); u16(2); u32(RATE); u32(RATE * block); u16(block); u16(bits);
+    if (fmt) { tag("fact"); u32(4); u32(dataBytes / block); }
+    tag("data"); u32(dataBytes);
+    fseek(f, 0, SEEK_SET);
+    fwrite(h, 1, n, f);
+    fflush(f);
+    if (here > (long)n) fseek(f, here, SEEK_SET);
+}
+static unsigned RcdHeaderLen(int fmt) { return fmt ? 56 : 44; }   // RIFF 12 + fmt 24 (+ fact 12) + data 8
+static bool RcdOpenPart(RcdState* s, RcdTrack& t)
+{
+    wchar_t path[MAX_PATH];
+    if (t.part == 1) swprintf(path, MAX_PATH, L"%ls.wav", t.base);
+    else swprintf(path, MAX_PATH, L"%ls (part %d).wav", t.base, t.part);
+    t.f = RcdFopen(path);
+    if (!t.f) {
+        swprintf(s->failMsg, 160, L"A file couldn't be made in the recordings folder.");
+        s->failed = true; return false;
+    }
+    setvbuf(t.f, nullptr, _IOFBF, 1 << 18);
+    t.dataBytes = 0;
+    RcdHeader(t.f, s->fmt, 0);
+    fseek(t.f, RcdHeaderLen(s->fmt), SEEK_SET);
+    if (s->nFiles < RCD_MAXT * 4) lstrcpynW(s->files[s->nFiles++], path, MAX_PATH);
+    return true;
+}
+static void RcdClosePart(RcdState* s, RcdTrack& t)
+{
+    if (!t.f) return;
+    RcdHeader(t.f, s->fmt, t.dataBytes);
+    fclose(t.f); t.f = nullptr;
+}
+// Write frames (interleaved stereo float; null = silence) to a track's file, going on to a new part at the limit.
+static void RcdWrite(RcdState* s, RcdTrack& t, const float* x, unsigned frames)
+{
+    const unsigned fb = s->fmt ? 8 : 4;         // bytes per stereo frame
+    static thread_local unsigned char buf[4096 * 8];
+    while (frames && !s->failed) {
+        if (!t.f && !RcdOpenPart(s, t)) return;
+        unsigned room = (gRcdSplitBytes - RcdHeaderLen(s->fmt) - t.dataBytes) / fb;
+        if (!room) { RcdClosePart(s, t); t.part++; continue; }
+        unsigned n = Imin((int)Imin((int)frames, 4096), (int)room);
+        if (s->fmt) {
+            if (x) memcpy(buf, x, n * 8); else memset(buf, 0, n * 8);
+        } else {
+            short* o = (short*)buf;
+            for (unsigned i = 0; i < n * 2; i++) {
+                float v = x ? x[i] : 0.0f;
+                v = v > 1.0f ? 1.0f : v < -1.0f ? -1.0f : v;
+                o[i] = (short)lrintf(v * 32767.0f);
+            }
+        }
+        if (fwrite(buf, 1, n * fb, t.f) != n * fb) {
+            swprintf(s->failMsg, 160, L"Writing the recording failed (is the disk full?).");
+            s->failed = true; return;
+        }
+        t.dataBytes += n * fb;
+        s->bytes += n * fb;
+        if (&t == &s->t[0]) s->written += n;
+        if (x) x += n * 2;
+        frames -= n;
+    }
+}
+// The writer: empties every ring (with the silences in their places) until recording stops and they're empty.
+static void RcdWriterMain(RcdState* s)
+{
+    unsigned long long lastHdr = RcdMs();
+    for (;;) {
+        const bool running = s->run.load();
+        bool any = false;
+        for (int i = 0; i < s->n; i++) {        // each track up to where it was when we got to it (no track waits on another)
+            RcdTrack& t = s->t[i];
+            const unsigned w = t.w.load(std::memory_order_acquire);
+            for (;;) {
+                unsigned r = t.r.load(std::memory_order_relaxed), avail = w - r;
+                const unsigned gw = t.gapW.load(std::memory_order_acquire), gr = t.gapR.load(std::memory_order_relaxed);
+                bool gapNow = false;
+                if (gr != gw) {
+                    const unsigned to = t.gapPos[gr % RCD_GAPQ] - r;   // frames before the gap
+                    if (to <= avail) { avail = to; gapNow = true; }
+                }
+                if (!avail && !gapNow) break;
+                while (avail) {                 // (in up to two pieces: the ring wraps)
+                    const unsigned pos = r % RCD_RING, n = Imin((int)avail, (int)(RCD_RING - pos));
+                    RcdWrite(s, t, t.ring + pos * 2, n);
+                    r += n; avail -= n; any = true;
+                    t.r.store(r, std::memory_order_release);
+                }
+                if (gapNow) {
+                    const unsigned len = t.gapLen[gr % RCD_GAPQ];
+                    RcdWrite(s, t, nullptr, len);
+                    if (i == 0) s->silence += len;
+                    t.gapR.store(gr + 1, std::memory_order_release);
+                    any = true;
+                }
+            }
+        }
+        const unsigned long long now = RcdMs();
+        if (now - lastHdr >= 1000) {            // headers up to date (a crash keeps what's written)
+            lastHdr = now;
+            for (int i = 0; i < s->n; i++) if (s->t[i].f) RcdHeader(s->t[i].f, s->fmt, s->t[i].dataBytes);
+        }
+        if (!running && !any) break;            // stopped, and nothing left
+        if (!any) RcdSleep(40);
+    }
+    for (int i = 0; i < s->n; i++) RcdClosePart(s, s->t[i]);
+}
+// (audio thread) one block for track i: into its ring, or dropped (and remembered as silence) if the ring is full.
+static inline void RcdPush(RcdTrack& t, const float* x, unsigned frames)
+{
+    const unsigned w = t.w.load(std::memory_order_relaxed), r = t.r.load(std::memory_order_acquire);
+    if (RCD_RING - (w - r) < frames) {          // the disk is behind: this block becomes silence
+        if (!t.pendLen) t.pendPos = w;
+        t.pendLen += frames;
+        return;
+    }
+    if (t.pendLen) {                            // a gap before this block: hand it over first
+        const unsigned gw = t.gapW.load(std::memory_order_relaxed), gr = t.gapR.load(std::memory_order_acquire);
+        if (gw - gr >= RCD_GAPQ) { t.pendLen += frames; return; }   // (its list is full: still a gap, a longer one)
+        t.gapPos[gw % RCD_GAPQ] = t.pendPos; t.gapLen[gw % RCD_GAPQ] = t.pendLen;
+        t.gapW.store(gw + 1, std::memory_order_release);
+        t.pendLen = 0;
+    }
+    float pk = 0;
+    for (unsigned f = 0; f < frames; f++) {
+        const unsigned i = ((w + f) % RCD_RING) * 2;
+        t.ring[i] = x[f * 2]; t.ring[i + 1] = x[f * 2 + 1];
+        const float a = Max(fabsf(x[f * 2]), fabsf(x[f * 2 + 1])); if (a > pk) pk = a;
+    }
+    t.w.store(w + frames, std::memory_order_release);
+    if (pk > t.peak.load(std::memory_order_relaxed)) t.peak.store(pk, std::memory_order_relaxed);
+}
+// Start: rings made, files named (no file is opened here: the writer does that), writer started.
+static RcdState* RcdBegin(int n, int fmt, wchar_t names[][MAX_PATH])
+{
+    RcdState* s = new (std::nothrow) RcdState();
+    if (!s) return nullptr;
+    s->n = n; s->fmt = fmt;
+    for (int i = 0; i < n; i++) {
+        s->t[i].ring = (float*)calloc((size_t)RCD_RING * 2, sizeof(float));
+        if (!s->t[i].ring) { for (int j = 0; j < i; j++) free(s->t[j].ring); delete s; return nullptr; }
+        lstrcpynW(s->t[i].base, names[i], MAX_PATH);
+    }
+    s->run = true;
+#ifdef _WIN32
+    HANDLE th = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD { RcdWriterMain((RcdState*)p); return 0; }, s, 0, nullptr);
+    if (!th) { for (int i = 0; i < n; i++) free(s->t[i].ring); delete s; return nullptr; }
+    SetThreadPriority(th, THREAD_PRIORITY_ABOVE_NORMAL);   // (it must keep up; it mostly sleeps)
+    s->th = th;
+#else
+    s->th = new std::thread(RcdWriterMain, s);
+#endif
+    return s;
+}
+// Stop: the audio thread has been told (gRcdLive cleared) and has finished its block; the writer empties the
+// rings, closes the files and ends; then everything is freed.
+static void RcdEnd(RcdState* s)
+{
+    if (!s) return;
+    for (int i = 0; i < s->n; i++) {            // a gap still waiting (the ring was full to the end): it's silence too,
+        RcdTrack& t = s->t[i];                  // so every track ends at the same length (the audio thread has let go)
+        if (!t.pendLen) continue;
+        while (t.gapW.load() - t.gapR.load() >= RCD_GAPQ) RcdSleep(5);
+        const unsigned gw = t.gapW.load();
+        t.gapPos[gw % RCD_GAPQ] = t.pendPos; t.gapLen[gw % RCD_GAPQ] = t.pendLen;
+        t.gapW.store(gw + 1, std::memory_order_release);
+        t.pendLen = 0;
+    }
+    s->run = false;
+#ifdef _WIN32
+    if (s->th) { WaitForSingleObject((HANDLE)s->th, INFINITE); CloseHandle((HANDLE)s->th); s->th = nullptr; }
+#else
+    if (s->th) { ((std::thread*)s->th)->join(); delete (std::thread*)s->th; s->th = nullptr; }
+#endif
+    for (int i = 0; i < s->n; i++) free(s->t[i].ring);
+}
+
 static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32 frames)
 {
     gMainFrames = frames;
+    gRcdCbSeq.fetch_add(1);
+    RcdState* const rcd = gRcdLive.load();       // Recorder: the tracks this block is handed to (null: not recording)
 #ifdef HAVE_SSE_FLAGS
     _mm_setcsr(_mm_getcsr() | 0x8040);         // flush denormals to zero: reverb tails stay cheap
 #endif
@@ -3473,6 +3731,20 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
     bool     on[MAX_OUT];
     unsigned w[MAX_OUT], r[MAX_OUT];
     int testLeft[MAX_OUT];
+    static float rcdBuf[RCD_MAXT][RCD_BLOCK * 2];   // Recorder: this block of each track
+    static float rcdChG[CH_MAX];                // (a channel's fader for its track, gliding like the live sound does)
+    int rcdVoice = -1, rcdSb = -1, rcdOut = -1, rcdOutT = -1; int rcdCh[CH_MAX];
+    const unsigned rcdN = frames < RCD_BLOCK ? frames : RCD_BLOCK;
+    for (int c = 0; c < CH_MAX; c++) rcdCh[c] = -1;
+    if (rcd) for (int i = 0; i < rcd->n; i++) {
+        const int a = rcd->arg[i];
+        switch (rcd->kind[i]) {
+        case RK_VOICE:  rcdVoice = i; break;
+        case RK_SOUNDS: rcdSb = i; break;
+        case RK_OUT:    rcdOut = a; rcdOutT = i; break;
+        case RK_CH:     if (a >= 0 && a < CH_MAX) { rcdCh[a] = i; memset(rcdBuf[i], 0, rcdN * 2 * sizeof(float)); } break;
+        }
+    }
     for (int k = 0; k < MAX_OUT; k++) {
         testLeft[k] = gTestTone[k];
         mode[k] = gRowMode[k];
@@ -3768,6 +4040,7 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         }
         for (int k = 0; k < MAX_OUT; k++) outVst[k] = (k == 0 || on[k]) && VstRangeOn(VST_OUT0 + k * VST_PER, VST_PER);
     }
+    const unsigned rcdW0 = rcdOut > 0 ? w[rcdOut] : 0;   // Recorder, an output: where this block starts in its ring
     // The first half of a sample: the soundboard, your mic, and the voice effects on it.
     auto front = [&](ma_uint32 f, float& sb, float& sbFx, float& clean) -> float {
         sbFx = 0; int padsOn = 0;
@@ -3863,6 +4136,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
         }
 
         if (duckGain < 0.999f) { everything *= duckGain; effect *= duckGain; clean *= duckGain; }
+        if (f < rcdN) {                         // Recorder: your voice (as others hear it) / the sounds, as tracks
+            if (rcdVoice >= 0) { rcdBuf[rcdVoice][f * 2] = everything; rcdBuf[rcdVoice][f * 2 + 1] = everything; }
+            if (rcdSb >= 0) { rcdBuf[rcdSb][f * 2] = sb; rcdBuf[rcdSb][f * 2 + 1] = sb; }
+        }
         if (gRecVoiceOn) RecPut(gRecVoice, everything + sb);   // instant replay: what Discord hears
         if (gPadRec) {                          // recording a pad from the mic (what Discord hears from you)
             float t = everything; t = t > 1 ? 1 : t < -1 ? -1 : t;
@@ -3923,6 +4200,10 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
                 if (chMono[c]) { L = R = (L + R) * 0.5f; }
                 L *= dk * chPanL[c]; R *= dk * chPanR[c];
                 { const float e = Max(fabsf(L), fabsf(R)) * chG[c]; if (e > chPk[c]) chPk[c] = e; }
+                if (rcdCh[c] >= 0 && f < rcdN) {        // Recorder: this channel as its own track (after its fader)
+                    rcdChG[c] += (chG[c] - rcdChG[c]) * fc;
+                    float* b = rcdBuf[rcdCh[c]] + f * 2; b[0] = L * rcdChG[c]; b[1] = R * rcdChG[c];
+                }
                 if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
                 else { chRd[c]++; chAv[c]--; }
                 if (f == frames / 2 && chAdj[c] > 0 && chAv[c] > 1) { chRd[c]++; chAv[c]--; }   // skip one
@@ -3981,6 +4262,17 @@ static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32
             if (k == 0) { out[f * 2] = oL; out[f * 2 + 1] = oR; }
             else { const unsigned i = (w[k] & (RING_FRAMES - 1)) * 2; ring[k][i] = oL; ring[k][i + 1] = oR; w[k]++; }
         }
+    }
+    if (rcd) {                                  // Recorder: the output as it went out, then every track handed over
+        if (rcdOut == 0) memcpy(rcdBuf[rcdOutT], out, rcdN * 2 * sizeof(float));
+        else if (rcdOut > 0) {
+            const unsigned made = w[rcdOut] - rcdW0;   // (fewer if its ring was full: the rest is silence, keeping time)
+            for (unsigned f = 0; f < rcdN; f++) {
+                if (f < made) { const unsigned i = ((rcdW0 + f) & (RING_FRAMES - 1)) * 2; rcdBuf[rcdOutT][f * 2] = ring[rcdOut][i]; rcdBuf[rcdOutT][f * 2 + 1] = ring[rcdOut][i + 1]; }
+                else rcdBuf[rcdOutT][f * 2] = rcdBuf[rcdOutT][f * 2 + 1] = 0.0f;
+            }
+        }
+        for (int i = 0; i < rcd->n; i++) RcdPush(rcd->t[i], rcdBuf[i], rcdN);
     }
     for (int c = 0; c < CH_MAX; c++) {
         if (gChA[c].live) gChA[c].r = chRd[c];
@@ -4122,6 +4414,7 @@ enum {
     IDC_MICSETUP = 4500, IDC_MICTYPE = 4501, IDC_GATELOOK = 4502, IDC_GATETHUMP = 4503, IDC_MICSIDE = 4504,   // Mic tab, 1.48.0
     IDC_WHINE = 4511,
     IDC_SEARCH = 4520, IDC_KEYSLIST = 4521, IDC_ONSTRIP = 4522,   // the bottom bar (1.51.0)
+    IDC_RCDBTN = 4523,                          // ... and its Recorder button (1.52.0)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -4152,6 +4445,7 @@ enum {
 #define WM_WS_MSG          (WM_APP + 17)         // remote control: a command arrived (wParam: connection, lParam: the text)
 #define WM_WS_CONN         (WM_APP + 18)         // remote control: something connected (lParam 1) / left (0)
 #define WM_WS_STATE        (WM_APP + 19)         // remote control: listening (1) / the port is in use (2)
+#define WM_APP_RCDMP3      (WM_APP + 20)         // Recorder: some MP3 copies couldn't be made (wParam: how many)
 #define TIMER_STATUS    1
 #define TIMER_KEY       2
 #define TIMER_RECONNECT 3
@@ -4440,7 +4734,9 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_TALKBACK (SLOT_FADE0 + CH_MAX)      // hold: only one output gets your mic
 #define MIX_SLOT_END (SLOT_TALKBACK + 1)         // (the Mixer's hotkeys end here)
 #define SLOT_VST0    MIX_SLOT_END                // then one per plugin slot: switches that plugin on / off
-#define KEY_SLOTS    (SLOT_VST0 + VST_SLOTS)
+#define SLOT_VST_END (SLOT_VST0 + VST_SLOTS)
+#define SLOT_RECORD  SLOT_VST_END                // Recorder: start / stop (1.52.0; keys are saved by name, so slots can be added)
+#define KEY_SLOTS    (SLOT_RECORD + 1)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -5062,6 +5358,7 @@ static LRESULT CALLBACK UpDownProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR,
 // ======================= settings =======================
 static const wchar_t* FxKeyIniName(int slot)
 {
+    if (slot == SLOT_RECORD) return L"recorder_hotkey";
     if (slot >= SLOT_VST0) {                    // "plugin3_key"
         static wchar_t vn[VST_SLOTS][20];
         wchar_t* n = vn[slot - SLOT_VST0];
@@ -5416,6 +5713,9 @@ static void LoadSettings()
     gGateMode     = Iclamp(INI_INT(L"gate_mode", INI_INT(L"gate", 0) ? GATE_VOLUME : GATE_OFF), 0, 3);
     gGateLastMode = Iclamp(INI_INT(L"gate_last_mode", GATE_VOLUME), 1, 3);
     gMicSide   = Iclamp(INI_INT(L"mic_side", 0), 0, 2);
+    gRcdWhat   = Iclamp(INI_INT(L"recorder_what", 0), 0, MAX_OUT);
+    gRcdFmt    = Iclamp(INI_INT(L"recorder_format", 0), 0, 2);
+    GetPrivateProfileStringW(L"settings", L"recorder_folder", L"", gRcdDir, MAX_PATH, gIni);
     gWhineOn   = INI_INT(L"whine_on", 0) != 0;
     for (int i = 0; i < WHINE_MAX; i++) { wchar_t k[24]; wsprintfW(k, L"whine_hz%d", i + 1); gWhineHz10[i] = Iclamp(INI_INT(k, 0), 0, 216000); }
     gWhineGen = gWhineGen + 1;
@@ -6166,6 +6466,8 @@ static void SaveSettings()
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
     SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
     SaveInt(L"whine_on", gWhineOn);
+    SaveInt(L"recorder_what", gRcdWhat); SaveInt(L"recorder_format", gRcdFmt);
+    WritePrivateProfileStringW(L"settings", L"recorder_folder", gRcdDir, gIni);
     for (int i = 0; i < WHINE_MAX; i++) { wchar_t k[24]; wsprintfW(k, L"whine_hz%d", i + 1); SaveInt(k, gWhineHz10[i]); }
     SaveInt(L"mic_side", gMicSide); SaveInt(L"gate_look_ahead", gGateLook); SaveInt(L"gate_ignore_thumps", gGateThump);
     SaveInt(L"leveler_threshold_db", gLvThrDb); SaveInt(L"leveler_ratio", gLvRatio); SaveInt(L"leveler_attack_ms", gLvAtkMs);
@@ -9323,6 +9625,7 @@ static void HotkeyBeep(bool on)
 // Who else uses a key combination (for the conflict warning).
 static void SlotName(int slot, wchar_t* out, int cap)
 {
+    if (slot == SLOT_RECORD) { lstrcpynW(out, L"starting / stopping the recorder", cap); return; }
     if (slot >= SLOT_VST0) { lstrcpynW(out, L"switching a plugin on / off", cap); return; }
     if (slot == 0) lstrcpynW(out, L"Voice effects", cap);
     else if (slot < FX_KEY_SLOTS) wsprintfW(out, L"%s (Voice FX)", gFxGroups[slot - 1].title);
@@ -13364,6 +13667,8 @@ static void AddTips()
                         L"its tab opens and it flashes.");
     TipId(IDC_KEYSLIST, L"Every hotkey you've set, in one list: what each does, where its button is, and keys set for more than one thing.");
     TipId(IDC_ONSTRIP,  L"What's on right now. Click one to go to its settings.");
+    TipId(IDC_RCDBTN,   L"Record what an output plays, or each part on its own track (your voice, sounds, each Mixer channel), "
+                        L"to WAV files of any length. It has its own start / stop key.");
     TipId(IDC_MUTEKEY, L"A hotkey that mutes / unmutes your mic from anywhere, even in a game. Right-click to clear it.");
     TipId(IDC_OSD,     L"Shows a short pop-up at the top of the screen (e.g. \"Pitch ON\", \"Mic muted\") when a hotkey "
                        L"switches something, so you know it worked. Doesn't show over exclusive-fullscreen games.");
@@ -14001,6 +14306,7 @@ static void MixHoldTick()                       // (every poll) each channel's h
 }
 
 static void VstKeyEdge(int k, bool pressed, bool released);   // (plugins: defined with them)
+static void RcdToggle();
 static void PollFxKeys()
 {
     BYTE cache[256] = {};
@@ -14009,7 +14315,7 @@ static void PollFxKeys()
                          (((slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) || slot == SLOT_PADBANK) && !gFeatSound) ||
                          ((slot == SLOT_CLIPNOW || (slot >= SLOT_CLIP0 && slot < SLOT_CLIP0 + CLIPS)) && !gFeatClips) ||
                          ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag) ||
-                         (slot >= SLOT_VST0 && !gFeatVst);
+                         (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst);
         if (off) { gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
@@ -14018,6 +14324,7 @@ static void PollFxKeys()
             if (pressed) HoldPress(slot); else if (released) HoldRelease(slot);
             continue;
         }
+        if (slot == SLOT_RECORD) { if (pressed) RcdToggle(); continue; }   // the recorder
         if (slot >= SLOT_VST0) { if (pressed || released) VstKeyEdge(slot - SLOT_VST0, pressed, released); continue; }   // a plugin on / off
         if (slot >= SLOT_MIX0) { MixKey(slot, down, pressed, released); continue; }   // the Mixer's
         if (slot == SLOT_DIVE) { gDiveHeld = down; continue; }   // hold to bend
@@ -17021,7 +17328,9 @@ static void ShowHelp()
         L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX has 12 effects for your live voice "
         L"on four sub-tabs, plus one-click Characters. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n"
         L"Along the bottom: search any setting (Ctrl+F), see every hotkey in one list (Hotkeys...), and what's on right now "
-        L"(click one to go to it). Right-click any knob to type an exact value.\n\n"
+        L"(click one to go to it). Right-click any knob to type an exact value.\n"
+        L"Recorder... records an output, or separate tracks (your voice, sounds, each Mixer channel), to WAV files; "
+        L"a red REC chip shows while it runs.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -17126,7 +17435,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 {
     wchar_t k[100];
     ComboName(gFxKeys[slot], MAX_KEYS, k, 100);
-    if (!k[0]) lstrcpynW(k, slot >= SLOT_VST0 ? L"Set key" : slot >= SLOT_MIX0 ? L"Set" : L"Set hotkey", 100);
+    if (!k[0]) lstrcpynW(k, slot >= SLOT_VST0 ? L"Set key" : slot >= SLOT_MIX0 ? L"Set" : L"Set hotkey", 100);   // (the recorder's too)
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
                        : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
                        : slot >= SLOT_PROF0 && slot < SLOT_MIX0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
@@ -17136,6 +17445,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
 
 static int FxKeyButtonId(int slot)
 {
+    if (slot == SLOT_RECORD) return 4545;       // (IDC_RCD_KEY, in the Recorder window)
     if (slot >= SLOT_VST0) {                    // a plugin slot: on the Mic tab, or in the open channel / output plugins window
         const int k = slot - SLOT_VST0;
         if (k < VST_MIC) return IDC_VSTKEY0 + k;
@@ -18171,6 +18481,7 @@ static void TrayMenu()
 
 // ======================= the bar along the bottom (1.51.0): search, all hotkeys, what's on =======================
 // It sits under every tab (not in the compact window): a search box, a "Hotkeys" button and the "what's on" chips.
+static void RcdShow(); static void RcdWindowSync(); static void RcdTick();
 static const wchar_t* PAGE_NAMES[TAB_COUNT] = { L"Main", L"Mic", L"Voice FX", L"Soundboard", L"Clips", L"Settings", L"Mixer" };
 static int DesignOf(HWND h) { if (h) for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == h) return i; return -1; }
 static int PagedFeatOf(HWND h) { if (h) for (int i = 0; i < gPagedN; i++) if (gPaged[i].h == h) return gPaged[i].feat; return 0; }
@@ -18273,6 +18584,11 @@ static int ChipsBuild(Chip* c)
 {
     int n = 0;
     auto add = [&](const wchar_t* t, int warn, int page, int sub) { if (n < 16) { lstrcpynW(c[n].t, t, 32); c[n].warn = warn; c[n].page = page; c[n].sub = sub; n++; } };
+    if (gRcd) {                                 // recording: first, in red; click = the Recorder window
+        const int secs = (int)(gRcd->written.load() / RATE);
+        wchar_t t[32]; swprintf(t, 32, L"\x25CF REC %d:%02d", secs / 60, secs % 60);
+        add(t, 1, -2, -1);
+    }
     if (!gRunning) add(L"Audio off", 1, PAGE_MAIN, -1);
     if (gMicMuted) add(L"Mic muted", 1, PAGE_MAIN, -1);
     if (gPttMode == 1) add(L"Push-to-talk", 0, PAGE_MIC, 0); else if (gPttMode == 2) add(L"Push-to-mute", 0, PAGE_MIC, 0);
@@ -18357,14 +18673,17 @@ static void ChipsClick()
     POINT p; GetCursorPos(&p);
     POINT q = p; ScreenToClient(s, &q);
     for (int i = 0; i < gChipN; i++)
-        if (gChips[i].shown && q.x >= gChips[i].x0 && q.x < gChips[i].x1) { GoTo(gChips[i].page, gChips[i].sub, nullptr); return; }
+        if (gChips[i].shown && q.x >= gChips[i].x0 && q.x < gChips[i].x1) {
+            if (gChips[i].page == -2) RcdShow(); else GoTo(gChips[i].page, gChips[i].sub, nullptr);
+            return;
+        }
     if (gMoreX0 >= 0 && q.x >= gMoreX0 && q.x < gMoreX1) {   // "+n": the ones that didn't fit
         HMENU m = CreatePopupMenu();
         for (int i = 0; i < gChipN; i++) if (!gChips[i].shown) AppendMenuW(m, MF_STRING, 1 + i, gChips[i].t);
         RECT r; GetWindowRect(s, &r);
         const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_NONOTIFY, p.x, r.top, 0, gWnd, nullptr);
         DestroyMenu(m);
-        if (cmd >= 1 && cmd <= gChipN) GoTo(gChips[cmd - 1].page, gChips[cmd - 1].sub, nullptr);
+        if (cmd >= 1 && cmd <= gChipN) { if (gChips[cmd - 1].page == -2) RcdShow(); else GoTo(gChips[cmd - 1].page, gChips[cmd - 1].sub, nullptr); }
     }
 }
 
@@ -18606,6 +18925,7 @@ static void KeyRowsBuild()
         r.btn = id ? GetDlgItem(gWnd, id) : nullptr;
         const int di = DesignOf(r.btn);
         if (di >= 0 && gDesign[di].page >= 0) { r.page = gDesign[di].page; r.sub = gDesign[di].sub; LocText(r.page, r.sub, gDesign[di].sec, r.where, 110); }
+        else if (slot == SLOT_RECORD) { r.page = -2; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"The Recorder window (bottom bar)", 110); }
         else if (slot >= SLOT_VST0) { r.page = PAGE_MIXER; r.sub = 0; r.btn = nullptr; lstrcpynW(r.where, L"Mixer > a channel's or output's plugins (FX)", 110); }
         else { r.page = -1; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"", 110); }
         gKeyRowN++;
@@ -18680,9 +19000,10 @@ static LRESULT CALLBACK KeysListProc(HWND h, UINT m, WPARAM w, LPARAM l)
                 if (gCapturingKey) EndKeyCapture();
                 for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = 0;
                 wchar_t name[120]; HotkeyName(name, 120); SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
-            } else if (FxKeyButtonId(r.slot)) ClearFxKey(r.slot);
+            } else if (FxKeyButtonId(r.slot) && r.slot != SLOT_RECORD) ClearFxKey(r.slot);
             else { if (gCapturingKey) EndKeyCapture(); for (int i = 0; i < MAX_KEYS; i++) gFxKeys[r.slot][i] = 0; }   // (its button isn't showing)
-            if (r.slot >= SLOT_VST0 && gRackWnd) RackRefresh();
+            if (r.slot >= SLOT_VST0 && r.slot < SLOT_VST_END && gRackWnd) RackRefresh();
+            if (r.slot == SLOT_RECORD) RcdWindowSync();
             SaveSettings();
             KeysListFill(h);
         }
@@ -18746,22 +19067,24 @@ static void KeysListShow()
     SetForegroundWindow(gWnd);
     if (gKeysGo >= 0 && gKeysGo < gKeyRowN) {
         const KeyRow r = gKeyRows[gKeysGo];
-        if (r.page >= 0) GoTo(r.page, r.sub, r.btn);
+        if (r.page == -2) RcdShow();
+        else if (r.page >= 0) GoTo(r.page, r.sub, r.btn);
     }
 }
 
 // ---- placing the bar ----
 static void PlaceStrip()                        // at the bottom of the window, the whole width; not in the compact window
 {
-    HWND e = GetDlgItem(gWnd, IDC_SEARCH), b = GetDlgItem(gWnd, IDC_KEYSLIST), s = GetDlgItem(gWnd, IDC_ONSTRIP);
-    if (!e || !b || !s) return;
-    if (gCompact) { ShowWindow(e, SW_HIDE); ShowWindow(b, SW_HIDE); ShowWindow(s, SW_HIDE); SearchHide(); return; }
+    HWND e = GetDlgItem(gWnd, IDC_SEARCH), b = GetDlgItem(gWnd, IDC_KEYSLIST), s = GetDlgItem(gWnd, IDC_ONSTRIP), rb = GetDlgItem(gWnd, IDC_RCDBTN);
+    if (!e || !b || !s || !rb) return;
+    if (gCompact) { ShowWindow(e, SW_HIDE); ShowWindow(b, SW_HIDE); ShowWindow(s, SW_HIDE); ShowWindow(rb, SW_HIDE); SearchHide(); return; }
     RECT c; GetClientRect(gWnd, &c);
     const int y = c.bottom - SC(STRIP_H) + SC(2), x0 = SC(14);
-    PlaceFree(e, x0, y, SC(190), SC(24));
-    PlaceFree(b, x0 + SC(196), y, SC(84), SC(24));
-    PlaceFree(s, x0 + SC(288), y, Imax(SC(60), (int)c.right - SC(14) - (x0 + SC(288))), SC(24));
-    ShowWindow(e, SW_SHOWNA); ShowWindow(b, SW_SHOWNA); ShowWindow(s, SW_SHOWNA);
+    PlaceFree(e, x0, y, SC(166), SC(24));
+    PlaceFree(b, x0 + SC(172), y, SC(80), SC(24));
+    PlaceFree(rb, x0 + SC(256), y, SC(84), SC(24));
+    PlaceFree(s, x0 + SC(348), y, Imax(SC(60), (int)c.right - SC(14) - (x0 + SC(348))), SC(24));
+    ShowWindow(e, SW_SHOWNA); ShowWindow(b, SW_SHOWNA); ShowWindow(s, SW_SHOWNA); ShowWindow(rb, SW_SHOWNA);
 }
 
 // ---- text that doesn't fit, after all the fitting: a list (right-click the version number) ----
@@ -18798,6 +19121,354 @@ static void CutTextReport()
     MessageBoxW(gWnd, msg, L"Lag Effect - Text that doesn't fit", n ? MB_ICONWARNING : MB_ICONINFORMATION);
 }
 
+// ======================= Recorder (1.52.0): the window, start / stop, MP3 copies =======================
+// Opened from the bottom bar ("Recorder..."). It records one output (exactly what it sends out), or separate tracks:
+// your voice as others hear it, the sounds (soundboard / clips / TTS), and each Mixer channel after its fader.
+// Its window can be closed while recording; the bottom bar shows a red "REC" chip until it stops.
+static wchar_t gRcdLast[MAX_PATH] = L"";        // the last recording: its file, or its folder of tracks
+static wchar_t gRcdNote[300] = L"";             // the line under the button after a recording
+static HWND    gRcdWnd = nullptr;
+static std::atomic<int> gRcdMp3Busy{0};         // MP3 copies being made
+enum { IDC_RCD_WHAT = 4540, IDC_RCD_FMT, IDC_RCD_DIR, IDC_RCD_DIRBTN, IDC_RCD_OPEN, IDC_RCD_KEY, IDC_RCD_GO, IDC_RCD_STAT, IDC_RCD_TRACKS };
+
+static void RcdDefaultDir(wchar_t* out)
+{
+    wchar_t docs[MAX_PATH] = L"";
+    if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs)) && docs[0]) swprintf(out, MAX_PATH, L"%ls\\Lag Effect recordings", docs);
+    else { lstrcpynW(out, gClipDir, MAX_PATH); wchar_t* sl = wcsrchr(out, L'\\'); if (sl) lstrcpyW(sl + 1, L"Recordings"); }
+}
+static const wchar_t* RcdDir() { static wchar_t d[MAX_PATH]; if (gRcdDir[0]) return gRcdDir; RcdDefaultDir(d); return d; }
+static void RcdSafeName(wchar_t* s) { for (; *s; s++) if (wcschr(L"\\/:*?\"<>|", *s) || *s < 32) *s = L'_'; }
+static void RcdOutLabel(int k, wchar_t* out, int cap)   // "Ears" (or its device when it has no name of its own)
+{
+    if (gOutName[k][0]) lstrcpynW(out, gOutName[k], cap);
+    else if (gRowName[k][0]) lstrcpynW(out, gRowName[k], cap);
+    else OutName(k, out, cap);
+}
+// What "separate tracks" would record right now: names (for files) and kinds.
+static int RcdTrackList(wchar_t names[][64], int* kind, int* arg)
+{
+    int n = 0;
+    lstrcpynW(names[n], L"Your voice", 64); kind[n] = RK_VOICE; arg[n] = 0; n++;
+    if (gFeatSound || gFeatClips) { lstrcpynW(names[n], L"Sounds", 64); kind[n] = RK_SOUNDS; arg[n] = 0; n++; }
+    for (int c = 0; c < CH_MAX && n < RCD_MAXT; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        wchar_t lab[64]; ChanLabel(c, lab, 64);
+        if (!lab[0]) swprintf(lab, 64, L"Channel %d", c + 1);
+        RcdSafeName(lab);
+        for (int j = 0; j < n; j++) if (!lstrcmpiW(names[j], lab)) { swprintf(lab + Imin(lstrlenW(lab), 50), 14, L" (%d)", c + 1); break; }
+        lstrcpynW(names[n], lab, 64); kind[n] = RK_CH; arg[n] = c; n++;
+    }
+    return n;
+}
+
+// ---- MP3 copies (after it stops; on their own thread, one file at a time) ----
+static bool Mp3FromWav(const wchar_t* wav)      // a 16-bit stereo WAV of ours -> the same name .mp3, 192 kbit/s
+{
+    HANDLE in = CreateFileW(wav, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (in == INVALID_HANDLE_VALUE) return false;
+    wchar_t mp3[MAX_PATH]; lstrcpynW(mp3, wav, MAX_PATH);
+    wchar_t* dot = wcsrchr(mp3, L'.'); if (dot) lstrcpyW(dot, L".mp3");
+    DeleteFileW(mp3);
+    HMODULE plat = LoadLibraryW(L"mfplat.dll"), rw = LoadLibraryW(L"mfreadwrite.dll");
+    typedef HRESULT (WINAPI* PStartup)(ULONG, DWORD);
+    typedef HRESULT (WINAPI* PShutdown)();
+    typedef HRESULT (WINAPI* PCreateAttr)(IMFAttributes**, UINT32);
+    typedef HRESULT (WINAPI* PCreateType)(IMFMediaType**);
+    typedef HRESULT (WINAPI* PCreateBuf)(DWORD, IMFMediaBuffer**);
+    typedef HRESULT (WINAPI* PCreateSample)(IMFSample**);
+    typedef HRESULT (WINAPI* PCreateWriter)(LPCWSTR, IMFByteStream*, IMFAttributes*, IMFSinkWriter**);
+    auto startup = plat ? (PStartup)(void*)GetProcAddress(plat, "MFStartup") : nullptr;
+    auto shutdown = plat ? (PShutdown)(void*)GetProcAddress(plat, "MFShutdown") : nullptr;
+    auto mkAttr = plat ? (PCreateAttr)(void*)GetProcAddress(plat, "MFCreateAttributes") : nullptr;
+    auto mkType = plat ? (PCreateType)(void*)GetProcAddress(plat, "MFCreateMediaType") : nullptr;
+    auto mkBuf = plat ? (PCreateBuf)(void*)GetProcAddress(plat, "MFCreateMemoryBuffer") : nullptr;
+    auto mkSample = plat ? (PCreateSample)(void*)GetProcAddress(plat, "MFCreateSample") : nullptr;
+    auto mkWriter = rw ? (PCreateWriter)(void*)GetProcAddress(rw, "MFCreateSinkWriterFromURL") : nullptr;
+    if (!startup || !shutdown || !mkAttr || !mkType || !mkBuf || !mkSample || !mkWriter || FAILED(startup(0x00020070, 0))) { CloseHandle(in); return false; }
+    bool ok = false;
+    IMFAttributes* at = nullptr; IMFSinkWriter* w = nullptr; IMFMediaType *outT = nullptr, *inT = nullptr;
+    DWORD stream = 0;
+    if (SUCCEEDED(mkAttr(&at, 1)) && SUCCEEDED(at->SetGUID(kMF_TRANSCODE_CONTAINERTYPE, kMFTranscodeContainerType_MP3)) &&
+        SUCCEEDED(mkWriter(mp3, nullptr, at, &w)) && SUCCEEDED(mkType(&outT)) && SUCCEEDED(mkType(&inT))) {
+        outT->SetGUID(kMF_MT_MAJOR_TYPE, kMFMediaType_Audio); outT->SetGUID(kMF_MT_SUBTYPE, kMFAudioFormat_MP3);
+        outT->SetUINT32(kMF_MT_AUDIO_SAMPLES_PER_SECOND, RATE); outT->SetUINT32(kMF_MT_AUDIO_NUM_CHANNELS, 2);
+        outT->SetUINT32(kMF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000 / 8);
+        inT->SetGUID(kMF_MT_MAJOR_TYPE, kMFMediaType_Audio); inT->SetGUID(kMF_MT_SUBTYPE, kMFAudioFormat_PCM);
+        inT->SetUINT32(kMF_MT_AUDIO_SAMPLES_PER_SECOND, RATE); inT->SetUINT32(kMF_MT_AUDIO_NUM_CHANNELS, 2);
+        inT->SetUINT32(kMF_MT_AUDIO_BITS_PER_SAMPLE, 16); inT->SetUINT32(kMF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        inT->SetUINT32(kMF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE * 4);
+        if (SUCCEEDED(w->AddStream(outT, &stream)) && SUCCEEDED(w->SetInputMediaType(stream, inT, nullptr)) && SUCCEEDED(w->BeginWriting())) {
+            ok = SetFilePointer(in, 44, nullptr, FILE_BEGIN) == 44;
+            static thread_local BYTE chunk[RATE / 10 * 4];   // 100 ms
+            unsigned long long done = 0;
+            while (ok) {
+                DWORD got = 0;
+                if (!ReadFile(in, chunk, sizeof(chunk), &got, nullptr)) { ok = false; break; }
+                got &= ~3u;
+                if (!got) break;
+                IMFMediaBuffer* b = nullptr; IMFSample* smp = nullptr; BYTE* dst = nullptr;
+                ok = SUCCEEDED(mkBuf(got, &b)) && SUCCEEDED(b->Lock(&dst, nullptr, nullptr));
+                if (ok) { memcpy(dst, chunk, got); b->Unlock(); b->SetCurrentLength(got); }
+                const unsigned frames = got / 4;
+                ok = ok && SUCCEEDED(mkSample(&smp)) && SUCCEEDED(smp->AddBuffer(b)) &&
+                     SUCCEEDED(smp->SetSampleTime((LONGLONG)(done * 10000000ULL / RATE))) &&
+                     SUCCEEDED(smp->SetSampleDuration((LONGLONG)frames * 10000000 / RATE)) && SUCCEEDED(w->WriteSample(stream, smp));
+                if (smp) smp->Release();
+                if (b) b->Release();
+                done += frames;
+            }
+            ok = SUCCEEDED(w->Finalize()) && ok;
+        }
+    }
+    if (inT) inT->Release(); if (outT) outT->Release(); if (w) w->Release(); if (at) at->Release();
+    shutdown();
+    CloseHandle(in);
+    if (!ok) DeleteFileW(mp3);
+    return ok;
+}
+struct RcdMp3Job { int n; wchar_t files[RCD_MAXT * 4][MAX_PATH]; };
+static DWORD WINAPI RcdMp3Main(LPVOID p)
+{
+    RcdMp3Job* j = (RcdMp3Job*)p;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    int bad = 0;
+    for (int i = 0; i < j->n; i++) if (!Mp3FromWav(j->files[i])) bad++;
+    CoUninitialize();
+    if (bad) PostMessageW(gWnd, WM_APP_RCDMP3, (WPARAM)bad, 0);
+    delete j;
+    gRcdMp3Busy--;
+    return 0;
+}
+
+// ---- start / stop ----
+static void RcdWindowSync();
+static void RcdStart()
+{
+    if (gRcd) return;
+    if (!gRunning) { MessageBoxW(gRcdWnd ? gRcdWnd : gWnd, L"Press Start on the Main tab first: the recorder records what Lag Effect is playing.", L"Lag Effect - Recorder", MB_ICONINFORMATION); return; }
+    const wchar_t* dir = RcdDir();
+    SHCreateDirectoryExW(nullptr, dir, nullptr);
+    if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES) {
+        MessageBoxW(gRcdWnd ? gRcdWnd : gWnd, L"The recordings folder couldn't be made. Pick another one with Change...", L"Lag Effect - Recorder", MB_ICONWARNING);
+        return;
+    }
+    SYSTEMTIME st; GetLocalTime(&st);
+    wchar_t stamp[64];
+    swprintf(stamp, 64, L"Lag Effect %04d-%02d-%02d %02d.%02d.%02d", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    wchar_t paths[RCD_MAXT][MAX_PATH]; int kind[RCD_MAXT], arg[RCD_MAXT], n = 0;
+    const int what = Iclamp(gRcdWhat, 0, MAX_OUT);
+    if (what < MAX_OUT) {                       // one output: one file, named after it
+        if (what >= gRows) { MessageBoxW(gRcdWnd ? gRcdWnd : gWnd, L"That output isn't there any more. Pick another one.", L"Lag Effect - Recorder", MB_ICONINFORMATION); return; }
+        wchar_t lab[64]; RcdOutLabel(what, lab, 64); RcdSafeName(lab);
+        swprintf(paths[0], MAX_PATH, L"%ls\\%ls - %ls", dir, stamp, lab);
+        kind[0] = RK_OUT; arg[0] = what; n = 1;
+        swprintf(gRcdLast, MAX_PATH, L"%ls.wav", paths[0]);
+    } else {                                    // separate tracks: a folder per recording
+        wchar_t sub[MAX_PATH]; swprintf(sub, MAX_PATH, L"%ls\\%ls", dir, stamp);
+        CreateDirectoryW(sub, nullptr);
+        wchar_t names[RCD_MAXT][64];
+        n = RcdTrackList(names, kind, arg);
+        for (int i = 0; i < n; i++) swprintf(paths[i], MAX_PATH, L"%ls\\%ls", sub, names[i]);
+        lstrcpynW(gRcdLast, sub, MAX_PATH);
+    }
+    RcdState* s = RcdBegin(n, gRcdFmt == 1 ? 1 : 0, paths);
+    if (!s) { MessageBoxW(gRcdWnd ? gRcdWnd : gWnd, L"There wasn't enough memory to start recording.", L"Lag Effect - Recorder", MB_ICONWARNING); return; }
+    for (int i = 0; i < n; i++) { s->kind[i] = kind[i]; s->arg[i] = arg[i]; }
+    gRcd = s; gRcdT0 = GetTickCount64(); gRcdNote[0] = 0;
+    gRcdLive.store(s);
+    ShowOsd(L"Recording", true);
+    RcdWindowSync();
+}
+static void RcdStop(bool quiet = false)
+{
+    RcdState* s = gRcd;
+    if (!s) return;
+    gRcdLive.store(nullptr);                    // the audio thread lets go: one more block and nobody holds it
+    const unsigned seq = gRcdCbSeq.load();      // (a block that took the old pointer started before this was read:
+    for (int i = 0; i < 30 && gRcdCbSeq.load() - seq < 1; i++) Sleep(10);   //  the next one starting means it's done.
+                                                //  Audio stopped: no block runs; this just waits 0.3 s)
+    RcdEnd(s);                                  // the writer empties the rings and closes the files
+    gRcd = nullptr;
+    const unsigned long long fr = s->written.load(), sil = s->silence.load();
+    const int secs = (int)(fr / RATE);
+    wchar_t len[32]; swprintf(len, 32, L"%d:%02d:%02d", secs / 3600, secs / 60 % 60, secs % 60);
+    if (s->failed) swprintf(gRcdNote, 300, L"%ls Saved %ls up to there.", s->failMsg, len);
+    else if (sil >= RATE / 100) swprintf(gRcdNote, 300, L"Saved %ls. The disk fell behind for %.1f s in total; that time is silence in the file.", len, sil / (double)RATE);
+    else swprintf(gRcdNote, 300, L"Saved %ls.", len);
+    if (gRcdFmt == 2 && !s->failed && s->nFiles) {   // the MP3 copies, in the background
+        RcdMp3Job* j = new (std::nothrow) RcdMp3Job();
+        if (j) {
+            j->n = s->nFiles; for (int i = 0; i < s->nFiles; i++) lstrcpynW(j->files[i], s->files[i], MAX_PATH);
+            gRcdMp3Busy++;
+            HANDLE th = CreateThread(nullptr, 0, RcdMp3Main, j, 0, nullptr);
+            if (th) { CloseHandle(th); lstrcatW(gRcdNote, L" Making the MP3 copy..."); } else { gRcdMp3Busy--; delete j; }
+        }
+    }
+    delete s;
+    if (!quiet) ShowOsd(L"Recording saved", true);
+    RcdWindowSync();
+}
+static void RcdToggle() { if (gRcd) RcdStop(); else RcdStart(); }
+static void RcdTick()                           // every 50 ms (the status timer): stop if something went wrong; the window's text
+{
+    if (gRcd && (gRcd->failed || !gRunning)) {
+        const bool audioStopped = !gRunning;
+        RcdStop(true);
+        if (audioStopped) { wchar_t t[300]; swprintf(t, 300, L"The audio stopped, so the recording did too. %ls", gRcdNote); lstrcpynW(gRcdNote, t, 300); }
+        RcdWindowSync();
+        MessageBeep(MB_ICONWARNING);
+    }
+    static unsigned long long last = 0;
+    if (!gRcdWnd || !IsWindowVisible(gRcdWnd) || GetTickCount64() - last < 250) return;
+    last = GetTickCount64();
+    wchar_t t[400];
+    if (gRcd) {
+        const unsigned long long fr = gRcd->written.load(), by = gRcd->bytes.load(), sil = gRcd->silence.load();
+        const int secs = (int)(fr / RATE);
+        swprintf(t, 400, L"Recording  %d:%02d:%02d\n%.1f MB so far%ls", secs / 3600, secs / 60 % 60, secs % 60, by / 1048576.0,
+                 sil >= RATE / 100 ? L"\nThe disk is falling behind: some silence was put in" : L"");
+    } else if (gRcdMp3Busy.load() > 0) swprintf(t, 400, L"%ls", gRcdNote);
+    else if (gRcdNote[0]) {
+        swprintf(t, 400, L"%ls", gRcdNote);
+        wchar_t* m = wcsstr(t, L" Making the MP3 copy..."); if (m) lstrcpyW(m, L" MP3 copy made.");
+    }
+    else lstrcpynW(t, L"Not recording.", 400);
+    SetTextIfChanged(gRcdWnd, IDC_RCD_STAT, t);
+}
+
+// ---- the window ----
+static void RcdFillWhat(HWND w)
+{
+    HWND cb = GetDlgItem(w, IDC_RCD_WHAT);
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+    for (int k = 0; k < gRows; k++) {
+        wchar_t lab[64], t[96]; RcdOutLabel(k, lab, 64);
+        swprintf(t, 96, L"Output: %ls (what it plays)", lab);
+        SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)t);
+        SendMessageW(cb, CB_SETITEMDATA, k, k);
+    }
+    const int ti = (int)SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)L"Separate tracks: your voice, sounds, each Mixer channel");
+    SendMessageW(cb, CB_SETITEMDATA, ti, MAX_OUT);
+    int sel = ti;
+    for (int i = 0; i < ti; i++) if ((int)SendMessageW(cb, CB_GETITEMDATA, i, 0) == gRcdWhat) sel = i;
+    if (gRcdWhat < MAX_OUT && sel == ti) { sel = 0; gRcdWhat = 0; }
+    SendMessageW(cb, CB_SETCURSEL, sel, 0);
+}
+static void RcdWindowSync()                     // the window shows what's going on (and only allows changes while stopped)
+{
+    if (!gRcdWnd) return;
+    const bool on = gRcd != nullptr;
+    SetDlgItemTextW(gRcdWnd, IDC_RCD_GO, on ? L"\x25A0  Stop" : L"\x25CF  Record");
+    EnableWindow(GetDlgItem(gRcdWnd, IDC_RCD_WHAT), !on);
+    EnableWindow(GetDlgItem(gRcdWnd, IDC_RCD_FMT), !on);
+    EnableWindow(GetDlgItem(gRcdWnd, IDC_RCD_DIRBTN), !on);
+    SetDlgItemTextW(gRcdWnd, IDC_RCD_DIR, RcdDir());
+    wchar_t t[600] = L"";
+    if (gRcdWhat >= MAX_OUT) {                  // which tracks
+        wchar_t names[RCD_MAXT][64]; int kind[RCD_MAXT], arg[RCD_MAXT];
+        const int n = RcdTrackList(names, kind, arg);
+        lstrcpynW(t, L"Tracks: ", 600);
+        for (int i = 0; i < n; i++) { if (i) lstrcatW(t, L", "); lstrcatW(t, names[i]); }
+        lstrcatW(t, L". Each is its own file, all the same length, in a folder per recording.");
+    } else lstrcpynW(t, L"Exactly what that output sends out (after its volume and limiter), in one file.", 600);
+    SetDlgItemTextW(gRcdWnd, IDC_RCD_TRACKS, t);
+    wchar_t k[100]; FxKeyButtonText(SLOT_RECORD, k, 100);
+    SetDlgItemTextW(gRcdWnd, IDC_RCD_KEY, k);
+    InvalidateRect(gRcdWnd, nullptr, TRUE);
+}
+static LRESULT CALLBACK RcdProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        if (id == IDC_RCD_GO && code == BN_CLICKED) RcdToggle();
+        if (id == IDC_RCD_WHAT && code == CBN_SELCHANGE) {
+            const int i = (int)SendDlgItemMessageW(h, id, CB_GETCURSEL, 0, 0);
+            gRcdWhat = (int)SendDlgItemMessageW(h, id, CB_GETITEMDATA, i, 0);
+            RcdWindowSync();
+        }
+        if (id == IDC_RCD_FMT && code == CBN_SELCHANGE) gRcdFmt = Iclamp((int)SendDlgItemMessageW(h, id, CB_GETCURSEL, 0, 0), 0, 2);
+        if (id == IDC_RCD_DIRBTN && code == BN_CLICKED) {
+            BROWSEINFOW bi = {}; bi.hwndOwner = h;
+            bi.lpszTitle = L"Pick the folder for recordings.";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+            if (pidl) { wchar_t d[MAX_PATH]; if (SHGetPathFromIDListW(pidl, d)) lstrcpynW(gRcdDir, d, MAX_PATH); CoTaskMemFree(pidl); }
+            RcdWindowSync();
+        }
+        if (id == IDC_RCD_OPEN && code == BN_CLICKED) {   // the folder (with the last recording picked, if there is one)
+            if (gRcdLast[0] && GetFileAttributesW(gRcdLast) != INVALID_FILE_ATTRIBUTES) {
+                wchar_t a[MAX_PATH + 16]; swprintf(a, MAX_PATH + 16, L"/select,\"%ls\"", gRcdLast);
+                ShellExecuteW(nullptr, L"open", L"explorer.exe", a, nullptr, SW_SHOWNORMAL);
+            } else { SHCreateDirectoryExW(nullptr, RcdDir(), nullptr); ShellExecuteW(nullptr, L"open", RcdDir(), nullptr, nullptr, SW_SHOWNORMAL); }
+        }
+        if (id == IDC_RCD_KEY && code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_RECORD], IDC_RCD_KEY, h);
+        return 0;
+    }
+    case WM_CONTEXTMENU:                        // right-click the key button: clear it
+        if ((HWND)w == GetDlgItem(h, IDC_RCD_KEY)) {
+            if (gCapturingKey) EndKeyCapture();
+            for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_RECORD][i] = 0;
+            RcdWindowSync();
+            return 0;
+        }
+        break;
+    case WM_CLOSE: if (gCapturingKey && gCapWnd == h) EndKeyCapture(); ShowWindow(h, SW_HIDE); return 0;   // (recording goes on)
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, m, w, l);
+    case WM_DESTROY: if (gRcdWnd == h) gRcdWnd = nullptr; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void RcdShow()
+{
+    if (gRcdWnd) {
+        RcdFillWhat(gRcdWnd); RcdWindowSync();
+        ShowWindow(gRcdWnd, SW_SHOW); SetForegroundWindow(gRcdWnd);
+        return;
+    }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = RcdProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagRecorder"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    const int cw = SC(520), ch = SC(292);
+    RECT r = { 0, 0, cw, ch }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND w = CreateWindowExW(0, L"LagRecorder", L"Lag Effect - Recorder", style,
+                             (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    gRcdWnd = w;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id) {
+        HWND c = CreateWindowExW(0, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x), SC(y), SC(w2), SC(h2), w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"STATIC", L"Record", 0, 16, 19, 90, 18, -1);
+    mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 110, 16, 394, 300, IDC_RCD_WHAT);
+    mk(L"STATIC", L"", 0, 110, 46, 394, 34, IDC_RCD_TRACKS);
+    mk(L"STATIC", L"Format", 0, 16, 89, 90, 18, -1);
+    HWND fm = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 110, 86, 394, 200, IDC_RCD_FMT);
+    SendMessageW(fm, CB_ADDSTRING, 0, (LPARAM)L"WAV, 16-bit (about 11 MB a minute)");
+    SendMessageW(fm, CB_ADDSTRING, 0, (LPARAM)L"WAV, 32-bit float (twice the size; never clips)");
+    SendMessageW(fm, CB_ADDSTRING, 0, (LPARAM)L"WAV, 16-bit, plus an MP3 copy when it stops");
+    SendMessageW(fm, CB_SETCURSEL, Iclamp(gRcdFmt, 0, 2), 0);
+    mk(L"STATIC", L"Save to", 0, 16, 125, 90, 18, -1);
+    mk(L"STATIC", L"", SS_PATHELLIPSIS | SS_NOPREFIX, 110, 125, 218, 18, IDC_RCD_DIR);
+    mk(L"BUTTON", L"Change...", WS_TABSTOP, 334, 120, 82, 28, IDC_RCD_DIRBTN);
+    mk(L"BUTTON", L"Open folder", WS_TABSTOP, 420, 120, 84, 28, IDC_RCD_OPEN);
+    mk(L"STATIC", L"Start / stop key", 0, 16, 163, 110, 18, -1);
+    mk(L"BUTTON", L"", WS_TABSTOP, 130, 158, 180, 28, IDC_RCD_KEY);
+    mk(L"STATIC", L"(right-click it to clear)", 0, 318, 163, 186, 18, -1);
+    mk(L"BUTTON", L"", WS_TABSTOP | BS_DEFPUSHBUTTON, 16, 210, 150, 52, IDC_RCD_GO);
+    mk(L"STATIC", L"", SS_NOPREFIX, 180, 206, 324, 72, IDC_RCD_STAT);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    RcdFillWhat(w);
+    RcdWindowSync();
+    ShowWindow(w, SW_SHOW);
+}
+
 // ======================= window =======================
 static void CreateUI()
 {
@@ -18821,6 +19492,8 @@ static void CreateUI()
         SendMessageW(e, EM_LIMITTEXT, 80, 0);
         SetWindowSubclass(e, SearchEditProc, 1, 0);
         Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP, 210, BASE_H - 28, 84, 24, IDC_KEYSLIST);
+        gDesign[gDesignN - 1].free = true;
+        Ctl(L"BUTTON", L"Recorder...", WS_TABSTOP, 298, BASE_H - 28, 84, 24, IDC_RCDBTN);
         gDesign[gDesignN - 1].free = true;
         Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 302, BASE_H - 28, 244, 24, IDC_ONSTRIP);
         gDesign[gDesignN - 1].free = true;
@@ -20042,6 +20715,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_WHINE)       { if (code == BN_CLICKED) WhineMenu(); return; }
     if (id == IDC_SEARCH)      { if (code == EN_CHANGE) SearchUpdate(); return; }
     if (id == IDC_KEYSLIST)    { if (code == BN_CLICKED) KeysListShow(); return; }
+    if (id == IDC_RCDBTN)      { if (code == BN_CLICKED) RcdShow(); return; }
     if (id == IDC_ONSTRIP)     { if (code == STN_CLICKED) ChipsClick(); return; }
     if (id == IDC_WINLVL) {                     // the mic's level in Windows
         BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
@@ -20864,6 +21538,10 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         SetTimer(h, TIMER_CLEANUP, 1000, nullptr);
         SetTimer(h, TIMER_FXKEYS, 20, nullptr);
         return 0;
+    case WM_APP_RCDMP3:
+        MessageBoxW(gRcdWnd && IsWindowVisible(gRcdWnd) ? gRcdWnd : h, L"The MP3 copy couldn't be made (Windows' MP3 encoder isn't available here). "
+                    L"The WAV recording is saved as usual.", L"Lag Effect - Recorder", MB_ICONWARNING);
+        return 0;
     case WM_VST_WAKE:                           // a plugin asked for the window's thread (a callback, a restart)
         gVstWakePending = 0;
         if (gFeatVst) VstTick(false);
@@ -20875,7 +21553,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick();
+            UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick(); RcdTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
                 chTick = 0; ChanTick();
@@ -21196,6 +21874,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             SaveInt(L"win_x", wp.rcNormalPosition.left);
             SaveInt(L"win_y", wp.rcNormalPosition.top);
         }
+        RcdStop(true);                          // a recording running: its files finished properly
         if (!gNoSaveOnExit) SaveSettings();     // (after Import, the imported file is kept as it is)
         KillTimer(h, TIMER_VST);
         VstStopAll(true);                       // each plugin's settings are saved, its window closed, and it's shut down
@@ -21206,6 +21885,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     case WM_QUERYENDSESSION:                    // Windows is restarting / shutting down: save now (no WM_CLOSE comes)
+        RcdStop(true);
         if (!gNoSaveOnExit) {
             WINDOWPLACEMENT wp = {}; wp.length = sizeof(wp);
             if (GetWindowPlacement(h, &wp)) { SaveInt(L"win_x", wp.rcNormalPosition.left); SaveInt(L"win_y", wp.rcNormalPosition.top); }
