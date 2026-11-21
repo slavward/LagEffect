@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.56.0"
+#define APP_VERSION L"1.57.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1261,6 +1261,7 @@ static float gOutShow[8] = { -80, -80, -80, -80, -80, -80, -80, -80 };
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 // Settings > Features: each of these is hidden and doesn't run at all while it's off (new installs: all off).
 static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false, gFeatVst = false;
+static volatile bool gFeatSpeech = false;          // Mic > Speech (1.57.0): voice commands, bleep, the TTS voice
 static bool gSafe = false;                      // safe start (Shift held while starting): plugins, Voice FX, remote control off for this run
 static bool gSafeVst = false, gSafeFx = false, gSafeWs = false;   // (what they were: saved back unless you switch them on)
 static unsigned long long gStartTick = 0;       // when Lag Effect started (bug report info: uptime)
@@ -1289,8 +1290,8 @@ static bool    gWsOn = false;
 static int     gWsPort = 7600;
 static wchar_t gWsPass[64] = L"";
 static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutter until then
-enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16 };
-static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst); }
+enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16, FEAT_SPEECH = 32 };
+static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst) || (mask & FEAT_SPEECH && gFeatSpeech); }
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
 static int  gBuildCond = 0;                     // (...and when they show: 0 always, 1 vocoder style isn't Synth plugin, 2 it is)
 static bool CondOn(int c);
@@ -4241,6 +4242,56 @@ static inline float BbRun(BbCore& B, float x, bool on, int mode, int kit, int se
     return out * vol;
 }
 
+// ======================= 1.57.0: Speech (Mic > Speech): the audio side =======================
+// A clock for everything below: frames since Lag Effect's audio first ran (it pauses while the audio is off).
+static std::atomic<long long> gAudT{ 0 };
+// The speech recognizer hears your mic (after cleanup, before effects and mutes) at 16 kHz, 16-bit, through this ring.
+// Speech sample n (counted from gSpBaseW) was the mic at clock gSpT0 + 3 n.
+#define SP_RING (1u << 19)                       // 32 s
+static short gSpRing[SP_RING];
+static std::atomic<unsigned> gSpW{ 0 };          // samples written (the audio thread)
+static std::atomic<bool> gSpFeed{ false };       // the window wants it
+static std::atomic<bool> gSpStartReq{ false };   // (re)start: the audio thread sets gSpBaseW / gSpT0 on its next block
+static std::atomic<unsigned> gSpBaseW{ 0 };
+static std::atomic<long long> gSpT0{ -1 };
+static std::atomic<bool> gSpLost{ false };       // the recognizer fell 32 s behind: the window restarts it
+static std::atomic<unsigned> gSpRead{ 0 };       // samples the recognizer has taken (its reader thread)
+struct SpFeedState { float l1 = 0, l2 = 0; int ph = 0; };
+static inline void SpFeed(SpFeedState& S, float x)   // one 48 kHz frame in; every 3rd goes in the ring (after a ~6 kHz low-pass)
+{
+    static const float a = 1.0f - expf(-6.2831853f * 6000.0f / RATE);
+    S.l1 += (x - S.l1) * a; S.l2 += (S.l1 - S.l2) * a;
+    if (++S.ph < 3) return;
+    S.ph = 0;
+    const unsigned w = gSpW.load(std::memory_order_relaxed);
+    if (w - gSpRead.load(std::memory_order_relaxed) >= SP_RING - 1) { gSpLost.store(true, std::memory_order_relaxed); return; }
+    float v = S.l2 * 32767.0f; v = v > 32767.0f ? 32767.0f : v < -32768.0f ? -32768.0f : v;
+    gSpRing[w & (SP_RING - 1)] = (short)v;
+    gSpW.store(w + 1, std::memory_order_release);
+}
+// Bleep: your voice on the chosen outputs runs gBlDelayF behind; stretches of the clock (words the recognizer
+// caught, or your bleep key) are replaced by a tone (or silence) when they come out.
+#define BL_RING   (1u << 18)                     // up to 5.4 s of delay
+#define BL_RANGES 64
+static float gBlBuf[MAX_OUT][BL_RING];
+static std::atomic<bool> gBlOn{ false };
+static std::atomic<unsigned> gBlOuts{ 0 };       // outputs (bits)
+static std::atomic<int> gBlDelayF{ 2 * RATE };
+static std::atomic<int> gBlSound{ 0 };           // 0 a bleep, 1 silence
+struct BlRange { std::atomic<long long> a{ 0 }, b{ 0 }; };   // [a, b) on the clock; b = LLONG_MAX while the key is held
+static BlRange gBlR[BL_RANGES];
+static std::atomic<unsigned> gBlRN{ 0 };          // ranges added (the newest is gBlR[(gBlRN - 1) % BL_RANGES])
+static unsigned BlAdd(long long a, long long b)   // (the window) returns its slot, for a key range that ends later
+{
+    const unsigned n = gBlRN.load(), i = n % BL_RANGES;
+    gBlR[i].b.store(0); gBlR[i].a.store(a); gBlR[i].b.store(b);
+    gBlRN.store(n + 1);
+    return i;
+}
+struct BlOutState { float g = 0, ph = 0; };
+// Talk through a TTS voice: your real voice is muted on every output while it's on (the TTS voice plays as a sound).
+static std::atomic<bool> gSpMuteVoice{ false };
+
 static void AudioCallback(ma_device* dev, void* output, const void* input, ma_uint32 frames)
 {
     DropWatch dropWatch(dev, frames);
@@ -4748,6 +4799,28 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool bbRun = bbOn || bb.busy();
     const int bbMode = gBbMode.load(std::memory_order_relaxed), bbKit = gBbKit.load(std::memory_order_relaxed), bbSens = gBbSens.load(std::memory_order_relaxed);
     const float bbVol = gBbVolPct.load(std::memory_order_relaxed) / 100.0f;
+    // Speech (Mic > Speech, 1.57.0): the clock, the recognizer's feed, bleeped outputs, your voice muted for the TTS voice
+    const long long T0 = gAudT.load(std::memory_order_relaxed);
+    static SpFeedState spf;
+    if (gSpStartReq.exchange(false)) { spf = SpFeedState(); gSpBaseW.store(gSpW.load()); gSpT0.store(T0); }
+    const bool spFeed = gSpFeed.load(std::memory_order_relaxed);
+    static float spG = 1.0f;                     // your voice (0 while the TTS voice talks for you)
+    const bool spMute = gFeatSpeech && gSpMuteVoice.load(std::memory_order_relaxed), spMuteRun = spMute || spG < 1.0f;
+    static BlOutState blSt[MAX_OUT];
+    const bool blOn = gFeatSpeech && gBlOn.load(std::memory_order_relaxed);
+    const unsigned blOuts = blOn ? gBlOuts.load(std::memory_order_relaxed) : 0u;
+    const int blD = Iclamp(gBlDelayF.load(std::memory_order_relaxed), 0, (int)BL_RING - 8192);
+    const bool blTone = gBlSound.load(std::memory_order_relaxed) == 0;
+    long long blA[8], blB[8]; int blN = 0;      // the stretches to bleep that come out during this block
+    if (blOuts) {
+        const long long t0 = T0 - blD, t1 = t0 + frames;
+        const unsigned rn = gBlRN.load(std::memory_order_acquire);
+        for (unsigned k = 0; k < BL_RANGES && k < rn && blN < 8; k++) {
+            const BlRange& r = gBlR[(rn - 1 - k) % BL_RANGES];
+            const long long a = r.a.load(std::memory_order_relaxed), b = r.b.load(std::memory_order_relaxed);
+            if (b > t0 && a < t1 && b > a) { blA[blN] = a; blB[blN] = b; blN++; }
+        }
+    }
     // The first half of a sample: the soundboard, your mic, and the voice effects on it.
     auto front = [&](ma_uint32 f, float& sb, float& sbFx, float& clean) -> float {
         sbFx = 0; int padsOn = 0;
@@ -4805,9 +4878,15 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             duckGain = gVstPadDuck[f]; chDuck = gVstDuck[f]; chDuckAll = gVstDuckAll[f];   // (these still glide per sample)
         }
         else s = front(f, sb, sbFx, clean);
+        if (spFeed) SpFeed(spf, clean);         // the speech recognizer hears your mic (before effects and mutes)
         if (bbRun) {                            // beatbox: your mouth sounds play drums (and "drums only" mutes your voice)
             sb += BbRun(bb, clean, bbOn, bbMode, bbKit, bbSens, bbVol);
             if (bb.voiceG < 1.0f) { s *= bb.voiceG; clean *= bb.voiceG; }
+        }
+        if (spMuteRun) {                        // talking through a TTS voice: your own is muted (glides, no click)
+            spG += ((spMute ? 0.0f : 1.0f) - spG) * 0.004f;
+            if (spG > 0.9999f) spG = 1.0f; else if (spG < 0.0001f) spG = 0.0f;
+            s *= spG; clean *= spG;
         }
 
         float effect = 0.0f, everything;
@@ -4944,7 +5023,23 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             if (mode[k] == MODE_ANYFX) return everything * Max(anyG * tbG[k], tbE[k]);
             return RowSignal(mode[k], effect, everything, clean) * tbG[k] + everything * tbE[k];
         };
-        float m0 = soloMask && soloOut == 0 ? 0.0f : micSig(0) + sounds(0);
+        auto vsig = [&](int k) -> float {       // your voice on output k (bleeped outputs: from behind, bleeps put in)
+            const float v = micSig(k);
+            if (!(blOuts >> k & 1)) return v;
+            float* rb = gBlBuf[k];
+            const long long t = T0 + (long long)f;
+            rb[(unsigned)t & (BL_RING - 1)] = v;
+            const float d = rb[(unsigned)(t - blD) & (BL_RING - 1)];
+            const long long td = t - blD;
+            bool in = false; for (int i = 0; i < blN; i++) if (td >= blA[i] && td < blB[i]) { in = true; break; }
+            BlOutState& st = blSt[k];
+            st.g += ((in ? 1.0f : 0.0f) - st.g) * 0.007f;   // (~3 ms in and out)
+            if (st.g < 0.0001f) { st.g = 0.0f; return d; }
+            float y = 0.0f;
+            if (blTone) { st.ph += 6.2831853f * 1000.0f / RATE; if (st.ph > 6.2831853f) st.ph -= 6.2831853f; y = 0.22f * BbSin(st.ph); }
+            return d * (1.0f - st.g) + y * st.g;
+        };
+        float m0 = soloMask && soloOut == 0 ? 0.0f : vsig(0) + sounds(0);
         if (outVst[0]) { gVstOutL[0][f] = m0 + cL[0]; gVstOutR[0][f] = m0 + cR[0]; }   // (plugins on it: finished after the loop)
         else {
             float oL = (m0 + cL[0]) * vol[0], oR = (m0 + cR[0]) * vol[0];
@@ -4958,12 +5053,12 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         for (int k = 1; k < MAX_OUT; k++) {
             if (!on[k]) continue;
             if (outVst[k]) {
-                const float mv = soloMask && soloOut == k ? 0.0f : micSig(k) + sounds(k);
+                const float mv = soloMask && soloOut == k ? 0.0f : vsig(k) + sounds(k);
                 gVstOutL[k][f] = mv + cL[k]; gVstOutR[k][f] = mv + cR[k];
                 continue;
             }
             if ((w[k] - r[k]) >= RING_FRAMES) continue;
-            const float mk = soloMask && soloOut == k ? 0.0f : micSig(k) + sounds(k);
+            const float mk = soloMask && soloOut == k ? 0.0f : vsig(k) + sounds(k);
             float kL = (mk + cL[k]) * vol[k], kR = (mk + cR[k]) * vol[k];
             if (testLeft[k] > 0) { const float t = TestToneAt(testLeft[k]--); kL += t; kR += t; }
             LimitStereo(k, kL, kR);
@@ -4973,6 +5068,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             w[k]++;
         }
     }
+    gAudT.store(T0 + frames, std::memory_order_relaxed);   // (the clock)
     {                                           // the looper, for the window
         int layers = lp.cur >= 0 ? lp.cur + 1 : lp.n; for (int i = 0; i < lp.n && i < LP_LAYERS; i++) if (lp.gone[i]) layers--;
         gLpState.store(lp.clearing ? LP_EMPTY : lp.state, std::memory_order_relaxed); gLpLen.store(lp.state == LP_REC ? lp.pos : lp.len, std::memory_order_relaxed);
@@ -5162,6 +5258,9 @@ enum {
     IDC_LPLAYER0 = 4580,                        // .. +8: the looper's layers (click: mute)
     IDC_BBON = 4590, IDC_BBKEY, IDC_BBMODE, IDC_BBKIT, IDC_BBSENS, IDC_BBVOL, IDC_BBVIEW,   // Soundboard > Beatbox
     IDC_BBTEACH0, IDC_BBTEACH1, IDC_BBTEACH2, IDC_BBFORGET, IDC_BBSTAT, IDC_BBHINT,
+    IDC_MICSUB4 = 4517,                         // Mic > Speech (1.57.0)
+    IDC_FEATSPEECH = 4610, IDC_SPCMDON, IDC_SPPREFIX, IDC_SPSAY, IDC_SPACT, IDC_SPADD, IDC_SPLIST, IDC_SPDEL, IDC_SPSTAT,
+    IDC_BLON, IDC_BLOUTS, IDC_BLDELAY, IDC_BLSOUND, IDC_BLWORDS, IDC_BLCOMMON, IDC_BLKEY, IDC_BLBACK, IDC_SPTTS, IDC_SPTTSKEY,
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5421,7 +5520,7 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun", L"Whisper" };
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume
-static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : -1; }
+static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : id == IDC_MICSUB4 ? 4 : -1; }
 static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features
 static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox
 static const wchar_t* SB_SUB_NAMES[3] = { L"Pads", L"Looper", L"Beatbox" };
@@ -5429,6 +5528,27 @@ static bool gLpSync = true;                     // Looper: line layers up with w
 static unsigned gBbTaught = 0;                  // Beatbox: sounds you taught it (bits: kick, snare, hi-hat)
 static const wchar_t* BB_KEYS[BB_SOUNDS] = { L"beatbox_sound_kick", L"beatbox_sound_snare", L"beatbox_sound_hihat" };
 static void LoopBbSave(); static void LoopTick(bool force = false); static void BbTick(); static void BbStatus();
+static void SpeechSave(); static void SpeechLoad(); static void SpeechTick(); static void SpeechStatus(); static void SpActFill();
+static void SpeechEvents(); static void TtsNextQueued(); static bool gTtsQuiet = false; static void SpCmdList(); static void BlOutsText();
+// Mic > Speech (1.57.0): its settings and the recognizer (the code is with the window's, further down)
+// ---- settings ----
+#define VC_MAX 32
+struct VoiceCmd { wchar_t say[64]; int slot; };
+static VoiceCmd gVc[VC_MAX]; static int gVcN = 0;
+static bool gSpCmdOn = false;
+static wchar_t gSpPrefix[32] = L"";
+static wchar_t gBlWords[600] = L"";
+static int gBlDelayMs = 2000, gBlBackMs = 600;
+static const int BL_DELAYS[5] = { 0, 1000, 1500, 2000, 3000 };
+// ---- the engine ----
+static ISpRecognizer* gSpRec = nullptr; static ISpRecoContext* gSpCtx = nullptr;
+static ISpRecoGrammar* gSpDict = nullptr; static ISpRecoGrammar* gSpCmdG = nullptr;
+class SpFeedStream; static SpFeedStream* gSpStream = nullptr;
+static wchar_t gSpEngine[128] = L"", gSpErr[300] = L"", gSpHeard[200] = L"";
+static DWORD gSpRetryAt = 0; static bool gSpErrShown = false;
+static wchar_t gTtsQ[4][600]; static int gTtsQN = 0;
+
+
 static void DrawLoopView(DRAWITEMSTRUCT* d); static void DrawBbView(DRAWITEMSTRUCT* d);
 static FxGroup gFxGroups[] = {
     { L"Pitch",      &gFxPitchOn,   L"fx_pitch_on",    true,  L"fx_pitch_hotkey",   0, 0 },
@@ -5495,8 +5615,10 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_LPUNDO  (SLOT_RECORD + 3)           //   undo the last layer
 #define SLOT_LPCLEAR (SLOT_RECORD + 4)           //   clear
 #define SLOT_BEATBOX (SLOT_RECORD + 5)           // Soundboard > Beatbox: drums on / off
+#define SLOT_BLEEP   (SLOT_RECORD + 6)           // Mic > Speech (1.57.0): bleep while held
+#define SLOT_SPTTS   (SLOT_RECORD + 7)           //   the TTS voice on / off
 #define SLOT_NEW0    SLOT_LPREC                  // (slots after the plugins' and the recorder's)
-#define KEY_SLOTS    (SLOT_BEATBOX + 1)
+#define KEY_SLOTS    (SLOT_SPTTS + 1)
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -6196,6 +6318,8 @@ static const wchar_t* FxKeyIniName(int slot)
     if (slot == SLOT_LPUNDO)  return L"looper_undo_hotkey";
     if (slot == SLOT_LPCLEAR) return L"looper_clear_hotkey";
     if (slot == SLOT_BEATBOX) return L"beatbox_hotkey";
+    if (slot == SLOT_BLEEP)   return L"bleep_hotkey";
+    if (slot == SLOT_SPTTS)   return L"tts_voice_hotkey";
     if (slot >= SLOT_VST0) {                    // "plugin3_key"
         static wchar_t vn[VST_SLOTS][20];
         wchar_t* n = vn[slot - SLOT_VST0];
@@ -6427,6 +6551,7 @@ static void LoadSettings()
         gFeatSound = INI_INT(L"feat_soundboard", had) != 0;
         gFeatClips = INI_INT(L"feat_clips", had) != 0;
         gFeatVst   = INI_INT(L"feat_plugins", 0) != 0;       // (new in 1.41: off for everyone until switched on)
+        gFeatSpeech = INI_INT(L"feat_speech", 0) != 0;       // (new in 1.57: off until switched on)
     }
     for (int k = 0; k < VST_SLOTS; k++) {       // which plugin is in each slot (their own settings: Plugins\slotN.bin)
         VstUi& u = gVstUi[k];
@@ -6510,9 +6635,10 @@ static void LoadSettings()
     gDiveSemis = Iclamp(INI_INT(L"pitch_dive_semitones", -12), -12, 12);
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
     gHarmMute = INI_INT(L"fx_harm_mute", 0) != 0;
-    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 3);
+    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 4);
     gSbSub     = Iclamp(INI_INT(L"sound_subtab", 0), 0, 2);
     if (gMicSub == 2 && !gFeatVst) gMicSub = 0;
+    if (gMicSub == 4 && !gFeatSpeech) gMicSub = 0;
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
     gChoStyle  = Iclamp(INI_INT(L"fx_chorus_style", 0), 0, CHO_N - 1);
     gMufStyle  = Iclamp(INI_INT(L"fx_muffle_style", 0), 0, MUF_N - 1);
@@ -6524,6 +6650,7 @@ static void LoadSettings()
     gClipReplace  = INI_INT(L"clip_replace_oldest", 1) != 0;
     gPadChoke     = INI_INT(L"pads_one_at_a_time", 0) != 0;
     gPadDuck      = INI_INT(L"pads_duck_voice", 0) != 0;
+    SpeechLoad();                               // Mic > Speech (1.57.0)
     gLpVolPct     = Iclamp(INI_INT(L"looper_volume", 100), 0, 200);   // Soundboard > Looper / Beatbox (1.56.0)
     gLpVoiceOnly  = INI_INT(L"looper_voice_only", 0) != 0;
     gLpSync       = INI_INT(L"looper_line_up", 1) != 0;
@@ -7372,6 +7499,7 @@ static void SaveSettings()
     SaveInt(L"remote_on", gSafe && !gWsOn ? gSafeWs : gWsOn); SaveInt(L"remote_port", gWsPort); IniSet(L"remote_password", gWsPass);
     SaveInt(L"feat_lag", gFeatLag); SaveInt(L"feat_voicefx", gFeatFx); SaveInt(L"feat_soundboard", gFeatSound); SaveInt(L"feat_clips", gFeatClips);
     SaveInt(L"feat_plugins", gSafe && !gFeatVst ? gSafeVst : gFeatVst);   // (safe start switched it off for this run only)
+    SaveInt(L"feat_speech", gFeatSpeech);
     for (int k = 0; k < VST_SLOTS; k++) {
         const VstUi& u = gVstUi[k];
         wchar_t key[32], id[40];
@@ -7442,6 +7570,7 @@ static void SaveSettings()
     SaveInt(L"mic_subtab", gMicSub);
     SaveInt(L"sound_subtab", gSbSub);
     LoopBbSave();
+    SpeechSave();
     SaveInt(L"fx_dist_style", gDistStyle);
     SaveInt(L"fx_chorus_style", gChoStyle);
     SaveInt(L"fx_muffle_style", gMufStyle);
@@ -9086,6 +9215,7 @@ static void PadTick()                           // every 50 ms: redraw pads that
     MicTestTick();
     LoopTick();
     BbTick();
+    SpeechTick();
     OverlayUpdate();
     AutoProfileTick();
     static int lastRunning = -1;                // hint line: remind to press Start
@@ -10514,6 +10644,8 @@ static void SlotName(int slot, wchar_t* out, int cap)
     if (slot == SLOT_LPUNDO)  { lstrcpynW(out, L"Looper: undo the last layer", cap); return; }
     if (slot == SLOT_LPCLEAR) { lstrcpynW(out, L"Looper: clear", cap); return; }
     if (slot == SLOT_BEATBOX) { lstrcpynW(out, L"Beatbox drums on / off", cap); return; }
+    if (slot == SLOT_BLEEP)   { lstrcpynW(out, L"Bleep (while held)", cap); return; }
+    if (slot == SLOT_SPTTS)   { lstrcpynW(out, L"TTS voice on / off", cap); return; }
     if (slot >= SLOT_VST0) { lstrcpynW(out, L"switching a plugin on / off", cap); return; }
     if (slot == 0) lstrcpynW(out, L"Voice effects", cap);
     else if (slot < FX_KEY_SLOTS) wsprintfW(out, L"%s (Voice FX)", gFxGroups[slot - 1].title);
@@ -13682,13 +13814,14 @@ static void OnTtsDone(TtsJob* j)
         PadSetData(TTS_SLOT, j->data, j->len);
         gPads[TTS_SLOT].vol = gTtsVol;
         gPads[TTS_SLOT].trigger = true;
-    } else {
+    } else if (!gTtsQuiet) {                    // (the TTS voice of Mic > Speech: no message boxes while you talk)
         MessageBoxW(gWnd, L"Windows couldn't speak that. Check that a voice is installed "
                           L"(Settings > Time & language > Speech).", L"Lag Effect - Text to speech", MB_ICONWARNING);
     }
     HeapFree(GetProcessHeap(), 0, j);
     gTtsBusy = 0;
     SetDlgItemTextW(gWnd, IDC_TTSSPEAK, L"Speak");
+    TtsNextQueued();
     if (gVoiceInstalling) VoiceProgressTick();
 }
 
@@ -14448,6 +14581,25 @@ static void AddTips()
     }
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
     TipId(IDC_SBSUB0, L"Pads: sounds on hotkeys, and text to speech.");
+    TipId(IDC_MICSUB4, L"Speech: voice commands, bleeping words, talking through a TTS voice.");
+    TipId(IDC_SPCMDON, L"Say a phrase from the list and it does its action, like pressing that hotkey. Windows' speech recognizer listens to your mic (on this PC, not online).");
+    TipId(IDC_SPPREFIX, L"Optional: a word every command starts with (like \"computer\"), so normal talk doesn't set them off.");
+    TipId(IDC_SPSAY, L"What you'll say. Short and clear works best (2-4 words).");
+    TipId(IDC_SPACT, L"What it does: anything a hotkey can do (mute, a voice effect, a pad, a Mixer channel, a scene...).");
+    TipId(IDC_SPADD, L"Add the command (the same words again: changes what they do).");
+    TipId(IDC_SPLIST, L"Your commands. Click one to change it (then Add), or Remove it.");
+    TipId(IDC_SPDEL, L"Remove the command picked in the list.");
+    TipId(IDC_BLON, L"Your voice on the chosen outputs runs a little behind, so words from your list (and the bleep key) can be bleeped before anyone hears them.");
+    TipId(IDC_BLOUTS, L"Which outputs are bleeped (the stream's, usually). Your voice runs behind on these only; the others (Discord) stay live.");
+    TipId(IDC_BLDELAY, L"How far behind. Longer catches words more surely (the recognizer needs about a second). 0: no delay, the key only bleeps from when you press it.");
+    TipId(IDC_BLSOUND, L"A bleep tone, or just silence.");
+    TipId(IDC_BLWORDS, L"Words it bleeps by itself, commas between. word* = anything starting with it (shit* catches shitty).");
+    TipId(IDC_BLCOMMON, L"Add the usual English swear words to the list.");
+    TipId(IDC_BLKEY, L"Hold to bleep: from a little before you pressed it (Reach back) until you let go. Right-click clears it.");
+    TipId(IDC_BLBACK, L"The bleep key also covers this much before you pressed it (how long you take to react), up to the delay.");
+    TipId(IDC_SPTTS, L"Your own voice is muted; what you say is typed out by Windows' speech recognizer and spoken by the voice set in "
+                     L"Soundboard > Text to speech (Windows' default voice if that's not set). Each sentence plays after you finish it.");
+    TipId(IDC_SPTTSKEY, L"A hotkey that switches the TTS voice on and off (right-click clears it).");
     TipId(IDC_SBSUB1, L"Looper: record a few seconds, it plays round and round; add layers on top.");
     TipId(IDC_SBSUB2, L"Beatbox to drums: your mouth sounds play a drum kit.");
     TipId(IDC_LPREC,   L"Empty: start recording. Recording: close the loop, it plays. Playing: add a layer on top (press again to finish it).");
@@ -14804,7 +14956,7 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 }
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
-static const wchar_t* MIC_SUB_NAMES[4] = { L"Cleanup", L"Tone", L"Plugins", L"Volume" };
+static const wchar_t* MIC_SUB_NAMES[5] = { L"Cleanup", L"Tone", L"Plugins", L"Volume", L"Speech" };
 static const wchar_t* SET_SUB_NAMES[4] = { L"General", L"Look", L"Pictures", L"Features" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic, Settings and Soundboard sub-tabs
 {
@@ -15280,6 +15432,9 @@ static void MixHoldTick()                       // (every poll) each channel's h
 static void VstKeyEdge(int k, bool pressed, bool released);   // (plugins: defined with them)
 static void RcdToggle();
 static void LoopKey(int slot); static void BbSetOn(bool on, bool fromKey);   // (Soundboard > Looper / Beatbox)
+static void BlKey(bool down); static void SpTtsSet(bool on, bool fromKey);   // (Mic > Speech)
+static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a hotkey: seen down for one tick, then let go
+static bool gSpTts = false;
 static void PollFxKeys()
 {
     BYTE cache[256] = {};
@@ -15289,9 +15444,11 @@ static void PollFxKeys()
                          ((slot == SLOT_CLIPNOW || (slot >= SLOT_CLIP0 && slot < SLOT_CLIP0 + CLIPS)) && !gFeatClips) ||
                          ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag) ||
                          (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst) ||
-                         (slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX && !gFeatSound);
-        if (off) { gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
+                         (slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX && !gFeatSound) ||
+                         ((slot == SLOT_BLEEP || slot == SLOT_SPTTS) && !gFeatSpeech);
+        if (off) { gVoiceTap[slot] = 0; gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
+        if (gVoiceTap[slot]) { if (gVoiceTap[slot] == 2) down = true; gVoiceTap[slot]--; }   // a voice command (Mic > Speech)
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
         if (slot < FX_KEY_SLOTS && gFxHold[slot]) {   // hold-to-activate effect hotkeys
@@ -15301,6 +15458,8 @@ static void PollFxKeys()
         if (slot == SLOT_RECORD) { if (pressed) RcdToggle(); continue; }   // the recorder
         if (slot >= SLOT_LPREC && slot <= SLOT_LPCLEAR) { if (pressed) LoopKey(slot); continue; }   // the looper
         if (slot == SLOT_BEATBOX) { if (pressed) BbSetOn(!gBbOn.load(), true); continue; }
+        if (slot == SLOT_BLEEP) { if (pressed) BlKey(true); else if (released) BlKey(false); continue; }
+        if (slot == SLOT_SPTTS) { if (pressed) SpTtsSet(!gSpTts, true); continue; }
         if (slot >= SLOT_VST0) { if (pressed || released) VstKeyEdge(slot - SLOT_VST0, pressed, released); continue; }   // a plugin on / off
         if (slot >= SLOT_MIX0) { MixKey(slot, down, pressed, released); continue; }   // the Mixer's
         if (slot == SLOT_DIVE) { gDiveHeld = down; continue; }   // hold to bend
@@ -18472,6 +18631,11 @@ static void ShowHelp()
         L"Press Record, sing or play something, press it again: it plays round and round on every output that gets sounds. "
         L"Press Record while it plays to add a layer, again to finish it. Undo takes the last layer off; click a layer's number to mute it. "
         L"Up to 8 layers and 20 seconds. Each button can have a hotkey.\n\n"
+        L"SPEECH (Mic tab, Settings > Features > Speech)\n"
+        L"Windows' speech recognizer listens to your mic, on this PC. Voice commands: say a phrase, it does what a hotkey would. "
+        L"Bleep: your voice on the outputs you pick runs a little behind, so words from your list are bleeped before they're heard; "
+        L"hold the bleep key to bleep anything (it reaches back a little). TTS voice: what you say is spoken by a text-to-speech voice "
+        L"and your own is muted.\n\n"
         L"BEATBOX TO DRUMS (Soundboard tab)\n"
         L"Tick Drums on and beatbox: kick (\"b\"), snare (\"pf\", \"k\") and hi-hat (\"ts\") sounds play a drum kit, about 8 ms after you. "
         L"Drums only mutes your voice while it's on. If a sound plays the wrong drum, Teach it your sounds.\n\n"
@@ -18503,7 +18667,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     const wchar_t* pre = slot == SLOT_REWIND ? L"Rewind: " : slot == SLOT_REPEAT ? L"Repeat word: "
                        : slot == SLOT_PADBANK ? L"Next page: " : slot == SLOT_PROFNEXT ? L"Next profile: "
                        : slot >= SLOT_PROF0 && slot < SLOT_MIX0 ? L"This profile: " : slot == SLOT_TAPESTOP ? L"Tape stop: "
-                       : slot == SLOT_DIVE ? L"Pitch dive (hold): " : slot == SLOT_PTT || slot >= SLOT_NEW0 ? L"Key: " : L"";
+                       : slot == SLOT_DIVE ? L"Pitch dive (hold): " : slot == SLOT_BLEEP ? L"Bleep key: " : slot == SLOT_PTT || slot >= SLOT_NEW0 ? L"Key: " : L"";
     wsprintfW(buf, L"%s%s", pre, k);
 }
 
@@ -18512,6 +18676,8 @@ static int FxKeyButtonId(int slot)
     if (slot == SLOT_RECORD) return 4545;       // (IDC_RCD_KEY, in the Recorder window)
     if (slot >= SLOT_LPREC && slot <= SLOT_LPCLEAR) return IDC_LPKREC + (slot - SLOT_LPREC);
     if (slot == SLOT_BEATBOX) return IDC_BBKEY;
+    if (slot == SLOT_BLEEP)   return IDC_BLKEY;
+    if (slot == SLOT_SPTTS)   return IDC_SPTTSKEY;
     if (slot >= SLOT_VST0) {                    // a plugin slot: on the Mic tab, or in the open channel / output plugins window
         const int k = slot - SLOT_VST0;
         if (k < VST_MIC) return IDC_VSTKEY0 + k;
@@ -19559,7 +19725,7 @@ static int PagedFeatOf(HWND h) { if (h) for (int i = 0; i < gPagedN; i++) if (gP
 static const wchar_t* SubName(int page, int sub)
 {
     if (sub < 0) return nullptr;
-    if (page == PAGE_MIC && sub < 4) return MIC_SUB_NAMES[sub];
+    if (page == PAGE_MIC && sub < 5) return MIC_SUB_NAMES[sub];
     if (page == PAGE_FX && sub < FX_SUBS) return FX_SUB_NAMES[sub];
     if (page == PAGE_SETTINGS && sub < 4) return SET_SUB_NAMES[sub];
     if (page == PAGE_SOUND && sub < 3) return SB_SUB_NAMES[sub];
@@ -19761,7 +19927,7 @@ static void GoTo(int page, int sub, HWND target, const wchar_t* title = nullptr,
     SetPage(page);
     if (sub >= 0) {
         int id = 0;
-        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : IDC_MICSUB3;
+        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : sub == 4 ? IDC_MICSUB4 : IDC_MICSUB3;
         if (page == PAGE_SETTINGS && sub <= 3) id = IDC_SETSUB0 + sub;
         if (page == PAGE_SOUND && sub <= 2) id = IDC_SBSUB0 + sub;
         if (page == PAGE_MIXER && sub != gMixSub) id = IDC_MIXKEYSBTN;
@@ -20169,6 +20335,10 @@ static void BugInfoBuild(wchar_t* o, int cap)
         BugAdd(o, cap, L"Looper: %ls, %d layer(s), %d ms; beatbox %ls (mode %d, kit %d, sensitivity %d, volume %d, taught %u)",
                LS[Iclamp(gLpState.load(), 0, 4)], gLpLayers.load(), (int)(gLpLen.load() * 1000LL / RATE), gBbOn.load() ? L"on" : L"off",
                gBbMode.load(), gBbKit.load(), gBbSens.load(), gBbVolPct.load(), gBbTaught);
+        BugAdd(o, cap, L"Speech: %ls; recognizer %ls%ls%ls; commands %ls (%d); bleep %ls (outputs %u, %d ms, %d words chars, key reach %d ms); TTS voice %ls",
+               gFeatSpeech ? L"on" : L"off", gSpRec ? L"running" : L"not running", gSpEngine[0] ? L", " : L"", gSpEngine,
+               gSpCmdOn ? L"on" : L"off", gVcN, gBlOn.load() ? L"on" : L"off", gBlOuts.load(), gBlDelayMs, lstrlenW(gBlWords), gBlBackMs, gSpTts ? L"on" : L"off");
+        if (gSpErr[0]) BugAdd(o, cap, L"Speech problem: %ls", gSpErr);
     }
     BugAdd(o, cap, L"Silence alarm: %ls%ls%ls (outputs 0x%x)", gSilMain ? L"audio stopped " : L"", gSilMic ? L"mic silent " : L"",
         !gSilMain && !gSilMic && !gSilOut ? L"nothing" : L"", gSilOut);
@@ -20335,6 +20505,11 @@ static int ChipsBuild(Chip* c)
         else if (ls == LP_PLAY) add(L"Looper", 0, PAGE_SOUND, 1);
         if (gBbOn.load()) add(gBbMode.load() == 1 ? L"Drums only" : L"Beatbox", gBbMode.load() == 1 ? 1 : 0, PAGE_SOUND, 2);
     }
+    if (gFeatSpeech) {                          // Mic > Speech (1.57.0)
+        if (gSpTts) add(L"TTS voice", 1, PAGE_MIC, 4);   // (red: your own voice is muted)
+        if (gBlOn.load() && gBlOuts.load()) { wchar_t t[32]; swprintf(t, 32, L"Bleep %.1f s", gBlDelayMs / 1000.0); add(t, 0, PAGE_MIC, 4); }
+        if (gSpCmdOn && gVcN > 0) add(L"Voice commands", 0, PAGE_MIC, 4);
+    }
     return n;
 }
 static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
@@ -20471,7 +20646,7 @@ static void SrchBuild()                         // (again each time the box gets
 {
     gSrchN = 0;
     for (int t = 0; t < TAB_COUNT; t++) SrchAdd(PAGE_NAMES[t], GetDlgItem(gWnd, IDC_TAB0 + t), t, -1, -1, 0, SK_TAB);
-    for (int s = 0; s < 4; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : 0, SK_SUB);
+    for (int s = 0; s < 5; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : s == 4 ? FEAT_SPEECH : 0, SK_SUB);
     for (int s = 0; s < 3; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
     for (int s = 0; s < FX_SUBS; s++) SrchAdd(FX_SUB_NAMES[s], nullptr, PAGE_FX, s, -1, 0, SK_SUB);
     for (int s = 0; s < 4; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
@@ -21084,6 +21259,459 @@ static void DrawBbView(DRAWITEMSTRUCT* d)       // a light per drum: lit when yo
     SelectObject(md, obm); DeleteObject(bm); DeleteDC(md);
 }
 
+// ======================= 1.57.0: Speech (Mic > Speech): the window side =======================
+// Windows' own speech recognizer (SAPI, the desktop engine) hears your mic through SpFeedStream (the audio
+// thread's 16 kHz ring). Voice commands are a grammar of your phrases; bleep words and the TTS voice use dictation.
+static const GUID kCLSID_SpInprocRecognizer = { 0x41b89b6b, 0x9399, 0x11d2, { 0x96, 0x23, 0x00, 0xc0, 0x4f, 0x8e, 0xe6, 0x28 } };
+static const GUID kIID_ISpRecognizer = { 0xc2b5f241, 0xdaa0, 0x4507, { 0x9e, 0x16, 0x5a, 0x1e, 0xaa, 0x2b, 0x7a, 0x5c } };
+static const GUID kIID_ISpStreamFormat = { 0xbed530be, 0x2606, 0x4f4d, { 0xa1, 0xc0, 0x54, 0xc5, 0xcd, 0xa5, 0x56, 0x6f } };
+static const GUID kIID_IStreamX = { 0x0000000c, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const GUID kIID_ISeqStream = { 0x0c733a30, 0x2a1c, 0x11ce, { 0xad, 0xe5, 0x00, 0xaa, 0x00, 0x44, 0x77, 0x3d } };
+static const GUID kIID_IUnknownX = { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+#define LE_SPFEI(e) ((1ULL << (e)) | (1ULL << SPEI_RESERVED1) | (1ULL << SPEI_RESERVED2))
+#define WM_APP_SPEECH (WM_APP + 21)
+
+class SpFeedStream : public ISpStreamFormat {   // the recognizer reads your mic from here (blocking until it's there)
+    LONG ref = 1; unsigned rpos = 0; bool started = false; ULONGLONG got = 0;
+public:
+    std::atomic<bool> quit{ false };
+    virtual ~SpFeedStream() {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** pp) override {
+        if (IsEqualGUID(id, kIID_IUnknownX) || IsEqualGUID(id, kIID_ISeqStream) || IsEqualGUID(id, kIID_IStreamX) || IsEqualGUID(id, kIID_ISpStreamFormat)) {
+            *pp = static_cast<ISpStreamFormat*>(this); AddRef(); return S_OK;
+        }
+        *pp = nullptr; return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref); }
+    ULONG STDMETHODCALLTYPE Release() override { const LONG r = InterlockedDecrement(&ref); if (!r) delete this; return (ULONG)r; }
+    HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
+        short* out = (short*)pv; const ULONG want = cb / 2; ULONG done = 0;
+        while (!started) {                      // (from where the audio thread started feeding)
+            if (quit.load()) break;
+            if (!gSpStartReq.load()) { rpos = gSpBaseW.load(); started = true; break; }
+            Sleep(5);
+        }
+        while (done < want && !quit.load()) {
+            const unsigned avail = gSpW.load(std::memory_order_acquire) - rpos;
+            if (!avail) { Sleep(10); continue; }
+            const unsigned n = Min<unsigned>(avail, want - done);
+            for (unsigned i = 0; i < n; i++) out[done + i] = gSpRing[(rpos + i) & (SP_RING - 1)];
+            rpos += n; done += n;
+            gSpRead.store(rpos, std::memory_order_relaxed);
+        }
+        got += (ULONGLONG)done * 2;
+        if (pcbRead) *pcbRead = done * 2;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG*) override { return STG_E_ACCESSDENIED; }
+    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER* np) override {
+        if (origin == STREAM_SEEK_CUR && move.QuadPart == 0) { if (np) np->QuadPart = got; return S_OK; }
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE CopyTo(IStream*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE Revert() override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Stat(STATSTG* st, DWORD) override {
+        if (!st) return E_POINTER;
+        ZeroMemory(st, sizeof(*st)); st->type = STGTY_STREAM; st->cbSize.QuadPart = 0x7FFFFFFFFFFFFFFFULL; return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetFormat(GUID* fmt, WAVEFORMATEX** wfx) override {
+        if (fmt) *fmt = kSPDFID_WaveFormatEx;
+        if (wfx) {
+            WAVEFORMATEX* w = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
+            if (!w) return E_OUTOFMEMORY;
+            w->wFormatTag = WAVE_FORMAT_PCM; w->nChannels = 1; w->nSamplesPerSec = 16000; w->wBitsPerSample = 16;
+            w->nBlockAlign = 2; w->nAvgBytesPerSec = 32000; w->cbSize = 0;
+            *wfx = w;
+        }
+        return S_OK;
+    }
+};
+
+static bool SpeechWanted()
+{
+    return gFeatSpeech && ((gSpCmdOn && gVcN > 0) || (gBlOn.load() && gBlWords[0]) || gSpTts);
+}
+static void SpeechStop()
+{
+    gSpFeed = false;
+    if (gSpStream) gSpStream->quit = true;
+    if (gSpRec) gSpRec->SetRecoState(SPRST_INACTIVE_WITH_PURGE);
+    if (gSpCmdG) { gSpCmdG->Release(); gSpCmdG = nullptr; }
+    if (gSpDict) { gSpDict->Release(); gSpDict = nullptr; }
+    if (gSpCtx) { gSpCtx->SetNotifySink(nullptr); gSpCtx->Release(); gSpCtx = nullptr; }
+    if (gSpRec) { gSpRec->Release(); gSpRec = nullptr; }
+    if (gSpStream) { gSpStream->Release(); gSpStream = nullptr; }
+}
+static void SpeechGrammars()                    // what it listens for: your command phrases, and / or everything you say
+{
+    if (!gSpCtx) return;
+    gSpCtx->Pause(0);
+    const bool dict = (gBlOn.load() && gBlWords[0]) || gSpTts;
+    if (dict && !gSpDict && SUCCEEDED(gSpCtx->CreateGrammar(1, &gSpDict)) && FAILED(gSpDict->LoadDictation(nullptr, SPLO_STATIC))) {
+        gSpDict->Release(); gSpDict = nullptr;
+        lstrcpyW(gSpErr, L"Windows' speech recognizer can't take dictation here (bleep words and the TTS voice need it).");
+    }
+    if (gSpDict) gSpDict->SetDictationState(dict ? SPRS_ACTIVE : SPRS_INACTIVE);
+    if (gSpCmdG) { gSpCmdG->Release(); gSpCmdG = nullptr; }
+    if (gSpCmdOn && gVcN > 0 && SUCCEEDED(gSpCtx->CreateGrammar(2, &gSpCmdG))) {
+        for (int i = 0; i < gVcN; i++) {
+            SPSTATEHANDLE h = nullptr;
+            if (FAILED(gSpCmdG->GetRule(nullptr, 100 + i, SPRAF_TopLevel | SPRAF_Active, TRUE, &h))) continue;
+            wchar_t ph[110];
+            if (gSpPrefix[0]) swprintf(ph, 110, L"%ls %ls", gSpPrefix, gVc[i].say); else lstrcpynW(ph, gVc[i].say, 110);
+            gSpCmdG->AddWordTransition(h, nullptr, ph, L" ", SPWT_LEXICAL, 1.0f, nullptr);
+        }
+        gSpCmdG->Commit(0);
+        gSpCmdG->SetRuleState(nullptr, nullptr, SPRS_ACTIVE);
+    }
+    gSpCtx->Resume(0);
+}
+static bool SpeechStart()
+{
+    gSpErr[0] = 0;
+    if (FAILED(CoCreateInstance(kCLSID_SpInprocRecognizer, nullptr, CLSCTX_ALL, kIID_ISpRecognizer, (void**)&gSpRec)) || !gSpRec) {
+        lstrcpyW(gSpErr, L"Windows' speech recognition isn't on this PC."); gSpRec = nullptr; return false;
+    }
+    // Windows' default recognizer (the desktop one: "Microsoft Speech Recognizer 8.0 for Windows" and the like)
+    ISpObjectTokenCategory* cat = nullptr; ISpObjectToken* tok = nullptr; wchar_t* defId = nullptr;
+    bool ok = SUCCEEDED(CoCreateInstance(kCLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL, kIID_ISpObjectTokenCategory, (void**)&cat)) &&
+              SUCCEEDED(cat->SetId(L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Recognizers", FALSE)) &&
+              SUCCEEDED(cat->GetDefaultTokenId(&defId)) && defId &&
+              SUCCEEDED(CoCreateInstance(kCLSID_SpObjectToken, nullptr, CLSCTX_ALL, kIID_ISpObjectToken, (void**)&tok)) &&
+              SUCCEEDED(tok->SetId(nullptr, defId, FALSE));
+    if (ok) {
+        wchar_t* d = nullptr;
+        if (SUCCEEDED(tok->GetStringValue(nullptr, &d)) && d) { lstrcpynW(gSpEngine, d, 128); CoTaskMemFree(d); }
+        ok = SUCCEEDED(gSpRec->SetRecognizer(tok));
+    }
+    if (defId) CoTaskMemFree(defId);
+    if (tok) tok->Release();
+    if (cat) cat->Release();
+    if (!ok) {
+        lstrcpyW(gSpErr, L"No Windows speech recognizer is installed (newer Windows 11 versions dropped it). "
+                         L"Voice commands, bleep words and the TTS voice need it; the bleep key works without it.");
+        SpeechStop(); return false;
+    }
+    gSpRead.store(gSpW.load()); gSpStartReq = true; gSpFeed = true; gSpLost = false;
+    gSpStream = new SpFeedStream();
+    if (FAILED(gSpRec->SetInput(static_cast<ISpStreamFormat*>(gSpStream), FALSE)) || FAILED(gSpRec->CreateRecoContext(&gSpCtx)) || !gSpCtx) {
+        lstrcpyW(gSpErr, L"Windows' speech recognizer wouldn't start."); SpeechStop(); return false;
+    }
+    gSpCtx->SetNotifyWindowMessage(gWnd, WM_APP_SPEECH, 0, 0);
+    const ULONGLONG want = LE_SPFEI(SPEI_RECOGNITION) | LE_SPFEI(SPEI_HYPOTHESIS) | LE_SPFEI(SPEI_END_SR_STREAM);
+    gSpCtx->SetInterest(want, want);
+    SpeechGrammars();
+    gSpRec->SetRecoState(SPRST_ACTIVE);
+    return true;
+}
+static void SpeechStatus();
+static void SpeechApply()                       // start / stop / re-grammar after a setting changed
+{
+    if (SpeechWanted() && gRunning) {
+        if (!gSpRec) { if (!SpeechStart()) gSpRetryAt = GetTickCount() + 10000; }
+        else SpeechGrammars();
+    } else if (gSpRec) SpeechStop();
+    SpeechStatus();
+}
+static void SpeechTick()                        // every 50 ms (PadTick): keep it running while it's wanted
+{
+    if (gSpRec && gSpLost.exchange(false)) { SpeechStop(); gSpRetryAt = GetTickCount() + 2000; SpeechStatus(); }   // (its stream ended: again in 2 s)
+    if (gSpRec && (!gRunning || !SpeechWanted())) { SpeechStop(); SpeechStatus(); }
+    static DWORD lastShown = 0;                 // the page's status line (and the lists, which name channels and outputs)
+    if (gPage == PAGE_MIC && gMicSub == 4 && !gCompact && GetTickCount() - lastShown > 1000) { lastShown = GetTickCount(); SpeechStatus(); BlOutsText(); }
+    if (!gSpRec && SpeechWanted() && gRunning && (int)(GetTickCount() - gSpRetryAt) >= 0) {
+        if (!SpeechStart()) {
+            gSpRetryAt = GetTickCount() + 30000;
+            if (!gSpErrShown && gSpErr[0]) { gSpErrShown = true; MessageBoxW(gWnd, gSpErr, L"Lag Effect - Speech", MB_ICONWARNING); }
+        }
+        SpeechStatus();
+    }
+}
+
+// ---- what it heard ----
+static bool BlWordMatch(const wchar_t* word)    // a word from your list? ("fuck*" = anything starting with it; "f***" from Windows' own filter too)
+{
+    wchar_t w[64]; int n = 0;
+    for (const wchar_t* q = word; *q && n < 63; q++) { if (*q == L'*') return true; if (IsCharAlphaNumericW(*q) || *q == L'\'') w[n++] = (wchar_t)(INT_PTR)CharLowerW((LPWSTR)(INT_PTR)*q); }
+    w[n] = 0;
+    if (!n) return false;
+    const wchar_t* p = gBlWords;
+    while (*p) {
+        while (*p == L',' || *p == L' ' || *p == L';') p++;
+        wchar_t t[64]; int m = 0; while (*p && *p != L',' && *p != L' ' && *p != L';' && m < 63) t[m++] = (wchar_t)(INT_PTR)CharLowerW((LPWSTR)(INT_PTR)*p++);
+        t[m] = 0;
+        if (!m) continue;
+        if (t[m - 1] == L'*') { t[m - 1] = 0; if (m > 1 && !wcsncmp(w, t, m - 1)) return true; }
+        else if (!lstrcmpW(w, t)) return true;
+    }
+    return false;
+}
+static void VoiceCmdRun(int i);
+static void TtsSay(const wchar_t* t);
+static void SpeechPhrase(const SPPHRASE* ph, bool final)
+{
+    if (ph->ullGrammarID == 2) {                // one of your commands
+        if (!final || ph->Rule.Confidence < SP_NORMAL_CONFIDENCE) return;
+        const int i = (int)ph->Rule.ulId - 100;
+        if (i >= 0 && i < gVcN) VoiceCmdRun(i);
+        return;
+    }
+    // dictation: bleep words (from the first guesses on, so they're caught early), then the TTS voice
+    const long long t0 = gSpT0.load();
+    wchar_t text[600] = L""; int tn = 0;
+    for (ULONG e = 0; e < ph->Rule.ulCountOfElements; e++) {
+        const SPPHRASEELEMENT& el = ph->pElements[e];
+        const wchar_t* w = el.pszDisplayText ? el.pszDisplayText : L"";
+        if (gBlOn.load() && t0 >= 0 && BlWordMatch(w)) {
+            const long long b0 = (long long)(ph->ullAudioStreamPosition + el.ulAudioStreamOffset) / 2;
+            const long long a = t0 + 3 * b0 - RATE * 60 / 1000, b = t0 + 3 * (b0 + el.ulAudioSizeBytes / 2) + RATE * 80 / 1000;
+            bool dup = false;                   // (the same word, from an earlier guess)
+            const unsigned rn = gBlRN.load();
+            for (unsigned k = 0; k < 16 && k < rn; k++) { const BlRange& r = gBlR[(rn - 1 - k) % BL_RANGES]; if (r.a.load() <= a + RATE / 20 && r.b.load() >= b - RATE / 20) dup = true; }
+            if (!dup) BlAdd(a, b);
+        }
+        if (final) {
+            const int len = lstrlenW(w);
+            if (tn && !(el.bDisplayAttributes & SPAF_CONSUME_LEADING_SPACES) && tn < 598) text[tn++] = L' ';
+            if (tn + len < 598) { memcpy(text + tn, w, len * sizeof(wchar_t)); tn += len; text[tn] = 0; }
+        }
+    }
+    if (!final || !tn) return;
+    lstrcpynW(gSpHeard, text, 200);
+    if (gSpTts) TtsSay(text);
+    SpeechStatus();
+}
+static void SpeechEvents()                      // WM_APP_SPEECH
+{
+    SPEVENT ev; ULONG n = 0;
+    while (gSpCtx && gSpCtx->GetEvents(1, &ev, &n) == S_OK && n == 1) {
+        if ((ev.eEventId == SPEI_RECOGNITION || ev.eEventId == SPEI_HYPOTHESIS) && ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) {
+            ISpRecoResult* r = (ISpRecoResult*)ev.lParam; SPPHRASE* ph = nullptr;
+            if (SUCCEEDED(r->GetPhrase(&ph)) && ph) { SpeechPhrase(ph, ev.eEventId == SPEI_RECOGNITION); CoTaskMemFree(ph); }
+        } else if (ev.eEventId == SPEI_END_SR_STREAM) gSpLost = true;   // (the stream ended: start again)
+        if (ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) ((IUnknown*)ev.lParam)->Release();
+        else if ((ev.elParamType == SPET_LPARAM_IS_POINTER || ev.elParamType == SPET_LPARAM_IS_STRING) && ev.lParam) CoTaskMemFree((void*)ev.lParam);
+    }
+}
+
+// ---- voice commands: what they can do ----
+static void VcActionName(int slot, wchar_t* out, int cap)
+{
+    if (slot >= SLOT_MIX0 && slot < SLOT_MIXOUT0) {
+        static const wchar_t* ca[MIXA_N] = { L"volume up", L"volume down", L"mute / unmute", L"solo", L"duck", L"hold" };
+        wchar_t nm[48]; ChanLabel((slot - SLOT_MIX0) / MIXA_N, nm, 48);
+        swprintf(out, cap, L"Mixer: %ls %ls", nm, ca[(slot - SLOT_MIX0) % MIXA_N]); return;
+    }
+    if (slot >= SLOT_MIXOUT0 && slot < SLOT_CHATG) {
+        static const wchar_t* oa[MIXO_N] = { L"volume up", L"volume down", L"mute / unmute" };
+        wchar_t nm[40]; OutName((slot - SLOT_MIXOUT0) / MIXO_N, nm, 40);
+        swprintf(out, cap, L"Output %ls %ls", nm, oa[(slot - SLOT_MIXOUT0) % MIXO_N]); return;
+    }
+    if (slot >= SLOT_SCENE0 && slot < SLOT_SCENE0 + SCENE_MAX) { swprintf(out, cap, L"Mixer scene \"%ls\"", gSceneName[slot - SLOT_SCENE0]); return; }
+    if (slot >= SLOT_FADE0 && slot < SLOT_FADE0 + CH_MAX) { wchar_t nm[48]; ChanLabel(slot - SLOT_FADE0, nm, 48); swprintf(out, cap, L"Mixer: fade %ls out / in", nm); return; }
+    if (slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) { swprintf(out, cap, L"Play pad %d", slot - SLOT_PAD0 + 1); return; }
+    if (slot >= SLOT_VST0 && slot < SLOT_VST0 + VST_MIC) { swprintf(out, cap, L"Mic plugin %d on / off", slot - SLOT_VST0 + 1); return; }
+    if (slot == SLOT_SPTTS) { lstrcpynW(out, L"TTS voice on / off", cap); return; }
+    if (slot == SLOT_RECORD) { lstrcpynW(out, L"Recorder: start / stop", cap); return; }
+    if (slot == SLOT_MUTE) { lstrcpynW(out, L"Mute / unmute mic", cap); return; }
+    if (slot > 0 && slot < FX_KEY_SLOTS) { swprintf(out, cap, L"%ls on / off (Voice FX)", gFxGroups[slot - 1].title); return; }
+    if (slot == 0) { lstrcpynW(out, L"Voice effects on / off", cap); return; }
+    SlotName(slot, out, cap);
+    if (out[0] >= L'a' && out[0] <= L'z') out[0] = (wchar_t)(out[0] - 32);
+}
+static int VcActions(int* out, int cap)          // the actions a command can pick (only what exists right now)
+{
+    int n = 0; auto add = [&](int s) { if (n < cap) out[n++] = s; };
+    add(SLOT_MUTE);
+    if (gFeatFx) { add(0); for (int g = 0; g < FX_GROUPS; g++) add(1 + g); add(SLOT_TAPESTOP); }
+    if (gFeatSound) { for (int i = 0; i < PADS; i++) add(SLOT_PAD0 + i); add(SLOT_PADBANK); for (int s = SLOT_LPREC; s <= SLOT_BEATBOX; s++) add(s); }
+    if (gFeatClips) add(SLOT_CLIPNOW);
+    if (gFeatLag) { add(SLOT_REWIND); add(SLOT_REPEAT); }
+    add(SLOT_PROFNEXT);
+    for (int i = 0; i < gProfCount && i < PROF_MAX; i++) add(SLOT_PROF0 + i);
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) { for (int a = 0; a < MIXA_N; a++) if (a != MIXA_HOLD) add(SLOT_MIX0 + c * MIXA_N + a); add(SLOT_FADE0 + c); }
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) for (int a = 0; a < MIXO_N; a++) add(SLOT_MIXOUT0 + k * MIXO_N + a);
+    add(SLOT_CHATG); add(SLOT_CHATC);
+    for (int i = 0; i < gSceneN; i++) add(SLOT_SCENE0 + i);
+    if (gFeatVst) for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0]) add(SLOT_VST0 + k);
+    add(SLOT_RECORD); add(SLOT_SPTTS);
+    return n;
+}
+static void VoiceCmdRun(int i)
+{
+    const int slot = gVc[i].slot;
+    if (slot < 0 || slot >= KEY_SLOTS) return;
+    gVoiceTap[slot] = 2;                        // (PollFxKeys: pressed this tick, let go the next)
+    wchar_t a[96], t[160]; VcActionName(slot, a, 96);
+    swprintf(t, 160, L"\x201C%ls\x201D: %ls", gVc[i].say, a);
+    lstrcpynW(gSpHeard, t, 200);
+    wchar_t o[64]; swprintf(o, 64, L"Voice: %ls", a); ShowOsd(o, true);
+    SpeechStatus();
+}
+static void TtsSay(const wchar_t* t)            // the TTS voice: one after another
+{
+    if (gTtsBusy) { if (gTtsQN < 4) lstrcpynW(gTtsQ[gTtsQN++], t, 600); return; }
+    gTtsQuiet = true; TtsSpeakText(t);
+}
+static void TtsNextQueued()                     // (a line finished speaking)
+{
+    gTtsQuiet = false;
+    if (!gTtsQN) return;
+    wchar_t t[600]; lstrcpynW(t, gTtsQ[0], 600);
+    for (int i = 1; i < gTtsQN; i++) lstrcpynW(gTtsQ[i - 1], gTtsQ[i], 600);
+    gTtsQN--;
+    gTtsQuiet = true; TtsSpeakText(t);
+}
+// ---- the bleep key: from a little before you pressed it until you let go ----
+static int gBlKeySlot = -1;
+static void BlKey(bool down)
+{
+    if (down) {
+        if (!gBlOn.load() || !gBlOuts.load()) { ShowOsd(L"Bleep is off (Mic > Speech)", false); return; }
+        gBlKeySlot = (int)BlAdd(gAudT.load() - (long long)gBlBackMs * RATE / 1000, LLONG_MAX);
+    } else if (gBlKeySlot >= 0) {
+        gBlR[gBlKeySlot].b.store(gAudT.load() + RATE / 20);
+        gBlKeySlot = -1;
+    }
+}
+static void SpTtsSet(bool on, bool fromKey)
+{
+    gSpTts = on; gSpMuteVoice = on;
+    if (gWnd) CheckDlgButton(gWnd, IDC_SPTTS, on ? BST_CHECKED : BST_UNCHECKED);
+    if (fromKey) ShowOsd(on ? L"TTS voice: on (your own is muted)" : L"TTS voice: off", on);
+    SpeechApply();
+}
+
+// ---- the page ----
+static void BlOutsText()
+{
+    wchar_t t[96] = L"Outputs: "; int any = 0;
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) if (gBlOuts.load() >> k & 1) {
+        wchar_t nm[40]; OutName(k, nm, 40);
+        if (any++) lstrcatW(t, L", ");
+        if (lstrlenW(t) + lstrlenW(nm) < 94) lstrcatW(t, nm);
+    }
+    if (!any) lstrcatW(t, L"pick...");
+    SetTextIfChanged(gWnd, IDC_BLOUTS, t);
+}
+static void BlOutsMenu()
+{
+    HMENU m = CreatePopupMenu();
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) {
+        wchar_t nm[40], t[64]; OutName(k, nm, 40); swprintf(t, 64, L"%ls", nm);
+        AppendMenuW(m, MF_STRING | ((gBlOuts.load() >> k & 1) ? MF_CHECKED : 0), 1 + k, t);
+    }
+    RECT r; GetWindowRect(GetDlgItem(gWnd, IDC_BLOUTS), &r);
+    const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (c >= 1 && c <= MAX_OUT) { gBlOuts.fetch_xor(1u << (c - 1)); BlOutsText(); SaveSettings(); }
+}
+static void SpCmdList()                         // the list box: "say" > what it does
+{
+    HWND lb = GetDlgItem(gWnd, IDC_SPLIST); if (!lb) return;
+    SendMessageW(lb, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gVcN; i++) {
+        wchar_t a[96], t[180]; VcActionName(gVc[i].slot, a, 96);
+        swprintf(t, 180, L"\x201C%ls%ls%ls\x201D  \x2192  %ls", gSpPrefix, gSpPrefix[0] ? L" " : L"", gVc[i].say, a);
+        SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)t);
+    }
+}
+static void SpActFill()                         // the "does" list (every time it's opened: channels and outputs change)
+{
+    HWND c = GetDlgItem(gWnd, IDC_SPACT); if (!c) return;
+    const int was = (int)SendMessageW(c, CB_GETITEMDATA, SendMessageW(c, CB_GETCURSEL, 0, 0), 0);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    int s[400]; const int n = VcActions(s, 400);
+    for (int i = 0; i < n; i++) {
+        wchar_t a[96]; VcActionName(s[i], a, 96);
+        const int idx = (int)SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)a);
+        SendMessageW(c, CB_SETITEMDATA, idx, s[i]);
+        if (s[i] == was) SendMessageW(c, CB_SETCURSEL, idx, 0);
+    }
+    if (SendMessageW(c, CB_GETCURSEL, 0, 0) < 0) SendMessageW(c, CB_SETCURSEL, 0, 0);
+}
+static void SpCmdAdd()
+{
+    wchar_t say[64]; GetDlgItemTextW(gWnd, IDC_SPSAY, say, 64);
+    int n = 0; for (wchar_t* q = say; *q; q++) if (*q > L' ') n++;
+    if (!n) { MessageBoxW(gWnd, L"Type what you'll say first (for example: mute discord).", L"Lag Effect - Voice commands", MB_ICONINFORMATION); return; }
+    HWND c = GetDlgItem(gWnd, IDC_SPACT);
+    const int sel = (int)SendMessageW(c, CB_GETCURSEL, 0, 0);
+    if (sel < 0) return;
+    const int slot = (int)SendMessageW(c, CB_GETITEMDATA, sel, 0);
+    int i = 0; while (i < gVcN && lstrcmpiW(gVc[i].say, say)) i++;   // (the same words again: changes what they do)
+    if (i == gVcN) { if (gVcN >= VC_MAX) { MessageBoxW(gWnd, L"32 commands is the most.", L"Lag Effect - Voice commands", MB_ICONINFORMATION); return; } gVcN++; }
+    lstrcpynW(gVc[i].say, say, 64); gVc[i].slot = slot;
+    SetDlgItemTextW(gWnd, IDC_SPSAY, L"");
+    SpCmdList(); SaveSettings(); SpeechApply();
+}
+static void SpCmdDel()
+{
+    const int i = (int)SendDlgItemMessageW(gWnd, IDC_SPLIST, LB_GETCURSEL, 0, 0);
+    if (i < 0 || i >= gVcN) return;
+    for (int k = i + 1; k < gVcN; k++) gVc[k - 1] = gVc[k];
+    gVcN--;
+    SpCmdList(); SaveSettings(); SpeechApply();
+}
+static void SpeechStatus()
+{
+    if (!gWnd || !GetDlgItem(gWnd, IDC_SPSTAT)) return;
+    wchar_t t[400];
+    if (!gFeatSpeech) t[0] = 0;
+    else if (gSpRec && gSpHeard[0]) swprintf(t, 400, L"Heard: %ls", gSpHeard);
+    else if (gSpRec) swprintf(t, 400, L"Listening (%ls)", gSpEngine[0] ? gSpEngine : L"Windows speech recognition");
+    else if (gSpErr[0] && SpeechWanted()) lstrcpynW(t, gSpErr, 400);
+    else if (SpeechWanted() && !gRunning) lstrcpyW(t, L"Starts listening when the audio is on.");
+    else lstrcpyW(t, L"Not listening: switch on voice commands (with one in the list), bleep words or the TTS voice.");
+    SetTextIfChanged(gWnd, IDC_SPSTAT, t);
+}
+static void SpeechSave()                        // (SaveSettings)
+{
+    SaveInt(L"voice_commands_on", gSpCmdOn); IniSet(L"voice_commands_prefix", gSpPrefix);
+    SaveInt(L"voice_commands", gVcN);
+    for (int i = 0; i < VC_MAX; i++) {
+        wchar_t k[32], v[160]; swprintf(k, 32, L"voice_command%d", i + 1);
+        if (i < gVcN) { const wchar_t* key = FxKeyIniName(gVc[i].slot); swprintf(v, 160, L"%ls|%ls", gVc[i].say, key ? key : L""); IniSet(k, v); }
+        else IniSet(k, nullptr);
+    }
+    SaveInt(L"bleep_on", gBlOn.load()); SaveInt(L"bleep_outputs", (int)gBlOuts.load()); SaveInt(L"bleep_delay_ms", gBlDelayMs);
+    SaveInt(L"bleep_sound", gBlSound.load()); SaveInt(L"bleep_reach_back_ms", gBlBackMs); IniSet(L"bleep_words", gBlWords);
+}
+static void SpeechLoad()                        // (LoadSettings)
+{
+    gSpCmdOn = GetPrivateProfileIntW(L"settings", L"voice_commands_on", 0, gIni) != 0;
+    GetPrivateProfileStringW(L"settings", L"voice_commands_prefix", L"", gSpPrefix, 32, gIni);
+    const int n = Iclamp(GetPrivateProfileIntW(L"settings", L"voice_commands", 0, gIni), 0, VC_MAX);
+    gVcN = 0;
+    for (int i = 0; i < n; i++) {
+        wchar_t k[32], v[160]; swprintf(k, 32, L"voice_command%d", i + 1);
+        GetPrivateProfileStringW(L"settings", k, L"", v, 160, gIni);
+        wchar_t* bar = wcschr(v, L'|'); if (!bar) continue;
+        *bar = 0;
+        int slot = -1; for (int s = 0; s < KEY_SLOTS && slot < 0; s++) { const wchar_t* nm = FxKeyIniName(s); if (nm && !lstrcmpiW(nm, bar + 1)) slot = s; }
+        if (slot < 0 || !v[0]) continue;
+        lstrcpynW(gVc[gVcN].say, v, 64); gVc[gVcN].slot = slot; gVcN++;
+    }
+    gBlOn = GetPrivateProfileIntW(L"settings", L"bleep_on", 0, gIni) != 0;
+    gBlOuts = (unsigned)GetPrivateProfileIntW(L"settings", L"bleep_outputs", 1, gIni) & ((1u << MAX_OUT) - 1);
+    gBlDelayMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_delay_ms", 2000, gIni), 0, 3000);
+    gBlDelayF = gBlDelayMs * RATE / 1000;
+    gBlSound = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_sound", 0, gIni), 0, 1);
+    gBlBackMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_reach_back_ms", 600, gIni), 0, 2000);
+    GetPrivateProfileStringW(L"settings", L"bleep_words", L"", gBlWords, 600, gIni);
+}
+static void SetFeatSpeech(bool on)
+{
+    gFeatSpeech = on;
+    if (!on) { if (gMicSub == 4) gMicSub = 0; if (gSpTts) SpTtsSet(false, false); }
+    SpeechApply();
+}
+
 // ======================= Recorder (1.52.0): the window, start / stop, MP3 copies =======================
 // Opened from the bottom bar ("Recorder..."). It records one output (exactly what it sends out), or separate tracks:
 // your voice as others hear it, the sounds (soundboard / clips / TTS), and each Mixer channel after its fader.
@@ -21564,11 +22192,14 @@ static void CreateUI()
     // Live meter, then AI noise suppression, noise gate and voice quality sections.
     gBuildPage = PAGE_MIC;
     Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 48, 532, 62, IDC_METER);   // (the bottom line: too loud / too quiet)
-    Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 76, 28, IDC_MICSUB0);
-    Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 94, 116, 76, 28, IDC_MICSUB1);
-    Ctl(L"BUTTON", L"Volume", BS_OWNERDRAW | WS_TABSTOP, 174, 116, 76, 28, IDC_MICSUB3);
+    Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 62, 28, IDC_MICSUB0);   // (62 wide since 1.57.0: room for Speech)
+    Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 78, 116, 62, 28, IDC_MICSUB1);
+    Ctl(L"BUTTON", L"Volume", BS_OWNERDRAW | WS_TABSTOP, 142, 116, 62, 28, IDC_MICSUB3);
     gBuildFeat = FEAT_VST;                      // (Settings > Features > Plugins: this sub-tab only exists while it's on)
-    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 254, 116, 76, 28, IDC_MICSUB2);
+    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 206, 116, 62, 28, IDC_MICSUB2);
+    gBuildFeat = FEAT_SPEECH;                   // (Settings > Features > Speech: this sub-tab only exists while it's on)
+    Ctl(L"BUTTON", L"Speech", BS_OWNERDRAW | WS_TABSTOP, 270, 116, 62, 28, IDC_MICSUB4);
+    gBuildFeat = FEAT_VST;
     {
         gBuildSub = 2;
         const int y = 160;
@@ -21717,6 +22348,57 @@ static void CreateUI()
         Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 294, y + 20, 140, 200, IDC_HWBOOST);
         Ctl(L"STATIC", L"", SS_NOPREFIX, 30, y + 52, 506, 48, IDC_MICVOLINFO);
         gBuildSub = -1;
+    }
+    {   // ---- Speech (1.57.0) ----
+        gBuildSub = 4; gBuildFeat = FEAT_SPEECH;
+        AddSection(14, 156, 532, 178, L"Voice commands");
+        Ctl(L"BUTTON", L"Voice commands", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 176, 150, 20, IDC_SPCMDON);
+        CheckDlgButton(gWnd, IDC_SPCMDON, gSpCmdOn ? BST_CHECKED : BST_UNCHECKED);
+        Ctl(L"STATIC", L"Start each with:", 0, 196, 178, 104, 20, -1);
+        Ctl(L"EDIT", gSpPrefix, ES_AUTOHSCROLL | WS_TABSTOP, 302, 174, 100, 23, IDC_SPPREFIX, WS_EX_CLIENTEDGE);
+        SendDlgItemMessageW(gWnd, IDC_SPPREFIX, EM_LIMITTEXT, 30, 0);
+        SendDlgItemMessageW(gWnd, IDC_SPPREFIX, EM_SETCUEBANNER, TRUE, (LPARAM)L"(nothing)");
+        Ctl(L"STATIC", L"Say:", 0, 30, 210, 36, 20, -1);
+        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 68, 206, 170, 23, IDC_SPSAY, WS_EX_CLIENTEDGE);
+        SendDlgItemMessageW(gWnd, IDC_SPSAY, EM_LIMITTEXT, 60, 0);
+        SendDlgItemMessageW(gWnd, IDC_SPSAY, EM_SETCUEBANNER, TRUE, (LPARAM)L"e.g. mute discord");
+        Ctl(L"STATIC", L"does:", 0, 246, 210, 40, 20, -1);
+        { HWND c = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 288, 206, 184, 320, IDC_SPACT); SendMessageW(c, CB_SETDROPPEDWIDTH, SC(260), 0); }
+        Ctl(L"BUTTON", L"Add", WS_TABSTOP, 478, 204, 52, 27, IDC_SPADD);
+        Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP, 30, 238, 442, 64, IDC_SPLIST, WS_EX_CLIENTEDGE);
+        Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 478, 238, 52, 27, IDC_SPDEL);
+        Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 308, 500, 20, IDC_SPSTAT);
+        AddSection(14, 344, 532, 148, L"Bleep");
+        Ctl(L"BUTTON", L"Bleep", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 366, 70, 20, IDC_BLON);
+        CheckDlgButton(gWnd, IDC_BLON, gBlOn.load() ? BST_CHECKED : BST_UNCHECKED);
+        Ctl(L"BUTTON", L"Outputs: pick...", WS_TABSTOP, 104, 362, 170, 28, IDC_BLOUTS);
+        Ctl(L"STATIC", L"Delay:", 0, 284, 368, 44, 20, -1);
+        {
+            HWND c = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 330, 364, 96, 200, IDC_BLDELAY);
+            static const wchar_t* DN[5] = { L"0 (key only)", L"1 s", L"1.5 s", L"2 s", L"3 s" };
+            int sel = 3; for (int i = 0; i < 5; i++) { SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)DN[i]); if (BL_DELAYS[i] == gBlDelayMs) sel = i; }
+            SendMessageW(c, CB_SETCURSEL, sel, 0);
+            HWND d = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 432, 364, 98, 200, IDC_BLSOUND);
+            SendMessageW(d, CB_ADDSTRING, 0, (LPARAM)L"Bleep tone"); SendMessageW(d, CB_ADDSTRING, 0, (LPARAM)L"Silence");
+            SendMessageW(d, CB_SETCURSEL, gBlSound.load(), 0);
+        }
+        Ctl(L"STATIC", L"Words:", 0, 30, 402, 52, 20, -1);
+        Ctl(L"EDIT", gBlWords, ES_AUTOHSCROLL | WS_TABSTOP, 84, 398, 386, 23, IDC_BLWORDS, WS_EX_CLIENTEDGE);
+        SendDlgItemMessageW(gWnd, IDC_BLWORDS, EM_LIMITTEXT, 590, 0);
+        SendDlgItemMessageW(gWnd, IDC_BLWORDS, EM_SETCUEBANNER, TRUE, (LPARAM)L"words it bleeps by itself, commas between (word* = starts with)");
+        Ctl(L"BUTTON", L"Swears", WS_TABSTOP, 476, 396, 54, 27, IDC_BLCOMMON);
+        { wchar_t kn[120]; FxKeyButtonText(SLOT_BLEEP, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 30, 428, 210, 28, IDC_BLKEY); }
+        Ctl(L"STATIC", L"Reach back:", 0, 250, 434, 76, 20, -1);
+        Spin(IDC_BLBACK, 328, 430, 64, 0, 2000, gBlBackMs);
+        Ctl(L"STATIC", L"ms", 0, 398, 434, 24, 20, -1);
+        Ctl(L"STATIC", L"Your voice on these outputs runs behind, so a word is caught before it's heard. The others stay live.",
+            0, 30, 464, 500, 16, IDC_HDR);
+        AddSection(14, 502, 532, 44, L"TTS voice");
+        Ctl(L"BUTTON", L"Talk through a TTS voice: it says what you say, your own voice is muted",
+            BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 518, 398, 20, IDC_SPTTS);
+        { wchar_t kn[120]; FxKeyButtonText(SLOT_SPTTS, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 434, 514, 96, 26, IDC_SPTTSKEY); }
+        gBuildSub = -1; gBuildFeat = 0;
+        SpCmdList(); BlOutsText(); SpActFill();
     }
     gBuildSub = -1;
     Ctl(L"BUTTON", L"\x25CF  Record 5 s", WS_TABSTOP | WS_GROUP, 14, 556, 128, 30, IDC_MICTEST);
@@ -22203,9 +22885,10 @@ static void CreateUI()
             { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, text to speech, a looper and beatbox drums. Adds a tab.", gFeatSound },
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
             { IDC_FEATVST,   L"Plugins (VST3, CLAP)", L"VST3 and CLAP effect plugins on your mic (Mic > Plugins), Mixer channels and outputs.", gFeatVst },
+            { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice (Mic > Speech).", gFeatSpeech },
         };
-        for (int i = 0; i < 5; i++) {
-            const int y = 150 + i * 47;
+        for (int i = 0; i < 6; i++) {
+            const int y = 150 + i * 38;
             Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 160, 20, f[i].id);
             CheckDlgButton(gWnd, f[i].id, f[i].on ? BST_CHECKED : BST_UNCHECKED);
             Ctl(L"STATIC", f[i].what, 0, 50, y + 22, 480, 18, IDC_HDR);
@@ -22659,6 +23342,55 @@ static void OnCommand(int id, int code)
     }
     if (id >= IDC_PADBANK0 && id < IDC_PADBANK0 + PAD_BANKS) { if (code == BN_CLICKED) SetPadBank(id - IDC_PADBANK0); return; }
     if (id == IDC_PADBANKKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_PADBANK], id); return; }
+    // Mic > Speech (1.57.0)
+    if (id == IDC_SPCMDON) { gSpCmdOn = Checked(id); SaveSettings(); SpeechApply(); return; }
+    if (id == IDC_SPPREFIX) {
+        if (code == EN_KILLFOCUS) { GetDlgItemTextW(gWnd, id, gSpPrefix, 32); SpCmdList(); SaveSettings(); SpeechApply(); }
+        return;
+    }
+    if (id == IDC_SPACT)  { if (code == CBN_DROPDOWN) SpActFill(); return; }
+    if (id == IDC_SPADD)  { if (code == BN_CLICKED) SpCmdAdd(); return; }
+    if (id == IDC_SPDEL)  { if (code == BN_CLICKED) SpCmdDel(); return; }
+    if (id == IDC_SPLIST) {                     // pick one: its words and action come back up (Add then changes it)
+        if (code != LBN_SELCHANGE) return;
+        const int i = (int)SendDlgItemMessageW(gWnd, id, LB_GETCURSEL, 0, 0);
+        if (i < 0 || i >= gVcN) return;
+        SetDlgItemTextW(gWnd, IDC_SPSAY, gVc[i].say);
+        SpActFill();
+        HWND c = GetDlgItem(gWnd, IDC_SPACT); const int n = (int)SendMessageW(c, CB_GETCOUNT, 0, 0);
+        for (int k = 0; k < n; k++) if ((int)SendMessageW(c, CB_GETITEMDATA, k, 0) == gVc[i].slot) SendMessageW(c, CB_SETCURSEL, k, 0);
+        return;
+    }
+    if (id == IDC_BLON)   { gBlOn = Checked(id); if (gBlOn.load() && !gBlOuts.load()) BlOutsMenu(); SaveSettings(); SpeechApply(); return; }
+    if (id == IDC_BLOUTS) { if (code == BN_CLICKED) BlOutsMenu(); return; }
+    if (id == IDC_BLDELAY) {
+        if (code == CBN_SELCHANGE) { gBlDelayMs = BL_DELAYS[Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 4)]; gBlDelayF = gBlDelayMs * RATE / 1000; SaveSettings(); }
+        return;
+    }
+    if (id == IDC_BLSOUND) { if (code == CBN_SELCHANGE) { gBlSound = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 1); SaveSettings(); } return; }
+    if (id == IDC_BLWORDS) {
+        if (code == EN_KILLFOCUS) { GetDlgItemTextW(gWnd, id, gBlWords, 600); SaveSettings(); SpeechApply(); }
+        return;
+    }
+    if (id == IDC_BLCOMMON) {                   // the usual English swear words (add your own)
+        if (code != BN_CLICKED) return;
+        static const wchar_t* COMMON = L"fuck*, shit*, bitch*, cunt*, asshole*, bastard*, dick, dickhead*, cock*, motherf*, piss*, wank*, twat*, bollocks";
+        GetDlgItemTextW(gWnd, IDC_BLWORDS, gBlWords, 600);
+        if (!wcsstr(gBlWords, L"fuck*")) { if (gBlWords[0] && lstrlenW(gBlWords) + 2 < 600) lstrcatW(gBlWords, L", "); if (lstrlenW(gBlWords) + lstrlenW(COMMON) < 600) lstrcatW(gBlWords, COMMON); }
+        SetDlgItemTextW(gWnd, IDC_BLWORDS, gBlWords);
+        SaveSettings(); SpeechApply();
+        return;
+    }
+    if (id == IDC_BLKEY)  { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_BLEEP], id); return; }
+    if (id == IDC_BLBACK) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        if (code == EN_CHANGE && ok) gBlBackMs = Iclamp(v, 0, 2000);
+        else if (code == EN_KILLFOCUS) { SetDlgItemInt(gWnd, id, (UINT)gBlBackMs, FALSE); SaveSettings(); }
+        return;
+    }
+    if (id == IDC_SPTTS)    { if (code == BN_CLICKED) SpTtsSet(Checked(id), false); return; }
+    if (id == IDC_SPTTSKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_SPTTS], id); return; }
     // Soundboard > Looper / Beatbox (1.56.0)
     if (id == IDC_LPREC)   { if (code == BN_CLICKED) LoopPress(LPC_REC); return; }
     if (id == IDC_LPPLAY)  { if (code == BN_CLICKED) LoopPress(LPC_PLAY); return; }
@@ -22739,9 +23471,10 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_VSTLIC) { if (code == BN_CLICKED) MessageBoxW(gWnd, VST_LICENCE, L"Lag Effect - Plugins", MB_ICONINFORMATION); return; }
-    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST) {   // Settings > Features
+    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST || id == IDC_FEATSPEECH) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
+        if (id == IDC_FEATSPEECH) SetFeatSpeech(on);
         if (id == IDC_FEATVST) SetFeatVst(on);  // off: every plugin is saved and unloaded, and nothing of this runs
         if (id == IDC_FEATLAG)   gFeatLag = on;
         if (id == IDC_FEATFX)    { gFeatFx = on; if (!on && gFxOn) SetFxOn(false); }   // (off: the effects stop too)
@@ -23329,12 +24062,14 @@ static void OnCommand(int id, int code)
     case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6: case IDC_FXSUB7:
         if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
         break;
-    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2: case IDC_MICSUB3:
+    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2: case IDC_MICSUB3: case IDC_MICSUB4:
         if (code == BN_CLICKED && gMicSub != MicSubOf(id)) {
             gMicSub = MicSubOf(id);
             Layout();
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB1), nullptr, FALSE);
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB2), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB3), nullptr, FALSE);
+            InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB4), nullptr, FALSE);
+            if (gMicSub == 4) { SpActFill(); SpCmdList(); BlOutsText(); SpeechStatus(); }
             if (gMicSub == 3) MicVolRefresh(true);
             if (gMicSub == 2) VstRefreshUi();
         }
@@ -23815,6 +24550,9 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     }
+    case WM_APP + 21:                           // Mic > Speech: the recognizer has news (WM_APP_SPEECH)
+        SpeechEvents();
+        return 0;
     case WM_MOVE:
         EdFollow();                             // the move-things-around layer stays over the window
         SearchHide(); CalloutHide();
@@ -23915,6 +24653,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_PTTKEY)      { ClearFxKey(SLOT_PTT); return 0; }
         if (id >= IDC_LPKREC && id <= IDC_LPKCLEAR) { ClearFxKey(SLOT_LPREC + id - IDC_LPKREC); return 0; }
         if (id == IDC_BBKEY)       { ClearFxKey(SLOT_BEATBOX); return 0; }
+        if (id == IDC_BLKEY)       { ClearFxKey(SLOT_BLEEP); return 0; }
+        if (id == IDC_SPTTSKEY)    { ClearFxKey(SLOT_SPTTS); return 0; }
         if (id >= IDC_MIXKEY0 && id < IDC_MIXKEY0 + (MIX_SLOT_END - SLOT_MIX0)) { ClearFxKey(SLOT_MIX0 + id - IDC_MIXKEY0); return 0; }
         if (id >= IDC_VSTKEY0 && id < IDC_VSTKEY0 + VST_MIC) { ClearFxKey(SLOT_VST0 + id - IDC_VSTKEY0); return 0; }
         if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) { gUserCol[id - IDC_COLSW0] = CLR_NONE; ApplyTheme(); return 0; }
