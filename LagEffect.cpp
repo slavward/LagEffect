@@ -1640,10 +1640,13 @@ static volatile unsigned gMainFrames = 256;     // the main device's block size 
 static volatile unsigned gMainBurst = 0;        // ...and what Windows hands it at once (its mic / output period: 480 in shared mode),
                                                 // which arrives in one go however small our blocks are (set when the audio starts)
 static volatile unsigned gExtBoost[MAX_OUT];    // extra cushion an output has learned it needs (grows each time it runs dry)
+static volatile unsigned gExtMaxReq[MAX_OUT];   // the most it has asked for at once (some drivers, like VB-Cable, sometimes take
+                                                // far more than their stated period in one go: that much is kept ready)
 static inline unsigned ExtTarget(int k, unsigned period)   // how much sound an extra output keeps in reserve (frames)
 {
     const unsigned mf = gMainFrames, mb = gMainBurst;
-    return period + (mf > mb ? mf : mb) + 384 + gExtBoost[k];
+    const unsigned t = period + (mf > mb ? mf : mb) + 384 + gExtBoost[k];
+    return t < RING_FRAMES - 1024 ? t : RING_FRAMES - 1024;   // (it has to fit in the ring, with room to spare)
 }
 static volatile bool     ringOn[MAX_OUT];
 
@@ -4364,7 +4367,8 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
     MemoryBarrier();
     unsigned r = ringR[k];
     unsigned avail = w - r;
-    unsigned period = dev->playback.internalPeriodSizeInFrames; if (period < frames) period = frames;
+    if (frames > gExtMaxReq[k] && frames <= 4096) gExtMaxReq[k] = frames;   // (remembered while Lag Effect runs)
+    unsigned period = dev->playback.internalPeriodSizeInFrames; if (period < gExtMaxReq[k]) period = gExtMaxReq[k];
     const unsigned target = ExtTarget(k, period);   // (enough that neither side's bursts empty it)
     float L = gExtL[k], R = gExtR[k];
 
@@ -18746,7 +18750,7 @@ static void DelayMeasure()                      // after StartAudio: from what W
         const ma_device& e = gExtraDev[k];
         const float rate = e.playback.internalSampleRate ? (float)e.playback.internalSampleRate : (float)RATE;
         const float per = e.playback.internalPeriodSizeInFrames * 1000.0f / rate;
-        const float cushion = ExtTarget(k, e.playback.internalPeriodSizeInFrames) * 1000.0f / RATE;
+        const float cushion = ExtTarget(k, Imax((int)e.playback.internalPeriodSizeInFrames, (int)gExtMaxReq[k])) * 1000.0f / RATE;
         const float extra = cushion + per * (float)Imax(1, (int)e.playback.internalPeriods) - play;
         if (extra > gExtraDelayMs) gExtraDelayMs = extra;
     }
@@ -18891,9 +18895,9 @@ static void BugInfoBuild(wchar_t* o, int cap)
         BugAdd(o, cap, L"  Output %d \"%ls\": %ls; plays %ls; volume %d%%%ls%ls", k + 1, nm, gRowName[k][0] ? gRowName[k] : L"(Windows' default)",
             modes[Iclamp(gRowMode[k], 0, MODE_LAST)], gRowVol[k], gOutMute[k] ? L", muted" : L"", k > 0 && !ringOn[k] ? L", not open" : L"");
         if (k > 0 && ringOn[k])                 // an extra output: what Windows gave it, its reserve, how often it ran dry
-            BugAdd(o, cap, L"    Windows gave %u x %u frames; keeps %d ms in reserve (+%d learned); ran dry %u times",
-                   gExtraDev[k].playback.internalPeriodSizeInFrames, gExtraDev[k].playback.internalPeriods,
-                   (int)(ExtTarget(k, gExtraDev[k].playback.internalPeriodSizeInFrames) * 1000.0f / RATE + 0.5f),
+            BugAdd(o, cap, L"    Windows gave %u x %u frames, asks for up to %u at once; keeps %d ms in reserve (+%d learned); ran dry %u times",
+                   gExtraDev[k].playback.internalPeriodSizeInFrames, gExtraDev[k].playback.internalPeriods, gExtMaxReq[k],
+                   (int)(ExtTarget(k, Imax((int)gExtraDev[k].playback.internalPeriodSizeInFrames, (int)gExtMaxReq[k])) * 1000.0f / RATE + 0.5f),
                    (int)(gExtBoost[k] * 1000.0f / RATE + 0.5f), gDropDryK[k].load());
     }
     BugAdd(o, cap, L"  Dropouts since it started: %u late, %u too slow, %u outputs ran dry; %d in the last minute",
