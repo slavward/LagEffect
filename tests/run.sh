@@ -8,7 +8,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 T=tests; B=$(mktemp -d); trap 'rm -r "$B"' EXIT
 CXX="${CXX:-g++}"
-CF=(-O2 -std=c++17 -w -I rnnoise/include -I "$T" -DHAVE_SSE_FLAGS=1 -include xmmintrin.h -include atomic -include thread -include chrono -DMAX_PATH=260 -pthread)
+# Built like the Windows exe: plain x86-64 (no FMA) and no multiply-add contraction, so "same sound" compares what ships.
+# (A runner whose compiler defaults to a newer CPU would otherwise fuse a * b + c differently in old and new code.)
+CF=(-O2 -std=c++17 -w -march=x86-64 -mtune=generic -ffp-contract=off -I rnnoise/include -I "$T" -DHAVE_SSE_FLAGS=1 -include xmmintrin.h -include atomic -include thread -include chrono -DMAX_PATH=260 -pthread)
 
 # RNNoise (the noise suppression), from the copy in the repo
 for f in denoise rnn rnn_data pitch kiss_fft celt_lpc; do gcc -O2 -w -c -I rnnoise/include "rnnoise/src/$f.c" -o "$B/$f.o"; done
