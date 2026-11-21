@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.50.0"
+#define APP_VERSION L"1.51.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4121,6 +4121,7 @@ enum {
     IDC_VSTKEY0 = 4470,                         // .. +4: a mic plugin slot's on / off hotkey
     IDC_MICSETUP = 4500, IDC_MICTYPE = 4501, IDC_GATELOOK = 4502, IDC_GATETHUMP = 4503, IDC_MICSIDE = 4504,   // Mic tab, 1.48.0
     IDC_WHINE = 4511,
+    IDC_SEARCH = 4520, IDC_KEYSLIST = 4521, IDC_ONSTRIP = 4522,   // the bottom bar (1.51.0)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -6495,7 +6496,8 @@ static void StopAudio()
 // the list are recorded with their starting position.
 // Controls also belong to a page (tab): Main, Mic, Voice FX, Settings. Only the current page is shown.
 #define CLIENT_W  560
-#define BASE_H    592                          // window height with one output
+#define STRIP_H   30                           // the bar along the bottom: search, Hotkeys, what's on (1.51.0)
+#define BASE_H    (592 + STRIP_H)              // window height with one output
 #define COMPACT_H 84                           // compact mode: status + a few buttons
 #define ROW_Y0    134
 #define ROW_H     30
@@ -6740,6 +6742,7 @@ static void FitFontOf(int i, int kind)
         if (nst != st) { SetWindowLongW(d.h, GWL_STYLE, nst); InvalidateRect(d.h, nullptr, TRUE); }
     }
 }
+static void FitLooseAll(bool mixerOnly);
 static void FitText()
 {
     if (!gWnd || !gFont) return;
@@ -6795,6 +6798,69 @@ static void FitText()
 
     // 4. still too big for its space: a slightly smaller font (down to 3 px smaller)
     for (int i = 0; i < gDesignN; i++) FitFontOf(i, kinds[i]);
+
+    // 5. the labels steps 1-4 don't look at (1.51.0)
+    FitLooseAll(false);
+}
+
+// 1.51.0. What the steps above leave alone: labels with an id (text set by code), right-aligned or centred ones, and
+// controls placed by their own code (the Mixer's). Nothing is moved or widened: a label that doesn't fit gets a
+// slightly smaller font (down to 3 px smaller), then "..." at its end, so its start is never what gets cut off.
+// Controls with a font of their own (bold titles, big readouts) are left as they are.
+static bool gFitEll[MAX_DESIGN];                // "..." was added here (taken off again once the text fits)
+static int FitKindLoose(const Design& d)
+{
+    wchar_t cls[16]; GetClassNameW(d.h, cls, 16);
+    const LONG st = GetWindowLongW(d.h, GWL_STYLE);
+    if (!lstrcmpiW(cls, L"Button")) {
+        const LONG t = st & BS_TYPEMASK;
+        if (t == BS_PUSHBUTTON || t == BS_DEFPUSHBUTTON) return 5;
+        return t == BS_AUTOCHECKBOX || t == BS_CHECKBOX || t == BS_AUTORADIOBUTTON || t == BS_RADIOBUTTON ? 2 : 0;
+    }
+    if (lstrcmpiW(cls, L"Static")) return 0;
+    const LONG t = st & SS_TYPEMASK;
+    if (t != SS_LEFT && t != SS_CENTER && t != SS_RIGHT && t != SS_LEFTNOWORDWRAP) return 0;
+    if ((st & SS_ELLIPSISMASK) && !gFitEll[&d - gDesign]) return 0;   // (already shortens itself)
+    RECT rc; GetClientRect(d.h, &rc);
+    return rc.bottom <= SC(24) ? 1 : 3;
+}
+static void FitLooseOne(int i)
+{
+    Design& d = gDesign[i];
+    if (!d.h || !gFont) return;
+    if (!d.free && (d.page < 0 || FitKind(d) != 0)) return;   // (the steps above look after it)
+    const int kind = FitKindLoose(d);
+    if (!kind) return;
+    HFONT cur = (HFONT)SendMessageW(d.h, WM_GETFONT, 0, 0);
+    bool ours = cur == gFont || !cur;
+    for (int k = 0; k < 3; k++) if (cur && cur == gFontFit[k]) ours = true;
+    if (!ours) return;
+    RECT rc; GetClientRect(d.h, &rc);
+    if (rc.right <= 0 || rc.bottom <= 0) return;
+    int lvl = 0; bool fits = false;
+    for (; lvl <= 3; lvl++) {
+        HFONT f = FitFont(lvl);
+        fits = kind == 3 ? FitMeasure(d.h, f, rc.right).cy <= rc.bottom : FitNeed(d, kind, f) <= rc.right;
+        if (fits) break;
+    }
+    if (lvl > 3) lvl = 3;
+    HFONT want = FitFont(lvl);
+    if (cur != want) SendMessageW(d.h, WM_SETFONT, (WPARAM)want, TRUE);
+    if (kind == 1) {
+        const LONG st = GetWindowLongW(d.h, GWL_STYLE);
+        if (!fits && !(st & SS_ELLIPSISMASK)) { SetWindowLongW(d.h, GWL_STYLE, st | SS_ENDELLIPSIS); gFitEll[i] = true; InvalidateRect(d.h, nullptr, TRUE); }
+        else if (fits && gFitEll[i]) { SetWindowLongW(d.h, GWL_STYLE, st & ~SS_ELLIPSISMASK); gFitEll[i] = false; InvalidateRect(d.h, nullptr, TRUE); }
+    }
+}
+static void FitLooseAll(bool mixerOnly)         // everything (after FitText), or the Mixer's own controls (after it places them)
+{
+    if (!gWnd || !gFont) return;
+    for (int i = 0; i < gDesignN; i++) {
+        const Design& d = gDesign[i];
+        if (mixerOnly && !(d.free && d.page == PAGE_MIXER)) continue;
+        if (d.free && !IsWindowVisible(d.h)) continue;   // (placed when it shows)
+        FitLooseOne(i);
+    }
 }
 
 // Text of one control changed (a hotkey name, a description): just pick the font size it needs.
@@ -6802,7 +6868,11 @@ static void FitOne(HWND h)
 {
     if (!h || !gFont) return;
     for (int i = 0; i < gDesignN; i++)
-        if (gDesign[i].h == h) { FitFontOf(i, gDesign[i].page >= 0 ? FitKind(gDesign[i]) : 0); return; }
+        if (gDesign[i].h == h) {
+            const int k = gDesign[i].page >= 0 && !gDesign[i].free ? FitKind(gDesign[i]) : 0;
+            if (k) FitFontOf(i, k); else FitLooseOne(i);
+            return;
+        }
 }
 
 // ======================= knob control (Voice FX page) =======================
@@ -6849,6 +6919,26 @@ static void SetKnobValue(HWND h, int i, int v)
         volatile int* other = k.var == &gAgcMaxDb ? &gLevelerPct : &gAgcMaxDb;
         if (*other > 0) for (int j = 0; j < KNOB_N; j++) if (gKnobs[j].var == other) { SetKnobValue(GetDlgItem(gWnd, IDC_KNOB + j), j, 0); break; }
     }
+}
+
+static bool InputBox(const wchar_t* title, const wchar_t* prompt, wchar_t* buf, int cap);
+static void KnobType(HWND h, int i)             // right-click (or Enter): type the value
+{
+    const Knob& k = gKnobs[i];
+    wchar_t unit[16]; lstrcpynW(unit, k.unit ? k.unit : L"", 16);
+    const wchar_t* u = unit; while (*u == L' ') u++;
+    wchar_t prompt[160];
+    if (k.offText) wsprintfW(prompt, L"%s: a number from %d to %d %s (%d = %s)", k.label, k.lo, k.hi, u, k.lo, k.offText);
+    else wsprintfW(prompt, L"%s: a number from %d to %d %s", k.label, k.lo, k.hi, u);
+    wchar_t buf[32]; wsprintfW(buf, L"%d", *k.var);
+    if (!InputBox(L"Lag Effect - Type a value", prompt, buf, 32)) return;
+    const wchar_t* p = buf; while (*p == L' ') p++;
+    if (k.offText && !lstrcmpiW(p, k.offText)) { SetKnobValue(h, i, k.lo); return; }
+    wchar_t* end = nullptr;
+    const double v = wcstod(p, &end);
+    if (end == p) { MessageBeep(MB_ICONWARNING); return; }
+    SetKnobValue(h, i, (int)floor(v + 0.5));
+    InvalidateRect(h, nullptr, FALSE);
 }
 
 static void RedrawKnobs()
@@ -6963,6 +7053,9 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_LBUTTONUP:
         if (GetCapture() == h) ReleaseCapture();
         return 0;
+    case WM_RBUTTONUP:                          // type an exact value
+        KnobType(h, i);
+        return 0;
     case WM_LBUTTONDBLCLK:
         SetFocus(h);
         SetKnobValue(h, i, k.def);
@@ -6986,6 +7079,7 @@ static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
         case VK_HOME:  SetKnobValue(h, i, k.lo);                             return 0;
         case VK_END:   SetKnobValue(h, i, k.hi);                             return 0;
         case VK_DELETE: case VK_BACK: SetKnobValue(h, i, k.def);             return 0;
+        case VK_RETURN: KnobType(h, i);                                     return 0;
         }
         break;
     }
@@ -12869,9 +12963,23 @@ static void OnVoiceInstalled(DWORD code, int accent)
 // Hover help for every setting. Labels get SS_NOTIFY so they can be hovered too
 // (clicking one still takes focus out of text boxes, see OnCommand). gTip is declared with the theme code.
 
+struct TipRec { HWND h; wchar_t* low; };       // every tooltip, lower-cased (search matches words in them)
+static TipRec gTipRec[3000]; static int gTipRecN = 0;
 static void Tip(HWND c, const wchar_t* text)
 {
     if (!gTip || !c || !text) return;
+    {
+        int i = 0; while (i < gTipRecN && gTipRec[i].h != c) i++;
+        if (i < 3000) {
+            const int n = lstrlenW(text);
+            wchar_t* low = (wchar_t*)malloc((n + 1) * sizeof(wchar_t));
+            if (low) {
+                memcpy(low, text, (n + 1) * sizeof(wchar_t)); CharLowerW(low);
+                if (i < gTipRecN) free(gTipRec[i].low); else gTipRecN++;
+                gTipRec[i].h = c; gTipRec[i].low = low;
+            }
+        }
+    }
     TTTOOLINFOW ti = {};
     ti.cbSize   = sizeof(ti);
     ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
@@ -13252,6 +13360,10 @@ static void AddTips()
     TipId(IDC_TRAY,    L"Hide the window. Lag Effect keeps running in the system tray; click the tray icon to bring it back. "
                        L"Right-click the tray icon for quick on/off switches.");
     TipId(IDC_HELPBTN, L"How everything works, plus setup steps for Discord and OBS.");
+    TipId(IDC_SEARCH,   L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
+                        L"its tab opens and it flashes.");
+    TipId(IDC_KEYSLIST, L"Every hotkey you've set, in one list: what each does, where its button is, and keys set for more than one thing.");
+    TipId(IDC_ONSTRIP,  L"What's on right now. Click one to go to its settings.");
     TipId(IDC_MUTEKEY, L"A hotkey that mutes / unmutes your mic from anywhere, even in a game. Right-click to clear it.");
     TipId(IDC_OSD,     L"Shows a short pop-up at the top of the screen (e.g. \"Pitch ON\", \"Mic muted\") when a hotkey "
                        L"switches something, so you know it worked. Doesn't show over exclusive-fullscreen games.");
@@ -13368,7 +13480,7 @@ static void AddTips()
         for (const TipText& t : gKnobTips)
             if (!lstrcmpW(t.key, gKnobs[i].key)) {
                 static wchar_t buf[KNOB_N][400];
-                wsprintfW(buf[i], L"%s\nDrag up/down or scroll. Shift = fine steps. Double-click = reset.", t.text);
+                wsprintfW(buf[i], L"%s\nDrag up/down or scroll. Shift = fine steps. Double-click = reset. Right-click = type a value.", t.text);
                 Tip(GetDlgItem(gWnd, IDC_KNOB + i), buf[i]);
             }
 
@@ -14797,6 +14909,7 @@ static void FillHearList()
     SendMessageW(c, CB_SETCURSEL, gHearOut == MAX_OUT + 1 ? gRows + 1 : gHearOut, 0);
 }
 
+static void PlaceStrip();
 static void Layout()
 {
     // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
@@ -14863,6 +14976,8 @@ static void Layout()
         gOwnSize = false;
     }
     PlaceAll(); MixerPlace(); PlaceTabs();      // (centred for the final width)
+    PlaceStrip();
+    if (gPage == PAGE_MIXER) FitLooseAll(true); // (the Mixer places its own controls: their labels checked where they ended up)
     LayoutCompact(gCompact);
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, TRUE, 0);
     RedrawWindow(gWnd, nullptr, nullptr, RDW_ERASE | RDW_FRAME | RDW_INVALIDATE | RDW_ALLCHILDREN | (freeze ? RDW_UPDATENOW : 0));
@@ -16459,7 +16574,7 @@ static void VstNameText(int k, wchar_t* t)      // a slot's name button
 static void SetTextIfChanged(HWND w, int id, const wchar_t* t)   // (no flicker from refreshing what didn't change)
 {
     wchar_t cur[160]; GetDlgItemTextW(w, id, cur, 160);
-    if (lstrcmpW(cur, t)) SetDlgItemTextW(w, id, t);
+    if (lstrcmpW(cur, t)) { SetDlgItemTextW(w, id, t); if (w == gWnd) FitOne(GetDlgItem(w, id)); }
 }
 static void MixBoxShow(HWND w, int id, int k)   // a Mix % box shows its slot's value (not while you're typing in it)
 {
@@ -16904,7 +17019,9 @@ static void ShowHelp()
         L"Tick \"Keep talking during the effect\" to speak over the loop; Voice level sets how loud you are.\n\n"
         L"PAGES\n"
         L"Main has the outputs, effect and hotkey. Mic cleans up your microphone. Voice FX has 12 effects for your live voice "
-        L"on four sub-tabs, plus one-click Characters. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n\n"
+        L"on four sub-tabs, plus one-click Characters. Settings has latency, theme and updates. Ctrl+Tab switches between them.\n"
+        L"Along the bottom: search any setting (Ctrl+F), see every hotkey in one list (Hotkeys...), and what's on right now "
+        L"(click one to go to it). Right-click any knob to type an exact value.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -18052,6 +18169,607 @@ static void TrayMenu()
     DestroyMenu(m);
 }
 
+// ======================= the bar along the bottom (1.51.0): search, all hotkeys, what's on =======================
+// It sits under every tab (not in the compact window): a search box, a "Hotkeys" button and the "what's on" chips.
+static const wchar_t* PAGE_NAMES[TAB_COUNT] = { L"Main", L"Mic", L"Voice FX", L"Soundboard", L"Clips", L"Settings", L"Mixer" };
+static int DesignOf(HWND h) { if (h) for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == h) return i; return -1; }
+static int PagedFeatOf(HWND h) { if (h) for (int i = 0; i < gPagedN; i++) if (gPaged[i].h == h) return gPaged[i].feat; return 0; }
+static const wchar_t* SubName(int page, int sub)
+{
+    if (sub < 0) return nullptr;
+    if (page == PAGE_MIC && sub < 4) return MIC_SUB_NAMES[sub];
+    if (page == PAGE_FX && sub < FX_SUBS) return FX_SUB_NAMES[sub];
+    if (page == PAGE_SETTINGS && sub < 4) return SET_SUB_NAMES[sub];
+    if (page == PAGE_MIXER && sub == 1) return L"Hotkeys";
+    return nullptr;
+}
+static void LocText(int page, int sub, int sec, wchar_t* out, int cap)   // "Mic > Cleanup > Noise gate"
+{
+    out[0] = 0;
+    if (page < 0 || page >= TAB_COUNT) return;
+    lstrcpynW(out, PAGE_NAMES[page], cap);
+    const wchar_t* sn = SubName(page, sub);
+    if (sn) { lstrcatW(out, L" > "); lstrcatW(out, sn); }
+    if (sec >= 0 && sec < gSectionN && gSections[sec].title && gSections[sec].title[0] && lstrlenW(out) + lstrlenW(gSections[sec].title) + 4 < cap) {
+        lstrcatW(out, L" > "); lstrcatW(out, gSections[sec].title);
+    }
+}
+
+// ---- a short blinking frame around what you went to ----
+static HWND gFlashWnd = nullptr; static int gFlashN = 0;
+static LRESULT CALLBACK FlashProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_NCHITTEST: return HTTRANSPARENT;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); HBRUSH b = CreateSolidBrush(ACCENT); FillRect((HDC)w, &rc, b); DeleteObject(b); return 1; }
+    case WM_TIMER:
+        if (++gFlashN >= 7) { KillTimer(h, 1); ShowWindow(h, SW_HIDE); }
+        else ShowWindow(h, gFlashN % 2 ? SW_HIDE : SW_SHOWNOACTIVATE);
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void FlashRect(RECT r)                   // screen coordinates
+{
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = FlashProc; wc.hInstance = gInst; wc.lpszClassName = L"LagFlash"; RegisterClassW(&wc); reg = true; }
+    InflateRect(&r, SC(4), SC(3));
+    const int w = r.right - r.left, h = r.bottom - r.top, t = Imax(2, SC(3));
+    if (!gFlashWnd) gFlashWnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"LagFlash", L"", WS_POPUP,
+                                                0, 0, 1, 1, gWnd, nullptr, gInst, nullptr);
+    if (!gFlashWnd) return;
+    SetWindowPos(gFlashWnd, HWND_TOP, r.left, r.top, w, h, SWP_NOACTIVATE);
+    HRGN outer = CreateRectRgn(0, 0, w, h), inner = CreateRectRgn(t, t, w - t, h - t);
+    CombineRgn(outer, outer, inner, RGN_DIFF); DeleteObject(inner);
+    SetWindowRgn(gFlashWnd, outer, TRUE);      // (the window owns the region now)
+    InvalidateRect(gFlashWnd, nullptr, TRUE);
+    gFlashN = 0;
+    ShowWindow(gFlashWnd, SW_SHOWNOACTIVATE);
+    SetTimer(gFlashWnd, 1, 220, nullptr);
+}
+static void FlashCtl(HWND c)
+{
+    if (!c || !IsWindowVisible(c)) return;
+    RECT r; GetWindowRect(c, &r);
+    const int di = DesignOf(c);
+    if (di >= 0 && gDesign[di].combo) r.bottom = r.top + SC(24);   // (a dropdown: just its box, not its list)
+    FlashRect(r);
+}
+
+// Go to a page (and sub-tab), then point at a control. A page whose feature is off: Settings > Features instead.
+static void GoTo(int page, int sub, HWND target)
+{
+    if (page < 0 || page >= TAB_COUNT) return;
+    if (!PageOn(page)) {
+        wchar_t msg[200];
+        wsprintfW(msg, L"That's on the %s tab, which is switched off.\n\nYou can turn it on in Settings > Features.", PAGE_NAMES[page]);
+        MessageBoxW(gWnd, msg, L"Lag Effect", MB_ICONINFORMATION);
+        page = PAGE_SETTINGS; sub = 3; target = nullptr;
+    }
+    if (gCompact) SetCompact(false);
+    SetPage(page);
+    if (sub >= 0) {
+        int id = 0;
+        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : IDC_MICSUB3;
+        if (page == PAGE_SETTINGS && sub <= 3) id = IDC_SETSUB0 + sub;
+        if (page == PAGE_MIXER && sub != gMixSub) id = IDC_MIXKEYSBTN;
+        if (page == PAGE_FX && sub < FX_SUBS) SetFxSub(sub);
+        HWND b = id ? GetDlgItem(gWnd, id) : nullptr;
+        if (b && IsWindowVisible(b)) SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)b);
+    }
+    if (target && IsWindowVisible(target)) {
+        wchar_t cls[24]; GetClassNameW(target, cls, 24);
+        if (lstrcmpiW(cls, L"Static")) SetFocus(target);   // (labels can't take the keyboard; everything else can)
+        FlashCtl(target);
+    }
+}
+
+// ---- the "what's on" chips ----
+struct Chip { wchar_t t[32]; int warn, page, sub; int x0, x1; };
+static Chip gChips[16]; static int gChipN = 0, gChipShown = 0;
+static int WhineCount();
+static int ChipsBuild(Chip* c)
+{
+    int n = 0;
+    auto add = [&](const wchar_t* t, int warn, int page, int sub) { if (n < 16) { lstrcpynW(c[n].t, t, 32); c[n].warn = warn; c[n].page = page; c[n].sub = sub; n++; } };
+    if (!gRunning) add(L"Audio off", 1, PAGE_MAIN, -1);
+    if (gMicMuted) add(L"Mic muted", 1, PAGE_MAIN, -1);
+    if (gPttMode == 1) add(L"Push-to-talk", 0, PAGE_MAIN, -1); else if (gPttMode == 2) add(L"Push-to-mute", 0, PAGE_MAIN, -1);
+    if (gFeatFx && gFxOn && FxAnyOn()) add(L"Voice FX", 0, PAGE_FX, -1);
+    if (gNsOn) add(L"Noise suppression", 0, PAGE_MIC, 0);
+    if (gGateMode != GATE_OFF) add(L"Gate", 0, PAGE_MIC, 0);
+    if (gWhineOn && WhineCount() > 0) add(L"Whine cut", 0, PAGE_MIC, 0);
+    if (gAgcMaxDb > 0) add(L"Auto volume", 0, PAGE_MIC, 3); else if (gLevelerPct > 0) add(L"Leveler", 0, PAGE_MIC, 3);
+    if (gLoudDb > 0) { wchar_t t[32]; wsprintfW(t, L"Loudness +%d", (int)gLoudDb); add(t, 0, PAGE_MIC, 3); }
+    if (gMicSide == 1) add(L"Left input", 0, PAGE_MIC, 1); else if (gMicSide == 2) add(L"Right input", 0, PAGE_MIC, 1);
+    if (gFeatVst) {
+        int live = 0; for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0] && gVstUi[k].want) live++;
+        if (live) { wchar_t t[32]; wsprintfW(t, live == 1 ? L"1 mic plugin" : L"%d mic plugins", live); add(t, 0, PAGE_MIC, 2); }
+    }
+    return n;
+}
+static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
+{
+    Chip now[16]; const int n = ChipsBuild(now);
+    bool same = n == gChipN;
+    for (int i = 0; same && i < n; i++) same = !lstrcmpW(now[i].t, gChips[i].t) && now[i].warn == gChips[i].warn;
+    if (same) return;
+    for (int i = 0; i < n; i++) gChips[i] = now[i];
+    gChipN = n;
+    InvalidateRect(GetDlgItem(gWnd, IDC_ONSTRIP), nullptr, FALSE);
+}
+static void DrawOnStrip(DRAWITEMSTRUCT* d)
+{
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    SetBkMode(dc, TRANSPARENT);
+    HGDIOBJ of = SelectObject(dc, gFont);
+    const int pad = SC(8), gap = SC(4), top = rc.top + SC(2), bot = rc.bottom - SC(2);
+    int x = rc.left;
+    gChipShown = 0;
+    if (!gChipN) {
+        SetTextColor(dc, gDark ? DK_DIM : gLtDim);
+        RECT tr = rc; tr.left += SC(4);
+        DrawTextW(dc, L"Nothing extra is on", -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    }
+    for (int i = 0; i < gChipN; i++) {
+        SIZE sz; GetTextExtentPoint32W(dc, gChips[i].t, lstrlenW(gChips[i].t), &sz);
+        int w = sz.cx + pad * 2;
+        const int rest = gChipN - i - 1;
+        if (x + w > rc.right || (rest && x + w + gap + SC(34) > rc.right)) {   // no room for this one (and a "+n" after it)
+            wchar_t more[12]; wsprintfW(more, L"+%d", gChipN - i);
+            SIZE ms; GetTextExtentPoint32W(dc, more, lstrlenW(more), &ms);
+            RECT mr = { x, top, Imin((int)rc.right, x + ms.cx + pad * 2), bot };
+            SetTextColor(dc, gDark ? DK_DIM : gLtDim);
+            DrawTextW(dc, more, -1, &mr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            break;
+        }
+        const bool warn = gChips[i].warn != 0;
+        HBRUSH br = CreateSolidBrush(warn ? RGB(190, 60, 50) : gDark ? DK_CTL : LT_CARD);
+        HPEN   pn = CreatePen(PS_SOLID, 1, warn ? RGB(190, 60, 50) : ACCENT);
+        HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pn);
+        RoundRect(dc, x, top, x + w, bot, SC(14), SC(14));
+        SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
+        SetTextColor(dc, warn ? RGB(255, 255, 255) : TXT_C);
+        RECT tr = { x, top, x + w, bot };
+        DrawTextW(dc, gChips[i].t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+        gChips[i].x0 = x - rc.left; gChips[i].x1 = x + w - rc.left;
+        gChipShown = i + 1;
+        x += w + gap;
+    }
+    SelectObject(dc, of);
+}
+static void ChipsClick()
+{
+    HWND s = GetDlgItem(gWnd, IDC_ONSTRIP);
+    POINT p; GetCursorPos(&p); ScreenToClient(s, &p);
+    for (int i = 0; i < gChipShown; i++)
+        if (p.x >= gChips[i].x0 && p.x < gChips[i].x1) { GoTo(gChips[i].page, gChips[i].sub, nullptr); return; }
+}
+
+// ---- search ----
+// Every label, button, knob, section, tab and sub-tab, with where it is; matched against your words in its name,
+// then where it is, then its tooltip.
+struct SrchItem { wchar_t name[64], low[64], loc[96], locLow[96]; const wchar_t* tipLow; HWND h; int page, sub, sec, feat, kind; };
+enum { SK_CTL = 0, SK_TAB, SK_SUB, SK_SEC };
+static SrchItem* gSrch = nullptr; static int gSrchN = 0;
+static int  gSrchRes[8], gSrchResN = 0, gSrchSel = 0;
+static HWND gSearchPop = nullptr;
+static const wchar_t* TipLowOf(HWND h) { for (int i = 0; i < gTipRecN; i++) if (gTipRec[i].h == h) return gTipRec[i].low; return nullptr; }
+static void SrchClean(const wchar_t* in, wchar_t* out, int cap)   // "&&" -> "&", no mnemonics, arrows, dots or a closing ':'
+{
+    int n = 0;
+    for (int i = 0; in[i] && n < cap - 1; i++) {
+        wchar_t ch = in[i];
+        if (ch == L'&') { if (in[i + 1] == L'&') { out[n++] = L'&'; i++; } continue; }
+        if (ch == 0x25BE || ch == 0x25CF || ch == 0x25B6 || ch == 0x2026 || ch == L'\n' || ch == L'\r' || ch == L'\t') ch = L' ';
+        if (ch == L' ' && (n == 0 || out[n - 1] == L' ')) continue;
+        out[n++] = ch;
+    }
+    while (n > 0 && (out[n - 1] == L' ' || out[n - 1] == L':' || out[n - 1] == L'.')) n--;
+    out[n] = 0;
+}
+static bool SrchWorthy(const wchar_t* t)        // at least two letters (not just "dB", "%", ": 1", a number)
+{
+    int letters = 0; for (int i = 0; t[i]; i++) if (IsCharAlphaW(t[i])) letters++;
+    return letters >= 2 && !(lstrlenW(t) <= 3 && (!lstrcmpiW(t, L"dB") || !lstrcmpiW(t, L"ms") || !lstrcmpiW(t, L"Hz")));
+}
+static void SrchAdd(const wchar_t* name, HWND h, int page, int sub, int sec, int feat, int kind)
+{
+    if (!gSrch) { gSrch = (SrchItem*)calloc(MAX_DESIGN + 256, sizeof(SrchItem)); if (!gSrch) return; }
+    if (gSrchN >= MAX_DESIGN + 256) return;
+    SrchItem& it = gSrch[gSrchN];
+    SrchClean(name, it.name, 64);
+    if (!SrchWorthy(it.name)) return;
+    LocText(page, sub, kind == SK_CTL ? sec : -1, it.loc, 96);
+    if (kind == SK_SEC) LocText(page, sub, -1, it.loc, 96);
+    lstrcpynW(it.low, it.name, 64); CharLowerW(it.low);
+    lstrcpynW(it.locLow, it.loc, 96); CharLowerW(it.locLow);
+    for (int i = 0; i < gSrchN; i++) if (!lstrcmpW(gSrch[i].low, it.low) && !lstrcmpW(gSrch[i].loc, it.loc)) return;   // (the same thing twice)
+    it.tipLow = h ? TipLowOf(h) : nullptr;
+    it.h = h; it.page = page; it.sub = sub; it.sec = sec; it.feat = feat; it.kind = kind;
+    gSrchN++;
+}
+static void SrchBuild()                         // (again each time the box gets the keyboard: names change)
+{
+    gSrchN = 0;
+    for (int t = 0; t < TAB_COUNT; t++) SrchAdd(PAGE_NAMES[t], GetDlgItem(gWnd, IDC_TAB0 + t), t, -1, -1, 0, SK_TAB);
+    for (int s = 0; s < 4; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : 0, SK_SUB);
+    for (int s = 0; s < FX_SUBS; s++) SrchAdd(FX_SUB_NAMES[s], nullptr, PAGE_FX, s, -1, 0, SK_SUB);
+    for (int s = 0; s < 4; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
+    SrchAdd(L"Mixer hotkeys", nullptr, PAGE_MIXER, 1, -1, 0, SK_SUB);
+    for (int k = 0; k < gSectionN; k++)
+        if (gSections[k].title && gSections[k].page >= 0) SrchAdd(gSections[k].title, nullptr, gSections[k].page, gSections[k].sub, k, gSections[k].feat, SK_SEC);
+    for (int i = 0; i < gDesignN; i++) {
+        const Design& d = gDesign[i];
+        if (d.page < 0 || !d.h) continue;
+        wchar_t cls[24]; GetClassNameW(d.h, cls, 24);
+        const LONG st = GetWindowLongW(d.h, GWL_STYLE);
+        const int id = GetDlgCtrlID(d.h);
+        wchar_t t[200] = L"";
+        if (!lstrcmpiW(cls, L"LagKnob")) { const int k = id - IDC_KNOB; if (k >= 0 && k < KNOB_N) lstrcpynW(t, gKnobs[k].label, 200); }
+        else if (!lstrcmpiW(cls, L"Button")) GetWindowTextW(d.h, t, 200);
+        else if (!lstrcmpiW(cls, L"Static")) {
+            if ((st & SS_TYPEMASK) == SS_OWNERDRAW || id == IDC_HDR) continue;   // (drawn things; long notes)
+            GetWindowTextW(d.h, t, 200);
+            if (lstrlenW(t) > 48) continue;
+        }
+        else continue;
+        if (!t[0]) continue;
+        SrchAdd(t, d.h, d.page, d.sub, d.sec, PagedFeatOf(d.h), SK_CTL);
+    }
+}
+static int SrchScore(const SrchItem& it, wchar_t words[][32], int nw)
+{
+    int score = 0;
+    for (int w = 0; w < nw; w++) {
+        const wchar_t* p = wcsstr(it.low, words[w]);
+        if (p) { score += 10; if (p == it.low || p[-1] == L' ' || p[-1] == L'-' || p[-1] == L'(') score += 5; continue; }
+        if (wcsstr(it.locLow, words[w])) { score += 4; continue; }
+        if (it.tipLow && wcsstr(it.tipLow, words[w])) { score += 2; continue; }
+        return 0;
+    }
+    if (it.kind != SK_CTL) score += 3;
+    if (it.feat && !FeatOn(it.feat)) score -= 2;
+    if (!lstrcmpW(it.low, words[0]) && nw == 1) score += 8;   // exactly what you typed
+    return score > 0 ? score : 1;
+}
+static void SearchHide() { if (gSearchPop) ShowWindow(gSearchPop, SW_HIDE); }
+static void SearchPick(int r)
+{
+    if (r < 0 || r >= gSrchResN) return;
+    const SrchItem it = gSrch[gSrchRes[r]];
+    SearchHide();
+    if (it.feat && !FeatOn(it.feat)) {
+        wchar_t msg[200]; wsprintfW(msg, L"\"%s\" belongs to a feature that's switched off.\n\nYou can turn it on in Settings > Features.", it.name);
+        MessageBoxW(gWnd, msg, L"Lag Effect", MB_ICONINFORMATION);
+        GoTo(PAGE_SETTINGS, 3, nullptr);
+        return;
+    }
+    HWND target = it.h;
+    if (it.kind == SK_TAB) target = nullptr;
+    GoTo(it.page, it.sub, target);
+    if (it.kind == SK_SEC) {                    // a section: point at the first thing showing in it
+        AssignSections();
+        for (int i = 0; i < gDesignN; i++)
+            if (gDesign[i].sec == it.sec && IsWindowVisible(gDesign[i].h)) { FlashCtl(gDesign[i].h); break; }
+    }
+    if (it.kind == SK_SUB || it.kind == SK_TAB) SetFocus(GetDlgItem(gWnd, IDC_TAB0 + it.page));
+}
+static LRESULT CALLBACK SearchPopProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    const int rh = SC(26);
+    switch (m) {
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;  // (the search box keeps the keyboard)
+    case WM_MOUSEMOVE: { const int r = (short)HIWORD(l) / rh; if (r != gSrchSel && r >= 0 && r < gSrchResN) { gSrchSel = r; InvalidateRect(h, nullptr, FALSE); } return 0; }
+    case WM_LBUTTONDOWN: SearchPick((short)HIWORD(l) / rh); return 0;
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps; HDC wdc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        HDC dc = CreateCompatibleDC(wdc); HBITMAP bm = CreateCompatibleBitmap(wdc, rc.right, rc.bottom); HGDIOBJ obm = SelectObject(dc, bm);
+        FillRect(dc, &rc, BgSolid());
+        SetBkMode(dc, TRANSPARENT);
+        if (!gSrchResN) {
+            SelectObject(dc, gFont); SetTextColor(dc, gDark ? DK_DIM : gLtDim);
+            RECT tr = rc; tr.left += SC(10);
+            DrawTextW(dc, L"Nothing found. Try another word.", -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+        }
+        for (int r = 0; r < gSrchResN; r++) {
+            const SrchItem& it = gSrch[gSrchRes[r]];
+            RECT row = { 0, r * rh, rc.right, (r + 1) * rh };
+            if (r == gSrchSel) { HBRUSH b = CreateSolidBrush(ACCENT); FillRect(dc, &row, b); DeleteObject(b); }
+            const bool off = it.feat && !FeatOn(it.feat);
+            SelectObject(dc, gFontBold);
+            SetTextColor(dc, r == gSrchSel ? RGB(255, 255, 255) : TXT_C);
+            RECT tr = row; tr.left += SC(10); tr.right = rc.right / 2 - SC(4);
+            DrawTextW(dc, it.name, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(dc, gFont);
+            SetTextColor(dc, r == gSrchSel ? RGB(235, 235, 235) : gDark ? DK_DIM : gLtDim);
+            wchar_t loc[140]; wsprintfW(loc, off ? L"%s  (off)" : L"%s", it.loc);
+            tr.left = rc.right / 2; tr.right = rc.right - SC(8);
+            DrawTextW(dc, loc, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        }
+        HPEN pn = CreatePen(PS_SOLID, 1, ACCENT); HGDIOBJ op = SelectObject(dc, pn); HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        Rectangle(dc, 0, 0, rc.right, rc.bottom);
+        SelectObject(dc, op); SelectObject(dc, obr); DeleteObject(pn);
+        BitBlt(wdc, 0, 0, rc.right, rc.bottom, dc, 0, 0, SRCCOPY);
+        SelectObject(dc, obm); DeleteObject(bm); DeleteDC(dc);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void SearchUpdate()                      // the box's text changed: find, and show the list above it
+{
+    HWND e = GetDlgItem(gWnd, IDC_SEARCH);
+    wchar_t q[96]; GetWindowTextW(e, q, 96); CharLowerW(q);
+    wchar_t words[4][32]; int nw = 0;
+    for (wchar_t* p = q; *p && nw < 4; ) {
+        while (*p == L' ') p++;
+        if (!*p) break;
+        int n = 0; while (*p && *p != L' ' && n < 31) words[nw][n++] = *p++;
+        while (*p && *p != L' ') p++;
+        words[nw][n] = 0; nw++;
+    }
+    if (!nw) { SearchHide(); return; }
+    if (!gSrchN) SrchBuild();
+    int score[8]; gSrchResN = 0;
+    for (int i = 0; i < gSrchN; i++) {
+        const int s = SrchScore(gSrch[i], words, nw);
+        if (!s) continue;
+        int at = gSrchResN;                     // keep the best 8, best first (ties: the shorter name)
+        while (at > 0 && (score[at - 1] < s || (score[at - 1] == s && lstrlenW(gSrch[gSrchRes[at - 1]].name) > lstrlenW(gSrch[i].name)))) at--;
+        if (at >= 8) continue;
+        for (int k = Imin(gSrchResN, 7); k > at; k--) { gSrchRes[k] = gSrchRes[k - 1]; score[k] = score[k - 1]; }
+        gSrchRes[at] = i; score[at] = s;
+        if (gSrchResN < 8) gSrchResN++;
+    }
+    gSrchSel = 0;
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = SearchPopProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
+                wc.lpszClassName = L"LagSearchList"; RegisterClassW(&wc); reg = true; }
+    if (!gSearchPop) gSearchPop = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"LagSearchList", L"", WS_POPUP, 0, 0, 1, 1, gWnd, nullptr, gInst, nullptr);
+    if (!gSearchPop) return;
+    RECT er; GetWindowRect(e, &er);
+    const int rows = Imax(1, gSrchResN), ph = rows * SC(26) + 1, pw = SC(460);
+    SetWindowPos(gSearchPop, HWND_TOP, er.left, er.top - ph - SC(3), pw, ph, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(gSearchPop, nullptr, FALSE);
+}
+static LRESULT CALLBACK SearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR)
+{
+    switch (m) {
+    case WM_SETFOCUS: SrchBuild(); break;
+    case WM_KILLFOCUS: SearchHide(); break;
+    case WM_KEYDOWN:
+        if (w == VK_DOWN || w == VK_UP) {
+            if (gSrchResN) { gSrchSel = (gSrchSel + (w == VK_DOWN ? 1 : gSrchResN - 1)) % gSrchResN; if (gSearchPop) InvalidateRect(gSearchPop, nullptr, FALSE); }
+            return 0;
+        }
+        if (w == VK_RETURN) { if (gSearchPop && IsWindowVisible(gSearchPop)) SearchPick(gSrchSel); return 0; }
+        if (w == VK_ESCAPE) { SetWindowTextW(h, L""); SearchHide(); SetFocus(GetDlgItem(gWnd, IDC_TAB0 + gPage)); return 0; }
+        break;
+    case WM_CHAR: if (w == VK_RETURN || w == VK_ESCAPE) return 0; break;   // (no beep)
+    case WM_GETDLGCODE: {                       // Enter, Esc and the arrows are the search's own (Tab still moves on)
+        LRESULT r = DefSubclassProc(h, m, w, l);
+        const MSG* mm = (const MSG*)l;
+        if (mm && mm->message == WM_KEYDOWN && (mm->wParam == VK_RETURN || mm->wParam == VK_ESCAPE || mm->wParam == VK_UP || mm->wParam == VK_DOWN))
+            r |= DLGC_WANTMESSAGE;
+        return r;
+    }
+    }
+    return DefSubclassProc(h, m, w, l);
+}
+
+// ---- every hotkey in one list ----
+struct KeyRow { int slot; wchar_t key[64], what[96], where[110]; HWND btn; int page, sub; bool clash; };
+static KeyRow* gKeyRows = nullptr; static int gKeyRowN = 0;
+static bool gKeysDone = false; static int gKeysGo = -1;
+static void KeyRowsBuild()
+{
+    if (!gKeyRows) gKeyRows = (KeyRow*)calloc(KEY_SLOTS + 1, sizeof(KeyRow));
+    if (!gKeyRows) return;
+    gKeyRowN = 0;
+    auto add = [&](int slot, const volatile int* keys) {
+        int k[MAX_KEYS]; bool any = false; for (int i = 0; i < MAX_KEYS; i++) { k[i] = keys[i]; any |= k[i] != 0; }
+        if (!any) return;
+        KeyRow& r = gKeyRows[gKeyRowN];
+        ComboName(k, MAX_KEYS, r.key, 64);
+        r.slot = slot;
+        if (slot < 0) lstrcpynW(r.what, L"The stutter effect", 96); else SlotName(slot, r.what, 96);
+        if (r.what[0] >= L'a' && r.what[0] <= L'z') r.what[0] = (wchar_t)(r.what[0] - 32);
+        int id = slot < 0 ? IDC_HOTKEY : FxKeyButtonId(slot);
+        if (slot >= SLOT_PROF0 && slot < SLOT_MIX0 && !id) id = IDC_PROFKEY;   // (another profile: its list is on the same page)
+        r.btn = id ? GetDlgItem(gWnd, id) : nullptr;
+        const int di = DesignOf(r.btn);
+        if (di >= 0 && gDesign[di].page >= 0) { r.page = gDesign[di].page; r.sub = gDesign[di].sub; LocText(r.page, r.sub, gDesign[di].sec, r.where, 110); }
+        else if (slot >= SLOT_VST0) { r.page = PAGE_MIXER; r.sub = 0; r.btn = nullptr; lstrcpynW(r.where, L"Mixer > a channel's or output's plugins (FX)", 110); }
+        else { r.page = -1; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"", 110); }
+        gKeyRowN++;
+    };
+    add(-1, gHotkeys);
+    for (int s = 0; s < KEY_SLOTS; s++) add(s, gFxKeys[s]);
+    for (int i = 0; i < gKeyRowN; i++) {        // the same keys for two things: both do it (shown in red)
+        gKeyRows[i].clash = false;
+        const volatile int* a = gKeyRows[i].slot < 0 ? gHotkeys : gFxKeys[gKeyRows[i].slot];
+        for (int j = 0; j < gKeyRowN; j++) {
+            if (j == i) continue;
+            const volatile int* b = gKeyRows[j].slot < 0 ? gHotkeys : gFxKeys[gKeyRows[j].slot];
+            if (SameCombo(a, b)) gKeyRows[i].clash = true;
+        }
+    }
+}
+static void KeysListFill(HWND w)
+{
+    HWND lb = GetDlgItem(w, 101);
+    const int sel = (int)SendMessageW(lb, LB_GETCURSEL, 0, 0);
+    SendMessageW(lb, LB_RESETCONTENT, 0, 0);
+    KeyRowsBuild();
+    for (int i = 0; i < gKeyRowN; i++) SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)i);
+    if (!gKeyRowN) SendMessageW(lb, LB_ADDSTRING, 0, (LPARAM)-1);
+    SendMessageW(lb, LB_SETCURSEL, Iclamp(sel, 0, Imax(0, gKeyRowN - 1)), 0);
+    int clashes = 0; for (int i = 0; i < gKeyRowN; i++) clashes += gKeyRows[i].clash;
+    wchar_t t[300];
+    if (!gKeyRowN) lstrcpynW(t, L"No hotkeys are set yet. Each tab has buttons for setting them.", 300);
+    else wsprintfW(t, L"%d hotkeys.%s To change one, pick it and press Go to: its button flashes; click it and press the new keys.",
+                   gKeyRowN, clashes ? L" Red ones are set for more than one thing: pressing them does all of them." : L"");
+    SetDlgItemTextW(w, 102, t);
+    EnableWindow(GetDlgItem(w, IDOK), gKeyRowN > 0);
+    EnableWindow(GetDlgItem(w, 103), gKeyRowN > 0);
+}
+static LRESULT CALLBACK KeysListProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_MEASUREITEM: ((MEASUREITEMSTRUCT*)l)->itemHeight = SC(26); return TRUE;
+    case WM_DRAWITEM: {
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        if (d->itemID == (UINT)-1) return TRUE;
+        HDC dc = d->hDC; RECT rc = d->rcItem;
+        const bool sel = (d->itemState & ODS_SELECTED) != 0;
+        if (sel) { HBRUSH b = CreateSolidBrush(ACCENT); FillRect(dc, &rc, b); DeleteObject(b); } else FillRect(dc, &rc, BgSolid());
+        SetBkMode(dc, TRANSPARENT);
+        const int i = (int)d->itemData;
+        if (i < 0 || i >= gKeyRowN) return TRUE;
+        const KeyRow& r = gKeyRows[i];
+        const int W = rc.right - rc.left;
+        RECT c1 = { rc.left + SC(8), rc.top, rc.left + W * 27 / 100, rc.bottom };
+        RECT c2 = { c1.right + SC(8), rc.top, rc.left + W * 60 / 100, rc.bottom };
+        RECT c3 = { c2.right + SC(8), rc.top, rc.right - SC(6), rc.bottom };
+        HGDIOBJ of = SelectObject(dc, gFontBold);
+        SetTextColor(dc, sel ? RGB(255, 255, 255) : r.clash ? RGB(215, 60, 50) : TXT_C);
+        DrawTextW(dc, r.key, -1, &c1, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, gFont);
+        SetTextColor(dc, sel ? RGB(255, 255, 255) : TXT_C);
+        DrawTextW(dc, r.what, -1, &c2, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SetTextColor(dc, sel ? RGB(235, 235, 235) : gDark ? DK_DIM : gLtDim);
+        DrawTextW(dc, r.where, -1, &c3, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+        SelectObject(dc, of);
+        return TRUE;
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        const int sel = (int)SendDlgItemMessageW(h, 101, LB_GETCURSEL, 0, 0);
+        if ((id == IDOK || (id == 101 && code == LBN_DBLCLK)) && sel >= 0 && sel < gKeyRowN) { gKeysGo = sel; gKeysDone = true; }
+        if (id == IDCANCEL) gKeysDone = true;
+        if (id == 103 && sel >= 0 && sel < gKeyRowN) {   // clear its keys
+            const KeyRow& r = gKeyRows[sel];
+            if (r.slot < 0) {
+                if (gCapturingKey) EndKeyCapture();
+                for (int i = 0; i < MAX_KEYS; i++) gHotkeys[i] = 0;
+                wchar_t name[120]; HotkeyName(name, 120); SetDlgItemTextW(gWnd, IDC_HOTKEY, name);
+            } else if (FxKeyButtonId(r.slot)) ClearFxKey(r.slot);
+            else { if (gCapturingKey) EndKeyCapture(); for (int i = 0; i < MAX_KEYS; i++) gFxKeys[r.slot][i] = 0; }   // (its button isn't showing)
+            if (r.slot >= SLOT_VST0 && gRackWnd) RackRefresh();
+            SaveSettings();
+            KeysListFill(h);
+        }
+        return 0;
+    }
+    case WM_CLOSE: gKeysDone = true; return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: return CtlColor(h, m, w, l);
+    case WM_CTLCOLORLISTBOX: return (LRESULT)BgSolid();
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void KeysListShow()
+{
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = KeysListProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagKeysList"; RegisterClassW(&wc); reg = true; }
+    if (gCapturingKey) EndKeyCapture();
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    const int cw = SC(620), ch = SC(420);
+    RECT r = { 0, 0, cw, ch }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND w = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LagKeysList", L"Lag Effect - All hotkeys", style,
+                             (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, x, y, w2, h2, w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    const int m = SC(14);
+    mk(L"STATIC", L"Hotkey", 0, m + SC(10), m, SC(150), SC(18), 104);
+    mk(L"STATIC", L"What it does", 0, m + (cw - 2 * m) * 27 / 100 + SC(16), m, SC(200), SC(18), 105);
+    mk(L"STATIC", L"Where its button is", 0, m + (cw - 2 * m) * 60 / 100 + SC(16), m, SC(200), SC(18), 106);
+    mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, m, m + SC(22), cw - 2 * m, ch - SC(130), 101, WS_EX_CLIENTEDGE);
+    mk(L"STATIC", L"", 0, m, ch - SC(98), cw - 2 * m, SC(40), 102);
+    mk(L"BUTTON", L"Go to", WS_TABSTOP | BS_DEFPUSHBUTTON, cw - m - SC(3 * 104 + 16), ch - SC(48), SC(104), SC(32), IDOK);
+    mk(L"BUTTON", L"Clear key", WS_TABSTOP, cw - m - SC(2 * 104 + 8), ch - SC(48), SC(104), SC(32), 103);
+    mk(L"BUTTON", L"Close", WS_TABSTOP, cw - m - SC(104), ch - SC(48), SC(104), SC(32), IDCANCEL);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    KeysListFill(w);
+    gKeysDone = false; gKeysGo = -1;
+    EnableWindow(gWnd, FALSE);
+    ShowWindow(w, SW_SHOW);
+    SetFocus(GetDlgItem(w, 101));
+    MSG msg;
+    while (!gKeysDone && GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (IsDialogMessageW(w, &msg)) continue;
+        TranslateMessage(&msg); DispatchMessageW(&msg);
+    }
+    EnableWindow(gWnd, TRUE);
+    DestroyWindow(w);
+    SetForegroundWindow(gWnd);
+    if (gKeysGo >= 0 && gKeysGo < gKeyRowN) {
+        const KeyRow r = gKeyRows[gKeysGo];
+        if (r.page >= 0) GoTo(r.page, r.sub, r.btn);
+    }
+}
+
+// ---- placing the bar ----
+static void PlaceStrip()                        // at the bottom of the window, the whole width; not in the compact window
+{
+    HWND e = GetDlgItem(gWnd, IDC_SEARCH), b = GetDlgItem(gWnd, IDC_KEYSLIST), s = GetDlgItem(gWnd, IDC_ONSTRIP);
+    if (!e || !b || !s) return;
+    if (gCompact) { ShowWindow(e, SW_HIDE); ShowWindow(b, SW_HIDE); ShowWindow(s, SW_HIDE); SearchHide(); return; }
+    RECT c; GetClientRect(gWnd, &c);
+    const int y = c.bottom - SC(STRIP_H) + SC(2), x0 = SC(14);
+    PlaceFree(e, x0, y, SC(190), SC(24));
+    PlaceFree(b, x0 + SC(196), y, SC(84), SC(24));
+    PlaceFree(s, x0 + SC(288), y, Imax(SC(60), (int)c.right - SC(14) - (x0 + SC(288))), SC(24));
+    ShowWindow(e, SW_SHOWNA); ShowWindow(b, SW_SHOWNA); ShowWindow(s, SW_SHOWNA);
+}
+
+// ---- text that doesn't fit, after all the fitting: a list (right-click the version number) ----
+static void CutTextReport()
+{
+    wchar_t out[2400]; int n = 0; out[0] = 0;
+    for (int i = 0; i < gDesignN && n < 24; i++) {
+        const Design& d = gDesign[i];
+        if (!d.h || !IsWindowVisible(d.h) || (d.page >= 0 && d.page != gPage)) continue;
+        wchar_t cls[24]; GetClassNameW(d.h, cls, 24);
+        const LONG st = GetWindowLongW(d.h, GWL_STYLE);
+        const bool stat = !lstrcmpiW(cls, L"Static"), btn = !lstrcmpiW(cls, L"Button");
+        if (!stat && !btn) continue;
+        if (stat && ((st & SS_TYPEMASK) == SS_OWNERDRAW || ((st & SS_TYPEMASK) > SS_RIGHT && (st & SS_TYPEMASK) != SS_LEFTNOWORDWRAP))) continue;
+        if (btn && (st & BS_TYPEMASK) == BS_OWNERDRAW) continue;
+        wchar_t t[200]; if (GetWindowTextW(d.h, t, 200) <= 0) continue;
+        RECT rc; GetClientRect(d.h, &rc);
+        HFONT f = (HFONT)SendMessageW(d.h, WM_GETFONT, 0, 0);
+        const bool wrapped = stat && rc.bottom > SC(24) && !(st & SS_ENDELLIPSIS);
+        const SIZE need = FitMeasure(d.h, f ? f : gFont, wrapped ? rc.right : 0);
+        int extra = 0;
+        if (btn) { const LONG bt = st & BS_TYPEMASK; extra = bt == BS_AUTOCHECKBOX || bt == BS_CHECKBOX || bt == BS_AUTORADIOBUTTON || bt == BS_RADIOBUTTON ? SC(20) : SC(10); }
+        const bool cut = wrapped ? need.cy > rc.bottom + 1 : need.cx + extra > rc.right + 1;
+        if (!cut) continue;
+        wchar_t clean[60]; SrchClean(t, clean, 60);
+        wchar_t line[140];
+        if (wrapped) wsprintfW(line, L"\x2022 \"%s\": needs %d px of height, has %d\n", clean, (int)need.cy, (int)rc.bottom);
+        else         wsprintfW(line, L"\x2022 \"%s\": needs %d px, has %d\n", clean, (int)(need.cx + extra), (int)rc.right);
+        if (lstrlenW(out) + lstrlenW(line) < 2350) { lstrcatW(out, line); n++; }
+    }
+    wchar_t msg[2600];
+    if (!n) wsprintfW(msg, L"Everything on this page fits (font %s, UI size %d%%).", gFontName, gUiScale);
+    else wsprintfW(msg, L"Text on this page that doesn't fully fit (font %s, UI size %d%%):\n\n%s\nA screenshot of this helps fix it.", gFontName, gUiScale, out);
+    MessageBoxW(gWnd, msg, L"Lag Effect - Text that doesn't fit", n ? MB_ICONWARNING : MB_ICONINFORMATION);
+}
+
 // ======================= window =======================
 static void CreateUI()
 {
@@ -18067,6 +18785,17 @@ static void CreateUI()
             Ctl(L"BUTTON", tabNames[t], BS_OWNERDRAW | WS_TABSTOP, 14 + slot * 76, 10, 74, 32, IDC_TAB0 + t);
             gDesign[gDesignN - 1].free = true;
         }
+    }
+    {                                           // the bar along the bottom, on every tab (PlaceStrip puts it there)
+        HWND e = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 14, BASE_H - 28, 190, 24, IDC_SEARCH, WS_EX_CLIENTEDGE);
+        gDesign[gDesignN - 1].free = true;
+        SendMessageW(e, EM_SETCUEBANNER, TRUE, (LPARAM)L"Search settings (Ctrl+F)");
+        SendMessageW(e, EM_LIMITTEXT, 80, 0);
+        SetWindowSubclass(e, SearchEditProc, 1, 0);
+        Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP, 210, BASE_H - 28, 84, 24, IDC_KEYSLIST);
+        gDesign[gDesignN - 1].free = true;
+        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 302, BASE_H - 28, 244, 24, IDC_ONSTRIP);
+        gDesign[gDesignN - 1].free = true;
     }
 
     // ---------------- Main page ----------------
@@ -19283,6 +20012,9 @@ static void OnCommand(int id, int code)
     if (id == IDC_MICPLAY)     { if (code == BN_CLICKED && gTestTotal) PrevPlay(gTestBuf, 0, gTestTotal, 1.0f); return; }
     if (id == IDC_MICSETUP)    { if (code == BN_CLICKED) MicSetupStart(); return; }
     if (id == IDC_WHINE)       { if (code == BN_CLICKED) WhineMenu(); return; }
+    if (id == IDC_SEARCH)      { if (code == EN_CHANGE) SearchUpdate(); return; }
+    if (id == IDC_KEYSLIST)    { if (code == BN_CLICKED) KeysListShow(); return; }
+    if (id == IDC_ONSTRIP)     { if (code == STN_CLICKED) ChipsClick(); return; }
     if (id == IDC_WINLVL) {                     // the mic's level in Windows
         BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
         if (code == EN_CHANGE && !mvGuard && ok && v >= 0 && v <= 100 && mvEv) mvEv->SetMasterVolumeLevelScalar(v / 100.0f, nullptr);
@@ -20013,6 +20745,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
         return true;
     }
     if ((d)->hwndItem == gStatus) { DrawStatus(d); return true; }
+    if (w == IDC_ONSTRIP) { DrawOnStrip(d); return true; }
     if (w == IDC_VOICEPROG) { DrawVoiceProgress(d); return true; }
     if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
     if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
@@ -20114,7 +20847,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick();
+            UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
                 chTick = 0; ChanTick();
@@ -20242,7 +20975,8 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
                     gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()));
                     gExtraH = Imax(0, (int)c.bottom - SC(DesignH()));
                 }
-                PlaceAll(); MixerPlace(); PlaceTabs();
+                PlaceAll(); MixerPlace(); PlaceTabs(); PlaceStrip();
+                if (gPage == PAGE_MIXER) FitLooseAll(true);
                 InvalidateRect(h, nullptr, FALSE);
                 busy = false;
             }
@@ -20268,6 +21002,10 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_MOVE:
         EdFollow();                             // the move-things-around layer stays over the window
+        SearchHide();
+        break;
+    case WM_ACTIVATE:
+        if (LOWORD(w) == WA_INACTIVE) SearchHide();   // (the search list belongs to the window: not over other apps)
         break;
     case WM_COPYDATA: {                         // command-line control from another LagEffect.exe (if allowed)
         const COPYDATASTRUCT* cd = (const COPYDATASTRUCT*)l;
@@ -20367,9 +21105,12 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             HMENU mm = CreatePopupMenu();
             AppendMenuW(mm, MF_STRING | (gCmdLine ? MF_CHECKED : 0), 1, L"Allow command-line control (Stream Deck, scripts)");
             AppendMenuW(mm, MF_STRING, 2, L"How to use it...");
+            AppendMenuW(mm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(mm, MF_STRING, 3, L"Find text that doesn't fit on this page");
             POINT pt; GetCursorPos(&pt);
             int cmd = TrackPopupMenu(mm, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, gWnd, nullptr);
             DestroyMenu(mm);
+            if (cmd == 3) { CutTextReport(); return 0; }
             if (cmd == 1) gCmdLine = !gCmdLine;
             if (cmd == 2) MessageBoxW(gWnd,
                 L"With this on, running LagEffect.exe with these switches controls the running copy:\n\n"
@@ -20616,6 +21357,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
             (msg.hwnd == h || IsChild(h, msg.hwnd))) {   // Ctrl+Z / Ctrl+Y (or Ctrl+Shift+Z): the Mixer's undo / redo
             wchar_t cls[16] = L""; GetClassNameW(msg.hwnd, cls, 16);
             if (lstrcmpiW(cls, L"Edit")) { MixUndo(msg.wParam == 'Y' || (GetKeyState(VK_SHIFT) & 0x8000)); continue; }
+        }
+        if (msg.message == WM_KEYDOWN && msg.wParam == 'F' && (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd)) && !gCompact) {
+            HWND e = GetDlgItem(h, IDC_SEARCH);   // Ctrl+F: the search box
+            SetFocus(e); SendMessageW(e, EM_SETSEL, 0, -1);
+            if (GetWindowTextLengthW(e) > 0) SearchUpdate();
+            continue;
         }
         if (msg.message == WM_KEYDOWN && msg.wParam == 'M' && (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
             SetCompact(!gCompact);              // Ctrl+M: compact window
