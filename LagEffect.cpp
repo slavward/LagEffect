@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.53.1"
+#define APP_VERSION L"1.53.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1117,6 +1117,23 @@ static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false, gFeatVst = false;
 static bool gSafe = false;                      // safe start (Shift held while starting): plugins, Voice FX, remote control off for this run
 static bool gSafeVst = false, gSafeFx = false, gSafeWs = false;   // (what they were: saved back unless you switch them on)
+static unsigned long long gStartTick = 0;       // when Lag Effect started (bug report info: uptime)
+static bool gNoThrottle = false;                // Windows was told not to slow Lag Effect down to save power
+#ifdef _WIN32
+static void NoPowerThrottling()                 // Windows 10 / 11 slow background programs down to save power (EcoQoS, coarse timers):
+{                                               // fine for most, but audio then misses its turn. Same as what music apps do.
+    struct PTS { ULONG Version, ControlMask, StateMask; };   // PROCESS_POWER_THROTTLING_STATE
+    typedef BOOL (WINAPI* PSetProcInfo)(HANDLE, int, LPVOID, DWORD);
+    PSetProcInfo spi = (PSetProcInfo)(void*)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetProcessInformation");
+    if (!spi) return;
+    PTS st = { 1, 0x1 | 0x4, 0 };               // execution speed + timer resolution: not throttled
+    if (spi(GetCurrentProcess(), 4 /* ProcessPowerThrottling */, &st, sizeof(st))) { gNoThrottle = true; return; }
+    st.ControlMask = 0x1;                       // (older Windows 10: only the first one exists)
+    gNoThrottle = spi(GetCurrentProcess(), 4, &st, sizeof(st)) != FALSE;
+}
+#else
+static void NoPowerThrottling() {}
+#endif
 static void DelayMeasure(); static void DelayTip(); static int DelayTotalMs(); static void DropTick(); static void DropExplain();
 static void ShortDevName(const wchar_t* full, wchar_t* out, int cap); static void DevTipUpdate(int id);
 static void BugInfoCopy(); static void BackupsMenu(); static void BackupOnNewVersion(); static bool BackupMake(const wchar_t* why);
@@ -3580,11 +3597,14 @@ static void RcdEnd(RcdState* s)
 // ---- dropouts: the audio thread noticing it fell behind (the window warns, see DropTick) ----
 static std::atomic<unsigned> gDropLate{0}, gDropBusy{0}, gDropDry{0};   // since the start: late blocks, blocks that took too long, outputs that ran dry
 static std::atomic<unsigned> gDropDryK[MAX_OUT];   // ...which output ran dry
+static std::atomic<unsigned> gDropBusyWait{0}, gDropBusyWork{0};   // the too-slow blocks: held up (Windows ran something else) / really working
+static std::atomic<unsigned> gDropWorstUs{0};   // the longest one (µs)
+static std::atomic<unsigned long long> gDropMainAt{0};   // when the main audio was last held up (ms): outputs running dry then aren't their fault
 static std::atomic<bool> gDropArmed{false};     // counting (not while devices start or stop)
 static std::atomic<int>  gDropWarm{0};          // blocks still to skip after a start (they come irregularly at first)
 #ifdef _WIN32
 struct DropWatch {                              // times one block of the main callback
-    LARGE_INTEGER t0; double perMs;
+    LARGE_INTEGER t0; double perMs; ULONG64 c0 = 0;
     static LARGE_INTEGER& Freq() { static LARGE_INTEGER f = {}; if (!f.QuadPart) QueryPerformanceFrequency(&f); return f; }
     static long long& Last() { static long long l = 0; return l; }
     DropWatch(ma_device* d, ma_uint32 frames)
@@ -3599,14 +3619,29 @@ struct DropWatch {                              // times one block of the main c
         if (!gDropArmed.load(std::memory_order_relaxed)) return;
         if (gDropWarm.load(std::memory_order_relaxed) > 0) { gDropWarm.fetch_sub(1, std::memory_order_relaxed); return; }
         const double gap = last ? (t0.QuadPart - last) * 1000.0 / fq : 0;
-        if (gap > perMs * 2 + 5 && gap < 1000) gDropLate.fetch_add(1, std::memory_order_relaxed);   // (> 1 s: paused or asleep, not a dropout)
+        if (gap > perMs * 2 + 5 && gap < 1000) {   // (> 1 s: paused or asleep, not a dropout)
+            gDropLate.fetch_add(1, std::memory_order_relaxed);
+            gDropMainAt.store(GetTickCount64(), std::memory_order_relaxed);
+        }
+        QueryThreadCycleTime(GetCurrentThread(), &c0);   // (the CPU time this block really uses: see below)
     }
     ~DropWatch()
     {
         if (!gDropArmed.load(std::memory_order_relaxed) || gDropWarm.load(std::memory_order_relaxed) > 0) return;
         LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
         const double took = (t1.QuadPart - t0.QuadPart) * 1000.0 / (double)Freq().QuadPart;
-        if (took > perMs + 1) gDropBusy.fetch_add(1, std::memory_order_relaxed);   // longer than Windows waits for it: a gap
+        ULONG64 c1 = 0; QueryThreadCycleTime(GetCurrentThread(), &c1);
+        const double cyc = (double)(c1 - c0);
+        static double avgCyc = 0;               // what a normal block costs (only this thread touches it)
+        if (took > perMs + 1) {                 // longer than Windows waits for it: a gap
+            gDropBusy.fetch_add(1, std::memory_order_relaxed);
+            gDropMainAt.store(GetTickCount64(), std::memory_order_relaxed);
+            // Did it do much more work than usual, or did it just not get the CPU (a driver, another program, power saving)?
+            if (avgCyc > 0 && cyc < avgCyc * 4) gDropBusyWait.fetch_add(1, std::memory_order_relaxed);
+            else gDropBusyWork.fetch_add(1, std::memory_order_relaxed);
+            const unsigned us = (unsigned)(took * 1000.0);
+            if (us > gDropWorstUs.load(std::memory_order_relaxed)) gDropWorstUs.store(us, std::memory_order_relaxed);
+        } else avgCyc = avgCyc > 0 ? avgCyc * 0.995 + cyc * 0.005 : cyc;
     }
 };
 #else
@@ -4405,7 +4440,10 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
         } else {                                // ran dry: fade out (no click) and re-prime
             if (gExtPrimed[k] && gDropArmed.load(std::memory_order_relaxed)) {   // (once: then it's not primed)
                 gDropDry.fetch_add(1, std::memory_order_relaxed); gDropDryK[k].fetch_add(1, std::memory_order_relaxed);
-                if (gExtBoost[k] < 1920) gExtBoost[k] = gExtBoost[k] + 128;   // keep 2.7 ms more from now on (up to 40 ms)
+                // Keep 2.7 ms more from now on (up to 40 ms), unless the main audio was just held up: then every
+                // output runs dry, and no reserve here is big enough to help (it would only add delay).
+                const bool mainHeld = GetTickCount64() - gDropMainAt.load(std::memory_order_relaxed) < 500;
+                if (!mainHeld && gExtBoost[k] < 1920) gExtBoost[k] = gExtBoost[k] + 128;
             }
             L *= 0.97f; R *= 0.97f; gExtPrimed[k] = false;
         }
@@ -6731,6 +6769,7 @@ static bool StartExtraOutput(int k)
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.dataCallback       = ExtraOutputCallback;
+    cfg.wasapi.usage       = ma_wasapi_usage_pro_audio;   // Windows runs it first, like music apps (MMCSS "Pro Audio")
     cfg.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;
     cfg.notificationCallback = NotifyCallback;
     cfg.pUserData          = (void*)(INT_PTR)k;
@@ -6783,6 +6822,7 @@ static bool StartAudio(bool quiet)
     cfg.periodSizeInFrames = BUFFERS[gBufIdx];
     cfg.performanceProfile = ma_performance_profile_low_latency;
     cfg.dataCallback       = AudioCallback;
+    cfg.wasapi.usage       = ma_wasapi_usage_pro_audio;   // Windows runs it first, like music apps (MMCSS "Pro Audio")
     cfg.resampling.linear.lpfOrder = MA_MAX_FILTER_ORDER;   // cleanest resampling if a device isn't at 48 kHz
     cfg.notificationCallback = NotifyCallback;
     if (gExclusive) {
@@ -18687,47 +18727,78 @@ static void GoTo(int page, int sub, HWND target)
 
 // ---- dropouts: the audio falling behind (counted by the audio threads, judged here) ----
 #define DROP_KEEP 512
-static unsigned long long gDropTimes[DROP_KEEP]; static int gDropTN = 0;   // when the recent ones happened (ms)
+struct DropEv { unsigned long long t; bool main; };   // when, and whether the main audio was held up (or an output ran dry)
+static DropEv gDropEv[DROP_KEEP]; static int gDropTN = 0;   // the last minute's
 static unsigned gDropSeenL = 0, gDropSeenB = 0, gDropSeenD = 0;
-static int  gDropRecent = 0;                    // in the last minute
+static int  gDropRecent = 0, gDropRecentMain = 0;   // in the last minute: all, and the main audio's
 static bool gDropWarn = false;                  // 3 or more in a minute: the chip shows
+static unsigned gDropHour[24];                  // the main audio held up, by hour of the day (bug report info)
+static unsigned gDryLastN[MAX_OUT]; static unsigned long long gDryLastAt[MAX_OUT];   // (reserve shrinking back)
 static void DropTick()                          // every 50 ms
 {
     const unsigned l = gDropLate.load(), b = gDropBusy.load(), d = gDropDry.load();
-    const unsigned add = (l - gDropSeenL) + (b - gDropSeenB) + (d - gDropSeenD);
+    const unsigned addMain = (l - gDropSeenL) + (b - gDropSeenB), addOut = d - gDropSeenD;
     gDropSeenL = l; gDropSeenB = b; gDropSeenD = d;
     const unsigned long long now = GetTickCount64();
-    for (unsigned i = 0; i < add && i < DROP_KEEP; i++) {
-        if (gDropTN == DROP_KEEP) { memmove(gDropTimes, gDropTimes + 1, (DROP_KEEP - 1) * sizeof(gDropTimes[0])); gDropTN = DROP_KEEP - 1; }
-        gDropTimes[gDropTN++] = now;
-    }
-    int keep = 0;
-    for (int i = 0; i < gDropTN; i++) if (now - gDropTimes[i] < 60000) gDropTimes[keep++] = gDropTimes[i];
-    gDropTN = keep; gDropRecent = keep;
+    auto push = [&](unsigned n, bool main) {
+        for (unsigned i = 0; i < n && i < DROP_KEEP; i++) {
+            if (gDropTN == DROP_KEEP) { memmove(gDropEv, gDropEv + 1, (DROP_KEEP - 1) * sizeof(gDropEv[0])); gDropTN = DROP_KEEP - 1; }
+            gDropEv[gDropTN].t = now; gDropEv[gDropTN].main = main; gDropTN++;
+        }
+    };
+    push(addMain, true); push(addOut, false);
+    if (addMain) { SYSTEMTIME st; GetLocalTime(&st); gDropHour[st.wHour % 24] += addMain; }
+    int keep = 0, mainN = 0;
+    for (int i = 0; i < gDropTN; i++) if (now - gDropEv[i].t < 60000) { if (gDropEv[i].main) mainN++; gDropEv[keep++] = gDropEv[i]; }
+    gDropTN = keep; gDropRecent = keep; gDropRecentMain = mainN;
     if (gDropRecent >= 3) gDropWarn = true;
     else if (gDropRecent == 0) gDropWarn = false;   // (stays up until a whole minute without one)
+    for (int k = 1; k < MAX_OUT; k++) {         // an output's learned reserve shrinks back after 10 quiet minutes
+        const unsigned n = gDropDryK[k].load();
+        if (n != gDryLastN[k] || !gDryLastAt[k]) { gDryLastN[k] = n; gDryLastAt[k] = now; continue; }
+        if (now - gDryLastAt[k] > 600000 && gExtBoost[k] >= 128) { gExtBoost[k] = gExtBoost[k] - 128; gDryLastAt[k] = now; }
+    }
 }
 static void DropExplain()
 {
-    wchar_t outs[400] = L"";                    // which outputs ran dry, and the reserve each one keeps now
-    for (int k = 1; k < gRows && k < MAX_OUT; k++) {
-        const unsigned n = gDropDryK[k].load();
-        if (!n) continue;
-        wchar_t nm[40], t[120]; OutName(k, nm, 40);
-        swprintf(t, 120, L"\n  %ls: %u time%ls, now keeps %d ms more in reserve", nm, n, n == 1 ? L"" : L"s", (int)(gExtBoost[k] * 1000.0f / RATE + 0.5f));
-        if (lstrlenW(outs) + lstrlenW(t) < 399) lstrcatW(outs, t);
+    wchar_t msg[2000] = L"", t[600];
+    const unsigned late = gDropLate.load(), busy = gDropBusy.load(), wait = gDropBusyWait.load(), work = gDropBusyWork.load();
+    const int bufMs = (int)(BUFFERS[gBufIdx] * 1000.0f / RATE + 0.5f);
+    if (gDropRecentMain > 0) {                  // the main audio itself was held up: every output had a gap, output 1 too
+        swprintf(t, 600, L"In the last minute Lag Effect's audio was held up %d%ls time%ls, so every output had a short gap (output 1 too).\n\n",
+                 gDropRecentMain, gDropRecentMain >= DROP_KEEP ? L"+" : L"", gDropRecentMain == 1 ? L"" : L"s");
+        lstrcatW(msg, t);
+        if (wait >= work)
+            swprintf(t, 600, L"Mostly it wasn't busy itself: Windows ran something else first (a driver, an update or virus scan, "
+                             L"another program, or power saving). The longest wait was %d ms.\n\n"
+                             L"Lag Effect already asks Windows to run its audio first, like music apps do. If it keeps happening:\n"
+                             L"  - a bigger buffer (Settings > General > Latency) rides over short waits\n"
+                             L"  - Copy bug report info shows the hours it happens at, which can point to a scheduled task\n\n",
+                     (int)(gDropWorstUs.load() / 1000));
+        else
+            swprintf(t, 600, L"Mostly it had too much to do: try switching off heavy effects (the vocoder styles) or plugins, "
+                             L"or a bigger buffer (Settings > General > Latency). The longest was %d ms.\n\n", (int)(gDropWorstUs.load() / 1000));
+        lstrcatW(msg, t);
+    } else {
+        wchar_t outs[400] = L"";                // only outputs ran dry: which, and the reserve each keeps now
+        for (int k = 1; k < gRows && k < MAX_OUT; k++) {
+            const unsigned n = gDropDryK[k].load();
+            if (!n) continue;
+            wchar_t nm[40], o[120]; OutName(k, nm, 40);
+            swprintf(o, 120, L"\n  %ls: now keeps %d ms more in reserve", nm, (int)(gExtBoost[k] * 1000.0f / RATE + 0.5f));
+            if (lstrlenW(outs) + lstrlenW(o) < 399) lstrcatW(outs, o);
+        }
+        swprintf(t, 600, L"In the last minute an output ran out of sound %d%ls time%ls (a short gap on that output).%ls\n\n"
+                         L"An output that runs dry keeps a little more sound in reserve each time (a few ms more delay on that output only), "
+                         L"so this should stop by itself within a minute or so.\n\n",
+                 gDropRecent, gDropRecent >= DROP_KEEP ? L"+" : L"", gDropRecent == 1 ? L"" : L"s", outs);
+        lstrcatW(msg, t);
     }
-    wchar_t msg[1400];
-    swprintf(msg, 1400, L"In the last minute the audio fell behind %d%ls time%ls (you may have heard a crackle or a gap).\n\n"
-                        L"Since Lag Effect started: %u late, %u too slow, %u output%ls ran dry.%ls%ls\n\n"
-                        L"%ls"
-                        L"Otherwise the usual fix is a bigger buffer: Settings > General > Latency, one step up (a few ms more delay). "
-                        L"Plugins and heavy effects (the vocoder styles) also take time; so can other programs keeping the PC busy.",
-             gDropRecent, gDropRecent >= DROP_KEEP ? L"+" : L"", gDropRecent == 1 ? L"" : L"s",
-             gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropDry.load() == 1 ? L"" : L"s",
-             outs[0] ? L"\n\nOutputs that ran dry:" : L"", outs,
-             outs[0] ? L"An output that runs dry keeps a little more sound in reserve each time (a few ms more delay on that output only), "
-                       L"so this should stop by itself within a minute or so.\n\n" : L"");
+    swprintf(t, 600, L"Since Lag Effect started: held up %u time%ls (%u late, %u too slow: %u waiting, %u working), outputs ran dry %u time%ls. "
+                     L"Your buffer is %d ms.\n\nOK opens the Latency setting.",
+             late > busy ? late : busy, (late > busy ? late : busy) == 1 ? L"" : L"s", late, busy, wait, work,
+             gDropDry.load(), gDropDry.load() == 1 ? L"" : L"s", bufMs);
+    lstrcatW(msg, t);
     if (MessageBoxW(gWnd, msg, L"Lag Effect - Audio dropouts", MB_ICONINFORMATION | MB_OKCANCEL) == IDOK)
         GoTo(PAGE_SETTINGS, 0, GetDlgItem(gWnd, IDC_BUFFER));
 }
@@ -18900,8 +18971,15 @@ static void BugInfoBuild(wchar_t* o, int cap)
                    (int)(ExtTarget(k, Imax((int)gExtraDev[k].playback.internalPeriodSizeInFrames, (int)gExtMaxReq[k])) * 1000.0f / RATE + 0.5f),
                    (int)(gExtBoost[k] * 1000.0f / RATE + 0.5f), gDropDryK[k].load());
     }
-    BugAdd(o, cap, L"  Dropouts since it started: %u late, %u too slow, %u outputs ran dry; %d in the last minute",
-        gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropRecent);
+    BugAdd(o, cap, L"  Dropouts since it started: %u late, %u too slow (%u waiting, %u working; longest %.1f ms), %u outputs ran dry; %d in the last minute (%d held up)",
+        gDropLate.load(), gDropBusy.load(), gDropBusyWait.load(), gDropBusyWork.load(), gDropWorstUs.load() / 1000.0,
+        gDropDry.load(), gDropRecent, gDropRecentMain);
+    {
+        wchar_t hrs[400] = L"";                 // when the main audio was held up (local time)
+        for (int h = 0; h < 24; h++) if (gDropHour[h]) { wchar_t x[24]; swprintf(x, 24, L" %02d:00 %u,", h, gDropHour[h]); if (lstrlenW(hrs) < 370) lstrcatW(hrs, x); }
+        if (hrs[0]) { hrs[lstrlenW(hrs) - 1] = 0; BugAdd(o, cap, L"  Held up by hour:%ls", hrs); }
+        BugAdd(o, cap, L"  Uptime %llu min; power throttling %ls", (unsigned long long)(GetTickCount64() - gStartTick) / 60000, gNoThrottle ? L"off for Lag Effect" : L"not changed");
+    }
     BugAdd(o, cap, L"");
     BugAdd(o, cap, L"Features: lag %ls, Voice FX %ls, soundboard %ls, clips %ls, plugins %ls; remote control %ls",
         gFeatLag ? L"on" : L"off", gFeatFx ? L"on" : L"off", gFeatSound ? L"on" : L"off", gFeatClips ? L"on" : L"off",
@@ -22442,6 +22520,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         }
     }
 
+    gStartTick = GetTickCount64();
+    NoPowerThrottling();
     LoadSettings();
     BackupOnNewVersion();                       // (a new version: the old settings are kept in Backups first)
     if (gSafe) {                                // safe start: these stay as saved, but are off for this run
