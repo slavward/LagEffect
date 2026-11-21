@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.51.0"
+#define APP_VERSION L"1.51.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -9336,7 +9336,7 @@ static void SlotName(int slot, wchar_t* out, int cap)
     else if (slot == SLOT_PROFNEXT) lstrcpynW(out, L"Next profile", cap);
     else if (slot == SLOT_TAPESTOP) lstrcpynW(out, L"Tape stop", cap);
     else if (slot == SLOT_DIVE) lstrcpynW(out, L"Pitch dive", cap);
-    else if (slot == SLOT_PTT) lstrcpynW(out, L"Push-to-talk", cap);
+    else if (slot == SLOT_PTT) lstrcpynW(out, gPttMode == 2 ? L"Push-to-mute" : L"Push-to-talk", cap);
     else if (slot >= SLOT_PROF0 && slot - SLOT_PROF0 < PROF_MAX) {
         if (slot - SLOT_PROF0 < gProfCount) wsprintfW(out, L"Profile \"%s\"", gProfNames[slot - SLOT_PROF0]); else lstrcpynW(out, L"a profile", cap);
     }
@@ -18266,8 +18266,8 @@ static void GoTo(int page, int sub, HWND target)
 }
 
 // ---- the "what's on" chips ----
-struct Chip { wchar_t t[32]; int warn, page, sub; int x0, x1; };
-static Chip gChips[16]; static int gChipN = 0, gChipShown = 0;
+struct Chip { wchar_t t[32]; int warn, page, sub; int x0, x1; bool shown; };
+static Chip gChips[16]; static int gChipN = 0, gMoreX0 = -1, gMoreX1 = -1;
 static int WhineCount();
 static int ChipsBuild(Chip* c)
 {
@@ -18275,7 +18275,7 @@ static int ChipsBuild(Chip* c)
     auto add = [&](const wchar_t* t, int warn, int page, int sub) { if (n < 16) { lstrcpynW(c[n].t, t, 32); c[n].warn = warn; c[n].page = page; c[n].sub = sub; n++; } };
     if (!gRunning) add(L"Audio off", 1, PAGE_MAIN, -1);
     if (gMicMuted) add(L"Mic muted", 1, PAGE_MAIN, -1);
-    if (gPttMode == 1) add(L"Push-to-talk", 0, PAGE_MAIN, -1); else if (gPttMode == 2) add(L"Push-to-mute", 0, PAGE_MAIN, -1);
+    if (gPttMode == 1) add(L"Push-to-talk", 0, PAGE_MIC, 0); else if (gPttMode == 2) add(L"Push-to-mute", 0, PAGE_MIC, 0);
     if (gFeatFx && gFxOn && FxAnyOn()) add(L"Voice FX", 0, PAGE_FX, -1);
     if (gNsOn) add(L"Noise suppression", 0, PAGE_MIC, 0);
     if (gGateMode != GATE_OFF) add(L"Gate", 0, PAGE_MIC, 0);
@@ -18306,46 +18306,66 @@ static void DrawOnStrip(DRAWITEMSTRUCT* d)
     SetBkMode(dc, TRANSPARENT);
     HGDIOBJ of = SelectObject(dc, gFont);
     const int pad = SC(8), gap = SC(4), top = rc.top + SC(2), bot = rc.bottom - SC(2);
-    int x = rc.left;
-    gChipShown = 0;
+    gMoreX0 = gMoreX1 = -1;
     if (!gChipN) {
         SetTextColor(dc, gDark ? DK_DIM : gLtDim);
         RECT tr = rc; tr.left += SC(4);
         DrawTextW(dc, L"Nothing extra is on", -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        SelectObject(dc, of);
+        return;
     }
+    int w[16], total = 0;
     for (int i = 0; i < gChipN; i++) {
         SIZE sz; GetTextExtentPoint32W(dc, gChips[i].t, lstrlenW(gChips[i].t), &sz);
-        int w = sz.cx + pad * 2;
-        const int rest = gChipN - i - 1;
-        if (x + w > rc.right || (rest && x + w + gap + SC(34) > rc.right)) {   // no room for this one (and a "+n" after it)
-            wchar_t more[12]; wsprintfW(more, L"+%d", gChipN - i);
-            SIZE ms; GetTextExtentPoint32W(dc, more, lstrlenW(more), &ms);
-            RECT mr = { x, top, Imin((int)rc.right, x + ms.cx + pad * 2), bot };
-            SetTextColor(dc, gDark ? DK_DIM : gLtDim);
-            DrawTextW(dc, more, -1, &mr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
-            break;
-        }
+        w[i] = sz.cx + pad * 2; total += w[i] + (i ? gap : 0);
+    }
+    // All of them if they fit; else as many as fit, in order of importance (a wide one is skipped, not the end of
+    // the row), with "+n" for the rest: clicking it lists them.
+    const int avail = (int)(rc.right - rc.left) - (total > rc.right - rc.left ? SC(40) : 0);
+    int x = 0, hidden = 0;
+    for (int i = 0; i < gChipN; i++) {
+        gChips[i].shown = x + w[i] <= avail;
+        if (!gChips[i].shown) { hidden++; continue; }
         const bool warn = gChips[i].warn != 0;
+        const int X = rc.left + x;
         HBRUSH br = CreateSolidBrush(warn ? RGB(190, 60, 50) : gDark ? DK_CTL : LT_CARD);
         HPEN   pn = CreatePen(PS_SOLID, 1, warn ? RGB(190, 60, 50) : ACCENT);
         HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pn);
-        RoundRect(dc, x, top, x + w, bot, SC(14), SC(14));
+        RoundRect(dc, X, top, X + w[i], bot, SC(14), SC(14));
         SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
         SetTextColor(dc, warn ? RGB(255, 255, 255) : TXT_C);
-        RECT tr = { x, top, x + w, bot };
+        RECT tr = { X, top, X + w[i], bot };
         DrawTextW(dc, gChips[i].t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
-        gChips[i].x0 = x - rc.left; gChips[i].x1 = x + w - rc.left;
-        gChipShown = i + 1;
-        x += w + gap;
+        gChips[i].x0 = x; gChips[i].x1 = x + w[i];
+        x += w[i] + gap;
+    }
+    if (hidden) {
+        wchar_t more[12]; wsprintfW(more, L"+%d more", hidden);
+        SIZE ms; GetTextExtentPoint32W(dc, more, lstrlenW(more), &ms);
+        if (x + ms.cx + SC(8) > rc.right - rc.left) wsprintfW(more, L"+%d", hidden);
+        GetTextExtentPoint32W(dc, more, lstrlenW(more), &ms);
+        RECT mr = { rc.left + x, top, Imin((int)rc.right, (int)rc.left + x + ms.cx + SC(8)), bot };
+        SetTextColor(dc, ACCENT);
+        DrawTextW(dc, more, -1, &mr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+        gMoreX0 = x; gMoreX1 = mr.right - rc.left;
     }
     SelectObject(dc, of);
 }
 static void ChipsClick()
 {
     HWND s = GetDlgItem(gWnd, IDC_ONSTRIP);
-    POINT p; GetCursorPos(&p); ScreenToClient(s, &p);
-    for (int i = 0; i < gChipShown; i++)
-        if (p.x >= gChips[i].x0 && p.x < gChips[i].x1) { GoTo(gChips[i].page, gChips[i].sub, nullptr); return; }
+    POINT p; GetCursorPos(&p);
+    POINT q = p; ScreenToClient(s, &q);
+    for (int i = 0; i < gChipN; i++)
+        if (gChips[i].shown && q.x >= gChips[i].x0 && q.x < gChips[i].x1) { GoTo(gChips[i].page, gChips[i].sub, nullptr); return; }
+    if (gMoreX0 >= 0 && q.x >= gMoreX0 && q.x < gMoreX1) {   // "+n": the ones that didn't fit
+        HMENU m = CreatePopupMenu();
+        for (int i = 0; i < gChipN; i++) if (!gChips[i].shown) AppendMenuW(m, MF_STRING, 1 + i, gChips[i].t);
+        RECT r; GetWindowRect(s, &r);
+        const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_NONOTIFY, p.x, r.top, 0, gWnd, nullptr);
+        DestroyMenu(m);
+        if (cmd >= 1 && cmd <= gChipN) GoTo(gChips[cmd - 1].page, gChips[cmd - 1].sub, nullptr);
+    }
 }
 
 // ---- search ----
@@ -18422,15 +18442,16 @@ static void SrchBuild()                         // (again each time the box gets
 }
 static int SrchScore(const SrchItem& it, wchar_t words[][32], int nw)
 {
-    int score = 0;
+    int score = 0; bool allInName = true;
     for (int w = 0; w < nw; w++) {
         const wchar_t* p = wcsstr(it.low, words[w]);
         if (p) { score += 10; if (p == it.low || p[-1] == L' ' || p[-1] == L'-' || p[-1] == L'(') score += 5; continue; }
+        allInName = false;
         if (wcsstr(it.locLow, words[w])) { score += 4; continue; }
-        if (it.tipLow && wcsstr(it.tipLow, words[w])) { score += 2; continue; }
+        if (it.tipLow && wcsstr(it.tipLow, words[w])) { score += it.kind == SK_CTL ? 2 : 1; continue; }   // (a tab's tooltip lists half its page)
         return 0;
     }
-    if (it.kind != SK_CTL) score += 3;
+    if (it.kind != SK_CTL && allInName) score += 3;
     if (it.feat && !FeatOn(it.feat)) score -= 2;
     if (!lstrcmpW(it.low, words[0]) && nw == 1) score += 8;   // exactly what you typed
     return score > 0 ? score : 1;
@@ -18693,10 +18714,17 @@ static void KeysListShow()
         SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
     };
     const int m = SC(14);
-    mk(L"STATIC", L"Hotkey", 0, m + SC(10), m, SC(150), SC(18), 104);
-    mk(L"STATIC", L"What it does", 0, m + (cw - 2 * m) * 27 / 100 + SC(16), m, SC(200), SC(18), 105);
-    mk(L"STATIC", L"Where its button is", 0, m + (cw - 2 * m) * 60 / 100 + SC(16), m, SC(200), SC(18), 106);
-    mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT, m, m + SC(22), cw - 2 * m, ch - SC(130), 101, WS_EX_CLIENTEDGE);
+    HWND lb = mk(L"LISTBOX", L"", WS_TABSTOP | WS_VSCROLL | WS_BORDER | LBS_OWNERDRAWFIXED | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_DISABLENOSCROLL,
+                 m, m + SC(22), cw - 2 * m, ch - SC(130), 101);
+    if (pSetWindowTheme) pSetWindowTheme(lb, gDark ? L"DarkMode_Explorer" : nullptr, nullptr);   // (a dark scrollbar)
+    {                                           // the headings over the list's columns (the rows draw at 0 / 27% / 60% of its inside)
+        RECT lc; GetClientRect(lb, &lc);
+        POINT o = { 0, 0 }; MapWindowPoints(lb, w, &o, 1);
+        const int W = lc.right;
+        mk(L"STATIC", L"Hotkey", 0, o.x + SC(8), m, SC(150), SC(18), 104);
+        mk(L"STATIC", L"What it does", 0, o.x + W * 27 / 100 + SC(8), m, SC(200), SC(18), 105);
+        mk(L"STATIC", L"Where its button is", 0, o.x + W * 60 / 100 + SC(8), m, SC(200), SC(18), 106);
+    }
     mk(L"STATIC", L"", 0, m, ch - SC(98), cw - 2 * m, SC(40), 102);
     mk(L"BUTTON", L"Go to", WS_TABSTOP | BS_DEFPUSHBUTTON, cw - m - SC(3 * 104 + 16), ch - SC(48), SC(104), SC(32), IDOK);
     mk(L"BUTTON", L"Clear key", WS_TABSTOP, cw - m - SC(2 * 104 + 8), ch - SC(48), SC(104), SC(32), 103);
