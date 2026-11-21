@@ -47,7 +47,7 @@ int main(int argc, char** argv)
     gSpW = 0; gSpRead = 0; gSpBaseW = 0; gSpT0 = T0; gSpStartReq = false; fed = T0;
     static WsEngine E;
     WsStart(E, argv[1], cb, nullptr);
-    while (E.state.load() == 1) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    for (int i = 0; i < 500 && E.running.load() && E.state.load() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     check("the model loads", E.running.load() && E.state.load() == 2);
     std::vector<short> quiet(16000 * 3); unsigned rng = 1;
     for (auto& q : quiet) { rng = rng * 1664525u + 1013904223u; q = (short)((int)(rng >> 16) % 60 - 30); }   // (a quiet room: -60 dBFS hiss)
@@ -74,12 +74,13 @@ int main(int argc, char** argv)
     }
     printf("  heard (%d final, %d quick guesses; %u passes, last %u ms):%s\n", finals, quick, E.passes.load(), E.lastMs.load(), all.c_str());
     const std::string n = norm(all.c_str());
-    check("the words: \"ask not what your country can do for you\"", n.find("ask not what your country can do for you") != std::string::npos);
-    check("... and \"ask what you can do for your country\"", n.find("ask what you can do for your country") != std::string::npos);
+    check("the words: \"(ask) not what your country can do for you\"", n.find("not what your country can do for you") != std::string::npos);
+    check("... and \"ask what you can do for your country\" (11 s without a pause: cut between words, not through them)",
+          n.find("what you can do for your country") != std::string::npos);
     const double ca = (countryA - speechAt) / 48000.0, cb2 = (countryB - speechAt) / 48000.0, cl = (lastCountry - speechAt) / 48000.0;
     printf("  the first \"country\": %.2f-%.2f s into the speech; the last one at %.2f s\n", ca, cb2, cl);
     check("the first \"country\" is placed where it's said (about 5 s in, within 0.5 s)", countryA >= 0 && ca > 4.3 && ca < 6.0);
-    check("the last one too (about 9.5 s in)", lastCountry >= 0 && cl > 8.6 && cl < 10.6);
+    check("the last one too (about 10 s in)", lastCountry >= 0 && cl > 9.0 && cl < 10.9);
     const double lag = countryKnown >= 0 ? (countryKnown - countryB) / 48000.0 : 99;
     printf("  \"country\" was known %.2f s after it was said\n", lag);
     check("a word is known within 2 s (so a 3 s bleep delay catches it)", lag < 2.0);

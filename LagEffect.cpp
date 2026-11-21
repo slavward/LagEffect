@@ -21393,10 +21393,19 @@ static void WsRun(WsEngine* pe)
         seg.insert(seg.end(), fr, fr + 320);
         sinceMs += 20; if (loud) { loudMs += 20; silentMs = 0; } else silentMs += 20;
         const bool full = seg.size() >= (size_t)WS_MAXSEG;
-        if (silentMs >= 600 || full) {           // you stopped (or 10 s): the final text
+        if (full && silentMs < 600) {            // 10 s without a pause: cut at the quietest moment of the last 2 s (between
+            size_t cut = seg.size() - WS_RATE / 2; double low = 1e30;   //  words, not through one), the rest starts the next stretch
+            for (size_t i = seg.size() - 2 * WS_RATE; i + 1600 <= seg.size(); i += 320) {
+                double e2 = 0; for (size_t j = i; j < i + 1600; j++) e2 += (double)seg[j] * seg[j];
+                if (e2 < low) { low = e2; cut = i + 800; }
+            }
+            std::vector<float> head(seg.begin(), seg.begin() + cut);
+            WsPass(E, head, segClock, true);
+            seg.erase(seg.begin(), seg.begin() + cut);
+            segClock += 3LL * (long long)cut; sinceMs = 0; loudMs = 200;
+        } else if (silentMs >= 600) {            // you stopped: the final text
             if (loudMs >= 200) WsPass(E, seg, segClock, true);
-            if (full && silentMs < 600) { seg.clear(); segClock = frClock + 3LL * 320; sinceMs = 0; loudMs = 0; }   // (still talking: carry on)
-            else { speech = false; preN = 0; E.state = 2; }
+            speech = false; preN = 0; E.state = 2;
         } else if (E.partials.load() && !behind && sinceMs >= 600 && loudMs >= 200) {
             WsPass(E, seg, segClock, false);     // a quick guess: bleep words are caught while you're still talking
             sinceMs = 0;
