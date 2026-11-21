@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.54.0"
+#define APP_VERSION L"1.55.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -117,7 +117,8 @@ namespace SV = Steinberg::Vst;
 #define VST_OUTS      5                         // outputs (= MAX_OUT below)
 #define VST_CH0       VST_MIC                   // slot numbers: the mic's, then the racks', then the outputs'
 #define VST_OUT0      (VST_CH0 + VST_RACKS * VST_PER)
-#define VST_SLOTS     (VST_OUT0 + VST_OUTS * VST_PER)
+#define VST_SYNTH     (VST_OUT0 + VST_OUTS * VST_PER)   // the vocoder's synth (1.55.0): an instrument your voice plays
+#define VST_SLOTS     (VST_SYNTH + 1)
 #define VST_RATE      48000                     // (the app runs everything at 48 kHz: same as RATE below)
 #define VST_BLOCK     1024                      // biggest block handed to a plugin in one go
 #define VST_MAXFRAMES 8192                      // (a callback bigger than this skips the plugins)
@@ -356,6 +357,8 @@ struct VstSlot {
     SV::IConnectionPoint* cpA; SV::IConnectionPoint* cpB;   // its two halves, wired to each other
     bool single;                                // one object is both halves
     bool stereo;                                // a Mixer channel's or an output's slot (the mic's are mono): set before it's opened
+    bool synth;                                 // the vocoder's synth slot: an instrument (notes in, no sound in): set before it's opened
+    bool cMidi;                                 // (a CLAP synth that only takes MIDI messages, not CLAP's own note events)
     int  nIn, nOut;                             // audio buses each way
     int  chIn[VST_MAXBUS], chOut[VST_MAXBUS];   // channels of each
     int  latency;                               // samples of delay it adds
@@ -432,13 +435,36 @@ static void VstPause(VstSlot& s)                // stop the audio thread using i
 }
 static void VstResume(VstSlot& s) { if (!s.live.exchange(1)) gVstLive++; }
 
+// The synth slot: stereo out if it'll take it, its notes input switched on, any sound inputs left silent.
+static const wchar_t* VstSetupSynthBuses(VstSlot& s)
+{
+    if (s.comp->getBusCount(SV::kEvent, SV::kInput) < 1) return L"It doesn't take notes, so it isn't an instrument (a synth).";
+    if (s.nIn > VST_MAXBUS || s.nOut > VST_MAXBUS) return L"It has more inputs or outputs than Lag Effect can feed.";
+    SV::SpeakerArrangement in[VST_MAXBUS], out[VST_MAXBUS];
+    for (int i = 0; i < s.nIn; i++)  { in[i] = 0;  s.proc->getBusArrangement(SV::kInput, i, in[i]); }
+    for (int i = 0; i < s.nOut; i++) { out[i] = 0; s.proc->getBusArrangement(SV::kOutput, i, out[i]); }
+    const SV::SpeakerArrangement out0 = out[0];
+    out[0] = VST_STEREO;
+    if (s.proc->setBusArrangements(in, s.nIn, out, s.nOut) != SB::kResultOk) { out[0] = out0; s.proc->setBusArrangements(in, s.nIn, out, s.nOut); }
+    for (int i = 0; i < s.nIn; i++)  { SV::SpeakerArrangement a = 0; s.proc->getBusArrangement(SV::kInput, i, a);  s.chIn[i] = VstChannels(a); }
+    for (int i = 0; i < s.nOut; i++) { SV::SpeakerArrangement a = 0; s.proc->getBusArrangement(SV::kOutput, i, a); s.chOut[i] = VstChannels(a); }
+    if (s.chOut[0] < 1) return L"Its main output has no channels.";
+    for (int i = 0; i < s.nIn; i++)  if (s.chIn[i] > VST_MAXCH)  return L"It needs more channels than Lag Effect can feed (surround).";
+    for (int i = 0; i < s.nOut; i++) if (s.chOut[i] > VST_MAXCH) return L"It needs more channels than Lag Effect can feed (surround).";
+    for (int i = 0; i < s.nIn; i++)  s.comp->activateBus(SV::kAudio, SV::kInput, i, false);   // (nothing goes in but notes)
+    for (int i = 0; i < s.nOut; i++) s.comp->activateBus(SV::kAudio, SV::kOutput, i, i == 0);
+    s.comp->activateBus(SV::kEvent, SV::kInput, 0, true);
+    return nullptr;
+}
 // Its buses: ask for mono in and out on a mic slot (stereo first on a Mixer one), else the other, then go
 // with whatever it settled on.
+static const wchar_t* VstSetupSynthBuses(VstSlot& s);
 static const wchar_t* VstSetupBuses(VstSlot& s)
 {
     s.nIn = s.comp->getBusCount(SV::kAudio, SV::kInput);
     s.nOut = s.comp->getBusCount(SV::kAudio, SV::kOutput);
     if (s.nOut < 1) return L"It has no sound output.";
+    if (s.synth) return VstSetupSynthBuses(s);
     if (s.nIn < 1) return L"It's an instrument (it makes its own sound). Only effects can go on your mic.";
     if (s.nIn > VST_MAXBUS || s.nOut > VST_MAXBUS) return L"It has more inputs or outputs than Lag Effect can feed.";
     SV::SpeakerArrangement in[VST_MAXBUS], out[VST_MAXBUS];
@@ -595,6 +621,23 @@ static const wchar_t* ClapPorts(VstSlot& s)
     }
     s.nIn = (int)ap->count(p, true); s.nOut = (int)ap->count(p, false);
     if (s.nOut < 1) return L"It has no sound output.";
+    if (s.synth) {                              // the synth slot: it must take notes; any sound inputs stay silent
+        const clap_plugin_note_ports_t* np = (const clap_plugin_note_ports_t*)p->get_extension(p, CLAP_EXT_NOTE_PORTS);
+        if (!np || np->count(p, true) < 1) return L"It doesn't take notes, so it isn't an instrument (a synth).";
+        {                                       // CLAP's own note events if it takes them, else MIDI messages
+            clap_note_port_info_t ni; memset(&ni, 0, sizeof(ni));
+            const uint32_t d = np->get(p, 0, true, &ni) ? ni.supported_dialects : CLAP_NOTE_DIALECT_CLAP;
+            s.cMidi = !(d & CLAP_NOTE_DIALECT_CLAP) && (d & CLAP_NOTE_DIALECT_MIDI);
+            if (!(d & (CLAP_NOTE_DIALECT_CLAP | CLAP_NOTE_DIALECT_MIDI))) return L"It only takes kinds of notes Lag Effect can't send (MIDI 2 / MPE only).";
+        }
+        if (s.nIn > VST_MAXBUS || s.nOut > VST_MAXBUS) return L"It has more inputs or outputs than Lag Effect can feed.";
+        for (int i = 0; i < s.nIn; i++)  { clap_audio_port_info_t f; memset(&f, 0, sizeof(f)); if (!ap->get(p, (uint32_t)i, true, &f))  return L"It wouldn't describe its inputs."; s.chIn[i] = (int)f.channel_count; }
+        for (int i = 0; i < s.nOut; i++) { clap_audio_port_info_t f; memset(&f, 0, sizeof(f)); if (!ap->get(p, (uint32_t)i, false, &f)) return L"It wouldn't describe its outputs."; s.chOut[i] = (int)f.channel_count; }
+        if (s.chOut[0] < 1) return L"Its main output has no channels.";
+        for (int i = 0; i < s.nIn; i++)  if (s.chIn[i] > VST_MAXCH || s.chIn[i] < 0)   return L"It needs more channels than Lag Effect can feed (surround).";
+        for (int i = 0; i < s.nOut; i++) if (s.chOut[i] > VST_MAXCH || s.chOut[i] < 0) return L"It needs more channels than Lag Effect can feed (surround).";
+        return nullptr;
+    }
     if (s.nIn < 1) return L"It's an instrument (it makes its own sound). Only effects can go on your mic.";
     if (s.nIn > VST_MAXBUS || s.nOut > VST_MAXBUS) return L"It has more inputs or outputs than Lag Effect can feed.";
     for (int i = 0; i < s.nIn; i++)  { clap_audio_port_info_t f; memset(&f, 0, sizeof(f)); if (!ap->get(p, (uint32_t)i, true, &f))  return L"It wouldn't describe its inputs."; s.chIn[i] = (int)f.channel_count; }
@@ -836,7 +879,7 @@ static void ClapDry(const VstSlot& s, int n)    // it wouldn't process: pass the
     const int oc = s.chOut[0] > 1 ? 2 : 1;
     for (int c = 0; c < oc; c++) memcpy(gVstBufOut[c], gVstBufIn[s.chIn[0] > 1 ? c : 0], n * sizeof(float));
 }
-static bool ClapProcess(VstSlot& s, int n)      // gVstBufIn -> gVstBufOut through a CLAP plugin; false: it crashed
+static bool ClapProcess(VstSlot& s, int n, const clap_input_events_t* evIn = &gClapNoIn)   // gVstBufIn -> gVstBufOut through a CLAP plugin; false: it crashed
 {
     int res = 0;
     if (!s.cStarted.load()) {                   // (the audio thread's first block with it)
@@ -870,13 +913,15 @@ static bool ClapProcess(VstSlot& s, int n)      // gVstBufIn -> gVstBufOut throu
     memset(&pr, 0, sizeof(pr));
     pr.steady_time = s.pos; pr.frames_count = (uint32_t)n; pr.transport = &tr;
     pr.audio_inputs = in; pr.audio_outputs = out; pr.audio_inputs_count = (uint32_t)s.nIn; pr.audio_outputs_count = (uint32_t)s.nOut;
-    pr.in_events = &gClapNoIn; pr.out_events = &gClapDrop;
+    pr.in_events = evIn; pr.out_events = &gClapDrop;
     if (!ClapCallGuarded(s.cp, 1, &pr, &res)) return false;
     s.cAsk.fetch_and(~CLAP_ASK_FLUSH);          // (processing takes in whatever its window changed)
     if (res == CLAP_PROCESS_ERROR) ClapDry(s, n);
     return true;
 }
-static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLOCK; r: null on a mono (mic) slot; false: it crashed
+// One block through the plugin: knob moves from its window in, its buses set up, gVstBufIn -> gVstBufOut, what it reports
+// back passed to the window. ev / cev: notes for it (the synth slot), else none. false: it crashed.
+static bool VstProcessCore(VstSlot& s, int n, SV::IEventList* ev, const clap_input_events_t* cev)
 {
     s.inCh.n = 0; s.outCh.n = 0;
     for (unsigned r = s.taR.load(); r != s.taW.load(); r++) {      // knob moves from its window
@@ -897,16 +942,6 @@ static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLO
         outB[b].numChannels = s.chOut[b]; outB[b].channelBuffers32 = outP[b]; outB[b].silenceFlags = 0;
         for (int c = 0; c < s.chOut[b]; c++) outP[b][c] = b == 0 ? gVstBufOut[c] : gVstJunk;
     }
-    const int oc = s.chOut[0] > 1 ? 2 : 1;
-    if (!r) {                                   // mono in: the same on both channels of a stereo plugin
-        memcpy(gVstBufIn[0], l, n * sizeof(float));
-        if (s.chIn[0] > 1) memcpy(gVstBufIn[1], l, n * sizeof(float));
-    } else if (s.chIn[0] > 1) {
-        memcpy(gVstBufIn[0], l, n * sizeof(float));
-        memcpy(gVstBufIn[1], r, n * sizeof(float));
-    } else {                                    // stereo into a mono-only plugin: it gets left and right mixed
-        for (int i = 0; i < n; i++) gVstBufIn[0][i] = 0.5f * (l[i] + r[i]);
-    }
     for (int c = 0; c < s.chOut[0]; c++) memset(gVstBufOut[c], 0, n * sizeof(float));
     SV::ProcessContext ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -920,8 +955,8 @@ static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLO
     d.processMode = SV::kRealtime; d.symbolicSampleSize = SV::kSample32; d.numSamples = n;
     d.numInputs = s.nIn; d.numOutputs = s.nOut; d.inputs = inB; d.outputs = outB;
     d.inputParameterChanges = &s.inCh; d.outputParameterChanges = &s.outCh;
-    d.inputEvents = &gVstNoEvents; d.outputEvents = &gVstNoEvents; d.processContext = &ctx;
-    if (s.cp) { if (!ClapProcess(s, n)) return false; }   // (a CLAP plugin: the same buffers, its own call)
+    d.inputEvents = ev; d.outputEvents = &gVstNoEvents; d.processContext = &ctx;
+    if (s.cp) { if (!ClapProcess(s, n, cev)) return false; }   // (a CLAP plugin: the same buffers, its own call)
     else if (!VstProcessGuarded(s.proc, &d)) return false;
     s.pos += n;
     for (int i = 0; i < s.outCh.n; i++) {       // what it reports back: the last value of each
@@ -930,6 +965,21 @@ static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLO
         const unsigned w = s.tuW.load();
         if (w - s.tuR.load() < VST_RING) { s.toUi[w % VST_RING] = { q.id, q.val[q.n - 1] }; s.tuW.store(w + 1); }
     }
+    return true;
+}
+static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLOCK; r: null on a mono (mic) slot; false: it crashed
+{
+    if (!r) {                                   // mono in: the same on both channels of a stereo plugin
+        memcpy(gVstBufIn[0], l, n * sizeof(float));
+        if (s.chIn[0] > 1) memcpy(gVstBufIn[1], l, n * sizeof(float));
+    } else if (s.chIn[0] > 1) {
+        memcpy(gVstBufIn[0], l, n * sizeof(float));
+        memcpy(gVstBufIn[1], r, n * sizeof(float));
+    } else {                                    // stereo into a mono-only plugin: it gets left and right mixed
+        for (int i = 0; i < n; i++) gVstBufIn[0][i] = 0.5f * (l[i] + r[i]);
+    }
+    if (!VstProcessCore(s, n, &gVstNoEvents, &gClapNoIn)) return false;
+    const int oc = s.chOut[0] > 1 ? 2 : 1;
     const float want = s.on.load() ? 1.0f : 0.0f;
     const float* ol = gVstBufOut[0]; const float* orr = gVstBufOut[oc - 1];
     float mix = s.mix;
@@ -980,6 +1030,81 @@ static bool VstRunBlock(VstSlot& s, float* l, float* r, int n)   // n <= VST_BLO
     s.mix = want == 0.0f && mix < 0.0005f ? 0.0f : mix;
     return true;
 }
+// ---- the synth slot (1.55.0): an instrument plugin your voice plays (the vocoder's "Synth plugin" style) ----
+// The vocoder hands it notes (on, off, and a tuning nudge so it follows slides and vibrato), it plays them, and its sound
+// becomes the vocoder's carrier. VST3 gets them as events; CLAP as note events (+ the tuning note expression).
+struct SynEv { int type; int key; int id; float vel; float tune; };   // type: 0 note on, 1 note off, 2 tuning (semitones off the key)
+#define SYN_EVMAX 48
+class VstNoteList : public SV::IEventList {
+public:
+    SV::Event ev[SYN_EVMAX]; int n = 0;
+    VST_NOREF
+    VST_QI1(SV::IEventList)
+    SB::int32 PLUGIN_API getEventCount() override { return n; }
+    SB::tresult PLUGIN_API getEvent(SB::int32 i, SV::Event& e) override { if (i < 0 || i >= n) return SB::kResultFalse; e = ev[i]; return SB::kResultOk; }
+    SB::tresult PLUGIN_API addEvent(SV::Event&) override { return SB::kResultOk; }
+};
+static VstNoteList gSynVstEv;
+union SynClapEv { clap_event_header_t h; clap_event_note_t note; clap_event_note_expression_t ex; clap_event_midi_t midi; };
+static SynClapEv gSynClapEv[SYN_EVMAX]; static uint32_t gSynClapN = 0;
+static uint32_t CLAP_ABI SynEvSize(const clap_input_events_t*) { return gSynClapN; }
+static const clap_event_header_t* CLAP_ABI SynEvGet(const clap_input_events_t*, uint32_t i) { return i < gSynClapN ? &gSynClapEv[i].h : nullptr; }
+static const clap_input_events_t gSynClapIn = { nullptr, SynEvSize, SynEvGet };
+// A block of the synth: these notes in (at the block's start), its sound (left / right) out. Faded by its On switch
+// (the hotkey); silence while it's off. false: it crashed.
+static bool VstSynthBlock(VstSlot& s, const SynEv* ev, int nev, float* outL, float* outR, int n)   // n <= VST_BLOCK
+{
+    nev = nev < SYN_EVMAX ? nev : SYN_EVMAX;
+    gSynVstEv.n = 0; gSynClapN = 0;
+    for (int i = 0; i < nev; i++) {
+        const SynEv& e = ev[i];
+        if (s.cp && s.cMidi) {                  // a MIDI-only CLAP synth: note on / off, and pitch bend (+-2 semitones) for the tuning
+            SynClapEv& c = gSynClapEv[gSynClapN++];
+            memset(&c, 0, sizeof(c));
+            c.midi.header.size = sizeof(c.midi); c.midi.header.type = CLAP_EVENT_MIDI; c.midi.port_index = 0;
+            if (e.type == 0) { c.midi.data[0] = 0x90; c.midi.data[1] = (uint8_t)(e.key & 127); const int vel = (int)(e.vel * 127.0f + 0.5f); c.midi.data[2] = (uint8_t)(vel < 1 ? 1 : vel > 127 ? 127 : vel); }
+            else if (e.type == 1) { c.midi.data[0] = 0x80; c.midi.data[1] = (uint8_t)(e.key & 127); c.midi.data[2] = 64; }
+            else { int pb = 8192 + (int)(e.tune / 2.0f * 8191.0f); pb = pb < 0 ? 0 : pb > 16383 ? 16383 : pb; c.midi.data[0] = 0xE0; c.midi.data[1] = (uint8_t)(pb & 127); c.midi.data[2] = (uint8_t)(pb >> 7); }
+            c.h.space_id = CLAP_CORE_EVENT_SPACE_ID; c.h.time = 0; c.h.flags = 0;
+        } else if (s.cp) {
+            SynClapEv& c = gSynClapEv[gSynClapN++];
+            memset(&c, 0, sizeof(c));
+            if (e.type == 2) {
+                c.ex.header.size = sizeof(c.ex); c.ex.header.type = CLAP_EVENT_NOTE_EXPRESSION;
+                c.ex.expression_id = CLAP_NOTE_EXPRESSION_TUNING; c.ex.note_id = e.id; c.ex.port_index = 0; c.ex.channel = 0;
+                c.ex.key = (int16_t)e.key; c.ex.value = e.tune;
+            } else {
+                c.note.header.size = sizeof(c.note); c.note.header.type = e.type == 0 ? CLAP_EVENT_NOTE_ON : CLAP_EVENT_NOTE_OFF;
+                c.note.note_id = e.id; c.note.port_index = 0; c.note.channel = 0; c.note.key = (int16_t)e.key; c.note.velocity = e.vel;
+            }
+            c.h.space_id = CLAP_CORE_EVENT_SPACE_ID; c.h.time = 0; c.h.flags = 0;
+        } else {
+            SV::Event& v = gSynVstEv.ev[gSynVstEv.n++];
+            memset(&v, 0, sizeof(v));
+            v.busIndex = 0; v.sampleOffset = 0;
+            if (e.type == 0) { v.type = SV::Event::kNoteOnEvent; v.noteOn.channel = 0; v.noteOn.pitch = (SB::int16)e.key; v.noteOn.velocity = e.vel; v.noteOn.noteId = e.id; }
+            else if (e.type == 1) { v.type = SV::Event::kNoteOffEvent; v.noteOff.channel = 0; v.noteOff.pitch = (SB::int16)e.key; v.noteOff.velocity = e.vel; v.noteOff.noteId = e.id; }
+            else { v.type = SV::Event::kNoteExpressionValueEvent; v.noteExpressionValue.typeId = 2;   // (kTuningTypeID: 0..1 = -120..+120 semitones)
+                   v.noteExpressionValue.noteId = e.id; v.noteExpressionValue.value = 0.5 + e.tune / 240.0; }
+        }
+    }
+    for (int c = 0; c < 2; c++) memset(gVstBufIn[c], 0, n * sizeof(float));   // (an instrument with a sound input hears silence)
+    if (!VstProcessCore(s, n, &gSynVstEv, &gSynClapIn)) return false;
+    const int oc = s.chOut[0] > 1 ? 2 : 1;
+    const float* ol = gVstBufOut[0]; const float* orr = gVstBufOut[oc - 1];
+    const float want = s.on.load() ? 1.0f : 0.0f;
+    float mix = s.mix;
+    for (int i = 0; i < n; i++) {
+        float l = ol[i], r = orr[i];
+        if (!(l > -64.0f && l < 64.0f)) l = 0;  // (garbage or NaN out of a plugin: silence, not a bang)
+        if (!(r > -64.0f && r < 64.0f)) r = 0;
+        mix += (want - mix) * 0.004f;
+        outL[i] = l * mix; outR[i] = r * mix;
+    }
+    s.mix = want == 0.0f && mix < 0.0005f ? 0.0f : mix;
+    return true;
+}
+
 // (post: -1 = all of them; 0 / 1 = only the mic slots that run before / after the voice effects)
 static bool VstRangeOn(int first, int count, int post = -1)   // would any of these slots do something to the sound right now?
 {
@@ -1013,6 +1138,27 @@ static void VstRunRange(int first, int count, float* l, float* r, int n, int pos
     }
 }
 static void VstRun(float* buf, int n) { VstRunRange(0, VST_MIC, buf, nullptr, n, 0); }   // your mic, through the slots that sit before the voice effects
+// The vocoder's synth, from the audio thread: these notes in, a block of its sound out (left / right). false: no synth
+// running (nothing written). Guarded like the other slots (busy flag, crash = switched off, CPU counted).
+static bool SynthLive() { return gVst[VST_SYNTH].live.load() != 0; }
+static bool SynthPluginRun(const SynEv* ev, int nev, float* l, float* r, int n)
+{
+    VstSlot& s = gVst[VST_SYNTH];
+    if (!s.live.load()) return false;
+    s.busy.store(1);
+    bool ok = s.live.load() != 0;
+    if (ok) {
+        const unsigned long long t0 = VstClock();
+        for (int off = 0; off < n; off += VST_BLOCK) {
+            const int m = n - off < VST_BLOCK ? n - off : VST_BLOCK;
+            if (!VstSynthBlock(s, ev, off ? 0 : nev, l + off, r + off, m)) { if (s.live.exchange(0)) gVstLive--; s.crashed = 1; ok = false; break; }
+        }
+        s.cpuT.fetch_add(VstClock() - t0, std::memory_order_relaxed);
+        s.cpuN.fetch_add((unsigned long long)n, std::memory_order_relaxed);
+    }
+    s.busy.store(0);
+    return ok;
+}
 // ======================= end of the VST3 host core =======================
 
 // ---- a slot as the window sees it: which plugin, its file, its own window ----
@@ -1146,6 +1292,8 @@ static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutte
 enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16 };
 static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst); }
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
+static int  gBuildCond = 0;                     // (...and when they show: 0 always, 1 vocoder style isn't Synth plugin, 2 it is)
+static bool CondOn(int c);
 // Plugins on (Settings > Features): the mic's own stages for one block, before and after the plugins ran over them.
 static float gVstMic[VST_MAXFRAMES], gVstDuck[VST_MAXFRAMES], gVstDuckAll[VST_MAXFRAMES];
 // ...the same for slots set to run after the voice effects: your voice with effects, and what else that part of the loop works out.
@@ -1726,11 +1874,14 @@ static volatile int  gFxRevMix = 30, gFxRevSize = 60, gFxRevDamp = 50, gFxPreMs 
 static volatile bool gFxResetReq = true;       // UI asks the audio thread to clear effect buffers
 static volatile bool gFxVocOn = false;
 // Vocoder (Voloco-style): style, key (0 = C .. 11 = B), scale, and knobs.
-enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_SONG = 4, VOC_STYLES };
+enum { VOC_TUNE = 0, VOC_HARMONY = 1, VOC_ROBOT = 2, VOC_CHOIR = 3, VOC_SONG = 4, VOC_PLUGIN = 5, VOC_STYLES };   // (Synth plugin: 1.55.0)
 static volatile int  gVocStyle = VOC_HARMONY, gVocKey = 0, gVocScale = 1;
 enum { VR_AUTO = 0, VR_HIGH = 1, VR_LOW = 2 };     // voice range (Vocoder): who's singing
 static volatile int  gVocRange = VR_AUTO;
 static volatile int  gVocRetuneMs = 15, gVocSynth = 60, gVocMix = 100;
+static volatile int  gSynNotes = 0, gSynOct = 0;   // Synth plugin style: what it plays (0 your note, 1 + an octave below, 2 a chord, 3 a big chord), octave shift (-2..+2)
+static float gSynCar[VST_MAXFRAMES];            // (audio thread) this block of the synth, left + right mixed: the vocoder's carrier
+static unsigned gSynCarN = 0, gSynRd = 0;       // how much there is, how far the vocoder has read
 static volatile bool gFxRadioOn = false;
 static volatile int  gRadioPreset = 0, gRadioDrive = 50, gRadioStatic = 50, gRadioSquelch = 70;
 
@@ -1927,8 +2078,11 @@ static struct VocState {
     float  oscFreq[VOC_OSC], oscGain[VOC_OSC];
     float  voiced;                             // 0..1, fades the synth in and out
     // vocoder
-    Biquad modBp[VOC_BANDS][2], carBp[VOC_BANDS][2];
-    float  modEnv[VOC_BANDS], carEnv[VOC_BANDS];
+    // The 28 bands' filters (two stages each), laid out band by band so four bands run side by side (1.55.0: half the
+    // vocoder's time was here). The voice's and the carrier's filters share coefficients; each keeps its own state.
+    alignas(16) float bq0[2][VOC_BANDS], bq1[2][VOC_BANDS], bq2[2][VOC_BANDS], ba1[2][VOC_BANDS], ba2[2][VOC_BANDS];
+    alignas(16) float mz1[2][VOC_BANDS], mz2[2][VOC_BANDS], cz1[2][VOC_BANDS], cz2[2][VOC_BANDS];   // (the voice's / carrier's filter state)
+    alignas(16) float modEnv[VOC_BANDS], carEnv[VOC_BANDS];
     Biquad sibHp[2];
     bool   ready;
     // voice range
@@ -1946,7 +2100,11 @@ static void VocBands(bool low)
     const double Q = 1.0 / (sqrt(r) - 1.0 / sqrt(r));
     for (int b = 0; b < VOC_BANDS; b++) {
         double fc = lo * pow(r, b);
-        for (int i = 0; i < 2; i++) { BqSet(gVoc.modBp[b][i], 1, fc, Q); BqSet(gVoc.carBp[b][i], 1, fc, Q); }
+        Biquad q; BqSet(q, 1, fc, Q);           // (both stages, the voice's and the carrier's: the same band-pass, fresh state)
+        for (int i = 0; i < 2; i++) {
+            gVoc.bq0[i][b] = q.b0; gVoc.bq1[i][b] = q.b1; gVoc.bq2[i][b] = q.b2; gVoc.ba1[i][b] = q.a1; gVoc.ba2[i][b] = q.a2;
+            gVoc.mz1[i][b] = gVoc.mz2[i][b] = gVoc.cz1[i][b] = gVoc.cz2[i][b] = 0;
+        }
     }
     gVoc.bandsLow = low;
 }
@@ -2155,11 +2313,13 @@ static inline float SongRead()                  // audio thread
 }
 
 // Per-block settings, read once per audio callback.
-static struct VocParams { int style, key, scale, range; float retuneCoef, synth, mix, blendCos, blendSin; } gVp;
+static struct VocParams { int style, key, scale, range; float retuneCoef, synth, mix, blendCos, blendSin; bool plugin; } gVp;
 
 static void VocBlock()
 {
     gVp.style = Iclamp(gVocStyle, 0, VOC_STYLES - 1);
+    gVp.plugin = gVp.style == VOC_PLUGIN && gFeatVst && SynthLive();
+    if (gVp.style == VOC_PLUGIN && !gVp.plugin) gVp.style = VOC_ROBOT;   // (no synth running: the built-in Robot voice until there is)
     gVp.key   = Iclamp(gVocKey, 0, 11);
     gVp.scale = Iclamp(gVocScale, 0, VOC_SCALES - 1);
     float ms  = (float)gVocRetuneMs;
@@ -2172,17 +2332,56 @@ static void VocBlock()
 
 // eps keeps silent carrier bands from blowing up; the synth styles were calibrated at 0.0005, the
 // Song style uses a smaller one so quiet music (low browser volume) still comes through at full level.
+// Each band: the voice and the carrier through its band-pass; the carrier is divided by its own level (flattened) and
+// multiplied by the voice's. Four bands at a time with SSE; every band does exactly the same steps in the same order as one
+// at a time would, and the bands are added up in order, so the result is the same to the last bit.
 static float VocodeBands(VocState& v, float mod, float car, float eps = 0.0005f)   // car shaped by mod
 {
-    float voc = 0;
-    for (int b = 0; b < VOC_BANDS; b++) {
-        float m = BqRun(v.modBp[b][1], BqRun(v.modBp[b][0], mod));
-        float c = BqRun(v.carBp[b][1], BqRun(v.carBp[b][0], car));
-        float am = m < 0 ? -m : m, ac = c < 0 ? -c : c;
-        v.modEnv[b] += (am - v.modEnv[b]) * (am > v.modEnv[b] ? 0.007f : 0.0014f);   // ~3 ms attack, ~15 ms release
-        v.carEnv[b] += (ac - v.carEnv[b]) * 0.0014f;
-        voc += c * v.modEnv[b] / (v.carEnv[b] + eps);             // carrier flattened, voice's shape applied
+    alignas(16) float term[VOC_BANDS];
+#ifdef HAVE_SSE_FLAGS
+    const __m128 xm = _mm_set1_ps(mod), xc = _mm_set1_ps(car), sign = _mm_set1_ps(-0.0f);
+    const __m128 kAtk = _mm_set1_ps(0.007f), kRel = _mm_set1_ps(0.0014f), kEps = _mm_set1_ps(eps);
+    for (int b = 0; b < VOC_BANDS; b += 4) {
+        __m128 m = xm, c = xc;
+        for (int st = 0; st < 2; st++) {        // y = b0 x + z1; z1 = b1 x - a1 y + z2; z2 = b2 x - a2 y (as BqRun)
+            const __m128 b0 = _mm_load_ps(v.bq0[st] + b), b1 = _mm_load_ps(v.bq1[st] + b), b2 = _mm_load_ps(v.bq2[st] + b);
+            const __m128 a1 = _mm_load_ps(v.ba1[st] + b), a2 = _mm_load_ps(v.ba2[st] + b);
+            __m128 z1 = _mm_load_ps(v.mz1[st] + b), z2 = _mm_load_ps(v.mz2[st] + b);
+            __m128 y = _mm_add_ps(_mm_mul_ps(b0, m), z1);
+            _mm_store_ps(v.mz1[st] + b, _mm_add_ps(_mm_sub_ps(_mm_mul_ps(b1, m), _mm_mul_ps(a1, y)), z2));
+            _mm_store_ps(v.mz2[st] + b, _mm_sub_ps(_mm_mul_ps(b2, m), _mm_mul_ps(a2, y)));
+            m = y;
+            z1 = _mm_load_ps(v.cz1[st] + b); z2 = _mm_load_ps(v.cz2[st] + b);
+            y = _mm_add_ps(_mm_mul_ps(b0, c), z1);
+            _mm_store_ps(v.cz1[st] + b, _mm_add_ps(_mm_sub_ps(_mm_mul_ps(b1, c), _mm_mul_ps(a1, y)), z2));
+            _mm_store_ps(v.cz2[st] + b, _mm_sub_ps(_mm_mul_ps(b2, c), _mm_mul_ps(a2, y)));
+            c = y;
+        }
+        const __m128 am = _mm_andnot_ps(sign, m), ac = _mm_andnot_ps(sign, c);
+        __m128 me = _mm_load_ps(v.modEnv + b), ce = _mm_load_ps(v.carEnv + b);
+        const __m128 up = _mm_cmpgt_ps(am, me);  // ~3 ms attack, ~15 ms release
+        me = _mm_add_ps(me, _mm_mul_ps(_mm_sub_ps(am, me), _mm_or_ps(_mm_and_ps(up, kAtk), _mm_andnot_ps(up, kRel))));
+        ce = _mm_add_ps(ce, _mm_mul_ps(_mm_sub_ps(ac, ce), kRel));
+        _mm_store_ps(v.modEnv + b, me); _mm_store_ps(v.carEnv + b, ce);
+        _mm_store_ps(term + b, _mm_div_ps(_mm_mul_ps(c, me), _mm_add_ps(ce, kEps)));   // carrier flattened, voice's shape applied
     }
+#else
+    for (int b = 0; b < VOC_BANDS; b++) {
+        float m = mod, c = car;
+        for (int st = 0; st < 2; st++) {
+            float y = v.bq0[st][b] * m + v.mz1[st][b];
+            v.mz1[st][b] = v.bq1[st][b] * m - v.ba1[st][b] * y + v.mz2[st][b]; v.mz2[st][b] = v.bq2[st][b] * m - v.ba2[st][b] * y; m = y;
+            y = v.bq0[st][b] * c + v.cz1[st][b];
+            v.cz1[st][b] = v.bq1[st][b] * c - v.ba1[st][b] * y + v.cz2[st][b]; v.cz2[st][b] = v.bq2[st][b] * c - v.ba2[st][b] * y; c = y;
+        }
+        const float am = m < 0 ? -m : m, ac = c < 0 ? -c : c;
+        v.modEnv[b] += (am - v.modEnv[b]) * (am > v.modEnv[b] ? 0.007f : 0.0014f);
+        v.carEnv[b] += (ac - v.carEnv[b]) * 0.0014f;
+        term[b] = c * v.modEnv[b] / (v.carEnv[b] + eps);
+    }
+#endif
+    float voc = 0;
+    for (int b = 0; b < VOC_BANDS; b++) voc += term[b];   // (in band order, as before)
     return voc;
 }
 
@@ -2251,6 +2450,15 @@ static float Vocoder(float x)
     if (v.f0 > 0) v.outNote = 69.0f + 12.0f * log2f(v.f0 / 440.0f) + v.shift;
     if (gVp.style == VOC_TUNE) return x + (tuned - x) * gVp.mix;
 
+    if (gVp.style == VOC_PLUGIN) {              // Synth plugin: its sound (played by your pitch, see SynthRender) is the carrier
+        static unsigned seedP = 12345;          // (a little noise between its harmonics, as the built-in voices have: keeps words clear)
+        seedP = seedP * 1664525u + 1013904223u;
+        const float car = (gSynRd < gSynCarN ? gSynCar[gSynRd++] : 0.0f) + ((int)(seedP >> 9) % 2000 - 1000) * 0.00002f;
+        float voc = VocodeBands(v, tuned, car) * 1.5f;
+        voc += BqRun(v.sibHp[1], BqRun(v.sibHp[0], tuned)) * 0.7f;
+        const float out = tuned * gVp.blendCos + voc * gVp.blendSin;
+        return x + (out - x) * gVp.mix;
+    }
     // --- synth carrier ---
     v.voiced += ((v.f0 > 0 ? 1.0f : 0.0f) - v.voiced) * 0.002f;   // ~10 ms fade
     static int steps[VOC_OSC], octs[VOC_OSC], voicesFor = -1; static float gains[VOC_OSC];
@@ -2258,9 +2466,16 @@ static float Vocoder(float x)
     float car = 0;
     if (v.targetNote >= 0) {
         float bend = v.outNote - (float)v.targetNote;              // follow vibrato and slides
+        // Each voice's note (scale steps from yours): worked out again only when your note, the key, the scale or the
+        // voices change, not every sample (1.55.0: that was a tenth of the Choir style's time; same notes either way).
+        static int noteOf[VOC_OSC], forTarget = -999, forKey = -1, forScale = -1, forVoices = -1;
+        if (forTarget != v.targetNote || forKey != gVp.key || forScale != gVp.scale || forVoices != voicesFor) {
+            forTarget = v.targetNote; forKey = gVp.key; forScale = gVp.scale; forVoices = voicesFor;
+            for (int i = 0; i < VOC_OSC; i++) noteOf[i] = steps[i] == 99 ? 0 : VocScaleStep(v.targetNote, steps[i], gVp.key, gVp.scale) + 12 * octs[i];
+        }
         for (int i = 0; i < VOC_OSC; i++) {
             if (steps[i] == 99) continue;
-            int n = VocScaleStep(v.targetNote, steps[i], gVp.key, gVp.scale) + 12 * octs[i];
+            int n = noteOf[i];
             float fq = MidiToHz((float)n + bend);
             if (fq > 6000.0f) continue;
             v.oscFreq[i] += (fq - v.oscFreq[i]) * (v.oscFreq[i] > 0 ? 0.01f : 1.0f);
@@ -2287,6 +2502,56 @@ static float Vocoder(float x)
         out = tuned * gVp.blendCos + voc * gVp.blendSin;
     }
     return x + (out - x) * gVp.mix;
+}
+
+// ---- Synth plugin style: your pitch, as notes for the synth plugin (once a block, before the samples) ----
+// The notes follow the vocoder's tuned note (so Key / Scale / Retune apply), with a tuning nudge for slides and
+// vibrato; they stop ~40 ms after your voice does. Its block of sound is the carrier Vocoder() reads, a sample at a time.
+// (The notes are from the previous block: at most one block late, 2.7-10 ms.)
+#define SYN_MAXN 6
+static int   gSynKey[SYN_MAXN] = { -1, -1, -1, -1, -1, -1 }, gSynId[SYN_MAXN];   // what's sounding on each voice (-1 = nothing)
+static float gSynTune[SYN_MAXN];
+static int   gSynNextId = 1;
+static unsigned gSynLastBlock = 0;              // (a gap since the last block: it was switched away; stray notes are stopped)
+static void SynVoices(int mode, bool low, int* steps, int* octs)   // scale steps from your note, and octaves (99 = unused)
+{
+    for (int i = 0; i < SYN_MAXN; i++) { steps[i] = 99; octs[i] = 0; }
+    steps[0] = 0;
+    if (mode == 1) { steps[1] = 0; octs[1] = -1; }                        // + an octave below
+    else if (mode == 2) { steps[1] = 2; steps[2] = 4; }                   // a chord (third and fifth above)
+    else if (mode == 3) { steps[1] = 2; steps[2] = 4; steps[3] = 0; octs[3] = -1; steps[4] = 4; octs[4] = -1; steps[5] = 0; octs[5] = 1; }   // big chord
+    if (low) for (int i = 0; i < SYN_MAXN; i++) if (octs[i] < 0) octs[i] = 1;   // (deep voices: above, not below)
+}
+static void SynthRender(unsigned frames)
+{
+    gSynRd = 0; gSynCarN = 0;
+    const unsigned n = frames < VST_MAXFRAMES ? frames : VST_MAXFRAMES;
+    VocState& v = gVoc;
+    SynEv ev[SYN_EVMAX]; int ne = 0;
+    const unsigned blk = gMainBlocks;
+    if (blk != gSynLastBlock + 1)               // (not played last block: stop whatever it was holding)
+        for (int i = 0; i < SYN_MAXN; i++) if (gSynKey[i] >= 0 && ne < SYN_EVMAX) { ev[ne++] = { 1, gSynKey[i], gSynId[i], 0.0f, 0.0f }; gSynKey[i] = -1; }
+    gSynLastBlock = blk;
+    int want[SYN_MAXN]; for (int i = 0; i < SYN_MAXN; i++) want[i] = -1;
+    if (v.ready && v.f0 > 0 && v.targetNote >= 0) {
+        int steps[SYN_MAXN], octs[SYN_MAXN];
+        SynVoices(Iclamp(gSynNotes, 0, 3), v.low, steps, octs);
+        for (int i = 0; i < SYN_MAXN; i++)
+            if (steps[i] != 99) want[i] = Iclamp(VocScaleStep(v.targetNote, steps[i], gVp.key, gVp.scale) + 12 * (octs[i] + Iclamp(gSynOct, -2, 2)), 0, 127);
+    }
+    const float bend = v.f0 > 0 && v.targetNote >= 0 ? fmaxf(-2.0f, fminf(2.0f, v.outNote - (float)v.targetNote)) : 0.0f;
+    for (int i = 0; i < SYN_MAXN && ne < SYN_EVMAX - 2; i++) {
+        if (gSynKey[i] != want[i]) {
+            if (gSynKey[i] >= 0) ev[ne++] = { 1, gSynKey[i], gSynId[i], 0.0f, 0.0f };
+            gSynKey[i] = want[i];
+            if (want[i] >= 0) { gSynId[i] = gSynNextId++ & 0x3fffffff; ev[ne++] = { 0, want[i], gSynId[i], 0.8f, 0.0f }; gSynTune[i] = 0; }
+        }
+        if (gSynKey[i] >= 0 && fabsf(bend - gSynTune[i]) > 0.02f) { ev[ne++] = { 2, gSynKey[i], gSynId[i], 0.0f, bend }; gSynTune[i] = bend; }
+    }
+    static float sl[VST_MAXFRAMES], sr[VST_MAXFRAMES];
+    if (!SynthPluginRun(ev, ne, sl, sr, (int)n)) return;   // (it stopped: the carrier is silence until the window notices)
+    for (unsigned i = 0; i < n; i++) gSynCar[i] = 0.5f * (sl[i] + sr[i]);
+    gSynCarN = n;
 }
 
 // ======================= radio (walkie-talkie, phone, megaphone...) =======================
@@ -3879,6 +4144,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool   fxRev   = fxNow && gFxRevOn;
     const bool   fxVoc   = fxNow && gFxVocOn;
     if (fxVoc) VocBlock();
+    if (fxVoc && gVp.plugin) SynthRender(frames);   // (Synth plugin style: the synth plays this block first)
     const bool   fxRadio = fxNow && gFxRadioOn;
     if (fxRadio) RadioBlock();
     // the newer effects (Voice FX sub-tabs)
@@ -4547,6 +4813,7 @@ enum {
     IDC_SEARCH = 4520, IDC_KEYSLIST = 4521, IDC_ONSTRIP = 4522,   // the bottom bar (1.51.0)
     IDC_RCDBTN = 4523,                          // ... and its Recorder button (1.52.0)
     IDC_BUGINFO = 4550, IDC_BACKUPS = 4551,     // Settings > General: Copy bug report info, Backups... (1.53.0)
+    IDC_SYNPICK = 4552, IDC_SYNNAME, IDC_SYNEDIT, IDC_SYNNOTES, IDC_SYNOCT, IDC_SYNNOTE,   // Voice FX > Tune > Synth plugin (1.55.0)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5739,6 +6006,8 @@ static void LoadSettings()
     // Mic tab. Settings from 1.5 and older: gate=1/0 and gate_db=50 (meaning -50 dB).
     gNsOn         = INI_INT(L"ns_on", 0) != 0;
     gVocStyle     = Iclamp(INI_INT(L"voc_style", VOC_HARMONY), 0, VOC_STYLES - 1);
+    gSynNotes     = Iclamp(INI_INT(L"voc_synth_notes", 0), 0, 3);
+    gSynOct       = Iclamp(INI_INT(L"voc_synth_octave", 0), -2, 2);
     gVocKey       = Iclamp(INI_INT(L"voc_key", 0), 0, 11);
     gVocScale     = Iclamp(INI_INT(L"voc_scale", 1), 0, VOC_SCALES - 1);
     gVocRange     = Iclamp(INI_INT(L"voc_range", VR_AUTO), 0, 2);
@@ -6680,6 +6949,7 @@ static void SaveSettings()
     SaveInt(L"leveler_threshold_db", gLvThrDb); SaveInt(L"leveler_ratio", gLvRatio); SaveInt(L"leveler_attack_ms", gLvAtkMs);
     SaveInt(L"leveler_release_ms", gLvRelMs); SaveInt(L"leveler_makeup_db", gLvMakeDb);
     SaveInt(L"voc_style", gVocStyle); SaveInt(L"voc_key", gVocKey); SaveInt(L"voc_scale", gVocScale); SaveInt(L"voc_range", gVocRange);
+    SaveInt(L"voc_synth_notes", gSynNotes); SaveInt(L"voc_synth_octave", gSynOct);
     IniSet(L"voc_song_app", gSongApp);
     IniSet(L"voc_song_file", gSongFile);
     SaveInt(L"voc_song_use_file", gSongUseFile);
@@ -7030,9 +7300,9 @@ static bool PageOn(int page)                    // Voice FX, Soundboard and Clip
     return page == PAGE_FX ? gFeatFx : page == PAGE_SOUND ? gFeatSound : page == PAGE_CLIPS ? gFeatClips : true;
 }
 
-struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; int feat; };   // feat: shown only with that feature on   // ox/oy: moved by you (design px)
+struct Section { int x, y, w, h; const wchar_t* title; bool shifts; int page; int sub; int ox, oy; int feat; int cond; };   // feat: shown only with that feature on   // ox/oy: moved by you (design px)
 struct Framed  { HWND edit, ud; };
-struct Paged   { HWND h; int page; int sub; int feat; };   // sub: Voice FX sub-tab (-1 = every sub-tab)
+struct Paged   { HWND h; int page; int sub; int feat; int cond; };   // sub: Voice FX sub-tab (-1 = every sub-tab); cond: see gBuildCond
 // Every control's position as laid out (scaled), how far FitText moved / widened it, and how far you moved it.
 // PlaceAll puts each control at: layout + FitText + (moves with the output list) + your offset + its section's offset.
 struct Design  {
@@ -7061,7 +7331,7 @@ static int     gBuildPage = -1;                // page new controls go on (-1 = 
 static int     gBuildSub = -1;                 // Voice FX sub-tab new controls go on (-1 = all)
 static int     gPage = 0;                      // page being shown
 
-static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage, gBuildSub, gBuildFeat }; }
+static void RecordPage(HWND h) { if (gBuildPage >= 0 && gPagedN < MAX_PAGED) gPaged[gPagedN++] = { h, gBuildPage, gBuildSub, gBuildFeat, gBuildCond }; }
 
 static int RowsDelta() { return ROW_H * (gRows - 1); }
 static int DesignH() { return gCompact ? COMPACT_H : BASE_H + RowsDelta(); }
@@ -7105,7 +7375,7 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
 
 static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 {
-    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub, 0, 0, gBuildFeat };
+    if (gSectionN < MAX_SECTIONS) gSections[gSectionN++] = { x, y, w, h, title, gRecordShift, gBuildPage, gBuildSub, 0, 0, gBuildFeat, gBuildCond };
 }
 
 
@@ -8157,8 +8427,10 @@ static void UpdateSongCapture()
     UpdateSongStatusText();
 }
 
+static void SynUiRefresh();
 static void SongStyleChanged()                  // style / on-off changed somewhere
 {
+    SynUiRefresh();
     Layout();
     RedrawKnobs();
     InvalidateRect(GetDlgItem(gWnd, IDC_SONGBTN), nullptr, FALSE);
@@ -9258,6 +9530,7 @@ static const ProfVar PROF_VARS[] = {
     { L"fx_on", nullptr, &gFxOn, nullptr },         { L"voc_style", &gVocStyle, nullptr, nullptr },
     { L"voc_key", &gVocKey, nullptr, nullptr },     { L"voc_scale", &gVocScale, nullptr, nullptr },
     { L"voc_range", &gVocRange, nullptr, nullptr }, { L"voc_synth_other", nullptr, nullptr, &gVocSynthSaved },
+    { L"voc_synth_notes", &gSynNotes, nullptr, nullptr }, { L"voc_synth_octave", &gSynOct, nullptr, nullptr },
     { L"radio_preset", &gRadioPreset, nullptr, nullptr },
     { L"fx_echo_style", &gEchoStyle, nullptr, nullptr }, { L"fx_dist_style", &gDistStyle, nullptr, nullptr },
     { L"fx_chorus_style", &gChoStyle, nullptr, nullptr }, { L"fx_muffle_style", &gMufStyle, nullptr, nullptr },
@@ -9361,6 +9634,8 @@ static void RefreshSoundUI()                    // after a profile changed lots 
     for (int g = 0; g < FX_GROUPS; g++) CheckDlgButton(gWnd, IDC_FXGRP_ON + g, *gFxGroups[g].on ? BST_CHECKED : BST_UNCHECKED);
     SendDlgItemMessageW(gWnd, IDC_VOCSTYLE, CB_SETCURSEL, gVocStyle, 0);
     SendDlgItemMessageW(gWnd, IDC_VOCKEY, CB_SETCURSEL, gVocKey, 0);
+    SendDlgItemMessageW(gWnd, IDC_SYNNOTES, CB_SETCURSEL, Iclamp(gSynNotes, 0, 3), 0);
+    SendDlgItemMessageW(gWnd, IDC_SYNOCT, CB_SETCURSEL, Iclamp(gSynOct, -2, 2) + 2, 0);
     SendDlgItemMessageW(gWnd, IDC_VOCSCALE, CB_SETCURSEL, gVocScale, 0);
     SendDlgItemMessageW(gWnd, IDC_VOCRANGE, CB_SETCURSEL, gVocRange, 0);
     SendDlgItemMessageW(gWnd, IDC_RADIOPRESET, CB_SETCURSEL, gRadioPreset, 0);
@@ -9404,6 +9679,7 @@ static bool ProfileLoad(int idx, bool osd)
         else *v.n = get(v.key, *v.n, 0, 100);
     }
     gVocStyle = Iclamp(gVocStyle, 0, VOC_STYLES - 1); gVocKey = Iclamp(gVocKey, 0, 11);
+    gSynNotes = Iclamp(gSynNotes, 0, 3); gSynOct = Iclamp(gSynOct, -2, 2);
     gVocScale = Iclamp(gVocScale, 0, VOC_SCALES - 1); gVocRange = Iclamp(gVocRange, 0, 2);
     gRadioPreset = Iclamp(gRadioPreset, 0, RADIO_N - 1); gGateMode = Iclamp(gGateMode, 0, 3);
     gEchoStyle = Iclamp(gEchoStyle, 0, ECHO_N - 1); gDistStyle = Iclamp(gDistStyle, 0, DIST_N - 1);
@@ -9642,6 +9918,7 @@ static void MyCharSave(const wchar_t* name)
     for (const FxGroup& g : gFxGroups) put(g.key, *g.on ? 1 : 0);
     for (const Knob& k : gKnobs) if (k.group < FX_GROUPS) put(k.key, *k.var);
     put(L"voc_style", gVocStyle); put(L"voc_key", gVocKey); put(L"voc_scale", gVocScale); put(L"voc_range", gVocRange);
+    put(L"voc_synth_notes", gSynNotes); put(L"voc_synth_octave", gSynOct);
     put(L"radio_preset", gRadioPreset); put(L"fx_echo_style", gEchoStyle); put(L"fx_dist_style", gDistStyle);
     put(L"fx_chorus_style", gChoStyle); put(L"fx_muffle_style", gMufStyle); put(L"fx_harm_style", gHarmStyle);
 }
@@ -9655,6 +9932,7 @@ static void MyCharLoad(const wchar_t* name)
     for (const FxGroup& g : gFxGroups) *g.on = get(g.key, 0, 0, 1) != 0;   // effects it doesn't mention: off
     for (const Knob& k : gKnobs) if (k.group < FX_GROUPS) *k.var = get(k.key, k.def, k.lo, k.hi);
     gVocStyle = get(L"voc_style", gVocStyle, 0, VOC_STYLES - 1); gVocKey = get(L"voc_key", gVocKey, 0, 11);
+    gSynNotes = get(L"voc_synth_notes", gSynNotes, 0, 3); gSynOct = get(L"voc_synth_octave", gSynOct, -2, 2);
     gVocScale = get(L"voc_scale", gVocScale, 0, VOC_SCALES - 1); gVocRange = get(L"voc_range", gVocRange, 0, 2);
     gRadioPreset = get(L"radio_preset", gRadioPreset, 0, RADIO_N - 1);
     gEchoStyle = get(L"fx_echo_style", gEchoStyle, 0, ECHO_N - 1); gDistStyle = get(L"fx_dist_style", gDistStyle, 0, DIST_N - 1);
@@ -13118,9 +13396,10 @@ static bool EdIsSubTab(HWND h)
     return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || MicSubOf(id) >= 0 ||
            (id >= IDC_SETSUB0 && id <= IDC_SETSUB3);
 }
+static bool CondOn(int c) { return c == 0 || (c == 2) == (gVocStyle == VOC_PLUGIN); }
 static bool SectionShown(const Section& s)
 {
-    if (gCompact || (s.page >= 0 && s.page != gPage)) return false;
+    if (gCompact || (s.page >= 0 && s.page != gPage) || !CondOn(s.cond)) return false;
     return s.sub < 0 || s.sub == (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : gFxSub);
 }
 static RECT SectionRect(const Section& s)
@@ -13942,7 +14221,14 @@ static void AddTips()
     TipId(IDC_NSON,     L"Turn AI noise suppression (RNNoise) on or off. It removes fans, keyboards, hum and room noise. Adds about 20 ms of delay.");
     TipId(IDC_RADIOPRESET, L"Which device you sound like. The knobs adjust the chosen preset; knobs it doesn't use are dimmed.");
     TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
-                        L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you.");
+                        L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you. "
+                        L"Synth plugin: any instrument plugin (VST3 / CLAP) plays your notes and talks with your voice.");
+    TipId(IDC_SYNPICK,  L"The synth your voice plays: an instrument plugin (VST3 or CLAP), e.g. the free Surge XT or Vital. "
+                        L"Its presets are your new voices. Click to pick, swap or remove it.");
+    TipId(IDC_SYNEDIT,  L"The synth's own window: pick its presets and sounds there.");
+    TipId(IDC_SYNNOTES, L"What the synth plays when you sing or talk: just your note, your note with an octave below, "
+                        L"or a chord built on it from the Key and Scale.");
+    TipId(IDC_SYNOCT,   L"Moves the synth's notes up or down by octaves (+1 for a high, bright voice; -1 for a deep one).");
     TipId(IDC_VOCKEY,   L"The key of the song (its home note). Not sure? Try C with Major, or A with Minor.");
     TipId(IDC_SONGBTN,  L"Vocode to song: the music says your words. Talk or sing and you hear the song "
                         L"shaped by your voice; stay quiet and it's silent. Turns on Voice effects and the Vocoder's Song style. "
@@ -15513,6 +15799,7 @@ static void Layout()
         bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat))
                 && (gPaged[i].sub < 0 || gPaged[i].sub == (gPaged[i].page == PAGE_MIC ? gMicSub : gPaged[i].page == PAGE_SETTINGS ? gSetSub
                                                          : gPaged[i].page == PAGE_MIXER ? gMixSub : gFxSub));
+        vis = vis && CondOn(gPaged[i].cond);
         int  cid = GetDlgCtrlID(gPaged[i].h);
         bool songStyle = gVocStyle == VOC_SONG;    // Song style: "Music from" replaces key / scale / voice
         if (cid == IDC_VOCKEY || cid == IDC_VOCSCALE || cid == IDC_VOCRANGE) vis = vis && !songStyle;
@@ -16186,6 +16473,7 @@ static void SetupVbCable()
 static void VstGroup(int k, int* first, int* count)   // the slots that run one after another with slot k (your mic's 4, or a pair)
 {
     if (k < VST_MIC) { *first = 0; *count = VST_MIC; }
+    else if (k == VST_SYNTH) { *first = VST_SYNTH; *count = 1; }   // (the vocoder's synth: on its own)
     else { *first = VST_CH0 + (k - VST_CH0) / VST_PER * VST_PER; *count = VST_PER; }
 }
 static void SaveSettings();
@@ -16417,7 +16705,7 @@ static void VstModuleClose(int k)
     VstGuard(job);
 }
 struct VstClass { SB::TUID cid; char clapId[160]; wchar_t name[80]; };
-static int ClapListClasses(const clap_plugin_factory_t* f, VstClass* out, int cap)   // the audio effects inside a CLAP file
+static int ClapListClasses(const clap_plugin_factory_t* f, VstClass* out, int cap, bool synths = false)   // the audio effects (or synths) inside a CLAP file
 {
     int n = 0;
     const uint32_t cnt = f->get_plugin_count(f);
@@ -16429,7 +16717,7 @@ static int ClapListClasses(const clap_plugin_factory_t* f, VstClass* out, int ca
             if (!strcmp(*ft, CLAP_PLUGIN_FEATURE_AUDIO_EFFECT)) fx = true;
             if (!strcmp(*ft, CLAP_PLUGIN_FEATURE_INSTRUMENT) || !strcmp(*ft, CLAP_PLUGIN_FEATURE_NOTE_EFFECT)) synth = true;
         }
-        if (synth && !fx) continue;             // a synth: nothing for a mic
+        if (synths ? !synth : synth && !fx) continue;   // (effects: not a synth; synths: only those)
         memset(out[n].cid, 0, 16);
         lstrcpynA(out[n].clapId, d->id, sizeof(out[n].clapId));
         if (!d->name || !MultiByteToWideChar(CP_UTF8, 0, d->name, -1, out[n].name, 80)) lstrcpyW(out[n].name, L"(no name)");
@@ -16438,7 +16726,7 @@ static int ClapListClasses(const clap_plugin_factory_t* f, VstClass* out, int ca
     }
     return n;
 }
-static int VstListClasses(SB::IPluginFactory* f, VstClass* out, int cap)   // the audio effects inside a plugin file
+static int VstListClasses(SB::IPluginFactory* f, VstClass* out, int cap, bool synths = false)   // the audio effects (or synths) inside a plugin file
 {
     int n = 0;
     void* p2 = nullptr; SB::IPluginFactory2* f2 = nullptr;
@@ -16450,10 +16738,13 @@ static int VstListClasses(SB::IPluginFactory* f, VstClass* out, int cap)   // th
         char cat[40]; memcpy(cat, ci.category, 32); cat[32] = 0;
         if (strcmp(cat, kVstAudioEffectClass)) continue;
         SB::PClassInfo2 c2;
+        bool inst = false;
         if (f2 && f2->getClassInfo2(i, &c2) == SB::kResultOk) {
             char sub[136]; memcpy(sub, c2.subCategories, 128); sub[128] = 0;
-            if (strstr(sub, "Instrument") && !strstr(sub, "Fx")) continue;   // a synth: nothing for a mic
+            inst = strstr(sub, "Instrument") != nullptr;
+            if (!synths && inst && !strstr(sub, "Fx")) continue;   // a synth: nothing for a mic
         }
+        if (synths && !inst) continue;          // (the synth slot: instruments only)
         char nm[72]; memcpy(nm, ci.name, 64); nm[64] = 0;
         memcpy(out[n].cid, ci.cid, 16); out[n].clapId[0] = 0;
         if (!MultiByteToWideChar(CP_UTF8, 0, nm, -1, out[n].name, 80)) lstrcpyW(out[n].name, L"(no name)");
@@ -16488,14 +16779,14 @@ static void VstRunMark(bool on)
 // A plugin you add is first loaded and run for a moment in a second, hidden copy of Lag Effect. If it crashes or
 // hangs there, it never gets near your live sound. ("LagEffect.exe --plugin-check ..." is that second copy.)
 enum { VCHK_OK = 0, VCHK_CANT = 1, VCHK_ERROR = 2, VCHK_CRASH = 3, VCHK_FROZE = 4 };
-static int VstCheck(const wchar_t* mode, const wchar_t* path, const wchar_t* id, bool stereo, wchar_t* outFile)   // outFile: MAX_PATH; delete it after
+static int VstCheck(const wchar_t* mode, const wchar_t* path, const wchar_t* id, int kind, wchar_t* outFile)   // kind: 0 mono, 1 stereo, 2 synth; outFile: MAX_PATH; delete it after
 {
     outFile[0] = 0;
     wchar_t exe[MAX_PATH], tdir[MAX_PATH];
     if (!GetModuleFileNameW(nullptr, exe, MAX_PATH) || !GetTempPathW(MAX_PATH, tdir) || !GetTempFileNameW(tdir, L"lfx", 0, outFile)) return VCHK_CANT;
     if (wcschr(path, L'"') || wcschr(id, L'"')) return VCHK_CANT;
     static wchar_t cmd[MAX_PATH * 3 + 400];
-    _snwprintf(cmd, MAX_PATH * 3 + 399, L"\"%s\" --plugin-check %s \"%s\" \"%s\" %d \"%s\"", exe, mode, path, id, stereo ? 1 : 0, outFile);
+    _snwprintf(cmd, MAX_PATH * 3 + 399, L"\"%s\" --plugin-check %s \"%s\" \"%s\" %d \"%s\"", exe, mode, path, id, kind, outFile);
     cmd[MAX_PATH * 3 + 399] = 0;
     STARTUPINFOW si = {}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
@@ -16563,6 +16854,7 @@ static bool VstLoad(int k, bool quiet)          // start the plugin this slot is
         int stLen = 0; unsigned char* st = VstReadFile(sp, &stLen);
         const wchar_t* e2 = nullptr;
         s.stereo = k >= VST_MIC;                // (Mixer channels and outputs are stereo; your mic is mono)
+        s.synth = k == VST_SYNTH;               // (the vocoder's synth: notes in, no sound in)
         s.post = k < VST_MIC && u.post ? 1 : 0;
         s.on = u.want ? 1 : 0;                  // (set before it goes live, so a bypassed one never sounds for a moment)
         auto job = [&] { e2 = clap ? ClapOpen(s, u.cfac, u.clapId, st, stLen) : VstOpen(s, u.fac, cid, st, stLen); };
@@ -16628,7 +16920,8 @@ static void VstAssign(int k, const wchar_t* path)   // put the plugin in this fi
     };
     // What's in the file: asked in a test run outside Lag Effect, so a plugin that crashes on being loaded can't touch the app.
     wchar_t tmp[MAX_PATH];
-    int rc = VstCheck(L"list", path, L"", false, tmp);
+    const bool syn = k == VST_SYNTH;            // (the vocoder's synth slot: instruments, not effects)
+    int rc = VstCheck(syn ? L"listsynth" : L"list", path, L"", 0, tmp);
     bool tested = rc == VCHK_OK;                // (false: the test run isn't available, or you chose to go ahead without it)
     if (rc == VCHK_OK) {
         int len = 0; unsigned char* d = VstReadFile(tmp, &len);
@@ -16636,7 +16929,8 @@ static void VstAssign(int k, const wchar_t* path)   // put the plugin in this fi
         if (n) memcpy(cl, d, n * sizeof(VstClass));
         if (d) HeapFree(GetProcessHeap(), 0, d);
         for (int i = 0; i < n; i++) { cl[i].name[79] = 0; cl[i].clapId[sizeof(cl[i].clapId) - 1] = 0; }
-        if (!n) err = L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
+        if (!n) err = syn ? L"There's no instrument (synth) in it: it's an effect, or not a plugin Lag Effect can use."
+                          : L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
     }
     else if (rc == VCHK_ERROR) err = readMsg(tmp);
     if (tmp[0]) DeleteFileW(tmp);
@@ -16646,9 +16940,10 @@ static void VstAssign(int k, const wchar_t* path)   // put the plugin in this fi
         err = VstModuleOpen(k);
         SetCursor(old);
         if (!err) {
-            auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400) : VstListClasses(u.fac, cl, 400); };
+            auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400, syn) : VstListClasses(u.fac, cl, 400, syn); };
             if (!VstGuard(job)) { err = L"It crashed while Lag Effect was asking what's in it."; VstDropModule(u); }
-            else if (!n) err = L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
+            else if (!n) err = syn ? L"There's no instrument (synth) in it: it's an effect, or not a plugin Lag Effect can use."
+                                   : L"There's no audio effect in it (it's an instrument, or not a plugin Lag Effect can use).";
         }
     }
     if (!err && n > 1) {                        // several effects in one file: which one?
@@ -16666,7 +16961,7 @@ static void VstAssign(int k, const wchar_t* path)   // put the plugin in this fi
     if (!err && tested) {                       // ...then the effect itself: started, fed some sound, its settings saved and put back, closed
         wchar_t wid[160];
         MultiByteToWideChar(CP_UTF8, 0, cl[pick].clapId[0] ? cl[pick].clapId : hex, -1, wid, 160); wid[159] = 0;
-        rc = VstCheck(L"run", path, wid, k >= VST_MIC, tmp);
+        rc = VstCheck(L"run", path, wid, syn ? 2 : k >= VST_MIC ? 1 : 0, tmp);
         if (rc == VCHK_ERROR) err = readMsg(tmp);
         if (tmp[0]) DeleteFileW(tmp);
         if ((rc == VCHK_CRASH || rc == VCHK_FROZE) && !VstCheckFailedAsk(rc, cl[pick].name)) { giveUp(); return; }
@@ -16959,18 +17254,23 @@ static void VstMenu(int k, HWND from)           // a slot's button: what's in it
         AppendMenuW(m, MF_STRING, 1, L"Open its window");
         AppendMenuW(m, MF_STRING, 2, u.loaded ? L"Reload it (keeps its settings)" : L"Load it");
         int g0, gn; VstGroup(k, &g0, &gn);
-        AppendMenuW(m, MF_STRING | (k > g0 ? 0 : MF_GRAYED), 4, L"Move up (runs earlier)");
-        AppendMenuW(m, MF_STRING | (k < g0 + gn - 1 ? 0 : MF_GRAYED), 5, L"Move down (runs later)");
+        if (gn > 1) {
+            AppendMenuW(m, MF_STRING | (k > g0 ? 0 : MF_GRAYED), 4, L"Move up (runs earlier)");
+            AppendMenuW(m, MF_STRING | (k < g0 + gn - 1 ? 0 : MF_GRAYED), 5, L"Move down (runs later)");
+        }
         if (k < VST_MIC) AppendMenuW(m, MF_STRING | (u.post ? MF_CHECKED : 0), 8, L"Run it after the voice effects (not before)");
-        HMENU km = CreatePopupMenu();           // what its hotkey does
+        HMENU km = k == VST_SYNTH ? nullptr : CreatePopupMenu();   // what its hotkey does (not the synth: the vocoder's own key switches it)
+        if (km) {
         AppendMenuW(km, MF_STRING | (u.keyMode == 0 ? MF_CHECKED : 0), 9,  L"Switches it on / off");
         AppendMenuW(km, MF_STRING | (u.keyMode == 1 ? MF_CHECKED : 0), 10, L"On only while you hold it");
         AppendMenuW(km, MF_STRING | (u.keyMode == 2 ? MF_CHECKED : 0), 11, L"Off only while you hold it (to compare)");
         AppendMenuW(m, MF_POPUP, (UINT_PTR)km, L"Its hotkey");
-        AppendMenuW(m, MF_STRING, 3, L"Remove it from this slot");
+        }
+        AppendMenuW(m, MF_STRING, 3, k == VST_SYNTH ? L"Remove it (the vocoder goes back to its Robot voice)" : L"Remove it from this slot");
         AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     }
-    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, u.path[0] ? L"Put another plugin here instead" : L"Plugins on this PC");
+    AppendMenuW(m, MF_STRING | MF_GRAYED, 0, k == VST_SYNTH ? (u.path[0] ? L"Use another synth instead" : L"Plugins on this PC (pick a synth)")
+                                                            : u.path[0] ? L"Put another plugin here instead" : L"Plugins on this PC");
     int loose = 0;
     for (int i = 0; i < gVstFoundN; i++) if (!gVstFound[i].group[0]) loose++;
     HMENU sub = nullptr; int inSub = 0, first = -1;
@@ -17178,6 +17478,7 @@ static void MixBoxShow(HWND w, int id, int k)   // a Mix % box shows its slot's 
 }
 static void VstRefreshUi()
 {
+    SynUiRefresh();                             // (Voice FX > Tune > Synth plugin)
     if (!gWnd || !GetDlgItem(gWnd, IDC_VSTNAME0)) return;
     for (int k = 0; k < VST_MIC; k++) {
         const VstUi& u = gVstUi[k];
@@ -17191,6 +17492,7 @@ static void VstRefreshUi()
     for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_OFX0 + k), nullptr, FALSE);   // (lit while an output has a plugin on)
     RackRefresh();
 }
+static void SynUiRefresh();
 static void VstSetOn(int k, bool on, bool quiet = false, bool save = true)   // a slot's On switch (quiet: from a hotkey, so no message boxes)
 {
     VstUi& u = gVstUi[k];
@@ -17426,6 +17728,42 @@ static void VstStopAll(bool quitting)           // quitting, or Plugins switched
     for (int c = 0; c < CH_MAX; c++) gVstChMap[c].store(0);
     for (int k = 0; k < VST_SLOTS; k++) VstUnload(k, true, quitting);
 }
+// ---- Voice FX > Tune > Synth plugin (1.55.0): the vocoder's synth slot ----
+static void SetFeatVst(bool on)                  // Plugins on / off (Settings > Features, or the synth panel asking)
+{
+    gFeatVst = on;
+    if (on) { SetTimer(gWnd, TIMER_VST, 100, nullptr); VstStartAll(); }
+    else { KillTimer(gWnd, TIMER_VST); VstStopAll(false); if (gMicSub == 2) gMicSub = 0; }
+    SynUiRefresh();
+}
+static void SynUiRefresh()                       // the panel: which synth, how it's doing
+{
+    if (!gWnd || !GetDlgItem(gWnd, IDC_SYNPICK)) return;
+    const VstUi& u = gVstUi[VST_SYNTH];
+    wchar_t b[100], t[200];
+    if (u.path[0] && gFeatVst) lstrcpynW(b, u.name[0] ? u.name : L"(synth)", 90); else lstrcpyW(b, L"Pick a synth...");
+    SetTextIfChanged(gWnd, IDC_SYNPICK, b);
+    if (!gFeatVst) lstrcpyW(t, L"Plugins are off. Until then: the Robot voice.");
+    else if (!u.path[0]) lstrcpyW(t, L"No synth yet: the Robot voice plays instead.");
+    else if (u.dead) lstrcpyW(t, L"It crashed: pick it again, or another.");
+    else if (!u.loaded) lstrcpyW(t, L"Not loaded (Robot voice for now).");
+    else { wchar_t c[60]; VstInfoText(VST_SYNTH, c); swprintf(t, 200, L"Playing your notes \x00B7 %ls", c); }
+    SetTextIfChanged(gWnd, IDC_SYNNAME, t);
+    EnableWindow(GetDlgItem(gWnd, IDC_SYNEDIT), u.loaded && gFeatVst);
+}
+static void SynPick()                            // "Pick a synth...": Plugins must be on first
+{
+    HWND b = GetDlgItem(gWnd, IDC_SYNPICK);
+    if (!gFeatVst) {
+        if (MessageBoxW(gWnd, L"The Synth plugin style plays an instrument plugin (VST3 or CLAP), and plugins are switched off "
+                              L"(Settings > Features > Plugins).\n\nSwitch Plugins on now?", L"Lag Effect - Synth plugin", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        SetFeatVst(true);
+        CheckDlgButton(gWnd, IDC_FEATVST, BST_CHECKED);
+        Layout(); SaveSettings();
+    }
+    VstMenu(VST_SYNTH, b);
+    SynUiRefresh();
+}
 static void VstTick(bool timer = true)          // ~10 times a second while Plugins is on, and whenever a plugin asks (timer = false)
 {
     if (!gVstStarted) { if (timer) VstStartAll(); return; }
@@ -17547,7 +17885,7 @@ static void VstProfileDelete(const wchar_t* name)
 // The second, hidden copy of Lag Effect that test-runs a plugin (see VstCheck). No window, no settings, no sound device.
 // Exit code: 0 fine, 2 it can't be used (why: in the out file), 3 it crashed. If it hangs, the first copy stops it.
 static LONG WINAPI VstCheckCrashed(EXCEPTION_POINTERS*) { ExitProcess(3); return EXCEPTION_EXECUTE_HANDLER; }
-static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t* id, bool stereo, const wchar_t* outFile)
+static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t* id, int kind, const wchar_t* outFile)
 {
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);   // (no "has stopped working" window)
     SetUnhandledExceptionFilter(VstCheckCrashed);
@@ -17558,11 +17896,12 @@ static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t*
     auto fail = [&](const wchar_t* why) { VstWriteFile(outFile, (const unsigned char*)why, (lstrlenW(why) + 1) * (int)sizeof(wchar_t)); return 2; };
     const wchar_t* err = VstModuleOpen(0);
     if (err) return fail(err);
-    if (!lstrcmpW(mode, L"list")) {
+    if (!lstrcmpW(mode, L"list") || !lstrcmpW(mode, L"listsynth")) {
         static VstClass cl[400];
         int n = 0;
         memset(cl, 0, sizeof(cl));
-        auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400) : VstListClasses(u.fac, cl, 400); };
+        const bool syn = mode[4] != 0;
+        auto job = [&] { n = u.cfac ? ClapListClasses(u.cfac, cl, 400, syn) : VstListClasses(u.fac, cl, 400, syn); };
         if (!VstGuard(job)) return 3;
         if (!VstWriteFile(outFile, (const unsigned char*)cl, n * (int)sizeof(VstClass))) return fail(L"The test run couldn't write its result.");
         return 0;
@@ -17571,7 +17910,8 @@ static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t*
     WideCharToMultiByte(CP_UTF8, 0, id, -1, aid, sizeof(aid), nullptr, nullptr); aid[sizeof(aid) - 1] = 0;
     const bool clap = u.cfac != nullptr;
     if (!clap && !VstCidFromHex(aid, cid)) return fail(L"Its ID is damaged.");
-    s.stereo = stereo; s.post = 0; s.on = 1;
+    const bool stereo = kind != 0;
+    s.stereo = stereo; s.synth = kind == 2; s.post = 0; s.on = 1;
     const wchar_t* e2 = nullptr;
     auto open = [&] { e2 = clap ? ClapOpen(s, u.cfac, aid, nullptr, 0) : VstOpen(s, u.fac, cid, nullptr, 0); };
     if (!VstGuard(open)) return 3;
@@ -17579,7 +17919,16 @@ static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t*
     static float L[480], R[480];
     unsigned seed = 1;
     gClapAudioRole = 1;                         // (this one thread plays the sound thread's part too)
-    for (int b = 0; b < 100 && !s.crashed.load(); b++) {   // a second of sound: silence, then noise at a talking level, then silence
+    if (s.synth) for (int b = 0; b < 100 && !s.crashed.load(); b++) {   // a synth: a second of notes (A3 + C4 on, a slide, off)
+        SynEv ev[4]; int ne = 0;
+        if (b == 10) { ev[ne++] = { 0, 57, 1, 0.8f, 0.0f }; ev[ne++] = { 0, 60, 2, 0.8f, 0.0f }; }
+        if (b == 40) ev[ne++] = { 2, 57, 1, 0.0f, 0.3f };
+        if (b == 80) { ev[ne++] = { 1, 57, 1, 0.0f, 0.0f }; ev[ne++] = { 1, 60, 2, 0.0f, 0.0f }; }
+        s.busy = 1;
+        if (!VstSynthBlock(s, ev, ne, L, R, 480)) s.crashed = 1;
+        s.busy = 0;
+    }
+    else for (int b = 0; b < 100 && !s.crashed.load(); b++) {   // a second of sound: silence, then noise at a talking level, then silence
         for (int i = 0; i < 480; i++) {
             seed = seed * 1664525u + 1013904223u; const float a = ((seed >> 9) & 0xffff) / 65536.0f - 0.5f;
             seed = seed * 1664525u + 1013904223u; const float c = ((seed >> 9) & 0xffff) / 65536.0f - 0.5f;
@@ -17633,7 +17982,8 @@ static void ShowHelp()
         L"They work from anywhere, even in a game. Right-click a hotkey button (or press Backspace while setting it) to clear it.\n"
         L"Pitch: semitones + fine cents. Grain: longer = smoother, shorter = less delay.\n"
         L"Reverb: Mix = how much room, Size = how big, Damping = darker tail, Pre-delay = gap before the echo.\n"
-        L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices. Pick the key of the song; "
+        L"Vocoder: auto-tune to a key and scale, plus synth harmonies, Robot or Choir voices, or Synth plugin: any instrument plugin "
+        L"(VST3 / CLAP, Plugins on) plays your notes and talks with your words. Pick the key of the song; "
         L"Vocode to song: click it and the music playing on your PC (one app, all PC sound, or an audio file) says your words. "
         L"Retune 0 ms gives the hard auto-tune sound. Deep voice? Set Voice to Low / deep (Auto usually picks it for you).\n"
         L"Radio: sound like a walkie-talkie, phone call, megaphone, old radio, space radio, drive-thru, 8-bit or the next room. "
@@ -19230,7 +19580,8 @@ static void BugInfoBuild(wchar_t* o, int cap)
         for (int k = 0; k < VST_SLOTS; k++) {
             if (!gVstUi[k].path[0]) continue;
             const wchar_t* file = wcsrchr(gVstUi[k].path, L'\\'); file = file ? file + 1 : gVstUi[k].path;
-            BugAdd(o, cap, L"Plugin slot %d: %ls (%ls)%ls%ls, delay %d samples, strikes %d", k + 1, gVstUi[k].name[0] ? gVstUi[k].name : L"?", file,
+            wchar_t slot[32]; if (k == VST_SYNTH) lstrcpyW(slot, L"Vocoder synth"); else swprintf(slot, 32, L"Plugin slot %d", k + 1);
+            BugAdd(o, cap, L"%ls: %ls (%ls)%ls%ls, delay %d samples, strikes %d", slot, gVstUi[k].name[0] ? gVstUi[k].name : L"?", file,
                 gVst[k].live.load() ? L" loaded" : L" not loaded", gVstUi[k].want ? L", on" : L", off", gVst[k].latency, gVstStrikes[k]);
         }
     }
@@ -19722,6 +20073,7 @@ static void KeyRowsBuild()
         const int di = DesignOf(r.btn);
         if (di >= 0 && gDesign[di].page >= 0) { r.page = gDesign[di].page; r.sub = gDesign[di].sub; LocText(r.page, r.sub, gDesign[di].sec, r.where, 110); }
         else if (slot == SLOT_RECORD) { r.page = -2; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"The Recorder window (bottom bar)", 110); }
+        else if (slot == SLOT_VST0 + VST_SYNTH) { r.page = PAGE_FX; r.sub = 1; r.btn = nullptr; lstrcpynW(r.where, L"Voice FX > Tune > Synth plugin", 110); }
         else if (slot >= SLOT_VST0) { r.page = PAGE_MIXER; r.sub = 0; r.btn = nullptr; lstrcpynW(r.where, L"Mixer > a channel's or output's plugins (FX)", 110); }
         else { r.page = -1; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"", 110); }
         gKeyRowN++;
@@ -20624,6 +20976,7 @@ static void CreateUI()
     {                                           // Tune sub-tab: Vocode to song (the music on your PC says your words)
         gBuildSub = 1;
         const int y = 144 + 120;
+        gBuildCond = 1;                         // (shown unless the vocoder's style is Synth plugin: that one takes this place)
         AddSection(14, y, 532, 110, L"Vocode to song");
         Ctl(L"BUTTON", L"Vocode to song", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 26, y + 12, 150, 44, IDC_SONGBTN);
         Ctl(L"STATIC", L"", 0, 28, y + 62, 150, 40, IDC_SONGSTATUS);
@@ -20640,6 +20993,27 @@ static void CreateUI()
         Ctl(L"STATIC", L"", SS_OWNERDRAW, 452, y + 30, 14, 70, IDC_SONGMETER);
         Ctl(L"STATIC", L"Loud enough? The bar should reach the top third.", 0, 472, y + 30, 64, 72, IDC_HDR);
         if (gSongUseFile && gSongFile[0]) LoadSongFile(gSongFile, true);   // reload last time's song, quietly
+        gBuildCond = 2;                         // Synth plugin (1.55.0): the vocoder's style; your voice plays an instrument plugin
+        AddSection(14, y, 532, 110, L"Synth plugin");
+        Ctl(L"BUTTON", L"Pick a synth...", WS_TABSTOP | WS_GROUP, 26, y + 12, 150, 30, IDC_SYNPICK);
+        Ctl(L"STATIC", L"", SS_NOPREFIX, 28, y + 46, 150, 30, IDC_SYNNAME);
+        Ctl(L"BUTTON", L"Open its window", WS_TABSTOP, 26, y + 78, 150, 24, IDC_SYNEDIT);
+        Ctl(L"STATIC", L"Plays", 0, 192, y + 10, 230, 16, IDC_HDR);
+        {
+            HWND sn = Ctl(L"COMBOBOX", L"", COMBO, 190, y + 27, 238, 300, IDC_SYNNOTES);
+            const wchar_t* nn[4] = { L"Your note", L"Your note + an octave below", L"A chord (3 notes)", L"A big chord (6 notes)" };
+            for (const wchar_t* t : nn) SendMessageW(sn, CB_ADDSTRING, 0, (LPARAM)t);
+            SendMessageW(sn, CB_SETCURSEL, Iclamp(gSynNotes, 0, 3), 0);
+        }
+        Ctl(L"STATIC", L"Octave:", 0, 192, y + 63, 54, 18, -1);
+        {
+            HWND so = Ctl(L"COMBOBOX", L"", COMBO, 248, y + 60, 80, 300, IDC_SYNOCT);
+            const wchar_t* on[5] = { L"\x2212" L"2", L"\x2212" L"1", L"0", L"+1", L"+2" };
+            for (const wchar_t* t : on) SendMessageW(so, CB_ADDSTRING, 0, (LPARAM)t);
+            SendMessageW(so, CB_SETCURSEL, Iclamp(gSynOct, -2, 2) + 2, 0);
+        }
+        Ctl(L"STATIC", L"Key and Scale pick the notes; Synth and Mix are the Vocoder's knobs above.", 0, 192, y + 89, 340, 16, IDC_SYNNOTE);
+        gBuildCond = 0;
         gBuildSub = -1;
     }
     const int FX_SEC_Y0 = 144, FX_SEC_STEP = 120, FX_SEC_H = 110, FX_KNOB_H = 96;
@@ -20651,7 +21025,7 @@ static void CreateUI()
         if (g == KG_VOCODER) {                  // dropdowns on the left, narrower knobs after them
             // three dropdowns stacked: style, key + scale, voice range (hover each for help)
             HWND st = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 26, y + 10, 152, 300, IDC_VOCSTYLE);
-            const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir", L"Song (vocode music)" };
+            const wchar_t* styleNames[VOC_STYLES] = { L"Tune", L"Tune + harmony", L"Robot", L"Choir", L"Song (vocode music)", L"Synth plugin" };
             for (const wchar_t* n : styleNames) SendMessageW(st, CB_ADDSTRING, 0, (LPARAM)n);
             SendMessageW(st, CB_SETCURSEL, gVocStyle, 0);
             HWND ky = Ctl(L"COMBOBOX", L"", COMBO, 26, y + 40, 56, 300, IDC_VOCKEY);
@@ -21205,7 +21579,7 @@ static LRESULT CtlColor(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     HDC dc = (HDC)w;
     int  cid    = GetDlgCtrlID((HWND)l);
-    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_SONGHINT || cid == IDC_SONGNOTE || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
+    bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_SONGHINT || cid == IDC_SONGNOTE || cid == IDC_SYNNAME || cid == IDC_SYNNOTE || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
                             : cid == IDT_HINT;  // dim helper text
     bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
     if (gBrPicture && !field && h == gWnd) {    // background picture: text sits on the picture, lined up with it
@@ -21282,6 +21656,7 @@ static void PaintWindow(HDC dc)
         if (s.sub >= 0 && s.sub != (s.page == PAGE_MIC ? gMicSub : s.page == PAGE_SETTINGS ? gSetSub : s.page == PAGE_MIXER ? gMixSub : gFxSub)) continue;
         if (gCompact) continue;
         if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
+        if (!CondOn(s.cond)) continue;          // (Synth plugin / Vocode to song: one or the other in the same place)
         int y = SC(s.y + s.oy + (s.shifts ? d : 0)), sx = SC(s.x + s.ox) + (i == gSecChan || i == gSecOut || i == gSecKeys ? 0 : gOrgX);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
@@ -21450,11 +21825,7 @@ static void OnCommand(int id, int code)
     if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
-        if (id == IDC_FEATVST) {                // off: every plugin is saved and unloaded, and nothing of this runs
-            gFeatVst = on;
-            if (on) { SetTimer(gWnd, TIMER_VST, 100, nullptr); VstStartAll(); }
-            else { KillTimer(gWnd, TIMER_VST); VstStopAll(false); if (gMicSub == 2) gMicSub = 0; }
-        }
+        if (id == IDC_FEATVST) SetFeatVst(on);  // off: every plugin is saved and unloaded, and nothing of this runs
         if (id == IDC_FEATLAG)   gFeatLag = on;
         if (id == IDC_FEATFX)    { gFeatFx = on; if (!on && gFxOn) SetFxOn(false); }   // (off: the effects stop too)
         if (id == IDC_FEATSOUND) { gFeatSound = on; if (!on) for (int i = 0; i < PADS; i++) gPads[i].stop = true; }
@@ -21796,6 +22167,10 @@ static void OnCommand(int id, int code)
     if (id == IDC_BEEPS)       { gBeeps = Checked(id); if (gBeeps) HotkeyBeep(true); return; }
     if (id == IDC_EXPORT)      { if (code == BN_CLICKED) ExportSettings(); return; }
     if (id == IDC_BUGINFO)     { if (code == BN_CLICKED) BugInfoCopy(); return; }
+    if (id == IDC_SYNPICK)     { if (code == BN_CLICKED) SynPick(); return; }
+    if (id == IDC_SYNEDIT)     { if (code == BN_CLICKED) { if (gVstUi[VST_SYNTH].loaded) VstEditorOpen(VST_SYNTH); else SynPick(); } return; }
+    if (id == IDC_SYNNOTES)    { if (code == CBN_SELCHANGE) gSynNotes = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3); return; }
+    if (id == IDC_SYNOCT)      { if (code == CBN_SELCHANGE) gSynOct = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) - 2, -2, 2); return; }
     if (id == IDC_BACKUPS)     { if (code == BN_CLICKED) BackupsMenu(); return; }
     if (id == IDC_IMPORT)      { if (code == BN_CLICKED) ImportSettings(); return; }
     if (id == IDC_COMPACT || id == IDC_COMPACTFULL) { if (code == BN_CLICKED) SetCompact(id == IDC_COMPACT); return; }
@@ -22721,7 +23096,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     {   // "--plugin-check": this copy only test-runs a plugin for the real one, then exits (see VstCheckMain)
         int ac = 0; LPWSTR* av = CommandLineToArgvW(GetCommandLineW(), &ac);
         if (av && ac >= 7 && !lstrcmpW(av[1], L"--plugin-check")) {
-            const UINT code = (UINT)VstCheckMain(av[2], av[3], av[4], av[5][0] == L'1', av[6]);
+            const UINT code = (UINT)VstCheckMain(av[2], av[3], av[4], _wtoi(av[5]), av[6]);
             TerminateProcess(GetCurrentProcess(), code);   // (straight out: the plugin gets no chance to crash on the way)
             return (int)code;
         }

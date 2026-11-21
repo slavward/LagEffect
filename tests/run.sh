@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lag Effect's tests, on Linux (GitHub runs them on every push: .github/workflows/tests.yml).
-#   tests/run.sh [base.cpp]
+#   tests/run.sh [base.cpp]     (tests: gate, synth, outputs, names, recorder; "same sound": mic, a Mixer channel, the vocoder)
 # Cuts the audio code out of LagEffect.cpp and runs it with stubs for Windows / miniaudio. With a base file (main's
 # LagEffect.cpp), also checks that default settings sound bit-for-bit the same as there.
 # Skip that one check for a commit meant to change the sound: put [audio-change] in its message (AUDIO_CHANGE=1 here).
@@ -34,12 +34,14 @@ fail=0
 run() { echo; echo "== $1"; shift; if ! "$@"; then fail=1; fi; }
 
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/gate" "$T/gate.cpp" "$B/rn.a"
+"$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/synth" "$T/synth.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -DEXT="\"$B/ext.inc\"" -o "$B/outputs" "$T/outputs.cpp" "$B/rn.a"
 "$CXX" -O2 -std=c++17 -w -DNAMES="\"$B/names.inc\"" -o "$B/names" "$T/names.cpp"
 "$CXX" -O2 -std=c++17 -w -pthread -DRCD="\"$B/rcd.inc\"" -o "$B/recorder" "$T/recorder.cpp"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/same_new" "$T/audio_same.cpp" "$B/rn.a"
 
 run "Mixer channel gate" "$B/gate"
+run "vocoder: Synth plugin style (a fake synth)" "$B/synth"
 run "extra outputs don't run dry" "$B/outputs"
 run "short device names" "$B/names"
 mkdir -p "$B/rec"; run "recorder" "$B/recorder" "$B/rec"

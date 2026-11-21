@@ -1,4 +1,4 @@
-// Same sound as before? Runs your mic (through the gate modes, leveler, noise suppression, Mic boost) and a Mixer channel
+// Same sound as before? Runs your mic (through the gate modes, leveler, noise suppression, Mic boost), a Mixer channel and the vocoder
 // through the real audio code with default settings, and prints a hash of every sample that came out.
 // run.sh builds this twice, against this commit's LagEffect.cpp and against main's, and the hashes must match:
 // a new feature that's off must not change a single sample. (Only long-standing settings are used here, so main builds too.)
@@ -49,4 +49,12 @@ int main()
         hashBlock(256);
     }
     printf("channel %016llx\n", (unsigned long long)h);
+    // the vocoder (the heaviest effect): Tune + harmony, Robot, Choir, Tune, through the band filters and the pitch tracker
+    h = 1469598103934665603ull;
+    gCh[0].type = CH_NONE; gChA[0].live = false; gMicMuted = false; gRowMode[0] = MODE_ALL;
+    gFxOn = true; gFxPitchOn = false; gFxRevOn = false; gFxVocOn = true;
+    gVocKey = 0; gVocScale = 1; gVocRetuneMs = 15; gVocSynth = 60; gVocMix = 100;
+    const int styles[4] = { VOC_HARMONY, VOC_ROBOT, VOC_CHOIR, VOC_TUNE };
+    for (int st : styles) { gVocStyle = st; feed(60, 1); feed(20, 0); }
+    printf("vocoder %016llx\n", (unsigned long long)h);
 }
