@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.53.0"
+#define APP_VERSION L"1.53.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1637,6 +1637,17 @@ static inline float Hermite(float xm1, float x0, float x1, float x2, float t)
 static float             ring[MAX_OUT][RING_SIZE];
 static volatile unsigned ringW[MAX_OUT], ringR[MAX_OUT];
 static volatile unsigned gMainFrames = 256;     // the main device's block size (extra outputs size their cushion by it)
+static volatile unsigned gMainBurst = 0;        // ...and what Windows hands it at once (its mic / output period: 480 in shared mode),
+                                                // which arrives in one go however small our blocks are (set when the audio starts)
+static volatile unsigned gExtBoost[MAX_OUT];    // extra cushion an output has learned it needs (grows each time it runs dry)
+static volatile unsigned gExtMaxReq[MAX_OUT];   // the most it has asked for at once (some drivers, like VB-Cable, sometimes take
+                                                // far more than their stated period in one go: that much is kept ready)
+static inline unsigned ExtTarget(int k, unsigned period)   // how much sound an extra output keeps in reserve (frames)
+{
+    const unsigned mf = gMainFrames, mb = gMainBurst;
+    const unsigned t = period + (mf > mb ? mf : mb) + 384 + gExtBoost[k];
+    return t < RING_FRAMES - 1024 ? t : RING_FRAMES - 1024;   // (it has to fit in the ring, with room to spare)
+}
 static volatile bool     ringOn[MAX_OUT];
 
 static inline double WrapPos(double p, double len)
@@ -3568,6 +3579,7 @@ static void RcdEnd(RcdState* s)
 
 // ---- dropouts: the audio thread noticing it fell behind (the window warns, see DropTick) ----
 static std::atomic<unsigned> gDropLate{0}, gDropBusy{0}, gDropDry{0};   // since the start: late blocks, blocks that took too long, outputs that ran dry
+static std::atomic<unsigned> gDropDryK[MAX_OUT];   // ...which output ran dry
 static std::atomic<bool> gDropArmed{false};     // counting (not while devices start or stop)
 static std::atomic<int>  gDropWarm{0};          // blocks still to skip after a start (they come irregularly at first)
 #ifdef _WIN32
@@ -4355,8 +4367,9 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
     MemoryBarrier();
     unsigned r = ringR[k];
     unsigned avail = w - r;
-    unsigned period = dev->playback.internalPeriodSizeInFrames; if (period < frames) period = frames;
-    const unsigned target = period + gMainFrames + 384;   // (enough that neither side's block size empties it)
+    if (frames > gExtMaxReq[k] && frames <= 4096) gExtMaxReq[k] = frames;   // (remembered while Lag Effect runs)
+    unsigned period = dev->playback.internalPeriodSizeInFrames; if (period < gExtMaxReq[k]) period = gExtMaxReq[k];
+    const unsigned target = ExtTarget(k, period);   // (enough that neither side's bursts empty it)
     float L = gExtL[k], R = gExtR[k];
 
     if (!gExtPrimed[k]) {                       // starting (or it ran dry): wait for a full cushion,
@@ -4390,7 +4403,10 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
                 i = (r & (RING_FRAMES - 1)) * 2; L = (L + ring[k][i]) * 0.5f; R = (R + ring[k][i + 1]) * 0.5f; r++; avail--;
             }
         } else {                                // ran dry: fade out (no click) and re-prime
-            if (gExtPrimed[k] && gDropArmed.load(std::memory_order_relaxed)) gDropDry.fetch_add(1, std::memory_order_relaxed);   // (once: then it's not primed)
+            if (gExtPrimed[k] && gDropArmed.load(std::memory_order_relaxed)) {   // (once: then it's not primed)
+                gDropDry.fetch_add(1, std::memory_order_relaxed); gDropDryK[k].fetch_add(1, std::memory_order_relaxed);
+                if (gExtBoost[k] < 1920) gExtBoost[k] = gExtBoost[k] + 128;   // keep 2.7 ms more from now on (up to 40 ms)
+            }
             L *= 0.97f; R *= 0.97f; gExtPrimed[k] = false;
         }
         out[f * 2] = L;
@@ -6817,6 +6833,8 @@ static bool StartAudio(bool quiet)
     }
     gRunning = true;
     ChanStartAll();                             // the mixer's apps / devices
+    gMainBurst = gDev.capture.internalPeriodSizeInFrames > gDev.playback.internalPeriodSizeInFrames
+               ? gDev.capture.internalPeriodSizeInFrames : gDev.playback.internalPeriodSizeInFrames;
     DelayMeasure();
     gDropWarm = 100; gDropArmed = true;         // (the first blocks come irregularly: not counted)
     if (gHideFailed && !quiet) {
@@ -18656,6 +18674,11 @@ static void GoTo(int page, int sub, HWND target)
     if (target && IsWindowVisible(target)) {
         wchar_t cls[24]; GetClassNameW(target, cls, 24);
         if (lstrcmpiW(cls, L"Static")) SetFocus(target);   // (labels can't take the keyboard; everything else can)
+        if (!gKbdNav) {                         // no dotted focus box from that: only when you use the keyboard
+            SendMessageW(gWnd, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
+            SendMessageW(target, WM_UPDATEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);
+            InvalidateRect(target, nullptr, TRUE);
+        }
         FlashCtl(target);
     }
 }
@@ -18663,7 +18686,8 @@ static void GoTo(int page, int sub, HWND target)
 // ======================= 1.53.0: bug-report info, settings backups, safe start, dropouts, delay =======================
 
 // ---- dropouts: the audio falling behind (counted by the audio threads, judged here) ----
-static unsigned long long gDropTimes[32]; static int gDropTN = 0;   // when the recent ones happened (ms)
+#define DROP_KEEP 512
+static unsigned long long gDropTimes[DROP_KEEP]; static int gDropTN = 0;   // when the recent ones happened (ms)
 static unsigned gDropSeenL = 0, gDropSeenB = 0, gDropSeenD = 0;
 static int  gDropRecent = 0;                    // in the last minute
 static bool gDropWarn = false;                  // 3 or more in a minute: the chip shows
@@ -18673,8 +18697,8 @@ static void DropTick()                          // every 50 ms
     const unsigned add = (l - gDropSeenL) + (b - gDropSeenB) + (d - gDropSeenD);
     gDropSeenL = l; gDropSeenB = b; gDropSeenD = d;
     const unsigned long long now = GetTickCount64();
-    for (unsigned i = 0; i < add && i < 32; i++) {
-        if (gDropTN == 32) { memmove(gDropTimes, gDropTimes + 1, 31 * sizeof(gDropTimes[0])); gDropTN = 31; }
+    for (unsigned i = 0; i < add && i < DROP_KEEP; i++) {
+        if (gDropTN == DROP_KEEP) { memmove(gDropTimes, gDropTimes + 1, (DROP_KEEP - 1) * sizeof(gDropTimes[0])); gDropTN = DROP_KEEP - 1; }
         gDropTimes[gDropTN++] = now;
     }
     int keep = 0;
@@ -18685,12 +18709,25 @@ static void DropTick()                          // every 50 ms
 }
 static void DropExplain()
 {
-    wchar_t msg[700];
-    swprintf(msg, 700, L"In the last minute the audio fell behind %d time%ls (you may have heard a crackle or a gap).\n\n"
-                       L"The usual fix is a bigger buffer: Settings > General > Latency, one step up (a few ms more delay).\n\n"
-                       L"Plugins and heavy effects (the vocoder styles) also take time; so can other programs keeping the PC busy.\n\n"
-                       L"Since Lag Effect started: %u late, %u too slow, %u output%ls ran dry.",
-             gDropRecent, gDropRecent == 1 ? L"" : L"s", gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropDry.load() == 1 ? L"" : L"s");
+    wchar_t outs[400] = L"";                    // which outputs ran dry, and the reserve each one keeps now
+    for (int k = 1; k < gRows && k < MAX_OUT; k++) {
+        const unsigned n = gDropDryK[k].load();
+        if (!n) continue;
+        wchar_t nm[40], t[120]; OutName(k, nm, 40);
+        swprintf(t, 120, L"\n  %ls: %u time%ls, now keeps %d ms more in reserve", nm, n, n == 1 ? L"" : L"s", (int)(gExtBoost[k] * 1000.0f / RATE + 0.5f));
+        if (lstrlenW(outs) + lstrlenW(t) < 399) lstrcatW(outs, t);
+    }
+    wchar_t msg[1400];
+    swprintf(msg, 1400, L"In the last minute the audio fell behind %d%ls time%ls (you may have heard a crackle or a gap).\n\n"
+                        L"Since Lag Effect started: %u late, %u too slow, %u output%ls ran dry.%ls%ls\n\n"
+                        L"%ls"
+                        L"Otherwise the usual fix is a bigger buffer: Settings > General > Latency, one step up (a few ms more delay). "
+                        L"Plugins and heavy effects (the vocoder styles) also take time; so can other programs keeping the PC busy.",
+             gDropRecent, gDropRecent >= DROP_KEEP ? L"+" : L"", gDropRecent == 1 ? L"" : L"s",
+             gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropDry.load() == 1 ? L"" : L"s",
+             outs[0] ? L"\n\nOutputs that ran dry:" : L"", outs,
+             outs[0] ? L"An output that runs dry keeps a little more sound in reserve each time (a few ms more delay on that output only), "
+                       L"so this should stop by itself within a minute or so.\n\n" : L"");
     if (MessageBoxW(gWnd, msg, L"Lag Effect - Audio dropouts", MB_ICONINFORMATION | MB_OKCANCEL) == IDOK)
         GoTo(PAGE_SETTINGS, 0, GetDlgItem(gWnd, IDC_BUFFER));
 }
@@ -18713,7 +18750,7 @@ static void DelayMeasure()                      // after StartAudio: from what W
         const ma_device& e = gExtraDev[k];
         const float rate = e.playback.internalSampleRate ? (float)e.playback.internalSampleRate : (float)RATE;
         const float per = e.playback.internalPeriodSizeInFrames * 1000.0f / rate;
-        const float cushion = (e.playback.internalPeriodSizeInFrames + gMainFrames + 384) * 1000.0f / RATE;
+        const float cushion = ExtTarget(k, Imax((int)e.playback.internalPeriodSizeInFrames, (int)gExtMaxReq[k])) * 1000.0f / RATE;
         const float extra = cushion + per * (float)Imax(1, (int)e.playback.internalPeriods) - play;
         if (extra > gExtraDelayMs) gExtraDelayMs = extra;
     }
@@ -18857,6 +18894,11 @@ static void BugInfoBuild(wchar_t* o, int cap)
         wchar_t nm[64]; OutName(k, nm, 64);
         BugAdd(o, cap, L"  Output %d \"%ls\": %ls; plays %ls; volume %d%%%ls%ls", k + 1, nm, gRowName[k][0] ? gRowName[k] : L"(Windows' default)",
             modes[Iclamp(gRowMode[k], 0, MODE_LAST)], gRowVol[k], gOutMute[k] ? L", muted" : L"", k > 0 && !ringOn[k] ? L", not open" : L"");
+        if (k > 0 && ringOn[k])                 // an extra output: what Windows gave it, its reserve, how often it ran dry
+            BugAdd(o, cap, L"    Windows gave %u x %u frames, asks for up to %u at once; keeps %d ms in reserve (+%d learned); ran dry %u times",
+                   gExtraDev[k].playback.internalPeriodSizeInFrames, gExtraDev[k].playback.internalPeriods, gExtMaxReq[k],
+                   (int)(ExtTarget(k, Imax((int)gExtraDev[k].playback.internalPeriodSizeInFrames, (int)gExtMaxReq[k])) * 1000.0f / RATE + 0.5f),
+                   (int)(gExtBoost[k] * 1000.0f / RATE + 0.5f), gDropDryK[k].load());
     }
     BugAdd(o, cap, L"  Dropouts since it started: %u late, %u too slow, %u outputs ran dry; %d in the last minute",
         gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropRecent);
@@ -22505,8 +22547,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
     };
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-        if (gKbdNav && (msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) && (msg.hwnd == h || IsChild(h, msg.hwnd)))
-            setKbdNav(false);
+        if ((msg.message == WM_LBUTTONDOWN || msg.message == WM_RBUTTONDOWN) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
+            if (gKbdNav) setKbdNav(false);
+            else SendMessageW(h, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);   // (Windows can turn focus boxes back on,
+        }                                       //  e.g. after a message box closed with Enter: a click hides them again)
         else if (!gKbdNav && msg.message == WM_KEYDOWN && (msg.hwnd == h || IsChild(h, msg.hwnd)) &&
                  (msg.wParam == VK_TAB || msg.wParam == VK_LEFT || msg.wParam == VK_RIGHT || msg.wParam == VK_UP || msg.wParam == VK_DOWN))
             setKbdNav(true);
