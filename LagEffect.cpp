@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.52.0"
+#define APP_VERSION L"1.53.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1115,6 +1115,12 @@ static float gOutShow[8] = { -80, -80, -80, -80, -80, -80, -80, -80 };
 static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 // Settings > Features: each of these is hidden and doesn't run at all while it's off (new installs: all off).
 static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false, gFeatVst = false;
+static bool gSafe = false;                      // safe start (Shift held while starting): plugins, Voice FX, remote control off for this run
+static bool gSafeVst = false, gSafeFx = false, gSafeWs = false;   // (what they were: saved back unless you switch them on)
+static void DelayMeasure(); static void DelayTip(); static int DelayTotalMs(); static void DropTick(); static void DropExplain();
+static void ShortDevName(const wchar_t* full, wchar_t* out, int cap); static void DevTipUpdate(int id);
+static void BugInfoCopy(); static void BackupsMenu(); static void BackupOnNewVersion(); static bool BackupMake(const wchar_t* why);
+static void SafeExplain();
 // Remote control (Streamer.bot & co.): a WebSocket server on this PC only, and only while it's switched on.
 static bool    gWsOn = false;
 static int     gWsPort = 7600;
@@ -3560,8 +3566,44 @@ static void RcdEnd(RcdState* s)
     for (int i = 0; i < s->n; i++) free(s->t[i].ring);
 }
 
-static void AudioCallback(ma_device*, void* output, const void* input, ma_uint32 frames)
+// ---- dropouts: the audio thread noticing it fell behind (the window warns, see DropTick) ----
+static std::atomic<unsigned> gDropLate{0}, gDropBusy{0}, gDropDry{0};   // since the start: late blocks, blocks that took too long, outputs that ran dry
+static std::atomic<bool> gDropArmed{false};     // counting (not while devices start or stop)
+static std::atomic<int>  gDropWarm{0};          // blocks still to skip after a start (they come irregularly at first)
+#ifdef _WIN32
+struct DropWatch {                              // times one block of the main callback
+    LARGE_INTEGER t0; double perMs;
+    static LARGE_INTEGER& Freq() { static LARGE_INTEGER f = {}; if (!f.QuadPart) QueryPerformanceFrequency(&f); return f; }
+    static long long& Last() { static long long l = 0; return l; }
+    DropWatch(ma_device* d, ma_uint32 frames)
+    {
+        QueryPerformanceCounter(&t0);
+        const double fq = (double)Freq().QuadPart;
+        unsigned per = frames;                  // Windows may hand over several of our blocks at once: its period is what counts
+        if (d) { if (d->capture.internalPeriodSizeInFrames > per) per = d->capture.internalPeriodSizeInFrames;
+                 if (d->playback.internalPeriodSizeInFrames > per) per = d->playback.internalPeriodSizeInFrames; }
+        perMs = per * 1000.0 / RATE;
+        const long long last = Last(); Last() = t0.QuadPart;
+        if (!gDropArmed.load(std::memory_order_relaxed)) return;
+        if (gDropWarm.load(std::memory_order_relaxed) > 0) { gDropWarm.fetch_sub(1, std::memory_order_relaxed); return; }
+        const double gap = last ? (t0.QuadPart - last) * 1000.0 / fq : 0;
+        if (gap > perMs * 2 + 5 && gap < 1000) gDropLate.fetch_add(1, std::memory_order_relaxed);   // (> 1 s: paused or asleep, not a dropout)
+    }
+    ~DropWatch()
+    {
+        if (!gDropArmed.load(std::memory_order_relaxed) || gDropWarm.load(std::memory_order_relaxed) > 0) return;
+        LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+        const double took = (t1.QuadPart - t0.QuadPart) * 1000.0 / (double)Freq().QuadPart;
+        if (took > perMs + 1) gDropBusy.fetch_add(1, std::memory_order_relaxed);   // longer than Windows waits for it: a gap
+    }
+};
+#else
+struct DropWatch { DropWatch(ma_device*, ma_uint32) {} };
+#endif
+
+static void AudioCallback(ma_device* dev, void* output, const void* input, ma_uint32 frames)
 {
+    DropWatch dropWatch(dev, frames);
     gMainFrames = frames;
     gRcdCbSeq.fetch_add(1);
     RcdState* const rcd = gRcdLive.load();       // Recorder: the tracks this block is handed to (null: not recording)
@@ -4348,6 +4390,7 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
                 i = (r & (RING_FRAMES - 1)) * 2; L = (L + ring[k][i]) * 0.5f; R = (R + ring[k][i + 1]) * 0.5f; r++; avail--;
             }
         } else {                                // ran dry: fade out (no click) and re-prime
+            if (gExtPrimed[k] && gDropArmed.load(std::memory_order_relaxed)) gDropDry.fetch_add(1, std::memory_order_relaxed);   // (once: then it's not primed)
             L *= 0.97f; R *= 0.97f; gExtPrimed[k] = false;
         }
         out[f * 2] = L;
@@ -4415,6 +4458,7 @@ enum {
     IDC_WHINE = 4511,
     IDC_SEARCH = 4520, IDC_KEYSLIST = 4521, IDC_ONSTRIP = 4522,   // the bottom bar (1.51.0)
     IDC_RCDBTN = 4523,                          // ... and its Recorder button (1.52.0)
+    IDC_BUGINFO = 4550, IDC_BACKUPS = 4551,     // Settings > General: Copy bug report info, Backups... (1.53.0)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -6509,9 +6553,9 @@ static void SaveSettings()
     SaveInt(L"clips_through_fx", gClipsFx);
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
     SaveInt(L"random_lag", gRandLagOn);
-    SaveInt(L"remote_on", gWsOn); SaveInt(L"remote_port", gWsPort); IniSet(L"remote_password", gWsPass);
+    SaveInt(L"remote_on", gSafe && !gWsOn ? gSafeWs : gWsOn); SaveInt(L"remote_port", gWsPort); IniSet(L"remote_password", gWsPass);
     SaveInt(L"feat_lag", gFeatLag); SaveInt(L"feat_voicefx", gFeatFx); SaveInt(L"feat_soundboard", gFeatSound); SaveInt(L"feat_clips", gFeatClips);
-    SaveInt(L"feat_plugins", gFeatVst);
+    SaveInt(L"feat_plugins", gSafe && !gFeatVst ? gSafeVst : gFeatVst);   // (safe start switched it off for this run only)
     for (int k = 0; k < VST_SLOTS; k++) {
         const VstUi& u = gVstUi[k];
         wchar_t key[32], id[40];
@@ -6610,7 +6654,8 @@ static void SaveSettings()
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare);
     SaveInt(L"hotkey_popup", gShowOsd); SaveInt(L"always_on_top", gTopMost); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"color_theme_custom", (int)gCustomAccent); SaveInt(L"update_on_start", gUpdateOnStart);
-    SaveInt(L"fx_on", gFxOn);
+    SaveInt(L"fx_on", gSafe && !gFxOn ? gSafeFx : gFxOn);
+    WritePrivateProfileStringW(L"settings", L"settings_version", APP_VERSION, gIni);   // (a newer version backs these up before it changes them)
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
         if (!FxKeyIniName(slot)) continue;
@@ -6695,6 +6740,7 @@ static bool StartExtraOutput(int k)
 
 static void StopDevices()
 {
+    gDropArmed = false;                         // (stopping isn't a dropout)
     gStopping = true;
     ChanStopAll();
     for (int k = 0; k < MAX_OUT; k++) ringOn[k] = false;
@@ -6771,6 +6817,8 @@ static bool StartAudio(bool quiet)
     }
     gRunning = true;
     ChanStartAll();                             // the mixer's apps / devices
+    DelayMeasure();
+    gDropWarm = 100; gDropArmed = true;         // (the first blocks come irregularly: not counted)
     if (gHideFailed && !quiet) {
         wchar_t list[64] = L"";
         for (int k = 0; k < MAX_OUT; k++)
@@ -9774,6 +9822,7 @@ static void ExecCommandLine(const wchar_t* cmd)
 }
 
 // ---- export / import every setting (one file) ----
+static void ExportToFile(const wchar_t* path);
 static void ExportSettings()
 {
     wchar_t path[MAX_PATH] = L"Lag Effect settings.ini";
@@ -9782,6 +9831,11 @@ static void ExportSettings()
     o.lpstrDefExt = L"ini"; o.lpstrTitle = L"Export all settings"; o.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
     if (!GetSaveFileNameW(&o)) return;
     SaveSettings();
+    ExportToFile(path);
+    ShowOsd(L"Settings exported", true);
+}
+static void ExportToFile(const wchar_t* path)   // (Export, and the automatic backups)
+{
     DeleteFileW(path);
     static wchar_t buf[65536];
     if (GetPrivateProfileSectionW(L"settings", buf, 65536, gIni)) WritePrivateProfileSectionW(L"settings", buf, path);
@@ -9800,9 +9854,10 @@ static void ExportSettings()
         } while (FindNextFileW(f, &fd));
         FindClose(f);
     }
-    ShowOsd(L"Settings exported", true);
 }
 
+static void ImportFromFile(const wchar_t* path);
+static bool BackupMake(const wchar_t* why);
 static void ImportSettings()
 {
     wchar_t path[MAX_PATH] = L"";
@@ -9812,6 +9867,12 @@ static void ImportSettings()
     if (!GetOpenFileNameW(&o)) return;
     if (MessageBoxW(gWnd, L"Replace your settings, profiles and characters with the ones in this file? Lag Effect will restart.",
                     L"Lag Effect - Import", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    SaveSettings();
+    BackupMake(L"Before importing");            // (so an import can be undone from Backups...)
+    ImportFromFile(path);
+}
+static void ImportFromFile(const wchar_t* path) // write a settings file back, then restart (Import, and restoring a backup)
+{
     static wchar_t names[16384], buf[65536];
     if (!GetPrivateProfileSectionNamesW(names, 16384, path)) { MessageBoxW(gWnd, L"That file has no Lag Effect settings in it.", L"Lag Effect", MB_ICONWARNING); return; }
     for (wchar_t* sec = names; *sec; sec += lstrlenW(sec) + 1) {
@@ -9821,9 +9882,10 @@ static void ImportSettings()
         else if (!wcsncmp(sec, L"profile:", 8)) { ProfileDir(dir); wsprintfW(file, L"%s\\%s.ini", dir, sec + 8); WritePrivateProfileSectionW(L"profile", buf, file); }
         else if (!wcsncmp(sec, L"character:", 10)) { MyCharDir(dir); wsprintfW(file, L"%s\\%s.ini", dir, sec + 10); WritePrivateProfileSectionW(L"character", buf, file); }
     }
+    WritePrivateProfileStringW(L"settings", L"settings_version", APP_VERSION, gIni);   // (an older file isn't "a new version" to back up again)
     gNoSaveOnExit = true;                       // keep what was just imported
     wchar_t exe[MAX_PATH]; GetModuleFileNameW(nullptr, exe, MAX_PATH);
-    ShellExecuteW(nullptr, L"open", exe, L"--updated", nullptr, SW_SHOWNORMAL);   // --updated: waits for this copy to close
+    ShellExecuteW(nullptr, L"open", exe, L"--restart", nullptr, SW_SHOWNORMAL);   // --restart: waits for this copy to close
     PostMessageW(gWnd, WM_CLOSE, 0, 0);
 }
 
@@ -10021,7 +10083,7 @@ static void ChanLabel(int c, wchar_t* out, int cap)   // what its strip calls it
 {
     if (gCh[c].name[0]) lstrcpynW(out, gCh[c].name, cap);
     else if (gCh[c].type == CH_APP) AppDisplayName(gCh[c].src, out, cap);
-    else if (gCh[c].type == CH_DEV || gCh[c].type == CH_OUT) lstrcpynW(out, gCh[c].src, cap);
+    else if (gCh[c].type == CH_DEV || gCh[c].type == CH_OUT) ShortDevName(gCh[c].src, out, cap);   // ("CABLE Output", not "... (VB-Audio Virtual Cable)")
     else lstrcpynW(out, L"", cap);
 }
 static void ChanIconFromPath(int c, const wchar_t* path)
@@ -13631,10 +13693,10 @@ static void AddTips()
     TipId(IDC_PADSTOP,   L"Stop every pad and clip that's playing.");
 
     // Main
-    TipId(IDC_MIC, L"The microphone Lag Effect listens to.");
+    DevTipUpdate(IDC_MIC);                      // (with the full name of the one picked)
     for (int k = 0; k < MAX_OUT; k++) {
         TipId(IDC_ROWLBL + k,  L"An output: a device Lag Effect plays to.");
-        TipId(IDC_ROWDEV + k,  L"Where this output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers.");
+        DevTipUpdate(IDC_ROWDEV + k);
         TipId(IDC_ROWMODE + k, L"Off = nothing. Stutter only = just the stutter. Everything = your voice plus the stutter (what others should hear). "
                                L"Apps only = just the Mixer channels you send to it, untouched (no mic, no effects).");
         TipId(IDC_ROWVOL + k,  L"Volume of this output. 100% = unchanged, up to 200%.");
@@ -13778,7 +13840,13 @@ static void AddTips()
     TipId(IDC_REPO,     L"The GitHub repo Lag Effect checks for new versions.");
     TipId(IDC_CHECKUPD, L"Check GitHub for a newer version now.");
     TipId(IDC_UPDSTART, L"Check for updates each time Lag Effect starts.");
-    TipId(IDC_OPENSET,  L"Open the folder with your settings file (LagEffect.ini).");
+    TipId(IDC_OPENSET,  L"Open the folder with your settings file (LagEffect.ini, in %APPDATA%\\LagEffect).");
+    TipId(IDC_BUGINFO,  L"Copies what someone fixing a problem needs to know: your version, Windows, devices, settings and plugins. "
+                        L"Paste it into your bug report. (No folders or file paths, so no user name.)");
+    TipId(IDC_BACKUPS,  L"Your settings, profiles and characters are backed up each time a new version starts (the last 5 are kept). "
+                        L"Put an older set back, or make a backup now.");
+    TipId(IDC_VERSION,  L"Hold Shift while opening Lag Effect for a safe start: plugins, Voice FX and the rest off for that run, "
+                        L"if something stops it from starting. Right-click for more.");
 
     // Knobs
     for (int i = 0; i < KNOB_N; i++)
@@ -15094,13 +15162,24 @@ static void FillCombo(int id, const wchar_t* defName, ma_device_info* list, ma_u
     SendMessageW(c, CB_RESETCONTENT, 0, 0);
     SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)defName);
     int sel = 0;
-    wchar_t n[512];
-    for (ma_uint32 i = 0; i < count; i++) {
-        Widen(list[i].name, n, 512);
+    // Shown short ("CABLE Input", not "CABLE Input (VB-Audio Virtual Cable)"); the full name is in the tooltip.
+    // Two that would look the same both keep their full names. (What's picked is by position, never by this text.)
+    static wchar_t full[64][512], shown[64][512];
+    const ma_uint32 m = count < 64 ? count : 64;
+    for (ma_uint32 i = 0; i < m; i++) { Widen(list[i].name, full[i], 512); ShortDevName(full[i], shown[i], 512); }
+    for (ma_uint32 i = 0; i < m; i++) {
+        bool dup = false;
+        for (ma_uint32 j = 0; j < m; j++) if (j != i && !lstrcmpiW(shown[i], shown[j])) dup = true;
+        SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)(dup ? full[i] : shown[i]));
+        if (want[0] && lstrcmpW(full[i], want) == 0) sel = (int)i + 1;
+    }
+    for (ma_uint32 i = m; i < count; i++) {     // (more than 64 devices: the rest as they are)
+        wchar_t n[512]; Widen(list[i].name, n, 512);
         SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)n);
         if (want[0] && lstrcmpW(n, want) == 0) sel = (int)i + 1;
     }
     SendMessageW(c, CB_SETCURSEL, sel, 0);
+    DevTipUpdate(id);
 }
 
 static void FillDevices()
@@ -15145,6 +15224,11 @@ static void UpdateStatus(bool force = false)
         if (gFeatLag) wsprintfW(s, L"Live  -  %s %s to stutter", gToggleMode ? L"press" : L"hold", key);
         else lstrcpynW(s, L"Live", 160);
     }
+    if (gRunning && !gLooping) {                 // how far behind you your voice is (hover: where it comes from)
+        wchar_t dl[40]; wsprintfW(dl, L"   \x00B7   %d ms delay", DelayTotalMs());
+        lstrcatW(s, dl);
+    }
+    DelayTip();
     if (gRunning && gFxOn && !gMicMuted) {       // which voice effects are on
         wchar_t fx[120] = L"";
         for (int g = 0; g < FX_GROUPS; g++)
@@ -18576,6 +18660,357 @@ static void GoTo(int page, int sub, HWND target)
     }
 }
 
+// ======================= 1.53.0: bug-report info, settings backups, safe start, dropouts, delay =======================
+
+// ---- dropouts: the audio falling behind (counted by the audio threads, judged here) ----
+static unsigned long long gDropTimes[32]; static int gDropTN = 0;   // when the recent ones happened (ms)
+static unsigned gDropSeenL = 0, gDropSeenB = 0, gDropSeenD = 0;
+static int  gDropRecent = 0;                    // in the last minute
+static bool gDropWarn = false;                  // 3 or more in a minute: the chip shows
+static void DropTick()                          // every 50 ms
+{
+    const unsigned l = gDropLate.load(), b = gDropBusy.load(), d = gDropDry.load();
+    const unsigned add = (l - gDropSeenL) + (b - gDropSeenB) + (d - gDropSeenD);
+    gDropSeenL = l; gDropSeenB = b; gDropSeenD = d;
+    const unsigned long long now = GetTickCount64();
+    for (unsigned i = 0; i < add && i < 32; i++) {
+        if (gDropTN == 32) { memmove(gDropTimes, gDropTimes + 1, 31 * sizeof(gDropTimes[0])); gDropTN = 31; }
+        gDropTimes[gDropTN++] = now;
+    }
+    int keep = 0;
+    for (int i = 0; i < gDropTN; i++) if (now - gDropTimes[i] < 60000) gDropTimes[keep++] = gDropTimes[i];
+    gDropTN = keep; gDropRecent = keep;
+    if (gDropRecent >= 3) gDropWarn = true;
+    else if (gDropRecent == 0) gDropWarn = false;   // (stays up until a whole minute without one)
+}
+static void DropExplain()
+{
+    wchar_t msg[700];
+    swprintf(msg, 700, L"In the last minute the audio fell behind %d time%ls (you may have heard a crackle or a gap).\n\n"
+                       L"The usual fix is a bigger buffer: Settings > General > Latency, one step up (a few ms more delay).\n\n"
+                       L"Plugins and heavy effects (the vocoder styles) also take time; so can other programs keeping the PC busy.\n\n"
+                       L"Since Lag Effect started: %u late, %u too slow, %u output%ls ran dry.",
+             gDropRecent, gDropRecent == 1 ? L"" : L"s", gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropDry.load() == 1 ? L"" : L"s");
+    if (MessageBoxW(gWnd, msg, L"Lag Effect - Audio dropouts", MB_ICONINFORMATION | MB_OKCANCEL) == IDOK)
+        GoTo(PAGE_SETTINGS, 0, GetDlgItem(gWnd, IDC_BUFFER));
+}
+
+// ---- the delay your voice gets on its way out ----
+static float gDevDelayMs = 0, gExtraDelayMs = 0;   // the device buffers (set when the audio starts)
+static void DelayMeasure()                      // after StartAudio: from what Windows actually gave us
+{
+    gDevDelayMs = gExtraDelayMs = 0;
+    if (!gRunning) return;
+    const ma_device& d = gDev;
+    const float capRate = d.capture.internalSampleRate ? (float)d.capture.internalSampleRate : (float)RATE;
+    const float playRate = d.playback.internalSampleRate ? (float)d.playback.internalSampleRate : (float)RATE;
+    const float cap  = d.capture.internalPeriodSizeInFrames * 1000.0f / capRate;
+    const float play = d.playback.internalPeriodSizeInFrames * (float)Imax(1, (int)d.playback.internalPeriods) * 1000.0f / playRate;
+    const float block = BUFFERS[gBufIdx] * 1000.0f / RATE;   // (one of ours, between taking the mic and giving it out)
+    gDevDelayMs = cap + block + play;
+    for (int k = 1; k < gRows && k < MAX_OUT; k++) {   // an extra output: its cushion, then its own buffer
+        if (!ringOn[k]) continue;
+        const ma_device& e = gExtraDev[k];
+        const float rate = e.playback.internalSampleRate ? (float)e.playback.internalSampleRate : (float)RATE;
+        const float per = e.playback.internalPeriodSizeInFrames * 1000.0f / rate;
+        const float cushion = (e.playback.internalPeriodSizeInFrames + gMainFrames + 384) * 1000.0f / RATE;
+        const float extra = cushion + per * (float)Imax(1, (int)e.playback.internalPeriods) - play;
+        if (extra > gExtraDelayMs) gExtraDelayMs = extra;
+    }
+}
+static float DelayProcMs(float* gate, float* lim, float* plug)   // what the settings add now
+{
+    *gate = gGateLook && gGateMode != GATE_OFF ? 5.0f : 0.0f;
+    *lim = gLoudDb > 0 || gAgcMaxDb > 0 ? LD_LA * 1000.0f / RATE : 0.0f;
+    int lat = 0;
+    if (gFeatVst) {
+        for (int k = 0; k < VST_MIC; k++) if (gVst[k].live.load() && gVst[k].on.load()) lat += Imax(0, gVst[k].latency);
+        for (int k = VST_OUT0; k < VST_OUT0 + VST_PER; k++) if (gVst[k].live.load() && gVst[k].on.load()) lat += Imax(0, gVst[k].latency);
+    }
+    *plug = lat * 1000.0f / RATE;
+    return *gate + *lim + *plug;
+}
+static int DelayTotalMs() { float g, l, p; return (int)(gDevDelayMs + DelayProcMs(&g, &l, &p) + 0.5f); }
+static void TipSet(HWND c, const wchar_t* text)  // a tooltip whose text changes (Tip adds one; this replaces it after that)
+{
+    if (!gTip || !c) return;
+    int i = 0; while (i < gTipRecN && gTipRec[i].h != c) i++;
+    if (i == gTipRecN) { Tip(c, text); return; }   // (the first time)
+    const int n = lstrlenW(text);                // the search's lower-case copy
+    wchar_t* low = (wchar_t*)malloc((n + 1) * sizeof(wchar_t));
+    if (low) { memcpy(low, text, (n + 1) * sizeof(wchar_t)); CharLowerW(low); free(gTipRec[i].low); gTipRec[i].low = low; }
+    TTTOOLINFOW ti = {}; ti.cbSize = sizeof(ti); ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS; ti.hwnd = gWnd; ti.uId = (UINT_PTR)c; ti.lpszText = (LPWSTR)text;
+    SendMessageW(gTip, TTM_UPDATETIPTEXTW, 0, (LPARAM)&ti);
+}
+static void DelayTip()                          // the status line's tooltip: where the delay comes from
+{
+    static wchar_t last[600];
+    if (!gTip) return;                          // (not made yet: next time)
+    wchar_t t[600];
+    if (!gRunning) lstrcpynW(t, L"How Lag Effect is doing. The delay your voice gets is shown here while it runs.", 600);
+    else {
+        float g, l, p; const float proc = DelayProcMs(&g, &l, &p);
+        wchar_t o0[64]; OutName(0, o0, 64);
+        swprintf(t, 600, L"Your voice reaches %ls about %d ms after you speak:\n"
+                         L"  Windows' buffers and ours: %d ms\n  Gate look ahead: %d ms\n  Loudness / Auto volume limiter: %.1f ms\n  Plugins: %d ms\n"
+                         L"Other outputs: about %d ms more (their own buffers).\n"
+                         L"A smaller buffer (Settings > General > Latency) means less delay, but more risk of dropouts.",
+                 o0, (int)(gDevDelayMs + proc + 0.5f), (int)(gDevDelayMs + 0.5f), (int)g, l, (int)(p + 0.5f), (int)(gExtraDelayMs + 0.5f));
+    }
+    if (!lstrcmpW(t, last)) return;
+    lstrcpynW(last, t, 600);
+    TipSet(gStatus, t);
+}
+
+// ---- shorter device names: "CABLE Input (VB-Audio Virtual Cable)" -> "CABLE Input" ----
+// Windows names a device "<its name> (<the hardware>)". The first part is kept unless it's a plain word every
+// device has ("Microphone", "Speakers"...): then the hardware's name says which one ("fifine Microphone").
+static void ShortDevName(const wchar_t* full, wchar_t* out, int cap)
+{
+    lstrcpynW(out, full, cap);
+    int n = lstrlenW(full);
+    while (n > 0 && full[n - 1] == L' ') n--;   // (a trailing space)
+    if (n < 4 || full[n - 1] != L')') return;
+    int depth = 0, open = -1;                   // the "(" that matches the last ")"
+    for (int i = n - 1; i >= 0; i--) {
+        if (full[i] == L')') depth++;
+        else if (full[i] == L'(' && --depth == 0) { open = i; break; }
+    }
+    if (open <= 1) return;
+    wchar_t head[256], inner[256];
+    lstrcpynW(head, full, Imin(open + 1, 256));
+    for (int e = lstrlenW(head); e > 0 && head[e - 1] == L' '; ) head[--e] = 0;
+    lstrcpynW(inner, full + open + 1, Imin(n - open - 1, 256));
+    auto strip = [](wchar_t* s) {               // no "(R)" / "(TM)", no doubled spaces
+        static const wchar_t* junk[] = { L"(R)", L"(r)", L"(TM)", L"(tm)", L"\x00AE", L"\x2122" };
+        for (const wchar_t* j : junk) for (wchar_t* p; (p = wcsstr(s, j)); ) memmove(p, p + lstrlenW(j), (lstrlenW(p + lstrlenW(j)) + 1) * sizeof(wchar_t));
+        wchar_t* w = s; for (wchar_t* r = s; *r; r++) if (!(*r == L' ' && (w == s || w[-1] == L' '))) *w++ = *r;
+        while (w > s && w[-1] == L' ') w--; *w = 0;
+    };
+    strip(head); strip(inner);
+    {   // "2- Arctis 7 Game": Windows numbers a second device of the same kind (the full name keeps that, see FillCombo)
+        int d = 0; while (inner[d] >= L'0' && inner[d] <= L'9') d++;
+        if (d > 0 && d < 3 && inner[d] == L'-' && inner[d + 1] == L' ') memmove(inner, inner + d + 2, (lstrlenW(inner + d + 2) + 1) * sizeof(wchar_t));
+    }
+    static const wchar_t* generic[] = { L"Microphone", L"Microphones", L"Microphone Array", L"Speakers", L"Speaker", L"Headphones",
+        L"Headphone", L"Headset", L"Headset Microphone", L"Headset Earphone", L"Earphones", L"Line", L"Line In", L"Line Out",
+        L"Line Input", L"Line Output", L"Input", L"Output", L"Analog", L"Digital Output", L"Digital Audio", L"SPDIF Out",
+        L"Stereo Mix", L"Mic", L"External Mic", L"Front Mic", L"Rear Mic", L"Internal Microphone", L"Monitor", L"Display Audio" };
+    bool gen = false;
+    for (const wchar_t* g : generic) if (!lstrcmpiW(head, g)) gen = true;
+    if (!inner[0] || !head[0]) return;
+    if (!gen) { lstrcpynW(out, head, cap); return; }
+    wchar_t lowI[256], lowH[256]; lstrcpynW(lowI, inner, 256); lstrcpynW(lowH, head, 256); CharLowerW(lowI); CharLowerW(lowH);
+    wchar_t r[512];
+    if (wcsstr(lowI, lowH)) lstrcpynW(r, inner, 512);     // "fifine Microphone"
+    else swprintf(r, 512, L"%ls %ls", inner, head);        // "Realtek Audio Speakers"
+    if (lstrlenW(r) + 4 < n) lstrcpynW(out, r, cap);       // (only if it's really shorter)
+}
+static void DevTipUpdate(int id)                // a device list's tooltip: what it's for, and the full name of the one picked
+{
+    HWND c = GetDlgItem(gWnd, id);
+    if (!c) return;
+    const bool mic = id == IDC_MIC;
+    const int i = (int)SendMessageW(c, CB_GETCURSEL, 0, 0) - 1;
+    wchar_t full[512] = L"";
+    if (mic && i >= 0 && i < (int)gCapCount) Widen(gCapDevs[i].name, full, 512);
+    if (!mic && i >= 0 && i < (int)gPlayCount) Widen(gPlayDevs[i].name, full, 512);
+    wchar_t t[800];
+    swprintf(t, 800, L"%ls%ls%ls", mic ? L"The microphone Lag Effect listens to."
+                                       : L"Where this output plays: VB-Cable (for Discord, OBS and games), your headphones or speakers.",
+             full[0] ? L"\n\nPicked: " : L"", full);
+    TipSet(c, t);
+}
+
+// ---- information for a bug report ----
+static void BugAdd(wchar_t* o, int cap, const wchar_t* fmt, ...)   // one line of it
+{
+    wchar_t line[1024]; va_list a; va_start(a, fmt); vswprintf(line, 1024, fmt, a); va_end(a);
+    if (lstrlenW(o) + lstrlenW(line) + 2 < cap) { lstrcatW(o, line); lstrcatW(o, L"\r\n"); }
+}
+static void BugInfoBuild(wchar_t* o, int cap)
+{
+    o[0] = 0;
+    // (No folders or file paths: they'd include your Windows user name.)
+    RTL_OSVERSIONINFOW vi = {}; vi.dwOSVersionInfoSize = sizeof(vi);
+    typedef LONG (WINAPI* PRtlGetVersion)(RTL_OSVERSIONINFOW*);
+    HMODULE nt = GetModuleHandleW(L"ntdll.dll");
+    PRtlGetVersion rgv = nt ? (PRtlGetVersion)(void*)GetProcAddress(nt, "RtlGetVersion") : nullptr;
+    if (rgv) rgv(&vi);
+    SYSTEM_INFO si; GetNativeSystemInfo(&si);
+    MEMORYSTATUSEX ms = {}; ms.dwLength = sizeof(ms); GlobalMemoryStatusEx(&ms);
+    BugAdd(o, cap, L"Lag Effect %ls%ls", APP_VERSION, gSafe ? L"  (safe start)" : L"");
+    BugAdd(o, cap, L"Windows %lu.%lu build %lu, %u CPU threads, %llu GB memory", vi.dwMajorVersion, vi.dwMinorVersion, vi.dwBuildNumber,
+        si.dwNumberOfProcessors, (unsigned long long)(ms.ullTotalPhys >> 30));
+    BugAdd(o, cap, L"Look: %ls theme, UI size %d%%, font %ls %dpx, picture %ls, %ls window", gDark ? L"dark" : L"light", gUiScale, gFontName, gFontPx,
+        PicActive() ? L"on" : L"off", gCompact ? L"compact" : L"full");
+    BugAdd(o, cap, L"");
+    static const int bufs[] = { 32, 64, 128, 256, 512 };
+    BugAdd(o, cap, L"Audio: %ls; buffer %d%ls; delay about %d ms (+%d on other outputs)", gRunning ? L"running" : gWantRunning ? L"reconnecting" : L"stopped",
+        bufs[Iclamp(gBufIdx, 0, 4)], gExclusive ? L", exclusive mode" : L"", gRunning ? DelayTotalMs() : 0, (int)(gExtraDelayMs + 0.5f));
+    if (gRunning) BugAdd(o, cap, L"  Windows gave: mic %u Hz, %u-frame blocks; output %u Hz, %u x %u frames",
+                      gDev.capture.internalSampleRate, gDev.capture.internalPeriodSizeInFrames,
+                      gDev.playback.internalSampleRate, gDev.playback.internalPeriodSizeInFrames, gDev.playback.internalPeriods);
+    BugAdd(o, cap, L"  Mic: %ls%ls", gMicName[0] ? gMicName : L"(Windows' default)", gMicSide == 1 ? L", left side" : gMicSide == 2 ? L", right side" : L"");
+    static const wchar_t* modes[] = { L"Off", L"Stutter only", L"Everything", L"Clean voice", L"Apps only", L"Any effect" };
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) {
+        wchar_t nm[64]; OutName(k, nm, 64);
+        BugAdd(o, cap, L"  Output %d \"%ls\": %ls; plays %ls; volume %d%%%ls%ls", k + 1, nm, gRowName[k][0] ? gRowName[k] : L"(Windows' default)",
+            modes[Iclamp(gRowMode[k], 0, MODE_LAST)], gRowVol[k], gOutMute[k] ? L", muted" : L"", k > 0 && !ringOn[k] ? L", not open" : L"");
+    }
+    BugAdd(o, cap, L"  Dropouts since it started: %u late, %u too slow, %u outputs ran dry; %d in the last minute",
+        gDropLate.load(), gDropBusy.load(), gDropDry.load(), gDropRecent);
+    BugAdd(o, cap, L"");
+    BugAdd(o, cap, L"Features: lag %ls, Voice FX %ls, soundboard %ls, clips %ls, plugins %ls; remote control %ls",
+        gFeatLag ? L"on" : L"off", gFeatFx ? L"on" : L"off", gFeatSound ? L"on" : L"off", gFeatClips ? L"on" : L"off",
+        gFeatVst ? L"on" : L"off", gWsOn ? L"on" : L"off");
+    if (gFeatFx) {
+        wchar_t fx[400] = L"";
+        for (int g = 0; g < FX_GROUPS; g++) if (*gFxGroups[g].on) { if (fx[0]) lstrcatW(fx, L", "); if (lstrlenW(fx) < 360) lstrcatW(fx, gFxGroups[g].title); }
+        BugAdd(o, cap, L"  Voice FX %ls: %ls", gFxOn ? L"on" : L"off", fx[0] ? fx : L"none ticked");
+    }
+    static const wchar_t* gates[] = { L"off", L"volume", L"voice", L"volume + voice" };
+    BugAdd(o, cap, L"Mic: boost %d dB, low cut %d Hz, noise suppression %ls, gate %ls%ls%ls, leveler %d%%, auto volume %ls, loudness %d dB, whine cut %ls",
+        (int)gMicBoostDb, (int)gLowCutHz, gNsOn ? L"on" : L"off", gates[Iclamp(gGateMode, 0, 3)], gGateLook ? L" + look ahead" : L"",
+        gGateThump ? L" + ignore thumps" : L"", (int)gLevelerPct, gAgcMaxDb > 0 ? L"on" : L"off", (int)gLoudDb, gWhineOn ? L"on" : L"off");
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        static const wchar_t* types[] = { L"", L"app", L"input", L"output's sound" };
+        BugAdd(o, cap, L"Mixer channel %d: %ls %ls, %.1f dB%ls, routes 0x%x%ls", c + 1, types[Iclamp(gCh[c].type, 0, 3)], gCh[c].src,
+            gCh[c].db10 / 10.0, gCh[c].mute ? L", muted" : L"", gCh[c].routes, gChA[c].live ? L"" : L", not capturing");
+    }
+    if (gFeatVst || gSafe) {
+        for (int k = 0; k < VST_SLOTS; k++) {
+            if (!gVstUi[k].path[0]) continue;
+            const wchar_t* file = wcsrchr(gVstUi[k].path, L'\\'); file = file ? file + 1 : gVstUi[k].path;
+            BugAdd(o, cap, L"Plugin slot %d: %ls (%ls)%ls%ls, delay %d samples, strikes %d", k + 1, gVstUi[k].name[0] ? gVstUi[k].name : L"?", file,
+                gVst[k].live.load() ? L" loaded" : L" not loaded", gVstUi[k].want ? L", on" : L", off", gVst[k].latency, gVstStrikes[k]);
+        }
+    }
+    BugAdd(o, cap, L"Recorder: %ls", gRcd ? L"recording" : L"idle");
+}
+static void BugInfoCopy()
+{
+    static wchar_t buf[16384];
+    BugInfoBuild(buf, 16384);
+    bool ok = false;
+    if (OpenClipboard(gWnd)) {
+        EmptyClipboard();
+        const size_t bytes = (lstrlenW(buf) + 1) * sizeof(wchar_t);
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (g) { void* p = GlobalLock(g); memcpy(p, buf, bytes); GlobalUnlock(g); ok = SetClipboardData(CF_UNICODETEXT, g) != nullptr; if (!ok) GlobalFree(g); }
+        CloseClipboard();
+    }
+    if (ok) MessageBoxW(gWnd, L"Copied. Paste it into your message (Ctrl+V) along with what went wrong.\n\n"
+                              L"It lists your version, Windows, devices, settings and plugins. There are no folders or file paths in it.",
+                        L"Lag Effect - Bug report info", MB_ICONINFORMATION);
+    else MessageBoxW(gWnd, L"The clipboard couldn't be used. Try again in a moment.", L"Lag Effect", MB_ICONWARNING);
+}
+
+// ---- settings backups: everything (settings, profiles, characters) in one file, as Export makes ----
+static void BackupDir(wchar_t* out)
+{
+    lstrcpynW(out, gIni, MAX_PATH);
+    wchar_t* sl = wcsrchr(out, L'\\'); if (sl) sl[1] = 0; else out[0] = 0;
+    lstrcatW(out, L"Backups");
+}
+static void ExportToFile(const wchar_t* path);   // (with Export)
+static void BackupPrune()                       // the 5 newest are kept
+{
+    wchar_t dir[MAX_PATH], pat[MAX_PATH]; BackupDir(dir); swprintf(pat, MAX_PATH, L"%ls\\*.ini", dir);
+    struct B { wchar_t n[MAX_PATH]; FILETIME t; } list[64]; int n = 0;
+    WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return;
+    do { if (n < 64) { lstrcpynW(list[n].n, fd.cFileName, MAX_PATH); list[n].t = fd.ftLastWriteTime; n++; } } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    for (int i = 0; i < n; i++) {               // how many are newer than this one
+        int newer = 0;
+        for (int j = 0; j < n; j++) if (CompareFileTime(&list[j].t, &list[i].t) > 0) newer++;
+        if (newer >= 5) { wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\%ls", dir, list[i].n); DeleteFileW(p); }
+    }
+}
+static bool BackupMake(const wchar_t* why)      // "Before 1.53.0" / "Made by you"
+{
+    if (GetFileAttributesW(gIni) == INVALID_FILE_ATTRIBUTES) return false;   // (nothing to keep yet)
+    wchar_t dir[MAX_PATH], path[MAX_PATH]; BackupDir(dir);
+    CreateDirectoryW(dir, nullptr);
+    SYSTEMTIME st; GetLocalTime(&st);
+    swprintf(path, MAX_PATH, L"%ls\\%ls - %04d-%02d-%02d %02d.%02d.%02d.ini", dir, why, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    ExportToFile(path);
+    BackupPrune();
+    return GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+static void BackupOnNewVersion()                // at start, before anything is saved: a new version keeps a copy of the old settings
+{
+    wchar_t was[32] = L"";
+    GetPrivateProfileStringW(L"settings", L"settings_version", L"", was, 32, gIni);
+    if (!lstrcmpW(was, APP_VERSION)) return;
+    wchar_t why[64]; swprintf(why, 64, L"Before %ls", APP_VERSION);
+    BackupMake(why);
+    WritePrivateProfileStringW(L"settings", L"settings_version", APP_VERSION, gIni);
+}
+static void ImportFromFile(const wchar_t* path);   // (with Import)
+static void BackupsMenu()
+{
+    HWND b = GetDlgItem(gWnd, IDC_BACKUPS);
+    RECT r; GetWindowRect(b, &r);
+    wchar_t dir[MAX_PATH], pat[MAX_PATH]; BackupDir(dir); swprintf(pat, MAX_PATH, L"%ls\\*.ini", dir);
+    static wchar_t names[16][MAX_PATH]; FILETIME times[16]; int n = 0;
+    WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
+    if (f != INVALID_HANDLE_VALUE) {
+        do { if (n < 16) { lstrcpynW(names[n], fd.cFileName, MAX_PATH); times[n] = fd.ftLastWriteTime; n++; } } while (FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    for (int i = 1; i < n; i++)                 // newest first
+        for (int j = i; j > 0 && CompareFileTime(&times[j], &times[j - 1]) > 0; j--) {
+            wchar_t t[MAX_PATH]; lstrcpynW(t, names[j], MAX_PATH); lstrcpynW(names[j], names[j - 1], MAX_PATH); lstrcpynW(names[j - 1], t, MAX_PATH);
+            FILETIME x = times[j]; times[j] = times[j - 1]; times[j - 1] = x;
+        }
+    HMENU m = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING, 1, L"Back up my settings now");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    if (!n) AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"No backups yet (one is made each time a new version starts)");
+    for (int i = 0; i < n; i++) {
+        wchar_t t[MAX_PATH + 16]; lstrcpynW(t, names[i], MAX_PATH);
+        wchar_t* dot = wcsrchr(t, L'.'); if (dot) *dot = 0;
+        wchar_t lab[MAX_PATH + 32]; swprintf(lab, MAX_PATH + 32, L"Restore: %ls", t);
+        AppendMenuW(m, MF_STRING, 100 + i, lab);
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 2, L"Open the backups folder");
+    const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (cmd == 1) {
+        SaveSettings();
+        if (BackupMake(L"Made by you")) ShowOsd(L"Settings backed up", true);
+        else MessageBoxW(gWnd, L"The backup couldn't be made.", L"Lag Effect", MB_ICONWARNING);
+    } else if (cmd == 2) {
+        CreateDirectoryW(dir, nullptr);
+        ShellExecuteW(nullptr, L"open", dir, nullptr, nullptr, SW_SHOWNORMAL);
+    } else if (cmd >= 100 && cmd < 100 + n) {
+        wchar_t path[MAX_PATH]; swprintf(path, MAX_PATH, L"%ls\\%ls", dir, names[cmd - 100]);
+        wchar_t q[MAX_PATH + 200];
+        swprintf(q, MAX_PATH + 200, L"Put back the settings, profiles and characters from \"%ls\"?\n\nYour current ones are backed up first "
+                                    L"(\"Before restoring\"), so this can be undone. Lag Effect will restart.", names[cmd - 100]);
+        if (MessageBoxW(gWnd, q, L"Lag Effect - Restore settings", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        SaveSettings();
+        BackupMake(L"Before restoring");
+        ImportFromFile(path);
+    }
+}
+
+// ---- safe start (Shift held while starting, or --safe) ----
+static void SafeExplain()
+{
+    MessageBoxW(gWnd, L"Safe start: you held Shift while Lag Effect started.\n\n"
+                      L"For this run, plugins, Voice FX, the background picture, the remote control and starting the audio by itself "
+                      L"are off, so whatever stopped it from working can't get in the way. Your settings aren't changed: "
+                      L"start Lag Effect normally to have everything back.\n\n"
+                      L"If a plugin was the problem, you can remove it now (switch Plugins on in Settings > Features first).",
+                L"Lag Effect - Safe start", MB_ICONINFORMATION);
+}
+
+
 // ---- the "what's on" chips ----
 struct Chip { wchar_t t[32]; int warn, page, sub; int x0, x1; bool shown; };
 static Chip gChips[16]; static int gChipN = 0, gMoreX0 = -1, gMoreX1 = -1;
@@ -18589,6 +19024,8 @@ static int ChipsBuild(Chip* c)
         wchar_t t[32]; swprintf(t, 32, L"\x25CF REC %d:%02d", secs / 60, secs % 60);
         add(t, 1, -2, -1);
     }
+    if (gSafe) add(L"Safe start", 1, -4, -1);   // (click: what it means)
+    if (gRunning && gDropWarn) add(L"Audio dropouts", 1, -3, -1);   // (click: why, and the Latency setting)
     if (!gRunning) add(L"Audio off", 1, PAGE_MAIN, -1);
     if (gMicMuted) add(L"Mic muted", 1, PAGE_MAIN, -1);
     if (gPttMode == 1) add(L"Push-to-talk", 0, PAGE_MIC, 0); else if (gPttMode == 2) add(L"Push-to-mute", 0, PAGE_MIC, 0);
@@ -18667,6 +19104,11 @@ static void DrawOnStrip(DRAWITEMSTRUCT* d)
     }
     SelectObject(dc, of);
 }
+static void ChipGo(const Chip& c)
+{
+    if (c.page == -2) RcdShow(); else if (c.page == -3) DropExplain(); else if (c.page == -4) SafeExplain();
+    else GoTo(c.page, c.sub, nullptr);
+}
 static void ChipsClick()
 {
     HWND s = GetDlgItem(gWnd, IDC_ONSTRIP);
@@ -18674,7 +19116,7 @@ static void ChipsClick()
     POINT q = p; ScreenToClient(s, &q);
     for (int i = 0; i < gChipN; i++)
         if (gChips[i].shown && q.x >= gChips[i].x0 && q.x < gChips[i].x1) {
-            if (gChips[i].page == -2) RcdShow(); else GoTo(gChips[i].page, gChips[i].sub, nullptr);
+            ChipGo(gChips[i]);
             return;
         }
     if (gMoreX0 >= 0 && q.x >= gMoreX0 && q.x < gMoreX1) {   // "+n": the ones that didn't fit
@@ -18683,7 +19125,7 @@ static void ChipsClick()
         RECT r; GetWindowRect(s, &r);
         const int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_BOTTOMALIGN | TPM_LEFTALIGN | TPM_NONOTIFY, p.x, r.top, 0, gWnd, nullptr);
         DestroyMenu(m);
-        if (cmd >= 1 && cmd <= gChipN) { if (gChips[cmd - 1].page == -2) RcdShow(); else GoTo(gChips[cmd - 1].page, gChips[cmd - 1].sub, nullptr); }
+        if (cmd >= 1 && cmd <= gChipN) ChipGo(gChips[cmd - 1]);
     }
 }
 
@@ -20104,7 +20546,9 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Check now", WS_TABSTOP, 302, 325, 100, 26, IDC_CHECKUPD);
     Ctl(L"BUTTON", L"On startup", BS_AUTOCHECKBOX | WS_TABSTOP, 412, 328, 118, 20, IDC_UPDSTART);
     CheckDlgButton(gWnd, IDC_UPDSTART, gUpdateOnStart ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Lag Effect " APP_VERSION L"  \x00B7  settings are in %APPDATA%\\LagEffect", SS_NOTIFY, 30, 360, 400, 18, IDC_VERSION);
+    Ctl(L"STATIC", L"Lag Effect " APP_VERSION, SS_NOTIFY, 30, 360, 150, 18, IDC_VERSION);
+    Ctl(L"BUTTON", L"Copy bug report info", WS_TABSTOP, 196, 356, 146, 24, IDC_BUGINFO);
+    Ctl(L"BUTTON", L"Backups...", WS_TABSTOP, 350, 356, 88, 24, IDC_BACKUPS);
     Ctl(L"BUTTON", L"Open folder", WS_TABSTOP, 446, 356, 84, 24, IDC_OPENSET);
 
     AddSection(14, 398, 532, 70, L"Screen share");
@@ -20530,11 +20974,13 @@ static void DrawStatus(DRAWITEMSTRUCT* d)
     SelectObject(dc, op); SelectObject(dc, ob);
     DeleteObject(br); DeleteObject(pn);
 
-    wchar_t s[160]; GetWindowTextW(d->hwndItem, s, 160);
+    wchar_t s[200]; GetWindowTextW(d->hwndItem, s, 200);
     HGDIOBJ of = SelectObject(dc, loop ? gFontBold : gFont);
     SIZE sz; GetTextExtentPoint32W(dc, s, lstrlenW(s), &sz);
     int total = sz.cx + 14;
     int x = (rc.left + rc.right - total) / 2, cy = (rc.top + rc.bottom) / 2;
+    const bool tooLong = total > rc.right - rc.left - SC(16);   // (a long Voice FX list: from the left, cut with "...")
+    if (tooLong) x = rc.left + SC(8);
 
     HBRUSH db = CreateSolidBrush(dotc);
     HPEN   dp = CreatePen(PS_SOLID, 1, dotc);
@@ -20545,7 +20991,8 @@ static void DrawStatus(DRAWITEMSTRUCT* d)
 
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, text);
-    TextOutW(dc, x + 14, cy - sz.cy / 2, s, lstrlenW(s));
+    if (tooLong) { RECT tr = { x + 14, rc.top, rc.right - SC(8), rc.bottom }; DrawTextW(dc, s, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX); }
+    else TextOutW(dc, x + 14, cy - sz.cy / 2, s, lstrlenW(s));
     SelectObject(dc, of);
 }
 
@@ -20559,7 +21006,7 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_ROWDEV && id < IDC_ROWDEV + MAX_OUT) {
-        if (code == CBN_SELCHANGE) RestartIfRunning();
+        if (code == CBN_SELCHANGE) { DevTipUpdate(id); RestartIfRunning(); }
         return;
     }
     if (id >= IDC_ROWMODE && id < IDC_ROWMODE + MAX_OUT) {
@@ -20994,6 +21441,8 @@ static void OnCommand(int id, int code)
     if (id == IDC_OVERLAY)     { gOverlayOn = Checked(id); OverlayUpdate(); return; }
     if (id == IDC_BEEPS)       { gBeeps = Checked(id); if (gBeeps) HotkeyBeep(true); return; }
     if (id == IDC_EXPORT)      { if (code == BN_CLICKED) ExportSettings(); return; }
+    if (id == IDC_BUGINFO)     { if (code == BN_CLICKED) BugInfoCopy(); return; }
+    if (id == IDC_BACKUPS)     { if (code == BN_CLICKED) BackupsMenu(); return; }
     if (id == IDC_IMPORT)      { if (code == BN_CLICKED) ImportSettings(); return; }
     if (id == IDC_COMPACT || id == IDC_COMPACTFULL) { if (code == BN_CLICKED) SetCompact(id == IDC_COMPACT); return; }
     if (id == IDC_COMPACTFX)   { if (code == BN_CLICKED) { SetFxOn(!gFxOn); SetDlgItemTextW(gWnd, id, gFxOn ? L"Voice FX: on" : L"Voice FX: off"); UpdateStatus(true); } return; }
@@ -21298,8 +21747,7 @@ static void OnCommand(int id, int code)
                 Widen(cap ? gCapDevs[idx - 4000].name : gPlayDevs[idx - 3000].name, gSongDevName, 256);
                 if (!cap)                       // the device Lag Effect plays on: it would hear itself
                     for (int k = 0; k < gRows; k++) {
-                        wchar_t t[512] = L""; GetDlgItemTextW(gWnd, IDC_ROWDEV + k, t, 512);
-                        if (!lstrcmpW(t, gSongDevName)) { ShowOsd(L"Lag Effect plays on that device too, so it may hear itself (echo)", false); break; }
+                        if (ComboIndex(IDC_ROWDEV + k) == idx - 3000) { ShowOsd(L"Lag Effect plays on that device too, so it may hear itself (echo)", false); break; }
                     }
             } else {
                 gSongUseFile = false; gSongKind = SONGK_PC;
@@ -21356,7 +21804,7 @@ static void OnCommand(int id, int code)
         }
         break;
     case IDC_MIC:
-        if (code == CBN_SELCHANGE) RestartIfRunning();
+        if (code == CBN_SELCHANGE) { DevTipUpdate(id); RestartIfRunning(); }
         break;
     case IDC_BUFFER:
         if (code == CBN_SELCHANGE) {
@@ -21523,11 +21971,11 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (gWsOn) WsStart();                   // remote control (only if you switched it on)
         WsStatusText();
         // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
-        if ((gAutoStart || gResumeAudio) && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
+        if ((gAutoStart || gResumeAudio) && !gSafe && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
         UpdateUi();
         if (gCompact) Layout();
         ExecCommandLine(GetCommandLineW());     // switches given on the first start (only if allowed)
-        PictureLoad(gPicPath);
+        if (!gSafe) PictureLoad(gPicPath);      // (safe start: no picture either)
         StkLoadAll();
         if (PicActive()) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
         PictureInfo();
@@ -21553,10 +22001,12 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
+            DropTick();
             UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick(); RcdTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
                 chTick = 0; ChanTick();
+                DelayMeasure();                 // (an output that came back changes it)
                 if (gPage == PAGE_MIXER) AppScanStart();
                 if (gRunning && !gStopping) {   // outputs that dropped out (unplugged, cable reinstalled...): try again,
                     const DWORD now = GetTickCount();   // less and less often (4 s .. 30 s) while they keep failing
@@ -21813,10 +22263,12 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
             AppendMenuW(mm, MF_STRING, 2, L"How to use it...");
             AppendMenuW(mm, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(mm, MF_STRING, 3, L"Find text that doesn't fit on this page");
+            AppendMenuW(mm, MF_STRING, 4, L"Copy bug report info");
             POINT pt; GetCursorPos(&pt);
             int cmd = TrackPopupMenu(mm, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, gWnd, nullptr);
             DestroyMenu(mm);
             if (cmd == 3) { CutTextReport(); return 0; }
+            if (cmd == 4) { BugInfoCopy(); return 0; }
             if (cmd == 1) gCmdLine = !gCmdLine;
             if (cmd == 2) MessageBoxW(gWnd,
                 L"With this on, running LagEffect.exe with these switches controls the running copy:\n\n"
@@ -21922,13 +22374,15 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         if (av) LocalFree(av);
     }
     bool justUpdated = wcsstr(GetCommandLineW(), L"--updated") != nullptr;
+    const bool restarting = justUpdated || wcsstr(GetCommandLineW(), L"--restart") != nullptr;   // (Import / restoring a backup)
     gResumeAudio = justUpdated && wcsstr(GetCommandLineW(), L"--resume") != nullptr;
+    gSafe = (GetAsyncKeyState(VK_SHIFT) & 0x8000) || wcsstr(GetCommandLineW(), L"--safe") != nullptr;   // Shift held: safe start
 
     // One copy at a time: a second launch brings the running one to the front instead of fighting it
     // for the mic. After an update, wait for the old version to finish closing.
     HANDLE single = CreateMutexW(nullptr, TRUE, L"LagEffect.SingleInstance");
     if (single && GetLastError() == ERROR_ALREADY_EXISTS) {
-        if (justUpdated) WaitForSingleObject(single, 5000);
+        if (restarting) WaitForSingleObject(single, 5000);
         else {
             HWND other = FindWindowW(L"LagEffectWnd", nullptr);
             const wchar_t* cl = GetCommandLineW();
@@ -21947,6 +22401,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     }
 
     LoadSettings();
+    BackupOnNewVersion();                       // (a new version: the old settings are kept in Backups first)
+    if (gSafe) {                                // safe start: these stay as saved, but are off for this run
+        gSafeVst = gFeatVst; gSafeFx = gFxOn; gSafeWs = gWsOn;
+        gFeatVst = false; gFxOn = false; gWsOn = false; gResumeAudio = false;
+        if (gMicSub == 2) gMicSub = 0;
+    }
     LoadThemeApis();
     gNs = rnnoise_create(nullptr);              // built-in model; created once, used by the audio thread
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
@@ -22022,16 +22482,17 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
         POINT probe = { gWinX + 60, gWinY + 15 };        // a point on the title bar
         if (MonitorFromPoint(probe, MONITOR_DEFAULTTONULL)) { wx = gWinX; wy = gWinY; }
     }
-    HWND h = CreateWindowExW(0, wc.lpszClassName, L"Lag Effect " APP_VERSION, style, wx, wy,
+    HWND h = CreateWindowExW(0, wc.lpszClassName, gSafe ? L"Lag Effect " APP_VERSION L" (safe start)" : L"Lag Effect " APP_VERSION, style, wx, wy,
                              r.right - r.left, r.bottom - r.top, nullptr, nullptr, hi, nullptr);
     if (!h) return 1;
     if (gTopMost) SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 
     if (!gCtxOk) MessageBoxW(h, L"Couldn't start the Windows audio system.", L"Lag Effect", MB_ICONERROR);
-    if (gAutoStart && !justUpdated) ToTray();
+    if (gAutoStart && !justUpdated && !gSafe) ToTray();
     else { ShowWindow(h, show); UpdateWindow(h); }
 
-    if (justUpdated)
+    if (gSafe) SafeExplain();
+    else if (justUpdated)
         MessageBoxW(h, L"Lag Effect was updated to version " APP_VERSION L".", L"Lag Effect", MB_ICONINFORMATION);
     else if (gUpdateOnStart && gUpdateRepo[0])
         StartUpdateCheck(false);
