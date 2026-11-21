@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.57.0"
+#define APP_VERSION L"1.58.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -65,6 +65,8 @@
 // libraries: put github.com/steinbergmedia/vst3_pluginterfaces next to this file as vst3/pluginterfaces and
 // build with /I vst3 (the GitHub build does both).
 #include <atomic>
+#include <vector>
+#include "whisper.h"                             // speech recognition (whisper.cpp, MIT licence): Mic > Speech, 1.58.0
 #define INIT_CLASS_IID                          // (this file is the one place the interface IDs get defined)
 #include "pluginterfaces/base/funknown.h"
 #include "pluginterfaces/base/ipluginbase.h"
@@ -5261,6 +5263,7 @@ enum {
     IDC_MICSUB4 = 4517,                         // Mic > Speech (1.57.0)
     IDC_FEATSPEECH = 4610, IDC_SPCMDON, IDC_SPPREFIX, IDC_SPSAY, IDC_SPACT, IDC_SPADD, IDC_SPLIST, IDC_SPDEL, IDC_SPSTAT,
     IDC_BLON, IDC_BLOUTS, IDC_BLDELAY, IDC_BLSOUND, IDC_BLWORDS, IDC_BLCOMMON, IDC_BLKEY, IDC_BLBACK, IDC_SPTTS, IDC_SPTTSKEY,
+    IDC_SPMODEL,                                // (1.58.0: Whisper's model)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5529,7 +5532,7 @@ static unsigned gBbTaught = 0;                  // Beatbox: sounds you taught it
 static const wchar_t* BB_KEYS[BB_SOUNDS] = { L"beatbox_sound_kick", L"beatbox_sound_snare", L"beatbox_sound_hihat" };
 static void LoopBbSave(); static void LoopTick(bool force = false); static void BbTick(); static void BbStatus();
 static void SpeechSave(); static void SpeechLoad(); static void SpeechTick(); static void SpeechStatus(); static void SpActFill();
-static void SpeechEvents(); static void TtsNextQueued(); static bool gTtsQuiet = false; static void SpCmdList(); static void BlOutsText();
+struct WsResult; static void SpeechResult(const WsResult* r); static void SpeechBugInfo(wchar_t* o, int cap); static void TtsNextQueued(); static bool gTtsQuiet = false; static void SpCmdList(); static void BlOutsText();
 // Mic > Speech (1.57.0): its settings and the recognizer (the code is with the window's, further down)
 // ---- settings ----
 #define VC_MAX 32
@@ -5538,13 +5541,12 @@ static VoiceCmd gVc[VC_MAX]; static int gVcN = 0;
 static bool gSpCmdOn = false;
 static wchar_t gSpPrefix[32] = L"";
 static wchar_t gBlWords[600] = L"";
-static int gBlDelayMs = 2000, gBlBackMs = 600;
+static int gBlDelayMs = 3000, gBlBackMs = 600;
 static const int BL_DELAYS[5] = { 0, 1000, 1500, 2000, 3000 };
-// ---- the engine ----
-static ISpRecognizer* gSpRec = nullptr; static ISpRecoContext* gSpCtx = nullptr;
-static ISpRecoGrammar* gSpDict = nullptr; static ISpRecoGrammar* gSpCmdG = nullptr;
-class SpFeedStream; static SpFeedStream* gSpStream = nullptr;
-static wchar_t gSpEngine[128] = L"", gSpErr[300] = L"", gSpHeard[200] = L"";
+// ---- the engine (Whisper since 1.58.0) ----
+static int gWsModel = 1;                        // 0 Fast (tiny.en), 1 Good (base.en), 2 Best (small.en)
+static bool SpeechRunning();
+static wchar_t gSpEngine[128] = L"", gSpErr[300] = L"", gSpHeard[400] = L"";
 static DWORD gSpRetryAt = 0; static bool gSpErrShown = false;
 static wchar_t gTtsQ[4][600]; static int gTtsQN = 0;
 
@@ -14582,7 +14584,8 @@ static void AddTips()
     TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech).");
     TipId(IDC_SBSUB0, L"Pads: sounds on hotkeys, and text to speech.");
     TipId(IDC_MICSUB4, L"Speech: voice commands, bleeping words, talking through a TTS voice.");
-    TipId(IDC_SPCMDON, L"Say a phrase from the list and it does its action, like pressing that hotkey. Windows' speech recognizer listens to your mic (on this PC, not online).");
+    TipId(IDC_SPCMDON, L"Say a phrase from the list and it does its action, like pressing that hotkey. Whisper listens to your mic (on this PC, not online).");
+    TipId(IDC_SPMODEL, L"The speech model Whisper uses: Fast (31 MB, least CPU), Good (57 MB) or Best (181 MB, most accurate, most CPU). Downloaded once.");
     TipId(IDC_SPPREFIX, L"Optional: a word every command starts with (like \"computer\"), so normal talk doesn't set them off.");
     TipId(IDC_SPSAY, L"What you'll say. Short and clear works best (2-4 words).");
     TipId(IDC_SPACT, L"What it does: anything a hotkey can do (mute, a voice effect, a pad, a Mixer channel, a scene...).");
@@ -14591,13 +14594,13 @@ static void AddTips()
     TipId(IDC_SPDEL, L"Remove the command picked in the list.");
     TipId(IDC_BLON, L"Your voice on the chosen outputs runs a little behind, so words from your list (and the bleep key) can be bleeped before anyone hears them.");
     TipId(IDC_BLOUTS, L"Which outputs are bleeped (the stream's, usually). Your voice runs behind on these only; the others (Discord) stay live.");
-    TipId(IDC_BLDELAY, L"How far behind. Longer catches words more surely (the recognizer needs about a second). 0: no delay, the key only bleeps from when you press it.");
+    TipId(IDC_BLDELAY, L"How far behind. Longer catches words more surely (Whisper needs one to two seconds). 0: no delay, the key only bleeps from when you press it.");
     TipId(IDC_BLSOUND, L"A bleep tone, or just silence.");
     TipId(IDC_BLWORDS, L"Words it bleeps by itself, commas between. word* = anything starting with it (shit* catches shitty).");
     TipId(IDC_BLCOMMON, L"Add the usual English swear words to the list.");
     TipId(IDC_BLKEY, L"Hold to bleep: from a little before you pressed it (Reach back) until you let go. Right-click clears it.");
     TipId(IDC_BLBACK, L"The bleep key also covers this much before you pressed it (how long you take to react), up to the delay.");
-    TipId(IDC_SPTTS, L"Your own voice is muted; what you say is typed out by Windows' speech recognizer and spoken by the voice set in "
+    TipId(IDC_SPTTS, L"Your own voice is muted; what you say is typed out by Whisper and spoken by the voice set in "
                      L"Soundboard > Text to speech (Windows' default voice if that's not set). Each sentence plays after you finish it.");
     TipId(IDC_SPTTSKEY, L"A hotkey that switches the TTS voice on and off (right-click clears it).");
     TipId(IDC_SBSUB1, L"Looper: record a few seconds, it plays round and round; add layers on top.");
@@ -18632,7 +18635,7 @@ static void ShowHelp()
         L"Press Record while it plays to add a layer, again to finish it. Undo takes the last layer off; click a layer's number to mute it. "
         L"Up to 8 layers and 20 seconds. Each button can have a hotkey.\n\n"
         L"SPEECH (Mic tab, Settings > Features > Speech)\n"
-        L"Windows' speech recognizer listens to your mic, on this PC. Voice commands: say a phrase, it does what a hotkey would. "
+        L"Whisper (speech recognition that runs on this PC; its model is downloaded once) listens to your mic. Voice commands: say a phrase, it does what a hotkey would. "
         L"Bleep: your voice on the outputs you pick runs a little behind, so words from your list are bleeped before they're heard; "
         L"hold the bleep key to bleep anything (it reaches back a little). TTS voice: what you say is spoken by a text-to-speech voice "
         L"and your own is muted.\n\n"
@@ -20336,8 +20339,9 @@ static void BugInfoBuild(wchar_t* o, int cap)
                LS[Iclamp(gLpState.load(), 0, 4)], gLpLayers.load(), (int)(gLpLen.load() * 1000LL / RATE), gBbOn.load() ? L"on" : L"off",
                gBbMode.load(), gBbKit.load(), gBbSens.load(), gBbVolPct.load(), gBbTaught);
         BugAdd(o, cap, L"Speech: %ls; recognizer %ls%ls%ls; commands %ls (%d); bleep %ls (outputs %u, %d ms, %d words chars, key reach %d ms); TTS voice %ls",
-               gFeatSpeech ? L"on" : L"off", gSpRec ? L"running" : L"not running", gSpEngine[0] ? L", " : L"", gSpEngine,
+               gFeatSpeech ? L"on" : L"off", SpeechRunning() ? L"running" : L"not running", gSpEngine[0] ? L", " : L"", gSpEngine,
                gSpCmdOn ? L"on" : L"off", gVcN, gBlOn.load() ? L"on" : L"off", gBlOuts.load(), gBlDelayMs, lstrlenW(gBlWords), gBlBackMs, gSpTts ? L"on" : L"off");
+        SpeechBugInfo(o, cap);
         if (gSpErr[0]) BugAdd(o, cap, L"Speech problem: %ls", gSpErr);
     }
     BugAdd(o, cap, L"Silence alarm: %ls%ls%ls (outputs 0x%x)", gSilMain ? L"audio stopped " : L"", gSilMic ? L"mic silent " : L"",
@@ -21259,178 +21263,326 @@ static void DrawBbView(DRAWITEMSTRUCT* d)       // a light per drum: lit when yo
     SelectObject(md, obm); DeleteObject(bm); DeleteDC(md);
 }
 
-// ======================= 1.57.0: Speech (Mic > Speech): the window side =======================
-// Windows' own speech recognizer (SAPI, the desktop engine) hears your mic through SpFeedStream (the audio
-// thread's 16 kHz ring). Voice commands are a grammar of your phrases; bleep words and the TTS voice use dictation.
-static const GUID kCLSID_SpInprocRecognizer = { 0x41b89b6b, 0x9399, 0x11d2, { 0x96, 0x23, 0x00, 0xc0, 0x4f, 0x8e, 0xe6, 0x28 } };
-static const GUID kIID_ISpRecognizer = { 0xc2b5f241, 0xdaa0, 0x4507, { 0x9e, 0x16, 0x5a, 0x1e, 0xaa, 0x2b, 0x7a, 0x5c } };
-static const GUID kIID_ISpStreamFormat = { 0xbed530be, 0x2606, 0x4f4d, { 0xa1, 0xc0, 0x54, 0xc5, 0xcd, 0xa5, 0x56, 0x6f } };
-static const GUID kIID_IStreamX = { 0x0000000c, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
-static const GUID kIID_ISeqStream = { 0x0c733a30, 0x2a1c, 0x11ce, { 0xad, 0xe5, 0x00, 0xaa, 0x00, 0x44, 0x77, 0x3d } };
-static const GUID kIID_IUnknownX = { 0x00000000, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
-#define LE_SPFEI(e) ((1ULL << (e)) | (1ULL << SPEI_RESERVED1) | (1ULL << SPEI_RESERVED2))
-#define WM_APP_SPEECH (WM_APP + 21)
-
-class SpFeedStream : public ISpStreamFormat {   // the recognizer reads your mic from here (blocking until it's there)
-    LONG ref = 1; unsigned rpos = 0; bool started = false; ULONGLONG got = 0;
-public:
-    std::atomic<bool> quit{ false };
-    virtual ~SpFeedStream() {}
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** pp) override {
-        if (IsEqualGUID(id, kIID_IUnknownX) || IsEqualGUID(id, kIID_ISeqStream) || IsEqualGUID(id, kIID_IStreamX) || IsEqualGUID(id, kIID_ISpStreamFormat)) {
-            *pp = static_cast<ISpStreamFormat*>(this); AddRef(); return S_OK;
-        }
-        *pp = nullptr; return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return (ULONG)InterlockedIncrement(&ref); }
-    ULONG STDMETHODCALLTYPE Release() override { const LONG r = InterlockedDecrement(&ref); if (!r) delete this; return (ULONG)r; }
-    HRESULT STDMETHODCALLTYPE Read(void* pv, ULONG cb, ULONG* pcbRead) override {
-        short* out = (short*)pv; const ULONG want = cb / 2; ULONG done = 0;
-        while (!started) {                      // (from where the audio thread started feeding)
-            if (quit.load()) break;
-            if (!gSpStartReq.load()) { rpos = gSpBaseW.load(); started = true; break; }
-            Sleep(5);
-        }
-        while (done < want && !quit.load()) {
-            const unsigned avail = gSpW.load(std::memory_order_acquire) - rpos;
-            if (!avail) { Sleep(10); continue; }
-            const unsigned n = Min<unsigned>(avail, want - done);
-            for (unsigned i = 0; i < n; i++) out[done + i] = gSpRing[(rpos + i) & (SP_RING - 1)];
-            rpos += n; done += n;
-            gSpRead.store(rpos, std::memory_order_relaxed);
-        }
-        got += (ULONGLONG)done * 2;
-        if (pcbRead) *pcbRead = done * 2;
-        return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Write(const void*, ULONG, ULONG*) override { return STG_E_ACCESSDENIED; }
-    HRESULT STDMETHODCALLTYPE Seek(LARGE_INTEGER move, DWORD origin, ULARGE_INTEGER* np) override {
-        if (origin == STREAM_SEEK_CUR && move.QuadPart == 0) { if (np) np->QuadPart = got; return S_OK; }
-        return E_NOTIMPL;
-    }
-    HRESULT STDMETHODCALLTYPE SetSize(ULARGE_INTEGER) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE CopyTo(IStream*, ULARGE_INTEGER, ULARGE_INTEGER*, ULARGE_INTEGER*) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE Commit(DWORD) override { return S_OK; }
-    HRESULT STDMETHODCALLTYPE Revert() override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE LockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE UnlockRegion(ULARGE_INTEGER, ULARGE_INTEGER, DWORD) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE Stat(STATSTG* st, DWORD) override {
-        if (!st) return E_POINTER;
-        ZeroMemory(st, sizeof(*st)); st->type = STGTY_STREAM; st->cbSize.QuadPart = 0x7FFFFFFFFFFFFFFFULL; return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Clone(IStream**) override { return E_NOTIMPL; }
-    HRESULT STDMETHODCALLTYPE GetFormat(GUID* fmt, WAVEFORMATEX** wfx) override {
-        if (fmt) *fmt = kSPDFID_WaveFormatEx;
-        if (wfx) {
-            WAVEFORMATEX* w = (WAVEFORMATEX*)CoTaskMemAlloc(sizeof(WAVEFORMATEX));
-            if (!w) return E_OUTOFMEMORY;
-            w->wFormatTag = WAVE_FORMAT_PCM; w->nChannels = 1; w->nSamplesPerSec = 16000; w->wBitsPerSample = 16;
-            w->nBlockAlign = 2; w->nAvgBytesPerSec = 32000; w->cbSize = 0;
-            *wfx = w;
-        }
-        return S_OK;
-    }
+// ======================= Whisper speech engine (1.58.0): the core =======================
+// whisper.cpp (OpenAI's Whisper, run on this PC) listens to your mic through gSpRing (16 kHz). A stretch of your
+// speech (found by its loudness) is looked at every 0.6 s while you talk (quick guesses, for bleeping) and once more
+// when you stop or after 10 s (the final text: commands, the TTS voice). Words come with their place on the audio clock.
+#define WS_RATE   16000
+#define WS_MAXSEG (10 * WS_RATE)
+struct WsWord { char text[48]; long long a, b; };     // a word, and where it is on the audio clock (gAudT frames)
+struct WsResult { int kind; int n; WsWord w[96]; char text[1024]; int ms; };   // kind 0 a quick guess, 1 final, 2 an error (text)
+typedef void (*WsCallback)(const WsResult* r, void* user);
+struct WsEngine {
+    whisper_context* ctx = nullptr;
+    void* th = nullptr;                           // its thread (Windows: a HANDLE; the Linux test: a std::thread*)
+    std::atomic<bool> quit{ false }, partials{ true }, running{ false };
+    std::atomic<int> state{ 0 };                  // 0 off, 1 loading, 2 listening, 3 you're talking, 4 working it out
+    int threads = 4;
+    char model[1024] = "";
+    std::atomic_flag pm = ATOMIC_FLAG_INIT; char prompt[600] = "";   // words to expect (your command phrases); pm guards it
+    WsCallback cb = nullptr; void* user = nullptr;
+    std::atomic<unsigned> passes{ 0 }, lastMs{ 0 };
 };
+static void WsLogQuiet(enum ggml_log_level, const char*, void*) {}
+static bool WsAbort(void* u) { return ((WsEngine*)u)->quit.load(); }
+static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, bool final)
+{
+    whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+    p.n_threads = E.threads; p.translate = false; p.language = "en"; p.detect_language = false;
+    p.no_context = true; p.single_segment = false; p.no_timestamps = false; p.token_timestamps = true;
+    p.print_special = p.print_progress = p.print_realtime = p.print_timestamps = false;
+    p.suppress_blank = true; p.suppress_nst = true;
+    p.temperature_inc = final ? 0.2f : 0.0f;      // (quick guesses: no second tries, so they stay quick)
+    const float secs = (float)a.size() / WS_RATE;   // a shorter look at the audio is much quicker (50 per second; 1500 = 30 s)
+    int ctx = (int)(secs * 50.0f * (final ? 1.5f : 1.0f)) + 128; ctx = ctx < 384 ? 384 : ctx > 1500 ? 1500 : ctx;
+    p.audio_ctx = ctx;
+    char prompt[600];
+    while (E.pm.test_and_set(std::memory_order_acquire)) {}
+    memcpy(prompt, E.prompt, sizeof(prompt));
+    E.pm.clear(std::memory_order_release);
+    p.initial_prompt = prompt[0] ? prompt : nullptr;
+    p.abort_callback = WsAbort; p.abort_callback_user_data = &E;
+    std::vector<float> pad(a); pad.resize(a.size() + WS_RATE / 4, 0.0f);   // (a little silence after: the last word isn't cut)
+    const unsigned long long t0 = RcdMs();
+    E.state = 4;
+    const int rc = whisper_full(E.ctx, p, pad.data(), (int)pad.size());
+    E.state = 3;
+    const unsigned ms = (unsigned)(RcdMs() - t0);
+    E.lastMs = ms; E.passes++;
+    if (rc != 0 || E.quit.load()) return;
+    static WsResult r; r.kind = final ? 1 : 0; r.n = 0; r.text[0] = 0; r.ms = (int)ms;
+    size_t tl = 0;
+    const int ns = whisper_full_n_segments(E.ctx);
+    const whisper_token eot = whisper_token_eot(E.ctx);
+    for (int s = 0; s < ns; s++) {
+        if (whisper_full_get_segment_no_speech_prob(E.ctx, s) > 0.6f) continue;   // (not speech: Whisper would make something up)
+        const char* st = whisper_full_get_segment_text(E.ctx, s);
+        if (st) {
+            const char* q = st; while (*q == ' ') q++;
+            if (*q == '[' || *q == '(') continue;  // "[BLANK_AUDIO]", "(music)"
+            const size_t l = strlen(st);
+            if (tl + l < sizeof(r.text) - 1) { memcpy(r.text + tl, st, l); tl += l; r.text[tl] = 0; }
+        }
+        const int nt = whisper_full_n_tokens(E.ctx, s);
+        for (int t = 0; t < nt; t++) {
+            if (whisper_full_get_token_id(E.ctx, s, t) >= eot) continue;   // (special tokens)
+            const char* tt = whisper_full_get_token_text(E.ctx, s, t);
+            if (!tt || !*tt) continue;
+            const whisper_token_data d = whisper_full_get_token_data(E.ctx, s, t);
+            const bool fresh = tt[0] == ' ' || r.n == 0;
+            if (fresh) {
+                if (r.n >= 96) break;
+                WsWord& w = r.w[r.n++]; w.text[0] = 0;
+                w.a = clock0 + d.t0 * 480; w.b = clock0 + d.t1 * 480;   // (Whisper counts in 10 ms; the clock in 48 kHz frames)
+            }
+            WsWord& w = r.w[r.n - 1];
+            const char* src = tt[0] == ' ' ? tt + 1 : tt;
+            const size_t wl = strlen(w.text), sl = strlen(src);
+            if (wl + sl < sizeof(w.text)) memcpy(w.text + wl, src, sl + 1);
+            const long long b = clock0 + d.t1 * 480; if (b > w.b) w.b = b;
+        }
+    }
+    { size_t i = 0; while (r.text[i] == ' ') i++; if (i) memmove(r.text, r.text + i, strlen(r.text + i) + 1); }
+    if ((r.n || r.text[0]) && E.cb) E.cb(&r, E.user);
+}
+static void WsRun(WsEngine* pe)
+{
+    WsEngine& E = *pe;
+    E.state = 1;
+    whisper_log_set(WsLogQuiet, nullptr);
+    whisper_context_params cp = whisper_context_default_params();
+    cp.use_gpu = false;
+    E.ctx = whisper_init_from_file_with_params(E.model, cp);
+    if (!E.ctx) {
+        static WsResult r; r = WsResult(); r.kind = 2;
+        strcpy(r.text, "The speech model couldn't be loaded (the file may be damaged: download it again).");
+        if (E.cb) E.cb(&r, E.user);
+        E.state = 0; E.running = false; return;
+    }
+    while (gSpStartReq.load() && !E.quit.load()) RcdSleep(5);
+    const unsigned base = gSpBaseW.load(); unsigned rpos = base;
+    E.state = 2;
+    std::vector<float> seg; seg.reserve(WS_MAXSEG + WS_RATE);
+    float pre[15][320]; int preN = 0, preHead = 0;  // the last 300 ms before you start (so the first word isn't cut)
+    long long segClock = 0;
+    bool speech = false; int silentMs = 0, sinceMs = 0, loudMs = 0;
+    float floorRms = 0.002f;
+    while (!E.quit.load()) {
+        const unsigned w = gSpW.load(std::memory_order_acquire);
+        if (w - rpos < 320) { RcdSleep(20); continue; }
+        const bool behind = w - rpos > (unsigned)WS_RATE;   // (more than 1 s waiting: no quick guesses until it's caught up)
+        float fr[320]; double e = 0;
+        for (int i = 0; i < 320; i++) { fr[i] = gSpRing[(rpos + i) & (SP_RING - 1)] / 32768.0f; e += (double)fr[i] * fr[i]; }
+        const long long frClock = gSpT0.load() + 3LL * (long long)(rpos - base);
+        rpos += 320; gSpRead.store(rpos, std::memory_order_relaxed);
+        const float rms = (float)sqrt(e / 320);
+        const bool loud = rms > floorRms * 3.2f && rms > 0.004f;   // (10 dB over the room, and over -48 dBFS)
+        if (!speech) {
+            floorRms += (rms - floorRms) * (rms < floorRms ? 0.3f : 0.02f);   // the room's own level
+            if (floorRms < 0.0003f) floorRms = 0.0003f;
+            memcpy(pre[preHead], fr, sizeof(fr)); preHead = (preHead + 1) % 15; if (preN < 15) preN++;
+            if (loud) {
+                speech = true; silentMs = 0; sinceMs = 0; loudMs = 0; seg.clear();
+                for (int k = 0; k < preN; k++) { const float* f = pre[(preHead - preN + k + 15) % 15]; seg.insert(seg.end(), f, f + 320); }
+                segClock = frClock - 3LL * (long long)(preN - 1) * 320;
+                preN = 0;
+                E.state = 3;
+            }
+            continue;
+        }
+        seg.insert(seg.end(), fr, fr + 320);
+        sinceMs += 20; if (loud) { loudMs += 20; silentMs = 0; } else silentMs += 20;
+        const bool full = seg.size() >= (size_t)WS_MAXSEG;
+        if (silentMs >= 600 || full) {           // you stopped (or 10 s): the final text
+            if (loudMs >= 200) WsPass(E, seg, segClock, true);
+            if (full && silentMs < 600) { seg.clear(); segClock = frClock + 3LL * 320; sinceMs = 0; loudMs = 0; }   // (still talking: carry on)
+            else { speech = false; preN = 0; E.state = 2; }
+        } else if (E.partials.load() && !behind && sinceMs >= 600 && loudMs >= 200) {
+            WsPass(E, seg, segClock, false);     // a quick guess: bleep words are caught while you're still talking
+            sinceMs = 0;
+        }
+    }
+    whisper_free(E.ctx); E.ctx = nullptr;
+    E.state = 0; E.running = false;
+}
+static void WsStart(WsEngine& E, const char* modelPath, WsCallback cb, void* user)
+{
+    if (E.running.load()) return;
+    strncpy(E.model, modelPath, sizeof(E.model) - 1);
+    E.cb = cb; E.user = user; E.quit = false; E.running = true;
+#ifdef _WIN32
+    SYSTEM_INFO si; GetSystemInfo(&si); const unsigned hc = si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 4;
+#else
+    unsigned hc = std::thread::hardware_concurrency(); if (!hc) hc = 4;
+#endif
+    E.threads = hc >= 8 ? 4 : hc >= 4 ? (int)hc / 2 : 1;   // (leave room for games and the audio)
+#ifdef _WIN32
+    HANDLE th = CreateThread(nullptr, 0, [](LPVOID p) -> DWORD { WsRun((WsEngine*)p); return 0; }, &E, 0, nullptr);
+    if (th) SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL);   // (games and the audio first)
+    else E.running = false;
+    E.th = th;
+#else
+    E.th = new std::thread(WsRun, &E);
+#endif
+}
+static void WsJoin(WsEngine& E)                 // (after it ended)
+{
+#ifdef _WIN32
+    if (E.th) { WaitForSingleObject((HANDLE)E.th, INFINITE); CloseHandle((HANDLE)E.th); }
+#else
+    if (E.th) { ((std::thread*)E.th)->join(); delete (std::thread*)E.th; }
+#endif
+    E.th = nullptr;
+}
+static void WsStop(WsEngine& E)                 // (a pass in progress is stopped at once: abort_callback)
+{
+    E.quit = true;
+    WsJoin(E);
+}
+// ======================= Whisper speech engine: end of the core =======================
+
+// ======================= 1.57.0 / 1.58.0: Speech (Mic > Speech): the window side =======================
+// Since 1.58.0 the recognizer is Whisper (whisper.cpp, the core above): much better than Windows' own (1.57.0),
+// which the user found "really bad at recognising what I'm actually saying". Its model is downloaded once.
+struct WsModelDef { const wchar_t* name; const wchar_t* file; const char* sha1; int mb; };
+static const WsModelDef WS_MODELS[3] = {
+    { L"Fast", L"ggml-tiny.en-q5_1.bin",  "3fb92ec865cbbc769f08137f22470d6b66e071b6",  31 },
+    { L"Good", L"ggml-base.en-q5_1.bin",  "d26d7ce5a1b6e57bea5d0431b9c20ae49423c94a",  57 },
+    { L"Best", L"ggml-small.en-q5_1.bin", "20f54878d608f94e4a8ee3ae56016571d47cba34", 181 },
+};
+static WsEngine gWs;
+static std::atomic<int> gWsDl{ -1 };            // downloading this model (-1 none)
+static std::atomic<int> gWsDlPct{ 0 };
+static bool gWsBroken = false, gWsAsked = false;
+static bool SpeechRunning() { return gWs.running.load(); }
+static void WsModelPath(int m, wchar_t* out, int cap)   // %APPDATA%\LagEffect\Models\<file> (next to the settings)
+{
+    lstrcpynW(out, gIni, cap);
+    wchar_t* s = wcsrchr(out, L'\\'); if (s) s[1] = 0; else out[0] = 0;
+    if (lstrlenW(out) + 8 < cap) lstrcatW(out, L"Models");
+    if (m >= 0 && m < 3 && lstrlenW(out) + lstrlenW(WS_MODELS[m].file) + 2 < cap) { lstrcatW(out, L"\\"); lstrcatW(out, WS_MODELS[m].file); }
+}
+static bool WsModelHave(int m) { wchar_t p[MAX_PATH]; WsModelPath(m, p, MAX_PATH); return GetFileAttributesW(p) != INVALID_FILE_ATTRIBUTES; }
+static bool WsCpuOk() { return IsProcessorFeaturePresent(40 /* PF_AVX2_INSTRUCTIONS_AVAILABLE */) != FALSE; }
+struct WsDlJob { int m; };
+static DWORD WINAPI WsDownloadThread(LPVOID arg)  // the model: HTTPS from Hugging Face (whisper.cpp's own copies), SHA-1 checked
+{
+    const int m = ((WsDlJob*)arg)->m; delete (WsDlJob*)arg;
+    wchar_t dir[MAX_PATH], path[MAX_PATH], part[MAX_PATH + 8];
+    WsModelPath(-1, dir, MAX_PATH); CreateDirectoryW(dir, nullptr);
+    WsModelPath(m, path, MAX_PATH); lstrcpyW(part, path); lstrcatW(part, L".part");
+    wchar_t url[256]; swprintf(url, 256, L"/ggerganov/whisper.cpp/resolve/main/%ls", WS_MODELS[m].file);
+    bool ok = false;
+    HINTERNET s = WinHttpOpen(L"LagEffect/" APP_VERSION, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    HINTERNET c = s ? WinHttpConnect(s, L"huggingface.co", INTERNET_DEFAULT_HTTPS_PORT, 0) : nullptr;
+    HINTERNET r = c ? WinHttpOpenRequest(c, L"GET", url, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) : nullptr;
+    if (r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr)) {
+        DWORD status = 0, sz = sizeof(status), total = 0, tsz = sizeof(total);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        WinHttpQueryHeaders(r, WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &total, &tsz, WINHTTP_NO_HEADER_INDEX);
+        HANDLE f = status == 200 ? CreateFileW(part, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr) : INVALID_HANDLE_VALUE;
+        HCRYPTPROV prov = 0; HCRYPTHASH h = 0;
+        if (f != INVALID_HANDLE_VALUE && CryptAcquireContextW(&prov, nullptr, nullptr, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT) && CryptCreateHash(prov, CALG_SHA1, 0, 0, &h)) {
+            static char buf[1 << 16]; DWORD got = 0; unsigned long long have = 0; ok = true;
+            while (ok) {
+                if (!WinHttpReadData(r, buf, sizeof(buf), &got)) { ok = false; break; }
+                if (!got) break;
+                DWORD wr = 0;
+                if (!WriteFile(f, buf, got, &wr, nullptr) || wr != got) { ok = false; break; }
+                CryptHashData(h, (const BYTE*)buf, got, 0);
+                have += got;
+                gWsDlPct = total ? (int)(have * 100 / total) : (int)(have * 100 / ((unsigned long long)WS_MODELS[m].mb << 20));
+            }
+            BYTE dig[20]; DWORD dl = 20; char hex[41] = "";
+            if (ok && CryptGetHashParam(h, HP_HASHVAL, dig, &dl, 0)) for (int i = 0; i < 20; i++) wsprintfA(hex + i * 2, "%02x", dig[i]);
+            ok = ok && !lstrcmpiA(hex, WS_MODELS[m].sha1);   // (a damaged or wrong file is never used)
+        }
+        if (h) CryptDestroyHash(h);
+        if (prov) CryptReleaseContext(prov, 0);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    if (ok) ok = MoveFileExW(part, path, MOVEFILE_REPLACE_EXISTING) != FALSE;
+    if (!ok) DeleteFileW(part);
+    PostMessageW(gWnd, WM_APP + 22, ok ? 1 : 0, m);
+    return 0;
+}
+static void WsDownload(int m)
+{
+    if (gWsDl.load() >= 0) return;
+    gWsDl = m; gWsDlPct = 0;
+    HANDLE t = CreateThread(nullptr, 0, WsDownloadThread, new WsDlJob{ m }, 0, nullptr);
+    if (t) CloseHandle(t); else gWsDl = -1;
+}
 
 static bool SpeechWanted()
 {
     return gFeatSpeech && ((gSpCmdOn && gVcN > 0) || (gBlOn.load() && gBlWords[0]) || gSpTts);
 }
+static void WsPrompt()                          // words it should expect: your command phrases (helps it hear them)
+{
+    char p[600] = ""; int n = 0;
+    for (int i = 0; i < gVcN && n < 500; i++) {
+        wchar_t ph[110];
+        if (gSpPrefix[0]) swprintf(ph, 110, L"%ls %ls. ", gSpPrefix, gVc[i].say); else swprintf(ph, 110, L"%ls. ", gVc[i].say);
+        n += WideCharToMultiByte(CP_UTF8, 0, ph, -1, p + n, 599 - n, nullptr, nullptr) - 1;
+        if (n < 0) { n = 0; p[0] = 0; break; }
+    }
+    while (gWs.pm.test_and_set(std::memory_order_acquire)) {}
+    memcpy(gWs.prompt, p, sizeof(p));
+    gWs.pm.clear(std::memory_order_release);
+    gWs.partials = gBlOn.load() && gBlWords[0] != 0;   // (quick guesses cost CPU: only bleeping needs them)
+}
+static void WsCallbackPost(const WsResult* r, void*)   // (the engine's thread) a copy goes to the window
+{
+    WsResult* c = (WsResult*)malloc(sizeof(WsResult));
+    if (!c) return;
+    memcpy(c, r, sizeof(WsResult));
+    if (!PostMessageW(gWnd, WM_APP + 21, 0, (LPARAM)c)) free(c);
+}
 static void SpeechStop()
 {
     gSpFeed = false;
-    if (gSpStream) gSpStream->quit = true;
-    if (gSpRec) gSpRec->SetRecoState(SPRST_INACTIVE_WITH_PURGE);
-    if (gSpCmdG) { gSpCmdG->Release(); gSpCmdG = nullptr; }
-    if (gSpDict) { gSpDict->Release(); gSpDict = nullptr; }
-    if (gSpCtx) { gSpCtx->SetNotifySink(nullptr); gSpCtx->Release(); gSpCtx = nullptr; }
-    if (gSpRec) { gSpRec->Release(); gSpRec = nullptr; }
-    if (gSpStream) { gSpStream->Release(); gSpStream = nullptr; }
+    WsStop(gWs);
 }
-static void SpeechGrammars()                    // what it listens for: your command phrases, and / or everything you say
-{
-    if (!gSpCtx) return;
-    gSpCtx->Pause(0);
-    const bool dict = (gBlOn.load() && gBlWords[0]) || gSpTts;
-    if (dict && !gSpDict && SUCCEEDED(gSpCtx->CreateGrammar(1, &gSpDict)) && FAILED(gSpDict->LoadDictation(nullptr, SPLO_STATIC))) {
-        gSpDict->Release(); gSpDict = nullptr;
-        lstrcpyW(gSpErr, L"Windows' speech recognizer can't take dictation here (bleep words and the TTS voice need it).");
-    }
-    if (gSpDict) gSpDict->SetDictationState(dict ? SPRS_ACTIVE : SPRS_INACTIVE);
-    if (gSpCmdG) { gSpCmdG->Release(); gSpCmdG = nullptr; }
-    if (gSpCmdOn && gVcN > 0 && SUCCEEDED(gSpCtx->CreateGrammar(2, &gSpCmdG))) {
-        for (int i = 0; i < gVcN; i++) {
-            SPSTATEHANDLE h = nullptr;
-            if (FAILED(gSpCmdG->GetRule(nullptr, 100 + i, SPRAF_TopLevel | SPRAF_Active, TRUE, &h))) continue;
-            wchar_t ph[110];
-            if (gSpPrefix[0]) swprintf(ph, 110, L"%ls %ls", gSpPrefix, gVc[i].say); else lstrcpynW(ph, gVc[i].say, 110);
-            gSpCmdG->AddWordTransition(h, nullptr, ph, L" ", SPWT_LEXICAL, 1.0f, nullptr);
-        }
-        gSpCmdG->Commit(0);
-        gSpCmdG->SetRuleState(nullptr, nullptr, SPRS_ACTIVE);
-    }
-    gSpCtx->Resume(0);
-}
+static void SpeechStatus();
 static bool SpeechStart()
 {
     gSpErr[0] = 0;
-    if (FAILED(CoCreateInstance(kCLSID_SpInprocRecognizer, nullptr, CLSCTX_ALL, kIID_ISpRecognizer, (void**)&gSpRec)) || !gSpRec) {
-        lstrcpyW(gSpErr, L"Windows' speech recognition isn't on this PC."); gSpRec = nullptr; return false;
+    if (!WsCpuOk()) { lstrcpyW(gSpErr, L"This PC's processor can't run the speech engine (it needs AVX2: most PCs from 2013 on have it)."); return false; }
+    if (gWsBroken) return false;
+    if (!WsModelHave(gWsModel)) {
+        swprintf(gSpErr, 300, L"The speech model (%ls, %d MB) isn't downloaded yet: Model > Download.", WS_MODELS[gWsModel].name, WS_MODELS[gWsModel].mb);
+        if (!gWsAsked && gWsDl.load() < 0) { gWsAsked = true; PostMessageW(gWnd, WM_APP + 23, 0, 0); }   // (once a run: ask to get it)
+        return false;
     }
-    // Windows' default recognizer (the desktop one: "Microsoft Speech Recognizer 8.0 for Windows" and the like)
-    ISpObjectTokenCategory* cat = nullptr; ISpObjectToken* tok = nullptr; wchar_t* defId = nullptr;
-    bool ok = SUCCEEDED(CoCreateInstance(kCLSID_SpObjectTokenCategory, nullptr, CLSCTX_ALL, kIID_ISpObjectTokenCategory, (void**)&cat)) &&
-              SUCCEEDED(cat->SetId(L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Speech\\Recognizers", FALSE)) &&
-              SUCCEEDED(cat->GetDefaultTokenId(&defId)) && defId &&
-              SUCCEEDED(CoCreateInstance(kCLSID_SpObjectToken, nullptr, CLSCTX_ALL, kIID_ISpObjectToken, (void**)&tok)) &&
-              SUCCEEDED(tok->SetId(nullptr, defId, FALSE));
-    if (ok) {
-        wchar_t* d = nullptr;
-        if (SUCCEEDED(tok->GetStringValue(nullptr, &d)) && d) { lstrcpynW(gSpEngine, d, 128); CoTaskMemFree(d); }
-        ok = SUCCEEDED(gSpRec->SetRecognizer(tok));
-    }
-    if (defId) CoTaskMemFree(defId);
-    if (tok) tok->Release();
-    if (cat) cat->Release();
-    if (!ok) {
-        lstrcpyW(gSpErr, L"No Windows speech recognizer is installed (newer Windows 11 versions dropped it). "
-                         L"Voice commands, bleep words and the TTS voice need it; the bleep key works without it.");
-        SpeechStop(); return false;
-    }
+    wchar_t wp[MAX_PATH]; WsModelPath(gWsModel, wp, MAX_PATH);
+    char mp[1024]; WideCharToMultiByte(CP_UTF8, 0, wp, -1, mp, 1024, nullptr, nullptr);
     gSpRead.store(gSpW.load()); gSpStartReq = true; gSpFeed = true; gSpLost = false;
-    gSpStream = new SpFeedStream();
-    if (FAILED(gSpRec->SetInput(static_cast<ISpStreamFormat*>(gSpStream), FALSE)) || FAILED(gSpRec->CreateRecoContext(&gSpCtx)) || !gSpCtx) {
-        lstrcpyW(gSpErr, L"Windows' speech recognizer wouldn't start."); SpeechStop(); return false;
-    }
-    gSpCtx->SetNotifyWindowMessage(gWnd, WM_APP_SPEECH, 0, 0);
-    const ULONGLONG want = LE_SPFEI(SPEI_RECOGNITION) | LE_SPFEI(SPEI_HYPOTHESIS) | LE_SPFEI(SPEI_END_SR_STREAM);
-    gSpCtx->SetInterest(want, want);
-    SpeechGrammars();
-    gSpRec->SetRecoState(SPRST_ACTIVE);
+    WsPrompt();
+    WsStart(gWs, mp, WsCallbackPost, nullptr);
+    swprintf(gSpEngine, 128, L"Whisper, %ls model", WS_MODELS[gWsModel].name);
     return true;
 }
-static void SpeechStatus();
-static void SpeechApply()                       // start / stop / re-grammar after a setting changed
+static void SpeechApply()                       // start / stop / new phrases after a setting changed
 {
-    if (SpeechWanted() && gRunning) {
-        if (!gSpRec) { if (!SpeechStart()) gSpRetryAt = GetTickCount() + 10000; }
-        else SpeechGrammars();
-    } else if (gSpRec) SpeechStop();
+    if (SpeechWanted() && gRunning) { if (!gWs.running.load()) { if (!SpeechStart()) gSpRetryAt = GetTickCount() + 10000; } else WsPrompt(); }
+    else if (gWs.running.load()) SpeechStop();
     SpeechStatus();
 }
 static void SpeechTick()                        // every 50 ms (PadTick): keep it running while it's wanted
 {
-    if (gSpRec && gSpLost.exchange(false)) { SpeechStop(); gSpRetryAt = GetTickCount() + 2000; SpeechStatus(); }   // (its stream ended: again in 2 s)
-    if (gSpRec && (!gRunning || !SpeechWanted())) { SpeechStop(); SpeechStatus(); }
-    static DWORD lastShown = 0;                 // the page's status line (and the lists, which name channels and outputs)
-    if (gPage == PAGE_MIC && gMicSub == 4 && !gCompact && GetTickCount() - lastShown > 1000) { lastShown = GetTickCount(); SpeechStatus(); BlOutsText(); }
-    if (!gSpRec && SpeechWanted() && gRunning && (int)(GetTickCount() - gSpRetryAt) >= 0) {
-        if (!SpeechStart()) {
-            gSpRetryAt = GetTickCount() + 30000;
-            if (!gSpErrShown && gSpErr[0]) { gSpErrShown = true; MessageBoxW(gWnd, gSpErr, L"Lag Effect - Speech", MB_ICONWARNING); }
-        }
+    if (gWs.running.load() && gSpLost.exchange(false)) { SpeechStop(); gSpRetryAt = GetTickCount() + 2000; SpeechStatus(); }   // (fell 32 s behind: start afresh)
+    if (gWs.running.load() && (!gRunning || !SpeechWanted())) { SpeechStop(); SpeechStatus(); }
+    if (!gWs.running.load() && gWs.th) WsJoin(gWs);   // (it stopped by itself: a load error)
+    if (!gWs.running.load() && SpeechWanted() && gRunning && gWsDl.load() < 0 && (int)(GetTickCount() - gSpRetryAt) >= 0) {
+        if (!SpeechStart()) gSpRetryAt = GetTickCount() + 30000;
         SpeechStatus();
     }
+    static DWORD lastShown = 0;                 // the page's status line (and the lists, which name channels and outputs)
+    if (gPage == PAGE_MIC && gMicSub == 4 && !gCompact && GetTickCount() - lastShown > 500) { lastShown = GetTickCount(); SpeechStatus(); BlOutsText(); }
 }
 
 // ---- what it heard ----
@@ -21451,52 +21603,72 @@ static bool BlWordMatch(const wchar_t* word)    // a word from your list? ("fuck
     }
     return false;
 }
+static int WsWords(const wchar_t* s, wchar_t w[][32], int cap)   // lower-case words (letters, digits, ')
+{
+    int n = 0, k = 0;
+    for (const wchar_t* q = s; ; q++) {
+        const bool in = *q && (IsCharAlphaNumericW(*q) || *q == L'\'');
+        if (in && k < 31 && n < cap) w[n][k++] = (wchar_t)(INT_PTR)CharLowerW((LPWSTR)(INT_PTR)*q);
+        else if (k) { w[n][k] = 0; k = 0; if (n < cap) n++; }
+        if (!*q) break;
+    }
+    return n;
+}
+static bool WsNear(const wchar_t* a, const wchar_t* b)   // the same word, or one letter off (longer words: two)
+{
+    if (!lstrcmpW(a, b)) return true;
+    const int la = lstrlenW(a), lb = lstrlenW(b);
+    if (la < 4 || lb < 4 || abs(la - lb) > 2) return false;
+    int d[33][33];
+    for (int i = 0; i <= la; i++) d[i][0] = i;
+    for (int j = 0; j <= lb; j++) d[0][j] = j;
+    for (int i = 1; i <= la; i++) for (int j = 1; j <= lb; j++)
+        d[i][j] = Imin(Imin(d[i - 1][j] + 1, d[i][j - 1] + 1), d[i - 1][j - 1] + (a[i - 1] != b[j - 1]));
+    return d[la][lb] <= (Imin(la, lb) >= 7 ? 2 : 1);
+}
+static int VcMatch(const wchar_t* text)         // which command was said (the longest that fits), or -1
+{
+    static wchar_t tw[128][32], cw[24][32];
+    const int nt = WsWords(text, tw, 128);
+    int best = -1, bestLen = 0;
+    for (int i = 0; i < gVcN; i++) {
+        wchar_t ph[110];
+        if (gSpPrefix[0]) swprintf(ph, 110, L"%ls %ls", gSpPrefix, gVc[i].say); else lstrcpynW(ph, gVc[i].say, 110);
+        const int nc = WsWords(ph, cw, 24);
+        if (!nc || nc > nt || nc <= bestLen) continue;
+        for (int s = 0; s + nc <= nt; s++) {
+            int k = 0; while (k < nc && WsNear(tw[s + k], cw[k])) k++;
+            if (k == nc) { best = i; bestLen = nc; break; }
+        }
+    }
+    return best;
+}
 static void VoiceCmdRun(int i);
 static void TtsSay(const wchar_t* t);
-static void SpeechPhrase(const SPPHRASE* ph, bool final)
+static void SpeechResult(const WsResult* r)     // WM_APP + 21: what Whisper heard
 {
-    if (ph->ullGrammarID == 2) {                // one of your commands
-        if (!final || ph->Rule.Confidence < SP_NORMAL_CONFIDENCE) return;
-        const int i = (int)ph->Rule.ulId - 100;
-        if (i >= 0 && i < gVcN) VoiceCmdRun(i);
+    if (r->kind == 2) {                         // it couldn't start
+        MultiByteToWideChar(CP_UTF8, 0, r->text, -1, gSpErr, 300);
+        gWsBroken = true; SpeechStatus();
         return;
     }
-    // dictation: bleep words (from the first guesses on, so they're caught early), then the TTS voice
-    const long long t0 = gSpT0.load();
-    wchar_t text[600] = L""; int tn = 0;
-    for (ULONG e = 0; e < ph->Rule.ulCountOfElements; e++) {
-        const SPPHRASEELEMENT& el = ph->pElements[e];
-        const wchar_t* w = el.pszDisplayText ? el.pszDisplayText : L"";
-        if (gBlOn.load() && t0 >= 0 && BlWordMatch(w)) {
-            const long long b0 = (long long)(ph->ullAudioStreamPosition + el.ulAudioStreamOffset) / 2;
-            const long long a = t0 + 3 * b0 - RATE * 60 / 1000, b = t0 + 3 * (b0 + el.ulAudioSizeBytes / 2) + RATE * 80 / 1000;
-            bool dup = false;                   // (the same word, from an earlier guess)
+    if (gBlOn.load() && gBlWords[0]) {          // bleep words (quick guesses too, so they're caught while you're still talking)
+        for (int i = 0; i < r->n; i++) {
+            wchar_t w[48]; MultiByteToWideChar(CP_UTF8, 0, r->w[i].text, -1, w, 48);
+            if (!BlWordMatch(w)) continue;
+            const long long a = r->w[i].a - RATE * 150 / 1000, b = r->w[i].b + RATE * 120 / 1000;   // (Whisper's word times are rough)
+            bool dup = false;
             const unsigned rn = gBlRN.load();
-            for (unsigned k = 0; k < 16 && k < rn; k++) { const BlRange& r = gBlR[(rn - 1 - k) % BL_RANGES]; if (r.a.load() <= a + RATE / 20 && r.b.load() >= b - RATE / 20) dup = true; }
+            for (unsigned k = 0; k < 16 && k < rn; k++) { const BlRange& g = gBlR[(rn - 1 - k) % BL_RANGES]; if (g.a.load() <= a + RATE / 10 && g.b.load() >= b - RATE / 10) dup = true; }
             if (!dup) BlAdd(a, b);
         }
-        if (final) {
-            const int len = lstrlenW(w);
-            if (tn && !(el.bDisplayAttributes & SPAF_CONSUME_LEADING_SPACES) && tn < 598) text[tn++] = L' ';
-            if (tn + len < 598) { memcpy(text + tn, w, len * sizeof(wchar_t)); tn += len; text[tn] = 0; }
-        }
     }
-    if (!final || !tn) return;
-    lstrcpynW(gSpHeard, text, 200);
+    if (r->kind != 1 || !r->text[0]) return;
+    wchar_t text[1024]; MultiByteToWideChar(CP_UTF8, 0, r->text, -1, text, 1024);
+    lstrcpynW(gSpHeard, text, 400);
+    if (gSpCmdOn && gVcN > 0) { const int c = VcMatch(text); if (c >= 0) VoiceCmdRun(c); }
     if (gSpTts) TtsSay(text);
     SpeechStatus();
-}
-static void SpeechEvents()                      // WM_APP_SPEECH
-{
-    SPEVENT ev; ULONG n = 0;
-    while (gSpCtx && gSpCtx->GetEvents(1, &ev, &n) == S_OK && n == 1) {
-        if ((ev.eEventId == SPEI_RECOGNITION || ev.eEventId == SPEI_HYPOTHESIS) && ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) {
-            ISpRecoResult* r = (ISpRecoResult*)ev.lParam; SPPHRASE* ph = nullptr;
-            if (SUCCEEDED(r->GetPhrase(&ph)) && ph) { SpeechPhrase(ph, ev.eEventId == SPEI_RECOGNITION); CoTaskMemFree(ph); }
-        } else if (ev.eEventId == SPEI_END_SR_STREAM) gSpLost = true;   // (the stream ended: start again)
-        if (ev.elParamType == SPET_LPARAM_IS_OBJECT && ev.lParam) ((IUnknown*)ev.lParam)->Release();
-        else if ((ev.elParamType == SPET_LPARAM_IS_POINTER || ev.elParamType == SPET_LPARAM_IS_STRING) && ev.lParam) CoTaskMemFree((void*)ev.lParam);
-    }
 }
 
 // ---- voice commands: what they can do ----
@@ -21662,16 +21834,75 @@ static void SpeechStatus()
 {
     if (!gWnd || !GetDlgItem(gWnd, IDC_SPSTAT)) return;
     wchar_t t[400];
+    const int st = gWs.state.load();
     if (!gFeatSpeech) t[0] = 0;
-    else if (gSpRec && gSpHeard[0]) swprintf(t, 400, L"Heard: %ls", gSpHeard);
-    else if (gSpRec) swprintf(t, 400, L"Listening (%ls)", gSpEngine[0] ? gSpEngine : L"Windows speech recognition");
+    else if (gWsDl.load() >= 0) swprintf(t, 400, L"Downloading the speech model (%ls, %d MB)... %d%%", WS_MODELS[gWsDl.load()].name, WS_MODELS[gWsDl.load()].mb, gWsDlPct.load());
+    else if (gWs.running.load() && st == 1) lstrcpyW(t, L"Loading the speech model...");
+    else if (gWs.running.load() && gSpHeard[0]) {   // (a long sentence: its end, on two lines)
+        const int n = lstrlenW(gSpHeard);
+        if (n > 150) { const wchar_t* q = gSpHeard + n - 150; while (*q && *q != L' ') q++; swprintf(t, 400, L"Heard: ...%ls", q); }
+        else swprintf(t, 400, L"Heard: %ls", gSpHeard);
+    }
+    else if (gWs.running.load()) swprintf(t, 400, L"Listening (%ls). Say something...", gSpEngine);
     else if (gSpErr[0] && SpeechWanted()) lstrcpynW(t, gSpErr, 400);
     else if (SpeechWanted() && !gRunning) lstrcpyW(t, L"Starts listening when the audio is on.");
     else lstrcpyW(t, L"Not listening: switch on voice commands (with one in the list), bleep words or the TTS voice.");
     SetTextIfChanged(gWnd, IDC_SPSTAT, t);
 }
+static void SpeechBugInfo(wchar_t* o, int cap)
+{
+    BugAdd(o, cap, L"Whisper: model %ls (%ls), CPU %ls, state %d, %u passes, last %u ms, %d threads", WS_MODELS[gWsModel].name,
+           WsModelHave(gWsModel) ? L"downloaded" : L"not downloaded", WsCpuOk() ? L"ok" : L"no AVX2", gWs.state.load(), gWs.passes.load(), gWs.lastMs.load(), gWs.threads);
+}
+static void WsModelMenu()                       // Model: which (Fast / Good / Best), download, delete
+{
+    HMENU m = CreatePopupMenu();
+    for (int i = 0; i < 3; i++) {
+        wchar_t t[120];
+        swprintf(t, 120, L"%ls (%d MB)%ls", WS_MODELS[i].name, WS_MODELS[i].mb, WsModelHave(i) ? L"   (downloaded)" : L"");
+        AppendMenuW(m, MF_STRING | (i == gWsModel ? MF_CHECKED : 0), 1 + i, t);
+    }
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    const bool have = WsModelHave(gWsModel);
+    wchar_t dl[80]; swprintf(dl, 80, have ? L"%ls is downloaded" : L"Download %ls now", WS_MODELS[gWsModel].name);
+    AppendMenuW(m, MF_STRING | (have || gWsDl.load() >= 0 ? MF_GRAYED : 0), 10, dl);
+    AppendMenuW(m, MF_STRING, 11, L"Delete the downloaded models");
+    AppendMenuW(m, MF_STRING, 12, L"About the speech engine...");
+    RECT r; GetWindowRect(GetDlgItem(gWnd, IDC_SPMODEL), &r);
+    const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (c >= 1 && c <= 3 && c - 1 != gWsModel) {
+        gWsModel = c - 1; gWsBroken = false; gSpRetryAt = 0;
+        if (gWs.running.load()) SpeechStop();
+        if (!WsModelHave(gWsModel)) gWsAsked = false;   // (asks to download it when it's next needed)
+        SaveSettings(); SpeechApply();
+    } else if (c == 10) WsDownload(gWsModel);
+    else if (c == 11) {
+        if (MessageBoxW(gWnd, L"Delete the downloaded speech models? (Speech will ask to download one again when it's needed.)", L"Lag Effect - Speech", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+            if (gWs.running.load()) SpeechStop();
+            for (int i = 0; i < 3; i++) { wchar_t p[MAX_PATH]; WsModelPath(i, p, MAX_PATH); DeleteFileW(p); }
+            gWsAsked = true; SpeechStatus();
+        }
+    } else if (c == 12) {
+        MessageBoxW(gWnd,
+            L"Speech recognition: whisper.cpp (OpenAI's Whisper, run on this PC; nothing you say goes online). Models: Fast = tiny.en, "
+            L"Good = base.en, Best = small.en (5-bit), from huggingface.co/ggerganov/whisper.cpp, checked when downloaded.\n\n"
+            L"whisper.cpp: MIT License, Copyright (c) 2023-2026 The ggml authors. Whisper models: MIT License, Copyright (c) 2022 OpenAI.\n\n"
+            L"Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files "
+            L"(the \"Software\"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, "
+            L"publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, "
+            L"subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or "
+            L"substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, "
+            L"INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT "
+            L"SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR "
+            L"OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.",
+            L"Lag Effect - Speech engine", MB_ICONINFORMATION);
+    }
+    SetTextIfChanged(gWnd, IDC_SPMODEL, WS_MODELS[gWsModel].name[0] == L'F' ? L"Model: Fast \x25BE" : WS_MODELS[gWsModel].name[0] == L'G' ? L"Model: Good \x25BE" : L"Model: Best \x25BE");
+}
 static void SpeechSave()                        // (SaveSettings)
 {
+    SaveInt(L"speech_model", gWsModel);
     SaveInt(L"voice_commands_on", gSpCmdOn); IniSet(L"voice_commands_prefix", gSpPrefix);
     SaveInt(L"voice_commands", gVcN);
     for (int i = 0; i < VC_MAX; i++) {
@@ -21685,6 +21916,7 @@ static void SpeechSave()                        // (SaveSettings)
 static void SpeechLoad()                        // (LoadSettings)
 {
     gSpCmdOn = GetPrivateProfileIntW(L"settings", L"voice_commands_on", 0, gIni) != 0;
+    gWsModel = Iclamp(GetPrivateProfileIntW(L"settings", L"speech_model", 1, gIni), 0, 2);
     GetPrivateProfileStringW(L"settings", L"voice_commands_prefix", L"", gSpPrefix, 32, gIni);
     const int n = Iclamp(GetPrivateProfileIntW(L"settings", L"voice_commands", 0, gIni), 0, VC_MAX);
     gVcN = 0;
@@ -21699,7 +21931,7 @@ static void SpeechLoad()                        // (LoadSettings)
     }
     gBlOn = GetPrivateProfileIntW(L"settings", L"bleep_on", 0, gIni) != 0;
     gBlOuts = (unsigned)GetPrivateProfileIntW(L"settings", L"bleep_outputs", 1, gIni) & ((1u << MAX_OUT) - 1);
-    gBlDelayMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_delay_ms", 2000, gIni), 0, 3000);
+    gBlDelayMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_delay_ms", 3000, gIni), 0, 3000);   // (3 s: Whisper needs 1-2)
     gBlDelayF = gBlDelayMs * RATE / 1000;
     gBlSound = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_sound", 0, gIni), 0, 1);
     gBlBackMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_reach_back_ms", 600, gIni), 0, 2000);
@@ -22356,6 +22588,7 @@ static void CreateUI()
         CheckDlgButton(gWnd, IDC_SPCMDON, gSpCmdOn ? BST_CHECKED : BST_UNCHECKED);
         Ctl(L"STATIC", L"Start each with:", 0, 196, 178, 104, 20, -1);
         Ctl(L"EDIT", gSpPrefix, ES_AUTOHSCROLL | WS_TABSTOP, 302, 174, 100, 23, IDC_SPPREFIX, WS_EX_CLIENTEDGE);
+        Ctl(L"BUTTON", gWsModel == 0 ? L"Model: Fast \x25BE" : gWsModel == 1 ? L"Model: Good \x25BE" : L"Model: Best \x25BE", WS_TABSTOP, 410, 172, 120, 27, IDC_SPMODEL);
         SendDlgItemMessageW(gWnd, IDC_SPPREFIX, EM_LIMITTEXT, 30, 0);
         SendDlgItemMessageW(gWnd, IDC_SPPREFIX, EM_SETCUEBANNER, TRUE, (LPARAM)L"(nothing)");
         Ctl(L"STATIC", L"Say:", 0, 30, 210, 36, 20, -1);
@@ -22365,9 +22598,9 @@ static void CreateUI()
         Ctl(L"STATIC", L"does:", 0, 246, 210, 40, 20, -1);
         { HWND c = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 288, 206, 184, 320, IDC_SPACT); SendMessageW(c, CB_SETDROPPEDWIDTH, SC(260), 0); }
         Ctl(L"BUTTON", L"Add", WS_TABSTOP, 478, 204, 52, 27, IDC_SPADD);
-        Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP, 30, 238, 442, 64, IDC_SPLIST, WS_EX_CLIENTEDGE);
+        Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP, 30, 238, 442, 52, IDC_SPLIST, WS_EX_CLIENTEDGE);
         Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 478, 238, 52, 27, IDC_SPDEL);
-        Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 308, 500, 20, IDC_SPSTAT);
+        Ctl(L"STATIC", L"", SS_NOPREFIX, 30, 296, 500, 34, IDC_SPSTAT);   // (two lines: long sentences wrap, 1.58.0)
         AddSection(14, 344, 532, 148, L"Bleep");
         Ctl(L"BUTTON", L"Bleep", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 366, 70, 20, IDC_BLON);
         CheckDlgButton(gWnd, IDC_BLON, gBlOn.load() ? BST_CHECKED : BST_UNCHECKED);
@@ -22885,7 +23118,7 @@ static void CreateUI()
             { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, text to speech, a looper and beatbox drums. Adds a tab.", gFeatSound },
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
             { IDC_FEATVST,   L"Plugins (VST3, CLAP)", L"VST3 and CLAP effect plugins on your mic (Mic > Plugins), Mixer channels and outputs.", gFeatVst },
-            { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice (Mic > Speech).", gFeatSpeech },
+            { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice (Mic > Speech). Downloads a speech model once.", gFeatSpeech },
         };
         for (int i = 0; i < 6; i++) {
             const int y = 150 + i * 38;
@@ -23349,6 +23582,7 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_SPACT)  { if (code == CBN_DROPDOWN) SpActFill(); return; }
+    if (id == IDC_SPMODEL) { if (code == BN_CLICKED) WsModelMenu(); return; }
     if (id == IDC_SPADD)  { if (code == BN_CLICKED) SpCmdAdd(); return; }
     if (id == IDC_SPDEL)  { if (code == BN_CLICKED) SpCmdDel(); return; }
     if (id == IDC_SPLIST) {                     // pick one: its words and action come back up (Add then changes it)
@@ -24550,9 +24784,24 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     }
-    case WM_APP + 21:                           // Mic > Speech: the recognizer has news (WM_APP_SPEECH)
-        SpeechEvents();
+    case WM_APP + 21:                           // Mic > Speech: Whisper heard something (lParam: a WsResult to free)
+        if (l) { SpeechResult((const WsResult*)l); free((void*)l); }
         return 0;
+    case WM_APP + 23: {                         // Mic > Speech: the model isn't there yet: download it?
+        wchar_t q[300];
+        swprintf(q, 300, L"Speech uses Whisper, which runs on this PC (nothing you say goes online). Its model (%ls, %d MB) needs "
+                         L"downloading once, from Hugging Face.\n\nDownload it now?", WS_MODELS[gWsModel].name, WS_MODELS[gWsModel].mb);
+        if (MessageBoxW(h, q, L"Lag Effect - Speech", MB_YESNO | MB_ICONQUESTION) == IDYES) WsDownload(gWsModel);
+        SpeechStatus();
+        return 0;
+    }
+    case WM_APP + 22: {                         // Mic > Speech: a model finished downloading (wParam 1 ok, lParam which)
+        const int m = (int)l; gWsDl = -1;
+        if (!w) { wchar_t t[200]; swprintf(t, 200, L"The speech model (%ls) couldn't be downloaded. Check your internet connection and try again (Model > Download).", WS_MODELS[Iclamp(m, 0, 2)].name); MessageBoxW(h, t, L"Lag Effect - Speech", MB_ICONWARNING); }
+        else { gWsBroken = false; gSpRetryAt = 0; }
+        SpeechStatus();
+        return 0;
+    }
     case WM_MOVE:
         EdFollow();                             // the move-things-around layer stays over the window
         SearchHide(); CalloutHide();
