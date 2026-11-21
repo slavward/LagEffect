@@ -47,3 +47,33 @@ static void VstRun(float*, int) {}
 #endif
 static bool gStubFxAny = false;
 static bool FxAnyOn() { return gStubFxAny; }
+// The vocoder's synth plugin (1.55.0): a small fake one here (a sawtooth per note, notes counted), so the
+// "Synth plugin" style can be tested end to end without a real plugin.
+struct SynEv { int type; int key; int id; float vel; float tune; };   // (as in LagEffect.cpp)
+#define SYN_EVMAX 48
+static bool gFakeSynth = false;                 // a synth is "loaded"
+static struct FakeNote { int key, id; float tune; double ph; bool on; } gFakeNote[16];
+static int gFakeOns = 0, gFakeOffs = 0, gFakeTunes = 0, gFakeLastKey = -1, gFakeHeld = 0;
+static bool SynthLive() { return gFakeSynth; }
+static bool SynthPluginRun(const SynEv* ev, int nev, float* l, float* r, int n)
+{
+    if (!gFakeSynth) return false;
+    for (int i = 0; i < nev; i++) {
+        const SynEv& e = ev[i];
+        if (e.type == 0) { gFakeOns++; gFakeLastKey = e.key; for (auto& x : gFakeNote) if (!x.on) { x = { e.key, e.id, 0.0f, 0.0, true }; break; } }
+        else if (e.type == 1) { gFakeOffs++; for (auto& x : gFakeNote) if (x.on && x.id == e.id) x.on = false; }
+        else { gFakeTunes++; for (auto& x : gFakeNote) if (x.on && x.id == e.id) x.tune = e.tune; }
+    }
+    gFakeHeld = 0;
+    for (auto& x : gFakeNote) if (x.on) gFakeHeld++;
+    for (int i = 0; i < n; i++) {
+        float s = 0;
+        for (auto& x : gFakeNote) if (x.on) {
+            const double hz = 440.0 * pow(2.0, (x.key + x.tune - 69) / 12.0);
+            x.ph += hz / 48000.0; if (x.ph >= 1) x.ph -= 1;
+            s += (float)(x.ph * 2 - 1) * 0.2f;
+        }
+        l[i] = r[i] = s;
+    }
+    return true;
+}

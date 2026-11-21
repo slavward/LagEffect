@@ -1,4 +1,5 @@
-# Runs Lag Effect's tests (tests/run.sh) on Linux on every push and pull request: the Mixer gate, extra outputs not
+# Runs Lag Effect's tests (tests/run.sh) on Linux on every push and pull request: the Mixer gate, the vocoder's Synth plugin
+# style (with a fake synth), extra outputs not
 # running dry, short device names, the Recorder, and "default settings sound bit-for-bit the same as main".
 # A commit meant to change the sound says so with [audio-change] in its message (that one check then only reports).
 name: Tests
