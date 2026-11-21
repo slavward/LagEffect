@@ -1,0 +1,31 @@
+# Runs Lag Effect's tests (tests/run.sh) on Linux on every push and pull request: the Mixer gate, extra outputs not
+# running dry, short device names, the Recorder, and "default settings sound bit-for-bit the same as main".
+# A commit meant to change the sound says so with [audio-change] in its message (that one check then only reports).
+name: Tests
+
+on:
+  push:
+    branches-ignore: [build-output]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get main's LagEffect.cpp (to compare the sound with)
+        run: |
+          git fetch --depth 1 origin main
+          git show FETCH_HEAD:LagEffect.cpp > "$RUNNER_TEMP/main.cpp"
+
+      - name: Run the tests
+        env:
+          MSG: ${{ github.event.head_commit.message || github.event.pull_request.title }}
+        run: |
+          case "$MSG" in *"[audio-change]"*) export AUDIO_CHANGE=1 ;; esac
+          bash tests/run.sh "$RUNNER_TEMP/main.cpp"

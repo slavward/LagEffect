@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.53.2"
+#define APP_VERSION L"1.54.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1314,6 +1314,8 @@ static float gtS[2][4];                         // the detector's 150 Hz high-pa
 static volatile int   gLvThrDb = -30, gLvRatio = 4, gLvAtkMs = 5, gLvRelMs = 200, gLvMakeDb = 6;
 static volatile float gLvGrDb = 0;              // how many dB the leveler is turning down now (UI reads, then clears)
 static volatile float gMicRawPk = 0, gMicInPk = 0;   // mic peak as it arrives / after Mic boost (UI reads, then clears)
+static volatile float gSilMicPk = 0;            // (the same, for the silence alarm: read and cleared by SilenceTick)
+static volatile unsigned gMainBlocks = 0, gExtBlocks[8];   // blocks run: the main audio, each extra output (the alarm sees them stop)
 // 1.50.0 (Mic > Volume). Auto volume: turns you up (by at most this many dB) or down to a steady level while you talk,
 // holds still between words. Loudness: gain into a limiter whose ceiling is -1 dB, at the very end of the mic's
 // own stages, so you're louder without clipping. Both 0 = off (then the audio is exactly as before).
@@ -1564,8 +1566,14 @@ struct ChanSet {
     volatile int eqLo, eqMid, eqHi;             // 3-band EQ, tenths of a dB (-120..+120): 100 Hz shelf, 1 kHz, 8 kHz shelf
     volatile int comp;                          // compressor / leveler: 0 = off .. 100 = strong
     volatile int send[MAX_OUT];                 // its level on each output, on top of the fader (tenths of a dB, -400..+60)
+    volatile int gate;                          // gate (1.54.0): 0 = off, 1..60 = opens above -70 + this dB (-69..-10)
+    volatile int gateHold, gateRange;           // ...stays open this long after (ms, 50..2000); turns down by (dB, 10..80; 80 = silent)
 };
-enum { CFX_LO = 101, CFX_MID, CFX_HI, CFX_COMP, CFX_SEND0 = 110, CFX_VAL = 200, CFX_GR = 300, CFX_FLAT = 301, CFX_HDR = 302 };
+#define CH_GATE_HOLD 250                        // (a new channel's gate: holds 250 ms, silent when shut)
+#define CH_GATE_RANGE 80
+enum { CFX_LO = 101, CFX_MID, CFX_HI, CFX_COMP, CFX_GATE, CFX_GHOLD, CFX_GRANGE, CFX_SEND0 = 110, CFX_GR = 300, CFX_FLAT = 301, CFX_HDR = 302,
+       CFX_GST = 303, CFX_VAL = 600 };          // (CFX_VAL + a slider's id: its value; clear of every other id)
+static volatile float gChGate[8];               // (each channel's gate: 1 = open .. its floor = shut; for the window)
 static HWND gCfxWnd = nullptr; static int gCfxCh = -1;
 static volatile float gChGr[8];                 // (each channel's compressor: how many dB it's turning down now)
 static volatile float gOutPeakMix[MAX_OUT];     // (each output's peak, for the Mixer's meters)
@@ -3715,11 +3723,15 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
 
     // Mixer channels: how much each has buffered, its gain and where it goes (read once per block).
     unsigned chRd[CH_MAX], chAv[CH_MAX]; int chAdj[CH_MAX], act[CH_MAX], nAct = 0; bool anyCh = false;
-    struct ChFx { Biquad lo[2], mid[2], hi[2]; int pl, pm, ph; bool eq; float env, gain, tgt, thr, ratio, makeup; int comp; };
+    struct ChFx { Biquad lo[2], mid[2], hi[2]; int pl, pm, ph; bool eq; float env, gain, tgt, thr, ratio, makeup; int comp;
+                  float gEnv, gGain; int gHold; };   // (gate: level, gain now, samples it stays open)
     static ChFx chFx[CH_MAX];
     static bool chFxInit = false;
-    if (!chFxInit) { for (int c = 0; c < CH_MAX; c++) { chFx[c].pl = chFx[c].pm = chFx[c].ph = 9999; chFx[c].gain = chFx[c].tgt = 1; chFx[c].comp = -1; } chFxInit = true; }
+    if (!chFxInit) { for (int c = 0; c < CH_MAX; c++) { chFx[c].pl = chFx[c].pm = chFx[c].ph = 9999; chFx[c].gain = chFx[c].tgt = 1; chFx[c].comp = -1; chFx[c].gGain = 1; } chFxInit = true; }
     bool     chEq[CH_MAX], chComp[CH_MAX];
+    bool     chGate[CH_MAX], chGateOn[CH_MAX];   // gate: runs this block (on, or still opening after switched off) / is on
+    float    chGOpen[CH_MAX], chGClose[CH_MAX], chGFloor[CH_MAX]; int chGHoldN[CH_MAX];
+    static const float chGAtk = 1.0f - expf(-1.0f / (0.001f * RATE)), chGRel = 1.0f - expf(-1.0f / (0.12f * RATE));   // opens in ~1 ms, shuts over ~120 ms
     unsigned chEqB[CH_MAX];                     // which EQ bands do anything this block (1 low, 2 middle, 4 high)
     unsigned chGo[CH_MAX];                      // which outputs this channel adds to this block (bit per output)
     unsigned chGlide[CH_MAX];                   // ...and on which of those its level is still gliding
@@ -3802,6 +3814,14 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             }
             chComp[c] = cp > 0;
             if (!cp) { x.gain = x.tgt = 1; x.env = 0; gChGr[c] = 0; }
+            const int gt = Iclamp(gCh[c].gate, 0, 60);   // gate (before the EQ): like the mic's volume gate
+            chGateOn[c] = gt > 0;
+            if (!gt && x.gGain > 0.9999f) { x.gGain = 1; x.gEnv = 0; x.gHold = 0; }   // (off and fully open: skipped, untouched)
+            chGate[c] = gt > 0 || x.gGain < 1.0f;
+            chGOpen[c] = powf(10.0f, (-70 + gt) / 20.0f); chGClose[c] = chGOpen[c] * 0.63f;   // (4 dB lower to shut: no flutter)
+            chGFloor[c] = Iclamp(gCh[c].gateRange, 10, 80) >= 80 ? 0.0f : powf(10.0f, -Iclamp(gCh[c].gateRange, 10, 80) / 20.0f);
+            chGHoldN[c] = Iclamp(gCh[c].gateHold, 50, 2000) * RATE / 1000;
+            gChGate[c] = gt ? x.gGain : 1.0f;
         }
         { const int pn = Iclamp(gCh[c].pan, -100, 100); chPanL[c] = pn > 0 ? 1.0f - pn / 100.0f : 1.0f; chPanR[c] = pn < 0 ? 1.0f + pn / 100.0f : 1.0f; }
         chGo[c] = chGlide[c] = 0;               // per output: still gliding, or there and audible (else nothing to add)
@@ -4266,6 +4286,18 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
                 }
                 if (chDucker[c]) { const float e = Max(fabsf(L), fabsf(R)); chTrig[c] = e > chTrig[c] ? e : chTrig[c] * 0.9995f; }
                 if (chVst[c]) { L = gVstChL[c][f]; R = gVstChR[c][f]; }   // (its plugins already ran over this block)
+                if (chGate[c]) {                 // gate: shuts it between someone's words (a noisy friend, a second mic)
+                    ChFx& x = chFx[c];
+                    const float e = Max(fabsf(L), fabsf(R));
+                    x.gEnv = e > x.gEnv ? e : x.gEnv * 0.99792f;          // 10 ms peak follower
+                    if (chGateOn[c]) {
+                        if (x.gEnv > (x.gHold > 0 ? chGClose[c] : chGOpen[c])) x.gHold = chGHoldN[c] + 1;
+                        else if (x.gHold > 0) x.gHold--;
+                    }
+                    const float t = !chGateOn[c] || x.gHold > 0 ? 1.0f : chGFloor[c];
+                    x.gGain += (t - x.gGain) * (t > x.gGain ? chGAtk : chGRel);
+                    L *= x.gGain; R *= x.gGain;
+                }
                 if (chEq[c]) {
                     ChFx& x = chFx[c];
                     const unsigned eb = chEqB[c];
@@ -4373,7 +4405,8 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     if (blockPeak > gMeterPeak) gMeterPeak = blockPeak;
     if (inPk > gMicInPk) gMicInPk = inPk;
     if (whRec0) { const int np = whP0 + (int)frames; gWhPos = np; if (np >= WH_REC) gWhRec = false; }
-    { const float r = boost > 0.0001f ? inPk / boost : 0.0f; if (r > gMicRawPk) gMicRawPk = r; if (suPhase && r > gSuRawPk) gSuRawPk = r; }
+    { const float r = boost > 0.0001f ? inPk / boost : 0.0f; if (r > gMicRawPk) gMicRawPk = r; if (r > gSilMicPk) gSilMicPk = r; if (suPhase && r > gSuRawPk) gSuRawPk = r; }
+    gMainBlocks = gMainBlocks + 1;
     if (lvGrMax > gLvGrDb) gLvGrDb = lvGrMax;
     if (ldGrMax > gLimGrDb) gLimGrDb = ldGrMax;
     if (micOutPk > gMicOutPk) gMicOutPk = micOutPk;
@@ -4398,6 +4431,7 @@ static void ExtraOutputCallback(ma_device* dev, void* output, const void*, ma_ui
 {
     int k = (int)(INT_PTR)dev->pUserData;
     float* out = (float*)output;                // stereo
+    gExtBlocks[k & 7] = gExtBlocks[k & 7] + 1;
     unsigned w = ringW[k];
     MemoryBarrier();
     unsigned r = ringR[k];
@@ -5241,6 +5275,78 @@ static void ThemeTitleBar(HWND w)
     pDwmSetWindowAttribute(w, 34, &brd, sizeof(brd));          // DWMWA_BORDER_COLOR
 }
 
+// ---- dark message boxes (1.54.0): Windows' own message box, recoloured while it's open ----
+// Every MessageBoxW below this point goes through DarkMessageBox (the #define after it). In the dark theme a hook catches
+// the box as it opens and recolours it (title bar, background, the strip behind the buttons, dark buttons); everything
+// else stays Windows' own (keys, sounds, Ctrl+C copies the text, sizing). In the light theme it's MessageBoxW as before.
+static HHOOK  gMbHook = nullptr; static int gMbDepth = 0;
+static HBRUSH gMbBr = nullptr; static COLORREF gMbBrC = 0xFFFFFFFF;
+static HBRUSH MbBrush() { if (gMbBrC != DK_BG || !gMbBr) { if (gMbBr) DeleteObject(gMbBr); gMbBr = CreateSolidBrush(DK_BG); gMbBrC = DK_BG; } return gMbBr; }
+static LRESULT CALLBACK MbProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    WNDPROC old = (WNDPROC)GetPropW(h, L"LagMbOld");
+    switch (m) {
+    case WM_CTLCOLORDLG: case WM_CTLCOLORBTN: return (LRESULT)MbBrush();
+    case WM_CTLCOLORSTATIC:
+        SetTextColor((HDC)w, DK_TEXT); SetBkColor((HDC)w, DK_BG);
+        return (LRESULT)MbBrush();
+    case WM_ERASEBKGND: return 1;               // (all painted in WM_PAINT)
+    case WM_PAINT: {                            // the dark page, and the slightly lighter strip behind the buttons (like Windows' own)
+        PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        FillRect(dc, &rc, MbBrush());
+        int top = rc.bottom;                    // (the strip starts a little above the highest button)
+        for (HWND c = GetWindow(h, GW_CHILD); c; c = GetWindow(c, GW_HWNDNEXT)) {
+            wchar_t cls[16]; GetClassNameW(c, cls, 16);
+            if (lstrcmpiW(cls, L"Button") || !IsWindowVisible(c)) continue;
+            RECT br; GetWindowRect(c, &br); MapWindowPoints(nullptr, h, (POINT*)&br, 2);
+            if (br.top < top) top = br.top;
+        }
+        if (top < rc.bottom) {
+            const int pad = MulDiv(11, GetDeviceCaps(dc, LOGPIXELSY), 96);   // (11 px at 100%)
+            RECT fr = { 0, top - pad, rc.right, rc.bottom };
+            HBRUSH fb = CreateSolidBrush(DK_CTL); FillRect(dc, &fr, fb); DeleteObject(fb);
+        }
+        EndPaint(h, &ps);
+        return 0;
+    }
+    case WM_NCDESTROY:
+        RemovePropW(h, L"LagMbOld");
+        SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)old);
+        break;
+    }
+    return CallWindowProcW(old, h, m, w, l);
+}
+static BOOL CALLBACK MbChild(HWND c, LPARAM)
+{
+    wchar_t cls[16]; GetClassNameW(c, cls, 16);
+    if (!lstrcmpiW(cls, L"Button")) SetTheme(c, L"DarkMode_Explorer", nullptr);   // (Windows' own dark buttons)
+    return TRUE;
+}
+static LRESULT CALLBACK MbCbt(int code, WPARAM w, LPARAM l)
+{
+    if (code == HCBT_ACTIVATE) {
+        HWND h = (HWND)w; wchar_t cls[16]; GetClassNameW(h, cls, 16);
+        if (!lstrcmpW(cls, L"#32770") && !GetPropW(h, L"LagMbOld")) {   // a message box, not seen yet
+            SetPropW(h, L"LagMbOld", (HANDLE)GetWindowLongPtrW(h, GWLP_WNDPROC));
+            SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)MbProc);
+            ThemeTitleBar(h);
+            EnumChildWindows(h, MbChild, 0);
+            InvalidateRect(h, nullptr, TRUE);
+        }
+    }
+    return CallNextHookEx(gMbHook, code, w, l);
+}
+static int DarkMessageBox(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type)
+{
+    if (!gDark) return MessageBoxW(owner, text, caption, type);
+    if (gMbDepth++ == 0) gMbHook = SetWindowsHookExW(WH_CBT, MbCbt, nullptr, GetCurrentThreadId());
+    const int r = MessageBoxW(owner, text, caption, type);
+    if (--gMbDepth == 0 && gMbHook) { UnhookWindowsHookEx(gMbHook); gMbHook = nullptr; }
+    return r;
+}
+#define MessageBoxW DarkMessageBox
+
 static void ApplyTheme()
 {
     gDark = gThemeMode == THEME_DARK || (gThemeMode == THEME_SYSTEM && SystemUsesDark());
@@ -5746,6 +5852,9 @@ static void LoadSettings()
         wsprintfW(k, L"ch_%d_eqmid", c);  gCh[c].eqMid = Iclamp(INI_INT(k, 0), -120, 120);
         wsprintfW(k, L"ch_%d_eqhi", c);   gCh[c].eqHi  = Iclamp(INI_INT(k, 0), -120, 120);
         wsprintfW(k, L"ch_%d_comp", c);   gCh[c].comp  = Iclamp(INI_INT(k, 0), 0, 100);
+        wsprintfW(k, L"ch_%d_gate", c);   gCh[c].gate  = Iclamp(INI_INT(k, 0), 0, 60);
+        wsprintfW(k, L"ch_%d_gatehold", c);  gCh[c].gateHold  = Iclamp(INI_INT(k, CH_GATE_HOLD), 50, 2000);
+        wsprintfW(k, L"ch_%d_gaterange", c); gCh[c].gateRange = Iclamp(INI_INT(k, CH_GATE_RANGE), 10, 80);
         for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); gCh[c].send[o] = Iclamp(INI_INT(k, 0), -400, 60); }
     }
     ScenesLoad();
@@ -6660,6 +6769,9 @@ static void SaveSettings()
         wsprintfW(k, L"ch_%d_eqmid", c);  SaveInt(k, gCh[c].eqMid);
         wsprintfW(k, L"ch_%d_eqhi", c);   SaveInt(k, gCh[c].eqHi);
         wsprintfW(k, L"ch_%d_comp", c);   SaveInt(k, gCh[c].comp);
+        wsprintfW(k, L"ch_%d_gate", c);   SaveInt(k, gCh[c].gate);
+        wsprintfW(k, L"ch_%d_gatehold", c);  SaveInt(k, gCh[c].gateHold);
+        wsprintfW(k, L"ch_%d_gaterange", c); SaveInt(k, gCh[c].gateRange);
         for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); SaveInt(k, gCh[c].send[o]); }
     }
     for (int c = 0; c < CH_MAX; c++) MixMemStore(c);   // (remember each app's settings for next time)
@@ -10221,6 +10333,7 @@ static void MixMemStore(int c)
     n += wsprintfW(v + n, L",%d,%d,%d,%d,%d", (int)gCh[c].chatRole, gCh[c].link, (int)gCh[c].pan, gCh[c].mono ? 1 : 0, gCh[c].ducker ? 1 : 0);
     n += wsprintfW(v + n, L",%d,%d,%d,%d", (int)gCh[c].eqLo, (int)gCh[c].eqMid, (int)gCh[c].eqHi, (int)gCh[c].comp);
     for (int k = 0; k < MAX_OUT; k++) n += wsprintfW(v + n, L",%d", (int)gCh[c].send[k]);
+    n += wsprintfW(v + n, L",%d,%d,%d", (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange);   // (added in 1.54)
     wsprintfW(v + n, L"|%s", gCh[c].name);
     WritePrivateProfileStringW(L"mixer_memory", key, v, gIni);
 }
@@ -10228,9 +10341,9 @@ static bool MixMemLoad(int c)
 {
     wchar_t key[200], v[700]; MixMemKey(c, key);
     if (!GetPrivateProfileStringW(L"mixer_memory", key, L"", v, 700, gIni) || !v[0]) return false;
-    int f[20 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
+    int f[30 + MIXA_N * MAX_KEYS] = {}; int nf = 0;
     const wchar_t* q = v;
-    while (*q && *q != L'|' && nf < 20 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+    while (*q && *q != L'|' && nf < 30 + MIXA_N * MAX_KEYS) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
     if (nf < 6) return false;
     gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].duck = f[1] != 0; gCh[c].routes = (unsigned)f[2] & ((1u << MAX_OUT) - 1);
     gCh[c].color = Iclamp(f[3], 0, 7); gChW[c] = f[4] ? Iclamp(f[4], 52, 240) : 0; gCh[c].holdTalk = f[5] != 0;
@@ -10245,6 +10358,10 @@ static bool MixMemLoad(int c)
         gCh[c].eqLo = has2 ? Iclamp(f[b + 4], -120, 120) : 0; gCh[c].eqMid = has2 ? Iclamp(f[b + 5], -120, 120) : 0;
         gCh[c].eqHi = has2 ? Iclamp(f[b + 6], -120, 120) : 0; gCh[c].comp = has2 ? Iclamp(f[b + 7], 0, 100) : 0;
         for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = has2 ? Iclamp(f[b + 8 + k], -400, 60) : 0;
+        const bool has3 = nf >= b + 16;         // (added in 1.54)
+        gCh[c].gate = has3 ? Iclamp(f[b + 13], 0, 60) : 0;
+        gCh[c].gateHold = has3 ? Iclamp(f[b + 14], 50, 2000) : CH_GATE_HOLD;
+        gCh[c].gateRange = has3 ? Iclamp(f[b + 15], 10, 80) : CH_GATE_RANGE;
     }
     const wchar_t* nm = wcschr(v, L'|');
     lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
@@ -10271,6 +10388,7 @@ static void ChanSetSource(int c, int type, const wchar_t* src)
         gCh[c].name[0] = 0; gCh[c].db10 = 0; gCh[c].duck = false; gCh[c].holdTalk = 0; gChW[c] = 0; gCh[c].chatRole = 0;
         gCh[c].link = 0; gCh[c].pan = 0; gCh[c].mono = false; gCh[c].ducker = false;
         gCh[c].eqLo = gCh[c].eqMid = gCh[c].eqHi = 0; gCh[c].comp = 0; for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = 0;
+        gCh[c].gate = 0; gCh[c].gateHold = CH_GATE_HOLD; gCh[c].gateRange = CH_GATE_RANGE;
         if (gCfxCh == c && gCfxWnd) DestroyWindow(gCfxWnd);
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = 0;
         if (type != CH_NONE && (wasEmpty || !gCh[c].routes)) gCh[c].routes = (1u << gRows) - 1;   // to every output
@@ -10409,11 +10527,12 @@ static void SceneWrite(int i)                   // the mixer as it is now -> sce
     for (int c = 0; c < CH_MAX; c++) {
         wchar_t k[16], v[400]; wsprintfW(k, L"ch%d", c + 1);
         if (gCh[c].type == CH_NONE) lstrcpyW(v, L"0");
-        else _snwprintf(v, 399, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
+        else _snwprintf(v, 399, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
                         gCh[c].solo ? 1 : 0, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk,
                         (int)gCh[c].chatRole, gCh[c].link, (int)gCh[c].pan, gCh[c].mono ? 1 : 0, gCh[c].ducker ? 1 : 0,
                         (int)gCh[c].eqLo, (int)gCh[c].eqMid, (int)gCh[c].eqHi, (int)gCh[c].comp,
-                        (int)gCh[c].send[0], (int)gCh[c].send[1], (int)gCh[c].send[2], (int)gCh[c].send[3], (int)gCh[c].send[4], gCh[c].name);
+                        (int)gCh[c].send[0], (int)gCh[c].send[1], (int)gCh[c].send[2], (int)gCh[c].send[3], (int)gCh[c].send[4],
+                        (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange, gCh[c].name);
         v[399] = 0;
         WritePrivateProfileStringW(sec, k, v, gIni);
     }
@@ -10444,8 +10563,8 @@ static void SceneApply(int i)                   // switch to scene i: volumes gl
         if (!p2) continue;
         lstrcpynW(src, p1 + 1, (int)Imin(128, (int)(p2 - p1)));
         if (gCh[c].type != type || lstrcmpiW(gCh[c].src, src)) ChanSetSource(c, type, src);
-        int f[22] = {}; int nf = 0; const wchar_t* q = p2 + 1;
-        while (*q && *q != L'|' && nf < 22) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+        int f[25] = {}; int nf = 0; const wchar_t* q = p2 + 1;
+        while (*q && *q != L'|' && nf < 25) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
         if (nf >= 8) {
             gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].mute = f[1] != 0; gCh[c].solo = f[2] != 0; gCh[c].duck = f[3] != 0;
             gCh[c].routes = (unsigned)f[4] & ((1u << MAX_OUT) - 1); gCh[c].color = Iclamp(f[5], 0, 7);
@@ -10455,6 +10574,8 @@ static void SceneApply(int i)                   // switch to scene i: volumes gl
                 gCh[c].eqLo = Iclamp(f[13], -120, 120); gCh[c].eqMid = Iclamp(f[14], -120, 120); gCh[c].eqHi = Iclamp(f[15], -120, 120);
                 gCh[c].comp = Iclamp(f[16], 0, 100); for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = Iclamp(f[17 + k], -400, 60);
             }
+            if (nf >= 25) { gCh[c].gate = Iclamp(f[22], 0, 60); gCh[c].gateHold = Iclamp(f[23], 50, 2000); gCh[c].gateRange = Iclamp(f[24], 10, 80); }
+            else gCh[c].gate = 0;               // (a scene from before 1.54: no gate)
         }
         const wchar_t* nm = wcschr(p2 + 1, L'|');
         lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
@@ -10658,6 +10779,7 @@ static volatile int* CfxVar(int id)
     if (gCfxCh < 0 || gCfxCh >= CH_MAX) return nullptr;
     ChanSet& g = gCh[gCfxCh];
     if (id == CFX_LO) return &g.eqLo; if (id == CFX_MID) return &g.eqMid; if (id == CFX_HI) return &g.eqHi; if (id == CFX_COMP) return &g.comp;
+    if (id == CFX_GATE) return &g.gate; if (id == CFX_GHOLD) return &g.gateHold; if (id == CFX_GRANGE) return &g.gateRange;
     if (id >= CFX_SEND0 && id < CFX_SEND0 + MAX_OUT) return &g.send[id - CFX_SEND0];
     return nullptr;
 }
@@ -10667,6 +10789,9 @@ static void SliderRange(HWND h, int* lo, int* hi, int* step)
     *lo = -100; *hi = 100; *step = 5;
     if (gCfxWnd && GetParent(h) == gCfxWnd) {
         if (id == CFX_COMP) { *lo = 0; *hi = 100; *step = 5; }
+        else if (id == CFX_GATE) { *lo = 0; *hi = 60; *step = 1; }         // (0 = off; else opens above -70 + this dB)
+        else if (id == CFX_GHOLD) { *lo = 50; *hi = 2000; *step = 50; }    // (ms)
+        else if (id == CFX_GRANGE) { *lo = 10; *hi = 80; *step = 5; }      // (dB; 80 = silent)
         else if (id >= CFX_SEND0) { *lo = -400; *hi = 60; *step = 10; }   // (tenths of a dB)
         else { *lo = -120; *hi = 120; *step = 5; }
     }
@@ -10675,6 +10800,9 @@ static void CfxValText(int id, wchar_t* t)
 {
     volatile int* v = CfxVar(id); const int x = v ? *v : 0;
     if (id == CFX_COMP) { if (x) wsprintfW(t, L"%d%%", x); else lstrcpyW(t, L"Off"); return; }
+    if (id == CFX_GATE) { if (x) wsprintfW(t, L"\x2212%d dB", 70 - x); else lstrcpyW(t, L"Off"); return; }
+    if (id == CFX_GHOLD) { wsprintfW(t, L"%d ms", x); return; }
+    if (id == CFX_GRANGE) { if (x >= 80) lstrcpyW(t, L"Silent"); else wsprintfW(t, L"\x2212%d dB", x); return; }
     const int a = x < 0 ? -x : x;
     if (!x) lstrcpyW(t, L"0 dB"); else wsprintfW(t, L"%s%d.%d dB", x < 0 ? L"\x2212" : L"+", a / 10, a % 10);
 }
@@ -10691,7 +10819,7 @@ static void SliderSet(HWND h, int v)
         int lo, hi, st; SliderRange(h, &lo, &hi, &st);
         const int id = GetDlgCtrlID(h);
         v = Iclamp(v, lo, hi);
-        if (id != CFX_COMP && v > -st && v < st) v = 0;   // (snaps to 0 dB)
+        if ((id < CFX_COMP || id >= CFX_SEND0) && v > -st && v < st) v = 0;   // (EQ and levels snap to 0 dB)
         volatile int* p = CfxVar(id); if (!p) return;
         *p = v;
         InvalidateRect(h, nullptr, FALSE);
@@ -10727,7 +10855,7 @@ static LRESULT CALLBACK ChatMixProc(HWND h, UINT m, WPARAM w, LPARAM l)
             const int tx = x0 + (int)((float)(SliderGet(h) - lo) / Imax(1, hi - lo) * (x1 - x0));
             RECT tr = { x0, cy - Imax(1, SC(2)), x1, cy + Imax(1, SC(2)) };
             HBRUSH tb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(d, &tr, tb); DeleteObject(tb);
-            const int mid = x0 + (int)((float)(0 - lo) / Imax(1, hi - lo) * (x1 - x0));   // (where 0 is: the fill starts there)
+            const int mid = x0 + (int)((float)(Iclamp(0, lo, hi) - lo) / Imax(1, hi - lo) * (x1 - x0));   // (where 0 is: the fill starts there)
             RECT fr = tr; fr.left = Imin(mid, tx); fr.right = Imax(mid, tx);
             HBRUSH fb = CreateSolidBrush(ACCENT); FillRect(d, &fr, fb); DeleteObject(fb);
             RECT mk = { mid, cy - (kh - 1), mid + 1, cy + (kh - 1) };
@@ -10775,7 +10903,7 @@ static void ChanFxBadge(int c) { InvalidateRect(GetDlgItem(gWnd, IDC_CHSRC0 + c)
 static bool ChanFxUsed(int c)
 {
     const ChanSet& g = gCh[c];
-    if (g.eqLo || g.eqMid || g.eqHi || g.comp) return true;
+    if (g.eqLo || g.eqMid || g.eqHi || g.comp || g.gate) return true;
     for (int k = 0; k < MAX_OUT; k++) if (g.send[k]) return true;
     return false;
 }
@@ -10784,7 +10912,7 @@ static void OutName(int k, wchar_t* out, int cap);
 static void ChanFxRefresh()                     // (values changed elsewhere: undo, a scene, Streamer.bot)
 {
     if (!gCfxWnd) return;
-    static const int ids[] = { CFX_LO, CFX_MID, CFX_HI, CFX_COMP, CFX_SEND0, CFX_SEND0 + 1, CFX_SEND0 + 2, CFX_SEND0 + 3, CFX_SEND0 + 4 };
+    static const int ids[] = { CFX_LO, CFX_MID, CFX_HI, CFX_COMP, CFX_GATE, CFX_GHOLD, CFX_GRANGE, CFX_SEND0, CFX_SEND0 + 1, CFX_SEND0 + 2, CFX_SEND0 + 3, CFX_SEND0 + 4 };
     for (int id : ids) {
         HWND s2 = GetDlgItem(gCfxWnd, id); if (!s2) continue;
         wchar_t t[24], o[24]; CfxValText(id, t); GetDlgItemTextW(gCfxWnd, CFX_VAL + id, o, 24);
@@ -10800,6 +10928,9 @@ static void ChanFxRefresh()                     // (values changed elsewhere: un
     if (!gCh[gCfxCh].comp) lstrcpyW(g, L"");
     else { const int d10 = (int)lround(gChGr[gCfxCh] * 10); wsprintfW(g, d10 > 0 ? L"turning down %d.%d dB" : L"not turning down now", d10 / 10, d10 % 10); }
     wchar_t o[48]; GetDlgItemTextW(gCfxWnd, CFX_GR, o, 48); if (lstrcmpW(g, o)) SetDlgItemTextW(gCfxWnd, CFX_GR, g);
+    if (!gCh[gCfxCh].gate) lstrcpyW(g, L"");     // the gate: open or shut right now
+    else lstrcpyW(g, gChGate[gCfxCh] > 0.5f ? L"open (sound gets through)" : L"shut (quiet now)");
+    GetDlgItemTextW(gCfxWnd, CFX_GST, o, 48); if (lstrcmpW(g, o)) SetDlgItemTextW(gCfxWnd, CFX_GST, g);
 }
 // EQ presets: bass / middle / treble (tenths of a dB) and the compressor
 static const struct { const wchar_t* name; int lo, mid, hi, comp; } CFX_PRESETS[] = {
@@ -10835,6 +10966,7 @@ static LRESULT CALLBACK ChanFxProc(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         if (LOWORD(w) == CFX_FLAT) {
             gCh[gCfxCh].eqLo = gCh[gCfxCh].eqMid = gCh[gCfxCh].eqHi = 0; gCh[gCfxCh].comp = 0;
+            gCh[gCfxCh].gate = 0; gCh[gCfxCh].gateHold = CH_GATE_HOLD; gCh[gCfxCh].gateRange = CH_GATE_RANGE;
             for (int k = 0; k < MAX_OUT; k++) gCh[gCfxCh].send[k] = 0;
             ChanFxRefresh(); ChanFxBadge(gCfxCh);
         } else if (LOWORD(w) == IDCANCEL) DestroyWindow(h);
@@ -10853,14 +10985,14 @@ static void ChanFxOpen(int c)
     if (gCfxWnd) DestroyWindow(gCfxWnd);
     if (c < 0 || c >= CH_MAX || gCh[c].type == CH_NONE) return;
     gCfxCh = c;
-    const int rows = Imax(1, gRows), W = 380, H = 236 + rows * 30 + 44;
+    const int rows = Imax(1, gRows), W = 380, H = 236 + 128 + rows * 30 + 44;
     DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN;
     RECT r = { 0, 0, SC(W), SC(H) }; AdjustWindowRect(&r, style, FALSE);
     RECT sr; GetWindowRect(GetDlgItem(gWnd, IDC_CHSRC0 + c), &sr);
     HMONITOR mon = MonitorFromRect(&sr, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
     const int ww = r.right - r.left, wh = r.bottom - r.top;
     const int x = Iclamp(sr.left, mi.rcWork.left, mi.rcWork.right - ww), y = Iclamp(sr.bottom + SC(4), mi.rcWork.top, mi.rcWork.bottom - wh);
-    wchar_t nm[40], title[80]; ChanLabel(c, nm, 32); wsprintfW(title, L"%s - EQ, compressor, levels", nm);
+    wchar_t nm[40], title[80]; ChanLabel(c, nm, 32); wsprintfW(title, L"%s - EQ, compressor, gate, levels", nm);
     gCfxWnd = CreateWindowExW(WS_EX_TOOLWINDOW, L"LagChanFx", title, style, x, y, ww, wh, gWnd, nullptr, gInst, nullptr);
     if (!gCfxWnd) { gCfxCh = -1; return; }
     ThemeTitleBar(gCfxWnd);
@@ -10889,9 +11021,16 @@ static void ChanFxOpen(int c)
     row(L"Amount", 152, CFX_COMP, -1);
     mk(L"STATIC", L"Evens out loud and quiet parts (videos, games, voice chat).", SS_NOPREFIX, 22, 178, 274, 18, -1);
     mk(L"STATIC", L"", SS_NOPREFIX, 22, 196, 274, 18, CFX_GR);
-    hdr(L"Level on each output", 218);
-    for (int k = 0; k < rows; k++) row(L"", 242 + k * 30, CFX_SEND0 + k, CFX_HDR + 10 + k);
-    mk(L"STATIC", L"On top of its fader: e.g. quieter on your stream than in your headphones.", SS_NOPREFIX, 22, 242 + rows * 30, 350, 18, -1);
+    hdr(L"Gate", 218);                          // (1.54.0: runs first, before the EQ)
+    row(L"Opens above", 242, CFX_GATE, -1);
+    row(L"Stays open", 268, CFX_GHOLD, -1);
+    row(L"Shut: down by", 294, CFX_GRANGE, -1);
+    mk(L"STATIC", L"Mutes it between words: a noisy friend, a second mic.", SS_NOPREFIX, 22, 320, 274, 18, -1);
+    mk(L"STATIC", L"", SS_NOPREFIX, 22, 338, 274, 18, CFX_GST);
+    const int y0 = 128;                         // (everything below moved down for the gate)
+    hdr(L"Level on each output", 218 + y0);
+    for (int k = 0; k < rows; k++) row(L"", 242 + y0 + k * 30, CFX_SEND0 + k, CFX_HDR + 10 + k);
+    mk(L"STATIC", L"On top of its fader: e.g. quieter on your stream than in your headphones.", SS_NOPREFIX, 22, 242 + y0 + rows * 30, 350, 18, -1);
     mk(L"BUTTON", L"Reset all", WS_TABSTOP, 270, H - 36, 96, 26, CFX_FLAT);
     ChanFxRefresh();
     SetTimer(gCfxWnd, 1, 100, nullptr);
@@ -14174,6 +14313,7 @@ struct MixSnapCh {
     int type; wchar_t src[128], name[32];
     int db10, mute, solo, duck, routes, color, holdTalk, chatRole, link, pan, mono, ducker, width;
     int eqLo, eqMid, eqHi, comp, send[MAX_OUT];
+    int gate, gateHold, gateRange;
     int keys[MIXA_N][MAX_KEYS];
     int fadeKeys[MAX_KEYS];
 };
@@ -14196,6 +14336,7 @@ static void MixSnapTake(MixSnap& m)
         o.db10 = g.db10; o.mute = g.mute; o.solo = g.solo; o.duck = g.duck; o.routes = (int)g.routes; o.color = g.color;
         o.holdTalk = g.holdTalk; o.chatRole = g.chatRole; o.link = g.link; o.pan = g.pan; o.mono = g.mono; o.ducker = g.ducker; o.width = gChW[c];
         o.eqLo = g.eqLo; o.eqMid = g.eqMid; o.eqHi = g.eqHi; o.comp = g.comp; for (int k = 0; k < MAX_OUT; k++) o.send[k] = g.send[k];
+        o.gate = g.gate; o.gateHold = g.gateHold; o.gateRange = g.gateRange;
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) o.keys[a][i] = gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i];
         for (int i = 0; i < MAX_KEYS; i++) o.fadeKeys[i] = gFxKeys[SLOT_FADE0 + c][i];
     }
@@ -14227,6 +14368,7 @@ static void MixSnapApply(const MixSnap& m)
         g.db10 = o.db10; g.mute = o.mute != 0; g.solo = o.solo != 0; g.duck = o.duck != 0; g.routes = (unsigned)o.routes; g.color = o.color;
         g.holdTalk = o.holdTalk; g.chatRole = o.chatRole; g.link = o.link; g.pan = o.pan; g.mono = o.mono != 0; g.ducker = o.ducker != 0; gChW[c] = o.width;
         g.eqLo = o.eqLo; g.eqMid = o.eqMid; g.eqHi = o.eqHi; g.comp = o.comp; for (int k = 0; k < MAX_OUT; k++) g.send[k] = o.send[k];
+        g.gate = o.gate; g.gateHold = o.gateHold; g.gateRange = o.gateRange;
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = o.keys[a][i];
         for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_FADE0 + c][i] = o.fadeKeys[i];
         MixKeysShow(c); FaderLabel(IDC_CHVOL0 + c);
@@ -14258,6 +14400,7 @@ static void MixSnapWhat(const MixSnap& a, const MixSnap& b, wchar_t* t)   // wha
                              : x.ducker != y.ducker ? L"duck the others" : lstrcmpW(x.name, y.name) ? L"name" : x.color != y.color ? L"colour"
                              : x.chatRole != y.chatRole ? L"ChatMix" : x.width != y.width ? L"width"
                              : x.eqLo != y.eqLo || x.eqMid != y.eqMid || x.eqHi != y.eqHi ? L"EQ" : x.comp != y.comp ? L"compressor"
+                             : x.gate != y.gate || x.gateHold != y.gateHold || x.gateRange != y.gateRange ? L"gate"
                              : memcmp(x.send, y.send, sizeof(x.send)) ? L"output levels" : L"hotkeys";
             _snwprintf(t, 63, L"%s %s", who, f); t[63] = 0; return;
         }
@@ -18288,6 +18431,10 @@ static void WsExec(int id, const char* m)
         if (JsonNum(m, "middle", &v))     gCh[c].eqMid = Iclamp((int)lround(v * 10), -120, 120);
         if (JsonNum(m, "treble", &v))     gCh[c].eqHi  = Iclamp((int)lround(v * 10), -120, 120);
         if (JsonNum(m, "compressor", &v)) gCh[c].comp  = Iclamp((int)lround(v), 0, 100);
+        if (JsonNum(m, "gate", &v))       gCh[c].gate  = v >= 0 ? 0 : Iclamp((int)lround(v) + 70, 1, 60);   // dB it opens above; 0 = off
+        else if (JsonOnOff(m, "gate") == 0) gCh[c].gate = 0;
+        if (JsonNum(m, "gatehold", &v))   gCh[c].gateHold  = Iclamp((int)lround(v), 50, 2000);
+        if (JsonNum(m, "gaterange", &v))  gCh[c].gateRange = Iclamp((int)lround(fabs(v)), 10, 80);
         for (int o = 0; o < MAX_OUT; o++) {     // "out1db": its level on output 1 (on top of the fader)
             char key[12]; wsprintfA(key, "out%ddb", o + 1);
             if (JsonNum(m, key, &v)) gCh[c].send[o] = Iclamp((int)lround(v * 10), -400, 60);
@@ -18482,6 +18629,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    channel Spotify mute   \x2014   also: unmute, solo, unsolo, duck, noduck, mono, stereo\n"
         L"    channel Spotify fade out   \x2014   fade it out (in, toggle); add seconds:  fade out 5\n"
         L"    channel Spotify pan -50   \x2014   also: bass 3, middle -2, treble 4, compressor 40, out2db -10\n"
+        L"    channel Discord gate -45   \x2014   gate: opens above -45 dB (gate 0 = off); also gatehold 300 (ms), gaterange 80 (dB, 80 = silent)\n"
         L"    output 2 mute   \x2014   an output: mute, unmute, or its volume:  output 2 80\n"
         L"    scene Gaming   \x2014   switch to a scene\n"
         L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
@@ -18759,6 +18907,83 @@ static void DropTick()                          // every 50 ms
         if (now - gDryLastAt[k] > 600000 && gExtBoost[k] >= 128) { gExtBoost[k] = gExtBoost[k] - 128; gDryLastAt[k] = now; }
     }
 }
+// ---- silence alarm (1.54.0): the mic sends nothing, the audio or an output stopped running ----
+static bool gSilMic = false, gSilMain = false;  // (the chips show while these are set)
+static unsigned gSilOut = 0;                    // outputs (bits) that stopped taking sound / couldn't be opened
+static int  gSilMicMs = 0, gSilMainMs = 0, gSilOutMs[MAX_OUT];
+static wchar_t gSilIgnore[256]; static bool gSilIgnoreRead = false;   // a mic you said sends silence on purpose (INI silence_ignore_mic)
+static void SilenceTick()                       // every 50 ms
+{
+    static unsigned lastMain = 0, lastExt[MAX_OUT];
+    const bool wasMic = gSilMic, wasMain = gSilMain; const unsigned wasOut = gSilOut;
+    const float pk = gSilMicPk; gSilMicPk = 0;
+    if (!gRunning) {                            // (not running: nothing expected; the "Audio off" chip says so)
+        gSilMic = gSilMain = false; gSilOut = 0; gSilMicMs = gSilMainMs = 0;
+        for (int k = 0; k < MAX_OUT; k++) gSilOutMs[k] = 0;
+        lastMain = gMainBlocks; for (int k = 0; k < MAX_OUT; k++) lastExt[k] = gExtBlocks[k];
+        return;
+    }
+    const unsigned mb = gMainBlocks;            // the audio itself: no block for 2 s = the device stopped answering
+    gSilMainMs = mb == lastMain ? gSilMainMs + 50 : 0; lastMain = mb;
+    gSilMain = gSilMainMs >= 2000;
+    {   // the mic: not even the faint hiss every mic has, for 10 s (a microphone Windows mutes or blocks sends perfect silence)
+        if (!gSilIgnoreRead) { GetPrivateProfileStringW(L"settings", L"silence_ignore_mic", L"", gSilIgnore, 256, gIni); gSilIgnoreRead = true; }
+        const bool quiet = pk < 1e-7f && !gSilMain;
+        gSilMicMs = quiet ? gSilMicMs + 50 : 0;
+        gSilMic = gSilMicMs >= 10000 && !(gSilIgnore[0] && !lstrcmpiW(gSilIgnore, gMicName[0] ? gMicName : L"(default)"));
+    }
+    unsigned outs = 0;                          // each extra output: stopped taking sound (2 s), or not open (5 s)
+    for (int k = 1; k < gRows && k < MAX_OUT; k++) {
+        const unsigned eb = gExtBlocks[k];
+        const bool wanted = gRowMode[k] != MODE_OFF;
+        const bool stuck = wanted && (ringOn[k] ? eb == lastExt[k] : true);
+        lastExt[k] = eb;
+        gSilOutMs[k] = stuck && !gSilMain ? gSilOutMs[k] + 50 : 0;
+        if (gSilOutMs[k] >= (ringOn[k] ? 2000 : 5000)) outs |= 1u << k;
+    }
+    gSilOut = outs;
+    // a new one: say so once, even with the window hidden (the on-screen popup, if those are on)
+    if (gSilMain && !wasMain) ShowOsd(L"Audio stopped responding", false);
+    else if (gSilMic && !wasMic) ShowOsd(L"No sound from your mic", false);
+    else if ((gSilOut & ~wasOut) != 0) {
+        int k = 0; while (!((gSilOut & ~wasOut) & (1u << k))) k++;
+        wchar_t nm[40], t[64]; OutName(k, nm, 40); swprintf(t, 64, L"Output \"%ls\" stopped", nm); ShowOsd(t, false);
+    }
+}
+static void SilenceExplain(int what)            // 0 the mic, 1 the audio, 2.. an output (2 + k)
+{
+    wchar_t msg[1200];
+    if (what == 0) {
+        swprintf(msg, 1200, L"For %d seconds Windows has sent no sound at all from your mic (%ls): not even the faint hiss every mic has.\n\n"
+                            L"Usually it's one of these:\n"
+                            L"  - it's muted in Windows, or with a button on the mic or headset\n"
+                            L"  - Windows' privacy settings block microphone access for desktop apps\n"
+                            L"  - another program is using it in exclusive mode\n"
+                            L"  - it was unplugged and plugged back in (restarting the audio helps)\n\n"
+                            L"Some headsets send perfect silence while you're not talking. If yours does, choose No.\n\n"
+                            L"Yes: open Windows' microphone privacy settings.\nNo: don't warn about this mic again.\nCancel: close.",
+                 gSilMicMs / 1000, gMicName[0] ? gMicName : L"Windows' default");
+        const int r = MessageBoxW(gWnd, msg, L"Lag Effect - No sound from your mic", MB_YESNOCANCEL | MB_ICONWARNING);
+        if (r == IDYES) ShellExecuteW(nullptr, L"open", L"ms-settings:privacy-microphone", nullptr, nullptr, SW_SHOWNORMAL);
+        else if (r == IDNO) {
+            const wchar_t* nm = gMicName[0] ? gMicName : L"(default)";   // (Windows' default mic has no name here)
+            WritePrivateProfileStringW(L"settings", L"silence_ignore_mic", nm, gIni);
+            lstrcpynW(gSilIgnore, nm, 256); gSilMic = false;
+        }
+        return;
+    }
+    if (what == 1)
+        swprintf(msg, 1200, L"Lag Effect's audio hasn't run for %d seconds: your mic or output 1 stopped answering "
+                            L"(a driver problem, or the device was switched off).\n\nRestart the audio now?", gSilMainMs / 1000);
+    else {
+        const int k = what - 2; wchar_t nm[40]; OutName(k, nm, 40);
+        swprintf(msg, 1200, ringOn[k] ? L"Output \"%ls\" (%ls) stopped taking sound %d seconds ago: its device stopped answering.\n\nRestart the audio now?"
+                                      : L"Output \"%ls\" (%ls) couldn't be opened: the device may be unplugged, switched off or used by another program "
+                                        L"in exclusive mode. Lag Effect keeps trying.\n\nRestart the audio now?",
+                 nm, gRowName[k][0] ? gRowName[k] : L"Windows' default", gSilOutMs[k] / 1000);
+    }
+    if (MessageBoxW(gWnd, msg, L"Lag Effect - Audio stopped", MB_YESNO | MB_ICONWARNING) == IDYES) RestartIfRunning();
+}
 static void DropExplain()
 {
     wchar_t msg[2000] = L"", t[600];
@@ -18996,8 +19221,10 @@ static void BugInfoBuild(wchar_t* o, int cap)
     for (int c = 0; c < CH_MAX; c++) {
         if (gCh[c].type == CH_NONE) continue;
         static const wchar_t* types[] = { L"", L"app", L"input", L"output's sound" };
-        BugAdd(o, cap, L"Mixer channel %d: %ls %ls, %.1f dB%ls, routes 0x%x%ls", c + 1, types[Iclamp(gCh[c].type, 0, 3)], gCh[c].src,
-            gCh[c].db10 / 10.0, gCh[c].mute ? L", muted" : L"", gCh[c].routes, gChA[c].live ? L"" : L", not capturing");
+        wchar_t gt[64] = L"";
+        if (gCh[c].gate) swprintf(gt, 64, L", gate -%d dB (%d ms, %d dB)", 70 - (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange);
+        BugAdd(o, cap, L"Mixer channel %d: %ls %ls, %.1f dB%ls, routes 0x%x%ls%ls", c + 1, types[Iclamp(gCh[c].type, 0, 3)], gCh[c].src,
+            gCh[c].db10 / 10.0, gCh[c].mute ? L", muted" : L"", gCh[c].routes, gChA[c].live ? L"" : L", not capturing", gt);
     }
     if (gFeatVst || gSafe) {
         for (int k = 0; k < VST_SLOTS; k++) {
@@ -19008,6 +19235,8 @@ static void BugInfoBuild(wchar_t* o, int cap)
         }
     }
     BugAdd(o, cap, L"Recorder: %ls", gRcd ? L"recording" : L"idle");
+    BugAdd(o, cap, L"Silence alarm: %ls%ls%ls (outputs 0x%x)", gSilMain ? L"audio stopped " : L"", gSilMic ? L"mic silent " : L"",
+        !gSilMain && !gSilMic && !gSilOut ? L"nothing" : L"", gSilOut);
 }
 static void BugInfoCopy()
 {
@@ -19146,6 +19375,11 @@ static int ChipsBuild(Chip* c)
     }
     if (gSafe) add(L"Safe start", 1, -4, -1);   // (click: what it means)
     if (gRunning && gDropWarn) add(L"Audio dropouts", 1, -3, -1);   // (click: why, and the Latency setting)
+    if (gSilMain) add(L"Audio stopped", 1, -5, 1);   // silence alarm (click: what it means, restart)
+    else {
+        if (gSilMic) add(L"No sound from mic", 1, -5, 0);
+        for (int k = 1; k < MAX_OUT; k++) if (gSilOut & (1u << k)) { wchar_t nm[40], t[64]; OutName(k, nm, 40); swprintf(t, 64, L"%ls stopped", nm); add(t, 1, -5, 2 + k); }
+    }
     if (!gRunning) add(L"Audio off", 1, PAGE_MAIN, -1);
     if (gMicMuted) add(L"Mic muted", 1, PAGE_MAIN, -1);
     if (gPttMode == 1) add(L"Push-to-talk", 0, PAGE_MIC, 0); else if (gPttMode == 2) add(L"Push-to-mute", 0, PAGE_MIC, 0);
@@ -19226,7 +19460,7 @@ static void DrawOnStrip(DRAWITEMSTRUCT* d)
 }
 static void ChipGo(const Chip& c)
 {
-    if (c.page == -2) RcdShow(); else if (c.page == -3) DropExplain(); else if (c.page == -4) SafeExplain();
+    if (c.page == -2) RcdShow(); else if (c.page == -3) DropExplain(); else if (c.page == -4) SafeExplain(); else if (c.page == -5) SilenceExplain(c.sub);
     else GoTo(c.page, c.sub, nullptr);
 }
 static void ChipsClick()
@@ -22121,7 +22355,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            DropTick();
+            DropTick(); SilenceTick();
             UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick(); RcdTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
