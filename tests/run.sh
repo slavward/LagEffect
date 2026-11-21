@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lag Effect's tests, on Linux (GitHub runs them on every push: .github/workflows/tests.yml).
-#   tests/run.sh [base.cpp]     (tests: gate, synth, beats, speech, outputs, names, recorder; "same sound": mic, a Mixer channel, the vocoder)
+#   tests/run.sh [base.cpp]     (tests: gate, synth, beats, speech, [whisper], outputs, names, recorder; "same sound": mic, a Mixer channel, the vocoder)
 # Cuts the audio code out of LagEffect.cpp and runs it with stubs for Windows / miniaudio. With a base file (main's
 # LagEffect.cpp), also checks that default settings sound bit-for-bit the same as there.
 # Skip that one check for a commit meant to change the sound: put [audio-change] in its message (AUDIO_CHANGE=1 here).
@@ -31,6 +31,7 @@ cut_audio LagEffect.cpp > "$B/audio.inc"
 cut_from_to LagEffect.cpp '^static float    gExtFill' > "$B/ext.inc"
 awk '/^static void ShortDevName\(const wchar_t\* full, wchar_t\* out, int cap\)$/{p=1} /^static void DevTipUpdate/{p=0} p' LagEffect.cpp > "$B/names.inc"
 awk '/^\/\/ =+ Recorder \(1\.52\.0\): the core/{p=1} p{print} p && /^    for \(int i = 0; i < s->n; i\+\+\) free\(s->t\[i\]\.ring\);/{getline; print; exit}' LagEffect.cpp > "$B/rcd.inc"
+awk '/^\/\/ =+ Whisper speech engine \(1\.58\.0\): the core/{p=1} p{print} /^\/\/ =+ Whisper speech engine: end of the core/{exit}' LagEffect.cpp > "$B/ws.inc"
 
 fail=0
 run() { echo; echo "== $1"; shift; if ! "$@"; then fail=1; fi; }
@@ -48,6 +49,15 @@ run "Mixer channel gate" "$B/gate"
 run "vocoder: Synth plugin style (a fake synth)" "$B/synth"
 run "Soundboard: looper and beatbox to drums" "$B/beats"
 run "Mic > Speech: the clock, the recognizer's feed, bleeps, muting your voice" "$B/speech"
+# Whisper (Mic > Speech, 1.58.0) with a real model: only where whisper.cpp is built and a model is there (tests.yml does both)
+if [ -n "${WHISPER_DIR:-}" ] && [ -n "${WHISPER_MODELS:-}" ]; then
+  W="$WHISPER_DIR"
+  "$CXX" "${CF[@]}" -I "$W/include" -I "$W/ggml/include" -DAUDIO="\"$B/audio.inc\"" -DWS="\"$B/ws.inc\"" -o "$B/whisper" "$T/whisper.cpp" \
+    "$W/build/src/libwhisper.a" "$W/build/ggml/src/libggml.a" "$W/build/ggml/src/libggml-cpu.a" "$W/build/ggml/src/libggml-base.a" "$B/rn.a" -lm -ldl
+  for m in $WHISPER_MODELS; do run "Mic > Speech: Whisper on a real recording (JFK), $(basename "$m")" "$B/whisper" "$m" "$W/samples/jfk.wav"; done
+else
+  echo; echo "== (Whisper on a real recording: skipped, no WHISPER_DIR / WHISPER_MODELS)"
+fi
 run "extra outputs don't run dry" "$B/outputs"
 run "short device names" "$B/names"
 mkdir -p "$B/rec"; run "recorder" "$B/recorder" "$B/rec"

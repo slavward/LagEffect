@@ -1,6 +1,6 @@
 # Runs Lag Effect's tests (tests/run.sh) on Linux on every push and pull request: the Mixer gate, the vocoder's Synth plugin
 # style (with a fake synth), the Soundboard's looper and beatbox drums, Mic > Speech's
-# recognizer feed / bleeps / muting, extra outputs not
+# recognizer feed / bleeps / muting, Whisper on a real recording (with whisper.cpp and its models), extra outputs not
 # running dry, short device names, the Recorder, and "default settings sound bit-for-bit the same as main".
 # A commit meant to change the sound says so with [audio-change] in its message (that one check then only reports).
 name: Tests
@@ -25,8 +25,29 @@ jobs:
           git fetch --depth 1 origin main
           git show FETCH_HEAD:LagEffect.cpp > "$RUNNER_TEMP/main.cpp"
 
+      # Speech (Mic > Speech, 1.58.0): whisper.cpp, built the way the exe has it, and its models, checked against the
+      # SHA-1s in LagEffect.cpp (the app refuses a model that doesn't match, so a wrong one there would break downloads).
+      - name: Get whisper.cpp v1.9.5 and build it
+        run: |
+          git clone -q --depth 1 --branch v1.9.5 https://github.com/ggml-org/whisper.cpp "$RUNNER_TEMP/whisper.cpp"
+          cmake -S "$RUNNER_TEMP/whisper.cpp" -B "$RUNNER_TEMP/whisper.cpp/build" -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF -DWHISPER_BUILD_SERVER=OFF \
+            -DGGML_NATIVE=OFF -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_OPENMP=OFF > /dev/null
+          cmake --build "$RUNNER_TEMP/whisper.cpp/build" -j 4 --target whisper > /dev/null
+
+      - name: Download the speech models and check them
+        run: |
+          for f in ggml-tiny.en-q5_1.bin ggml-base.en-q5_1.bin ggml-small.en-q5_1.bin; do
+            curl -sSfL -o "$RUNNER_TEMP/$f" "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/$f"
+            want=$(grep -o "\"$f\", *\"[0-9a-f]*\"" LagEffect.cpp | grep -o "[0-9a-f]\{40\}")
+            got=$(sha1sum "$RUNNER_TEMP/$f" | cut -d' ' -f1)
+            echo "$f: LagEffect.cpp has $want, the file is $got"; [ "$want" = "$got" ]
+          done
+
       - name: Run the tests
         env:
+          WHISPER_DIR: ${{ runner.temp }}/whisper.cpp
+          WHISPER_MODELS: ${{ runner.temp }}/ggml-tiny.en-q5_1.bin ${{ runner.temp }}/ggml-base.en-q5_1.bin
           MSG: ${{ github.event.head_commit.message || github.event.pull_request.title }}
         run: |
           case "$MSG" in *"[audio-change]"*) export AUDIO_CHANGE=1 ;; esac
