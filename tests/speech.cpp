@@ -179,6 +179,19 @@ int main()
     rec.clear(); run(20, tone300);
     check("off: no delay again", goertzel(rec, 0, 4800, 300) > 0.17);
 
+    printf("Live bleep key (1.59.1)\n");
+    gBlLive = true; rec.clear(); run(10, tone300);
+    check("held: a bleep at once (no delay), no voice", goertzel(rec, 480, 3840, 1000) > 0.18 && goertzel(rec, 480, 3840, 300) < 0.01);
+    gBlLive = false; rec.clear(); run(10, tone300);
+    check("let go: your voice at once", goertzel(rec, 480, 3840, 300) > 0.17 && goertzel(rec, 480, 3840, 1000) < 0.01);
+    gBlSound = BLS_BACK; gBlLive = true; rec.clear(); run(10, tone300);
+    check("Backwards can't be live: a beep instead", goertzel(rec, 480, 3840, 1000) > 0.18);
+    gBlLive = false; gBlSound = 0; run(10, tone300);
+    gRowMode[0] = MODE_APPS; gBlLive = true; rec.clear(); run(10, tone300);
+    double ea = 0; for (float v : rec) ea += v * v;
+    check("not on an output without your voice (Apps only)", sqrt(ea / rec.size()) < 0.001);
+    gBlLive = false; gRowMode[0] = MODE_ALL; run(10, tone300);
+
     printf("Talk through a TTS voice\n");
     const unsigned w0 = gSpW.load();
     gSpMuteVoice = true; run(20, tone300); rec.clear(); run(50, tone300);
