@@ -141,6 +141,73 @@ int main()
     rec.clear(); run(50, silence);
     check("cleared: silent", gLpState.load() == LP_EMPTY && rms(rec, 0, rec.size()) == 0.0);
 
+    {   // 1.61.0: the looper records a Mixer channel (an app like Discord), before its fader: muted, it's still recorded
+        printf("Looper from a Mixer channel (1.61.0)\n");
+        gMicMuted = true;
+        gCh[0].type = CH_APP; gCh[0].db10 = 0; gCh[0].routes = 1; gCh[0].mute = true; gChA[0].live = true;
+        static long chn = 0; static float pkt[480 * 2];
+        auto runCh = [&](int blocks) {
+            for (int b = 0; b < blocks; b++) {
+                while (chn < pos + BLK * 4) { for (int i = 0; i < 480; i++) { const float v = 0.2f * (float)sin(2 * M_PI * 523 * (chn + i) / R); pkt[2 * i] = v; pkt[2 * i + 1] = v; } ChanPush(0, pkt, 480, 2); chn += 480; }
+                run(1, silence);
+            }
+        };
+        chn = pos;                              // (the app's audio starts now)
+        gCh[0].mute = false; runCh(50); rec.clear(); runCh(50);
+        const double heard = goertzel(rec, 2400, 19200, 523);
+        gCh[0].mute = true; runCh(20); rec.clear(); runCh(50);
+        printf("  the app on output 1: %.3f unmuted, %.3f muted\n", heard, goertzel(rec, 2400, 19200, 523));
+        check("the channel plays, and muted it doesn't", heard > 0.15 && goertzel(rec, 2400, 19200, 523) < 0.01);
+        gLpSrcCh.store(0);
+        press(LPC_REC); runCh(100); press(LPC_REC); runCh(1);
+        gCh[0].type = CH_NONE; gChA[0].live = false;   // (the app goes quiet: what plays now is the loop)
+        rec.clear(); run(100, silence);
+        const double c = goertzel(rec, 2400, 24000, 523);
+        printf("  the loop plays the app's 523 Hz at %.3f (state %d, len %d, layers %d)\n", c, gLpState.load(), gLpLen.load(), gLpLayers.load());
+        check("the loop has the app in it", c > 0.1);
+        gLpSrcCh.store(-1); press(LPC_CLEAR); run(5, silence);
+        gMicMuted = false; gCh[0].mute = false;
+    }
+    {   // 1.61.0: pads through the voice effects go through the mic plugins too (a fake plugin halving here)
+        printf("Pads through the voice effects, and the mic plugins (1.61.0)\n");
+        static short pad[R]; for (int i = 0; i < R; i++) pad[i] = (short)(0.4 * 32767 * sin(2 * M_PI * 880 * i / R));
+        gPads[0].data = pad; gPads[0].len = R; gPads[0].vol = 100; gPads[0].speed = 0;
+        gFeatVst = true; gVstLive.v = 1; gStubMicPlug = true; gStubPlugGain = 0.5f;
+        auto padLevel = [&]() { gPads[0].trigger = true; rec.clear(); run(40, silence); gPads[0].stop = true; run(10, silence); return goertzel(rec, 2400, 9600, 880); };
+        gPadsFx = false; const double direct = padLevel();
+        gPadsFx = true; const double through = padLevel();
+        printf("  pad 880 Hz: straight to the outputs %.3f, through the voice effects (and the plugin) %.3f\n", direct, through);
+        check("a pad not through the effects skips the mic plugin", direct > 0.37);
+        check("a pad through the effects goes through the mic plugin too", through > 0.17 && through < 0.23);
+        gPadsFx = false; gFeatVst = false; gVstLive.v = 0; gStubMicPlug = false; gStubPlugGain = 1.0f; gPads[0].data = nullptr; gPads[0].len = 0;
+        run(10, silence);
+    }
+    {   // 1.61.0: music on the outputs you pick
+        printf("Music (1.61.0)\n");
+        for (unsigned i = 0; i < MUS_RING; i++) { const float v = 0.25f * (float)sin(2 * M_PI * 660 * i / R); gMusRing[i * 2] = v; gMusRing[i * 2 + 1] = v; }
+        gMusR = 0; gMusW = MUS_RING - 1; gMusVolPc = 100; gMusOuts = 1;
+        gMicMuted = true; gMusPlay = true; rec.clear(); run(50, silence);
+        const double on = goertzel(rec, 2400, 19200, 660);
+        gMusOuts = 2; rec.clear(); run(50, silence);
+        const double other = goertzel(rec, 2400, 19200, 660);
+        gMusOuts = 1; gMusVolPc = 50; rec.clear(); run(50, silence);
+        const double half = goertzel(rec, 2400, 19200, 660);
+        printf("  660 Hz on output 1: %.3f; only on output 2: %.3f; at 50%%: %.3f\n", on, other, half);
+        check("plays on the output picked", on > 0.23 && on < 0.27);
+        check("not on an output that isn't picked", other < 0.001);
+        check("its volume", half > 0.11 && half < 0.14);
+        const unsigned at = gMusR.load();
+        gMusPlay = false; rec.clear(); run(50, silence);
+        check("pause: silent, and it keeps its place", goertzel(rec, 2400, 19200, 660) < 0.001 && gMusR.load() - at < 3000);
+        gMusPlay = true; run(10, silence);
+        {   // a new song / a seek: fades out, jumps, fades in (no click)
+            gMusJump.store(gMusR.load() + 30000); gMusJumpGen.fetch_add(1);
+            rec.clear(); run(20, silence);
+            double worst = 0; for (size_t i = 1; i < rec.size(); i++) worst = std::max(worst, (double)fabs(rec[i] - rec[i - 1]));
+            check("a jump fades out and in (no click)", worst < 2 * M_PI * 660 / R * 0.125 * 1.3 && gMusR.load() > at + 30000);
+        }
+        gMusPlay = false; run(10, silence); gMusR = 0; gMusW = 0; gMicMuted = false;
+    }
     printf("Beatbox to drums\n");
     gBbOn.store(true); gBbMode.store(0); gBbKit.store(0); gBbSens.store(5); gBbVolPct.store(100);
     run(20, silence);

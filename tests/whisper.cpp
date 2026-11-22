@@ -118,12 +118,21 @@ int main(int argc, char** argv)
             feed(x.data(), x.size()); feed(sil.data(), sil.size());
             std::this_thread::sleep_for(std::chrono::milliseconds(300));
             std::lock_guard<std::mutex> g(mu);
-            std::string words; for (const Got& g2 : got) if (g2.r.kind == 1) for (int i = 0; i < g2.r.n; i++) { char t[80]; snprintf(t, 80, " %s(%.2f)", g2.r.w[i].text, g2.r.w[i].p); words += t; }
-            printf("  %s: final words:%s\n", curClip.c_str(), words.empty() ? " none" : words.c_str());
-            clips++; if (!words.empty()) madeUp++;
+            std::string words; bool bad = false;
+            for (const Got& g2 : got) for (int i = 0; i < g2.r.n; i++) {   // (quick guesses too: the captions show them)
+                char t[80]; snprintf(t, 80, " %s%s(%.2f)", g2.r.kind == 1 ? "" : "~", g2.r.w[i].text, g2.r.w[i].p); words += t;
+                static const char* ok[] = { "ha", "haha", "hahaha", "hahahaha", "heh", "hehe", "hehehe", "he", "oh", "ah", "uh", "um", "ugh",
+                                            "yeah", "mm", "hmm", "huh", "ow", "aw", "wow", "whoa", "ooh", "eh" };
+                const std::string w = norm(g2.r.w[i].text); std::string k; for (char c : w) if (c != ' ') k += c;
+                bool fine = k.empty(); for (const char* o : ok) if (k == o) fine = true;
+                if (!fine) bad = true;
+            }
+            printf("  %s: words (~ = quick guess):%s\n", curClip.c_str(), words.empty() ? " none" : words.c_str());
+            clips++; if (bad) madeUp++;
         }
         WsStop(E);
-        printf("  made-up words in %d of %d clips\n", madeUp, clips);
+        printf("  words that weren't said (other than a laugh, \"oh\", \"yeah\"...) in %d of %d clips\n", madeUp, clips);
+        check("laughing / coughing / breathing: made-up words in at most 2 of 13 clips", madeUp <= 2);
     }
     printf(fails ? "%d FAILED\n" : "all ok\n", fails);
     return fails ? 1 : 0;

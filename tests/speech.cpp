@@ -191,6 +191,21 @@ int main()
     double ea = 0; for (float v : rec) ea += v * v;
     check("not on an output without your voice (Apps only)", sqrt(ea / rec.size()) < 0.001);
     gBlLive = false; gRowMode[0] = MODE_ALL; run(10, tone300);
+    printf("Any effect outputs and the bleep (1.61.0)\n");
+    gRowMode[0] = MODE_ANYFX; run(20, tone300);
+    rec.clear(); run(10, tone300);
+    check("Any effect, no effect on: silent", goertzel(rec, 480, 3840, 300) < 0.005 && goertzel(rec, 480, 3840, 1000) < 0.005);
+    gBlLive = true; rec.clear(); run(10, tone300);
+    check("the live bleep key: the bleep plays there (not your voice)", goertzel(rec, 480, 3840, 1000) > 0.18 && goertzel(rec, 480, 3840, 300) < 0.01);
+    gBlLive = false; run(10, tone300);
+    gBlOn = true; gBlOuts = 0; gBlDelayF = R / 2; run(10, tone300);
+    {   // a word bleep: Any effect plays it when the bleeped outputs would (half a second after)
+        const long long c2 = gAudT.load() + 4800; BlAdd(c2, c2 + 4800);
+        rec.clear(); const long long rc = gAudT.load(); run(100, tone300);
+        const size_t a = (size_t)(c2 + R / 2 - rc);
+        check("a word bleep plays there, as late as the delay", goertzel(rec, a + 480, 3840, 1000) > 0.18 && goertzel(rec, a - 9600, 4800, 1000) < 0.005);
+    }
+    gBlOn = false; gRowMode[0] = MODE_ALL; run(20, tone300);
 
     printf("Talk through a TTS voice\n");
     const unsigned w0 = gSpW.load();
