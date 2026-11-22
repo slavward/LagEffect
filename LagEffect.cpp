@@ -4925,7 +4925,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const int lpCh = gLpSrcCh.load(std::memory_order_relaxed);
     static MusState mus;                         // Music (1.61.0): only while playing or fading
     const bool musPlay = gFeatSound && gMusPlay.load(std::memory_order_relaxed);
-    const bool musRun = musPlay || mus.g > 0.0f || mus.jumping;
+    const bool musRun = musPlay || mus.g > 0.0f || mus.jumping || gMusJumpGen.load(std::memory_order_relaxed) != mus.gen;   // (a jump while paused: done at once)
     const float musVol = Iclamp(gMusVolPc.load(std::memory_order_relaxed), 0, 200) * 0.01f;
     const unsigned musOuts = gMusOuts.load(std::memory_order_relaxed);
     static float lpChS = 0.0f;                   // (that channel's last sample: the looper hears it one sample late, which can't matter)
@@ -22683,6 +22683,8 @@ static volatile bool gMusQuit = false;
 struct MusSeg { unsigned start; int idx; long long len, off; };   // from ring frame `start`: song idx, from frame off of len
 static MusSeg gMusSeg[8]; static int gMusSegN = 0;   // (under gMusCs)
 static volatile bool gMusDecoding = false;      // the decoder has a song open (more is coming)
+static volatile bool gMusPending = false;       // a command it hasn't picked up yet
+static volatile bool gMusStopped = true;        // stopped (not just paused): what's left in the ring doesn't count
 static wchar_t gMusErr[MAX_PATH + 40] = L"";
 static void MusLock() { if (!gMusCsInit) { InitializeCriticalSection(&gMusCs); gMusCsInit = true; } EnterCriticalSection(&gMusCs); }
 static void MusUnlock() { LeaveCriticalSection(&gMusCs); }
@@ -22733,6 +22735,7 @@ static DWORD WINAPI MusThread(LPVOID)
                 if (open) { idx = i; MusLock(); MusSegPush(w, i, len, c.seekF); MusUnlock(); }
             }
             gMusDecoding = open;
+            MusLock(); if (!gMusCmd.kind) gMusPending = false; MusUnlock();   // (picked up; unless another came meanwhile)
             PostMessageW(gWnd, WM_APP + 31, 0, 0);
             continue;
         }
@@ -22759,7 +22762,8 @@ static void MusCommand(int kind, int idx, long long seekF)
 {
     if (!gMusEv) gMusEv = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (!gMusTh) gMusTh = CreateThread(nullptr, 0, MusThread, nullptr, 0, nullptr);
-    MusLock(); gMusCmd = { kind, idx, seekF }; MusUnlock();
+    MusLock(); gMusCmd = { kind, idx, seekF }; gMusPending = true; MusUnlock();
+    gMusStopped = kind == 2;
     SetEvent(gMusEv);
 }
 static bool MusNow(int* idx, long long* pos, long long* len)   // what the audio is playing, and where
@@ -22773,7 +22777,7 @@ static bool MusNow(int* idx, long long* pos, long long* len)   // what the audio
     MusUnlock();
     return ok;
 }
-static bool MusActive() { return gMusDecoding || gMusW.load() != gMusR.load(); }   // a song is loaded (playing or paused)
+static bool MusActive() { return !gMusStopped && (gMusPending || gMusDecoding || gMusW.load() != gMusR.load()); }   // a song is loaded (playing or paused)
 static void MusUi();
 static void MusPlayIdx(int i, long long seekF = 0)
 {
