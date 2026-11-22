@@ -21793,7 +21793,12 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
             if (mn < 0.15f || avgP * (1.0f - noSp) < 0.52f) continue;   // (real speech in the tests: the least sure word 0.39+, 0.78+ here)
         }
         if (sn && (sw[0].text[0] == '[' || sw[0].text[0] == '(')) continue;   // "[BLANK_AUDIO]", "(music)"
-        if (sn == 1) { const size_t L = strlen(key[0]); if ((L >= 8 && key[0][L - 2] == 'l' && key[0][L - 1] == 'y') || L <= 1) continue; }   // (also a lone "I" / "a")
+        if (sn == 1) {                          // one word on its own: a lone "-ly" word, letter, or "I'm" / "You..." / "and" says nothing
+            const size_t L = strlen(key[0]); if ((L >= 8 && key[0][L - 2] == 'l' && key[0][L - 1] == 'y') || L <= 1) continue;
+            static const char* const bare[] = { "im", "you", "and", "the", "so", "but", "to", "of", "it", "is", "are", "am", "be" };
+            bool b = false; for (const char* w : bare) if (!strcmp(key[0], w)) b = true;
+            if (b) continue;
+        }
         bool odd = false;                       // "P-P-P-P-P..." (one letter over and over), or a "word" far too long
         for (int i = 0; i < sn && !odd; i++) {
             const size_t L = strlen(key[i]); bool one = L >= 4;
