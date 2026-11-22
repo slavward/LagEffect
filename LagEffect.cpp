@@ -21787,7 +21787,11 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
             key[i][k] = 0; letters += k;
         }
         if (!gWsNoFilter) {
-        if (noSp > 0.5f || avgP < (final ? 0.5f : 0.55f) || !letters) continue;   // (quick guesses: a little stricter; the final text follows)
+        if (noSp > 0.5f || avgP < (final ? 0.5f : 0.6f) || !letters) continue;   // (quick guesses: a little stricter; the final text follows)
+        if (final) {                            // made-up sentences over a laugh or a cough: one word Whisper all but guessed,
+            float mn = 1; for (int i = 0; i < sn; i++) if (sw[i].p < mn) mn = sw[i].p;   // or "sure" of the words but not that it's speech
+            if (mn < 0.15f || avgP * (1.0f - noSp) < 0.52f) continue;   // (real speech in the tests: the least sure word 0.39+, 0.78+ here)
+        }
         if (sn && (sw[0].text[0] == '[' || sw[0].text[0] == '(')) continue;   // "[BLANK_AUDIO]", "(music)"
         if (sn == 1) { const size_t L = strlen(key[0]); if ((L >= 8 && key[0][L - 2] == 'l' && key[0][L - 1] == 'y') || L <= 1) continue; }   // (also a lone "I" / "a")
         bool odd = false;                       // "P-P-P-P-P..." (one letter over and over), or a "word" far too long

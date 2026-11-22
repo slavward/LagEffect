@@ -127,9 +127,11 @@ int main(int argc, char** argv)
             for (const Got& g2 : got) for (int i = 0; i < g2.r.n; i++) {   // (quick guesses too: the captions show them)
                 char t[80]; snprintf(t, 80, " %s%s(%.2f)", g2.r.kind == 1 ? "" : "~", g2.r.w[i].text, g2.r.w[i].p); words += t;
                 static const char* ok[] = { "ha", "haha", "hahaha", "hahahaha", "heh", "hehe", "hehehe", "he", "oh", "ah", "uh", "um", "ugh",
-                                            "yeah", "mm", "hmm", "huh", "ow", "aw", "wow", "whoa", "ooh", "eh" };
+                                            "yeah", "mm", "hmm", "huh", "ow", "aw", "wow", "whoa", "ooh", "eh", "ahem" };
                 const std::string w = norm(g2.r.w[i].text); std::string k; for (char c : w) if (c != ' ') k += c;
                 bool fine = k.empty(); for (const char* o : ok) if (k == o) fine = true;
+                bool laugh = k.size() >= 2 && k[0] == 'h'; for (char c : k) if (c != 'h' && c != 'a' && c != 'e') laugh = false;
+                if (laugh) fine = true;         // "hahahaha", "heheheh": a laugh written down, not a made-up word
                 if (!fine) bad = true;
             }
             printf("  %s: words (~ = quick guess):%s\n", curClip.c_str(), words.empty() ? " none" : words.c_str());
@@ -140,7 +142,7 @@ int main(int argc, char** argv)
         }
         WsStop(E); gWsNoFilter = false;
         printf("  made-up words: %d of the clips without the filter, %d with it\n", madeUpBy[0], madeUpBy[1]);
-        check("laughing / coughing / breathing: the filter takes out most made-up words", madeUpBy[1] * 2 <= madeUpBy[0] + 1 && madeUpBy[1] <= 5);
+        check("laughing / coughing / breathing: the filter takes out most made-up words", madeUpBy[1] * 2 <= madeUpBy[0] + 1 && madeUpBy[1] <= 3);
     }
     printf(fails ? "%d FAILED\n" : "all ok\n", fails);
     return fails ? 1 : 0;
