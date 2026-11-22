@@ -1595,7 +1595,12 @@ static volatile bool  gMeterGateOpen = true;
 #define NS_FRAME 480
 #define NS_DELAY (NS_FRAME * 2)
 #define DRY_RING 1024
+// RNNoise 0.2 (1.60.0, the "New" model; same licence): built from its release with every name prefixed rn2_
+// (rnnoise2/names.h, force-included; rnnoise2/get.sh), so it links next to 0.1.1.
+extern "C" { DenoiseState* rn2_rnnoise_create(RNNModel* model); float rn2_rnnoise_process_frame(DenoiseState* st, float* out, const float* in); }
 static DenoiseState* gNs = nullptr;
+static std::atomic<int> gNsModel{ 0 };           // 0 Classic (RNNoise 0.1.1), 1 New (RNNoise 0.2; 1.60.0)
+static std::atomic<DenoiseState*> gNs2{ nullptr };   // (made by the window the first time New is picked)
 static float nsIn[NS_FRAME], nsOut[NS_FRAME], dryRing[DRY_RING];
 static int   nsIdx = 0, dryW = 0;
 static float nsVad = 0;
@@ -1642,8 +1647,9 @@ static inline float NoiseStage(float x, float* dry)
     if (++nsIdx == NS_FRAME) {
         nsIdx = 0;
         float frame[NS_FRAME];
-        nsVad = gNs ? rnnoise_process_frame(gNs, frame, nsIn) : 1.0f;
-        for (int i = 0; i < NS_FRAME; i++) nsOut[i] = gNs ? frame[i] * (1.0f / 32768.0f) : nsIn[i] * (1.0f / 32768.0f);
+        DenoiseState* n2 = gNsModel.load(std::memory_order_relaxed) ? gNs2.load(std::memory_order_acquire) : nullptr;
+        nsVad = n2 ? rn2_rnnoise_process_frame(n2, frame, nsIn) : gNs ? rnnoise_process_frame(gNs, frame, nsIn) : 1.0f;
+        for (int i = 0; i < NS_FRAME; i++) nsOut[i] = (n2 || gNs) ? frame[i] * (1.0f / 32768.0f) : nsIn[i] * (1.0f / 32768.0f);
     }
     return den;
 }
@@ -5363,6 +5369,7 @@ enum {
     IDC_SPMODEL,                                // (1.58.0: Whisper's model)
     IDC_BLHEAR, IDC_BLSNDLBL,                   // (1.59.0: bleep sounds)
     IDC_BLLIVEKEY,                              // (1.59.1: Mic > Cleanup, live bleep key)
+    IDC_NSMODEL,                                // (1.60.0: Classic / New noise model)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -6612,6 +6619,7 @@ static void LoadSettings()
     }
     // Mic tab. Settings from 1.5 and older: gate=1/0 and gate_db=50 (meaning -50 dB).
     gNsOn         = INI_INT(L"ns_on", 0) != 0;
+    gNsModel      = Iclamp(INI_INT(L"ns_model", 0), 0, 1);
     gVocStyle     = Iclamp(INI_INT(L"voc_style", VOC_HARMONY), 0, VOC_STYLES - 1);
     gSynNotes     = Iclamp(INI_INT(L"voc_synth_notes", 0), 0, 3);
     gSynOct       = Iclamp(INI_INT(L"voc_synth_octave", 0), -2, 2);
@@ -7567,7 +7575,7 @@ static void SaveSettings()
     SaveInt(L"hotkey", gHotkeys[0]); SaveInt(L"hotkey2", gHotkeys[1]); SaveInt(L"hotkey3", gHotkeys[2]);
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
-    SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn);
+    SaveInt(L"gate_mode", gGateMode); SaveInt(L"gate_last_mode", gGateLastMode); SaveInt(L"ns_on", gNsOn); SaveInt(L"ns_model", gNsModel.load());
     SaveInt(L"whine_on", gWhineOn);
     SaveInt(L"recorder_what", gRcdWhat); SaveInt(L"recorder_format", gRcdFmt);
     WritePrivateProfileStringW(L"settings", L"recorder_folder", gRcdDir, gIni);
@@ -14955,6 +14963,9 @@ static void AddTips()
                         L"Voice: how sure the AI is that you're talking (shown when noise suppression or the Voice gate is on); "
                         L"the blue line is the Voice setting.");
     TipId(IDC_NSON,     L"Turn AI noise suppression (RNNoise) on or off. It removes fans, keyboards, hum and room noise. Adds about 20 ms of delay.");
+    TipId(IDC_NSMODEL,  L"Which noise model. Classic: RNNoise 0.1.1, what Lag Effect always used. New: RNNoise 0.2, trained on much more noise: "
+                        L"a lot better with keyboard clicks and hiss, about the same with fans and chatter, and it changes a clean voice a little more. "
+                        L"Same delay. Try both with Mic test.");
     TipId(IDC_RADIOPRESET, L"Which device you sound like. The knobs adjust the chosen preset; knobs it doesn't use are dimmed.");
     TipId(IDC_VOCSTYLE, L"Tune: auto-tune only. Tune + harmony: your tuned voice plus synth harmonies (the Voloco sound). "
                         L"Robot: a synth that talks with your voice. Choir: a full synth chord that sings with you. "
@@ -20482,8 +20493,8 @@ static void BugInfoBuild(wchar_t* o, int cap)
         BugAdd(o, cap, L"  Voice FX %ls: %ls", gFxOn ? L"on" : L"off", fx[0] ? fx : L"none ticked");
     }
     static const wchar_t* gates[] = { L"off", L"volume", L"voice", L"volume + voice" };
-    BugAdd(o, cap, L"Mic: boost %d dB, low cut %d Hz, noise suppression %ls, gate %ls%ls%ls, leveler %d%%, auto volume %ls, loudness %d dB, whine cut %ls",
-        (int)gMicBoostDb, (int)gLowCutHz, gNsOn ? L"on" : L"off", gates[Iclamp(gGateMode, 0, 3)], gGateLook ? L" + look ahead" : L"",
+    BugAdd(o, cap, L"Mic: boost %d dB, low cut %d Hz, noise suppression %ls%ls, gate %ls%ls%ls, leveler %d%%, auto volume %ls, loudness %d dB, whine cut %ls",
+        (int)gMicBoostDb, (int)gLowCutHz, gNsOn ? L"on" : L"off", gNsModel.load() ? L" (New, 0.2)" : L" (Classic)", gates[Iclamp(gGateMode, 0, 3)], gGateLook ? L" + look ahead" : L"",
         gGateThump ? L" + ignore thumps" : L"", (int)gLevelerPct, gAgcMaxDb > 0 ? L"on" : L"off", (int)gLoudDb, gWhineOn ? L"on" : L"off");
     for (int c = 0; c < CH_MAX; c++) {
         if (gCh[c].type == CH_NONE) continue;
@@ -22904,6 +22915,11 @@ static void CreateUI()
         CheckDlgButton(gWnd, IDC_NSON, gNsOn ? BST_CHECKED : BST_UNCHECKED);
         Ctl(L"BUTTON", L"Remove whine...", WS_TABSTOP, 428, y + 46, 108, 26, IDC_WHINE);   // (a steady electrical tone: its own narrow cuts)
         WhineButton();
+        {
+            HWND nm = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 428, y + 80, 108, 200, IDC_NSMODEL);
+            SendMessageW(nm, CB_ADDSTRING, 0, (LPARAM)L"Classic"); SendMessageW(nm, CB_ADDSTRING, 0, (LPARAM)L"New (0.2)");
+            SendMessageW(nm, CB_SETCURSEL, gNsModel.load(), 0);
+        }
 
         y += MIC_STEP;                          // noise gate
         AddSection(14, y, 532, MIC_H, L"Noise gate");
@@ -24727,6 +24743,13 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) SetGateMode((int)SendDlgItemMessageW(gWnd, IDC_GATEMODE, CB_GETCURSEL, 0, 0));
         break;
     case IDC_NSON:     gNsOn = Checked(IDC_NSON); RedrawKnobs(); break;
+    case IDC_NSMODEL:
+        if (code == CBN_SELCHANGE) {
+            const int m = Iclamp((int)SendDlgItemMessageW(gWnd, IDC_NSMODEL, CB_GETCURSEL, 0, 0), 0, 1);
+            if (m && !gNs2.load()) gNs2.store(rn2_rnnoise_create(nullptr));   // (made once; the audio thread picks it up)
+            gNsModel = m; SaveSettings();
+        }
+        break;
     case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6: case IDC_FXSUB7:
         if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
         break;
@@ -25496,6 +25519,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     }
     LoadThemeApis();
     gNs = rnnoise_create(nullptr);              // built-in model; created once, used by the audio thread
+    if (gNsModel.load()) gNs2.store(rn2_rnnoise_create(nullptr));   // (New: RNNoise 0.2)
     gCtxOk = ma_context_init(nullptr, 0, nullptr, &gCtx) == MA_SUCCESS;
     if (gCtxOk) ma_context_get_devices(&gCtx, &gPlayDevs, &gPlayCount, &gCapDevs, &gCapCount);
 

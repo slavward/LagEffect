@@ -14,6 +14,15 @@ CF=(-O2 -std=c++17 -w -march=x86-64 -mtune=generic -ffp-contract=off -I rnnoise/
 
 # RNNoise (the noise suppression), from the copy in the repo
 for f in denoise rnn rnn_data pitch kiss_fft celt_lpc; do gcc -O2 -w -c -I rnnoise/include "rnnoise/src/$f.c" -o "$B/$f.o"; done
+# RNNoise 0.2 (the "New" model, 1.60.0): its release (rnnoise2/get.sh), every name prefixed rn2_, CPU picked at run time
+[ -d rnnoise2/rnnoise-0.2 ] || bash rnnoise2/get.sh
+R2=rnnoise2/rnnoise-0.2/src
+D2=(-O2 -w -DRNN_ENABLE_X86_RTCD -DCPU_INFO_BY_C -include rnnoise2/names.h -I rnnoise2/rnnoise-0.2/include -I "$R2")
+for f in denoise rnn rnnoise_data rnnoise_tables pitch kiss_fft celt_lpc nnet nnet_default parse_lpcnet_weights x86/x86cpu x86/x86_dnn_map; do
+  gcc "${D2[@]}" -c "$R2/$f.c" -o "$B/rn2_$(basename "$f").o"
+done
+gcc "${D2[@]}" -msse4.1 -c "$R2/x86/nnet_sse4_1.c" -o "$B/rn2_nnet_sse4_1.o"
+gcc "${D2[@]}" -mavx -mfma -mavx2 -c "$R2/x86/nnet_avx2.c" -o "$B/rn2_nnet_avx2.o"
 ar rcs "$B/rn.a" "$B"/*.o
 
 # the pieces of LagEffect.cpp the tests use
@@ -40,6 +49,7 @@ run() { echo; echo "== $1"; shift; if ! "$@"; then fail=1; fi; }
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/synth" "$T/synth.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/beats" "$T/beats.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/speech" "$T/speech.cpp" "$B/rn.a"
+"$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/noise" "$T/noise.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -DEXT="\"$B/ext.inc\"" -o "$B/outputs" "$T/outputs.cpp" "$B/rn.a"
 "$CXX" -O2 -std=c++17 -w -DNAMES="\"$B/names.inc\"" -o "$B/names" "$T/names.cpp"
 "$CXX" -O2 -std=c++17 -w -pthread -DRCD="\"$B/rcd.inc\"" -o "$B/recorder" "$T/recorder.cpp"
@@ -49,6 +59,7 @@ run "Mixer channel gate" "$B/gate"
 run "vocoder: Synth plugin style (a fake synth)" "$B/synth"
 run "Soundboard: looper and beatbox to drums" "$B/beats"
 run "Mic > Speech: the clock, the recognizer's feed, bleeps, muting your voice" "$B/speech"
+run "Mic > Noise suppression: Classic and New models" "$B/noise"
 # Whisper (Mic > Speech, 1.58.0) with a real model: only where whisper.cpp is built and a model is there (tests.yml does both)
 if [ -n "${WHISPER_DIR:-}" ] && [ -n "${WHISPER_MODELS:-}" ]; then
   W="$WHISPER_DIR"
