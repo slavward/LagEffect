@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.58.0"
+#define APP_VERSION L"1.59.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4279,7 +4279,15 @@ static float gBlBuf[MAX_OUT][BL_RING];
 static std::atomic<bool> gBlOn{ false };
 static std::atomic<unsigned> gBlOuts{ 0 };       // outputs (bits)
 static std::atomic<int> gBlDelayF{ 2 * RATE };
-static std::atomic<int> gBlSound{ 0 };           // 0 a bleep, 1 silence
+enum { BLS_BEEP, BLS_SILENCE, BLS_STATIC, BLS_MUFFLE, BLS_BACK, BLS_FILE, BLS_N };   // (1.59.0: static .. your files)
+static std::atomic<int> gBlSound{ BLS_BEEP };
+static std::atomic<int> gBlHz{ 1000 };            // the beep's pitch
+static std::atomic<int> gBlVolPc{ 100 };          // the bleep sound's volume, %
+static std::atomic<bool> gBlFinish{ true };       // your sound files play to their end (else they stop with the word)
+#define BL_CLIPS 8
+struct BlClip { float* d; int n; };              // a sound file, 48 kHz mono (the window decodes it)
+static std::atomic<BlClip*> gBlClip[BL_CLIPS];
+static std::atomic<int> gBlClipSel{ 0 };          // which file, -1 = a random one each bleep
 struct BlRange { std::atomic<long long> a{ 0 }, b{ 0 }; };   // [a, b) on the clock; b = LLONG_MAX while the key is held
 static BlRange gBlR[BL_RANGES];
 static std::atomic<unsigned> gBlRN{ 0 };          // ranges added (the newest is gBlR[(gBlRN - 1) % BL_RANGES])
@@ -4290,7 +4298,77 @@ static unsigned BlAdd(long long a, long long b)   // (the window) returns its sl
     gBlRN.store(n + 1);
     return i;
 }
-struct BlOutState { float g = 0, ph = 0; };
+struct BlOutState {
+    float g = 0, ph = 0;                         // fade in / out of the bleep; the beep's phase
+    bool wasIn = false, backFull = false;        // a bleep began; Backwards: the whole word mirrored (else 250 ms pieces)
+    long long ra = 0, rb = 0;                    // the stretch it's in (Backwards, and the fade after it)
+    unsigned seed = 22222;                       // static, random file
+    float n1 = 0, m1 = 0, m2 = 0, m3 = 0;        // static's filter; muffled's three low-passes
+    int ci = -1, pos = 0;                        // the sound file playing, where
+};
+struct BlParams { int sound, delay; float hz, vol; bool finish; int sel; };
+// One sample of a bleeped output: d is your voice from behind (time td), rb the output's ring (written up to t).
+static float BlOut(BlOutState& st, const float* rb, long long t, long long td, float d,
+                   const long long* A, const long long* B, int n, const BlParams& p)
+{
+    int hit = -1;
+    for (int i = 0; i < n; i++) if (td >= A[i] && td < B[i] && (hit < 0 || A[i] < A[hit])) hit = i;
+    const bool in = hit >= 0, start = in && !st.wasIn;
+    st.wasIn = in;
+    if (in) { st.ra = A[hit]; st.rb = B[hit]; }
+    if (start) {
+        if (p.sound == BLS_BACK) st.backFull = st.rb != LLONG_MAX && st.rb - st.ra <= p.delay && st.rb - st.ra < (long long)BL_RING - p.delay - 8192;
+        if (p.sound == BLS_FILE) {
+            st.pos = 0; st.ci = -1;
+            if (p.sel >= 0) { if (gBlClip[p.sel].load(std::memory_order_acquire)) st.ci = p.sel; }
+            else {                               // a random one of yours
+                int have[BL_CLIPS], k = 0;
+                for (int i = 0; i < BL_CLIPS; i++) if (gBlClip[i].load(std::memory_order_acquire)) have[k++] = i;
+                if (k) { st.seed = st.seed * 1664525u + 1013904223u; st.ci = have[(st.seed >> 16) % (unsigned)k]; }
+            }
+        }
+    }
+    st.g += ((in ? 1.0f : 0.0f) - st.g) * 0.007f;   // (~3 ms in and out)
+    if (p.sound == BLS_MUFFLE && st.g < 0.0001f) { st.m1 = st.m2 = st.m3 = d; }   // (warm: no thump when it starts)
+    if (st.g < 0.0001f && st.ci < 0) { st.g = 0.0f; return d; }
+    float y = 0.0f, tail = 0.0f;
+    switch (p.sound) {
+    case BLS_BEEP:
+        st.ph += 6.2831853f * p.hz / RATE; if (st.ph > 6.2831853f) st.ph -= 6.2831853f;
+        y = 0.22f * p.vol * BbSin(st.ph); break;
+    case BLS_STATIC: {                           // TV static: white noise, the top softened a little
+        st.seed = st.seed * 1664525u + 1013904223u;
+        const float w = (float)(int)st.seed * (1.0f / 2147483648.0f);
+        st.n1 += (w - st.n1) * 0.6f; y = 0.16f * p.vol * st.n1; break; }
+    case BLS_MUFFLE: {                           // your word through a pillow (three ~350 Hz low-passes)
+        const float c = 0.045f;
+        st.m1 += (d - st.m1) * c; st.m2 += (st.m1 - st.m2) * c; st.m3 += (st.m2 - st.m3) * c;
+        y = 1.6f * p.vol * st.m3; break; }
+    case BLS_BACK: {                             // your word played backwards
+        long long m;
+        if (st.backFull) m = st.ra + st.rb - 1 - td;   // (the whole stretch, mirrored: it has all come in by now)
+        else {                                   // (end not known yet, or longer than the delay: 250 ms pieces)
+            const long long L = p.delay < 12000 ? p.delay : 12000;
+            if (L < 960) break;                  // (no delay: nothing to play backwards; silence)
+            const long long c0 = st.ra + ((td - st.ra) / L) * L;
+            m = 2 * c0 + L - 1 - td;
+        }
+        if (m > t) m = t;
+        y = p.vol * rb[(unsigned long long)m & (BL_RING - 1)]; break; }
+    case BLS_FILE:
+        if (st.ci >= 0) {
+            const BlClip* c = gBlClip[st.ci].load(std::memory_order_acquire);
+            if (!c) { st.ci = -1; break; }
+            const float v = p.vol * c->d[st.pos];
+            if (++st.pos >= c->n) { if (in) st.pos = 0; else st.ci = -1; }   // (loops while the word lasts)
+            if (in || !p.finish) y = v; else tail = v;   // (after the word: it finishes over your voice, or fades with it)
+            if (!in && !p.finish && st.g < 0.0002f) st.ci = -1;
+        }
+        break;
+    default: break;                              // silence
+    }
+    return d * (1.0f - st.g) + y * st.g + tail;
+}
 // Talk through a TTS voice: your real voice is muted on every output while it's on (the TTS voice plays as a sound).
 static std::atomic<bool> gSpMuteVoice{ false };
 
@@ -4812,7 +4890,14 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool blOn = gFeatSpeech && gBlOn.load(std::memory_order_relaxed);
     const unsigned blOuts = blOn ? gBlOuts.load(std::memory_order_relaxed) : 0u;
     const int blD = Iclamp(gBlDelayF.load(std::memory_order_relaxed), 0, (int)BL_RING - 8192);
-    const bool blTone = gBlSound.load(std::memory_order_relaxed) == 0;
+    BlParams blP{};
+    if (blOuts) {
+        blP.sound = Iclamp(gBlSound.load(std::memory_order_relaxed), 0, BLS_N - 1); blP.delay = blD;
+        blP.hz = (float)Iclamp(gBlHz.load(std::memory_order_relaxed), 100, 5000);
+        blP.vol = Iclamp(gBlVolPc.load(std::memory_order_relaxed), 0, 300) * 0.01f;
+        blP.finish = gBlFinish.load(std::memory_order_relaxed);
+        blP.sel = Iclamp(gBlClipSel.load(std::memory_order_relaxed), -1, BL_CLIPS - 1);
+    }
     long long blA[8], blB[8]; int blN = 0;      // the stretches to bleep that come out during this block
     if (blOuts) {
         const long long t0 = T0 - blD, t1 = t0 + frames;
@@ -5032,14 +5117,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             const long long t = T0 + (long long)f;
             rb[(unsigned)t & (BL_RING - 1)] = v;
             const float d = rb[(unsigned)(t - blD) & (BL_RING - 1)];
-            const long long td = t - blD;
-            bool in = false; for (int i = 0; i < blN; i++) if (td >= blA[i] && td < blB[i]) { in = true; break; }
-            BlOutState& st = blSt[k];
-            st.g += ((in ? 1.0f : 0.0f) - st.g) * 0.007f;   // (~3 ms in and out)
-            if (st.g < 0.0001f) { st.g = 0.0f; return d; }
-            float y = 0.0f;
-            if (blTone) { st.ph += 6.2831853f * 1000.0f / RATE; if (st.ph > 6.2831853f) st.ph -= 6.2831853f; y = 0.22f * BbSin(st.ph); }
-            return d * (1.0f - st.g) + y * st.g;
+            return BlOut(blSt[k], rb, t, t - blD, d, blA, blB, blN, blP);
         };
         float m0 = soloMask && soloOut == 0 ? 0.0f : vsig(0) + sounds(0);
         if (outVst[0]) { gVstOutL[0][f] = m0 + cL[0]; gVstOutR[0][f] = m0 + cR[0]; }   // (plugins on it: finished after the loop)
@@ -5264,6 +5342,7 @@ enum {
     IDC_FEATSPEECH = 4610, IDC_SPCMDON, IDC_SPPREFIX, IDC_SPSAY, IDC_SPACT, IDC_SPADD, IDC_SPLIST, IDC_SPDEL, IDC_SPSTAT,
     IDC_BLON, IDC_BLOUTS, IDC_BLDELAY, IDC_BLSOUND, IDC_BLWORDS, IDC_BLCOMMON, IDC_BLKEY, IDC_BLBACK, IDC_SPTTS, IDC_SPTTSKEY,
     IDC_SPMODEL,                                // (1.58.0: Whisper's model)
+    IDC_BLHEAR, IDC_BLSNDLBL,                   // (1.59.0: bleep sounds)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5542,6 +5621,10 @@ static bool gSpCmdOn = false;
 static wchar_t gSpPrefix[32] = L"";
 static wchar_t gBlWords[600] = L"";
 static int gBlDelayMs = 3000, gBlBackMs = 600;
+static int gBlCover = 1;                        // around each word Whisper finds: 0 tight, 1 normal, 2 wide (1.59.0)
+static const int BL_COVER_PRE[3] = { 60, 150, 300 }, BL_COVER_POST[3] = { 40, 120, 250 };   // ms (Whisper's word times are rough)
+static wchar_t gBlFile[8][MAX_PATH];            // your bleep sound files (gBlClip holds them decoded)
+static void BlSoundText(); static void BlFilesLoad(); static void BlRetireTick();
 static const int BL_DELAYS[5] = { 0, 1000, 1500, 2000, 3000 };
 // ---- the engine (Whisper since 1.58.0) ----
 static int gWsModel = 1;                        // 0 Fast (tiny.en), 1 Good (base.en), 2 Best (small.en)
@@ -5580,6 +5663,16 @@ static bool FxAnyOn()                           // is any voice effect switched 
     return false;
 }
 static_assert(FX_GROUPS <= 20, "room for 20 effects in the IDC_FXGRP_* ranges");
+// An effect's hotkey (or voice command) while Voice effects is off (1.59.0): just that effect goes on. The other
+// ticked effects are unticked for the time being (gSoloPrev keeps them); turning it off again puts them back and
+// switches Voice effects off. Changing a tick yourself in between ends it (your ticks stay as you set them).
+static bool gSoloOn = false, gSoloPrev[FX_GROUPS];
+static unsigned gSoloMask = 0;                  // the effects its keys turned on
+static bool SoloIntact()                        // still exactly what the keys left?
+{
+    for (int g = 0; g < FX_GROUPS; g++) if (*gFxGroups[g].on != ((gSoloMask >> g & 1u) != 0)) return false;
+    return true;
+}
 
 // Optional hotkeys that switch Voice FX on/off: slot 0 = the whole page, slot 1+g = effect group g.
 // Each is a combination of up to MAX_KEYS keys (0 = unused). Polled by the window (TIMER_FXKEYS).
@@ -7606,7 +7699,8 @@ static void SaveSettings()
     SaveInt(L"buffer", gBufIdx); SaveInt(L"exclusive", gExclusive); SaveInt(L"hide_from_share", gHideShare);
     SaveInt(L"hotkey_popup", gShowOsd); SaveInt(L"always_on_top", gTopMost); SaveInt(L"autostart", gAutoStart);
     SaveInt(L"theme", gThemeMode); SaveInt(L"color_theme", gColorTheme); SaveInt(L"color_theme_custom", (int)gCustomAccent); SaveInt(L"update_on_start", gUpdateOnStart);
-    SaveInt(L"fx_on", gSafe && !gFxOn ? gSafeFx : gFxOn);
+    const bool solo = gSoloOn && SoloIntact();   // (an effect key's "just this one": save the ticks it put aside, switch off)
+    SaveInt(L"fx_on", gSafe && !gFxOn ? gSafeFx : solo ? false : gFxOn);
     WritePrivateProfileStringW(L"settings", L"settings_version", APP_VERSION, gIni);   // (a newer version backs these up before it changes them)
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         wchar_t b[64];
@@ -7614,7 +7708,7 @@ static void SaveSettings()
         wsprintfW(b, L"%d,%d,%d", gFxKeys[slot][0], gFxKeys[slot][1], gFxKeys[slot][2]);
         IniSet(FxKeyIniName(slot), b);
     }
-    for (FxGroup& g : gFxGroups) SaveInt(g.key, *g.on);
+    for (int g = 0; g < FX_GROUPS; g++) SaveInt(gFxGroups[g].key, solo ? gSoloPrev[g] : *gFxGroups[g].on);
     for (Knob& k : gKnobs) SaveInt(k.key, *k.var);
     IniSet(L"update_repo", gUpdateRepo);
     wchar_t name[512], key[32];
@@ -10276,14 +10370,52 @@ static void ProfileDeleteClicked()
 
 // ---- hold-to-activate effect hotkeys ----
 // Holding the key turns the effect (and the Voice effects switch) on; letting go puts both back as they were.
-static bool gHoldActive[1 + FX_GROUPS], gHoldPrevOn[1 + FX_GROUPS];
+static bool gHoldActive[1 + FX_GROUPS], gHoldPrevOn[1 + FX_GROUPS], gHoldSolo[1 + FX_GROUPS];
 static bool gHoldMasterPrev = false;
 static int  gHoldCount = 0;
+
+static void SoloRestore()                       // put back the ticks an effect key put aside
+{
+    gSoloOn = false; gSoloMask = 0;
+    for (int g = 0; g < FX_GROUPS; g++) SetFxGroupOn(g, gSoloPrev[g]);
+}
+static void SoloCheck()                         // (PollFxKeys, every tick)
+{
+    if (!gSoloOn) return;
+    if (!SoloIntact()) { gSoloOn = false; return; }   // you changed a tick: things stay as you set them
+    if (!gFxOn) SoloRestore();                  // Voice effects switched off some other way: the ticks come back
+}
+static void FxKeyGroup(int g, bool on)          // an effect's hotkey or voice command turns effect g on / off
+{
+    SoloCheck();
+    const unsigned bit = 1u << g;
+    if (on && !gFxOn && gFeatFx) {              // Voice effects is off: this effect alone
+        if (!gSoloOn) { for (int i = 0; i < FX_GROUPS; i++) gSoloPrev[i] = *gFxGroups[i].on; gSoloOn = true; gSoloMask = 0; }
+        for (int i = 0; i < FX_GROUPS; i++) if (i != g && *gFxGroups[i].on) SetFxGroupOn(i, false);
+        gSoloMask = bit; SetFxGroupOn(g, true); SetFxOn(true);
+        return;
+    }
+    if (gSoloOn) {                              // another key while one is on alone: both, until both are off
+        if (on) gSoloMask |= bit; else gSoloMask &= ~bit;
+        SetFxGroupOn(g, on);
+        if (!gSoloMask) { SetFxOn(false); SoloRestore(); }
+        return;
+    }
+    SetFxGroupOn(g, on);
+}
 
 static void HoldPress(int slot)                 // slot 0 = the Voice effects switch, 1+g = effect g
 {
     if (gHoldActive[slot]) return;
     gHoldActive[slot] = true;
+    SoloCheck();
+    if (slot > 0 && (!gFxOn || gSoloOn)) {      // Voice effects off: just this effect while held (1.59.0)
+        gHoldSolo[slot] = true;
+        gHoldPrevOn[slot] = gSoloOn && (gSoloMask >> (slot - 1) & 1u);   // (already on by a key: stays on after)
+        FxKeyGroup(slot - 1, true);
+        UpdateStatus(true);
+        return;
+    }
     if (gHoldCount++ == 0) gHoldMasterPrev = gFxOn;
     if (slot > 0) { gHoldPrevOn[slot] = *gFxGroups[slot - 1].on; SetFxGroupOn(slot - 1, true); }
     if (!gFxOn) SetFxOn(true);
@@ -10294,6 +10426,12 @@ static void HoldRelease(int slot)
 {
     if (!gHoldActive[slot]) return;
     gHoldActive[slot] = false;
+    if (gHoldSolo[slot]) {
+        gHoldSolo[slot] = false;
+        if (!gHoldPrevOn[slot]) FxKeyGroup(slot - 1, false);
+        UpdateStatus(true);
+        return;
+    }
     if (slot > 0) SetFxGroupOn(slot - 1, gHoldPrevOn[slot]);
     if (--gHoldCount <= 0) { gHoldCount = 0; if (!gHoldMasterPrev) SetFxOn(false); }
     UpdateStatus(true);
@@ -14595,7 +14733,9 @@ static void AddTips()
     TipId(IDC_BLON, L"Your voice on the chosen outputs runs a little behind, so words from your list (and the bleep key) can be bleeped before anyone hears them.");
     TipId(IDC_BLOUTS, L"Which outputs are bleeped (the stream's, usually). Your voice runs behind on these only; the others (Discord) stay live.");
     TipId(IDC_BLDELAY, L"How far behind. Longer catches words more surely (Whisper needs one to two seconds). 0: no delay, the key only bleeps from when you press it.");
-    TipId(IDC_BLSOUND, L"A bleep tone, or just silence.");
+    TipId(IDC_BLSOUND, L"What a bleeped word sounds like: a beep (pick its pitch), silence, static, your word muffled or backwards, "
+                       L"or your own sound files (one, or a random one each time). Also its volume and how much around each word is covered.");
+    TipId(IDC_BLHEAR, L"Hear the bleep on your speakers. With Bleep on, say something first: you'll hear your last moment with a word bleeped.");
     TipId(IDC_BLWORDS, L"Words it bleeps by itself, commas between. word* = anything starting with it (shit* catches shitty).");
     TipId(IDC_BLCOMMON, L"Add the usual English swear words to the list.");
     TipId(IDC_BLKEY, L"Hold to bleep: from a little before you pressed it (Reach back) until you let go. Right-click clears it.");
@@ -14873,7 +15013,7 @@ static void AddTips()
     for (int g = 0; g < FX_GROUPS; g++) {
         static wchar_t on[FX_GROUPS][96], key[FX_GROUPS][128], rst[FX_GROUPS][96];
         wsprintfW(on[g],  L"Turn %s on or off.", gFxGroups[g].title);
-        wsprintfW(key[g], L"Set a hotkey that turns %s on/off from anywhere (also turns Voice effects on). Right-click to clear it.", gFxGroups[g].title);
+        wsprintfW(key[g], L"Set a hotkey that turns %s on/off from anywhere. If Voice effects is off, only this effect goes on, and turning it off puts things back. Right-click to clear it.", gFxGroups[g].title);
         wsprintfW(rst[g], L"Put all %s knobs back to their defaults.", gFxGroups[g].title);
         TipId(IDC_FXGRP_ON + g, on[g]);
         TipId(IDC_FXGRP_KEY + g, key[g]);
@@ -15064,7 +15204,7 @@ static void SetFxGroupOn(int g, bool on)
 }
 
 // Voice FX hotkeys: the page key flips the master switch; an effect's key flips that effect
-// (and turns the master switch on with it, so the key always does something you can hear).
+// (if the master switch is off, only that effect goes on, with the switch: FxKeyGroup, 1.59.0).
 // ---- Mute mic ----
 static void UpdateTrayTip();
 static void SetMute(bool on)
@@ -15440,6 +15580,7 @@ static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a h
 static bool gSpTts = false;
 static void PollFxKeys()
 {
+    SoloCheck();
     BYTE cache[256] = {};
     for (int slot = 0; slot < KEY_SLOTS; slot++) {
         const bool off = ((slot < FX_KEY_SLOTS || slot == SLOT_TAPESTOP || slot == SLOT_DIVE) && !gFeatFx) ||
@@ -15499,9 +15640,9 @@ static void PollFxKeys()
         } else {
             int g = slot - 1;
             on = !(*gFxGroups[g].on && gFxOn);
-            SetFxGroupOn(g, on);
-            if (on && !gFxOn) SetFxOn(true);
-            wsprintfW(msg, L"%s %s", gFxGroups[g].title, on ? L"ON" : L"OFF");
+            const bool alone = on && !gFxOn;
+            FxKeyGroup(g, on);                  // (Voice effects off: just this one; 1.59.0)
+            wsprintfW(msg, alone ? L"%s ON (just this effect)" : L"%s %s", gFxGroups[g].title, on ? L"ON" : L"OFF");
         }
         ShowOsd(msg, slot == SLOT_MUTE ? !on : on);
         UpdateStatus(true);
@@ -18608,7 +18749,8 @@ static void ShowHelp()
         L"switch on by itself while a game runs. The tray menu switches profiles, characters and soundboard pages.\n\n"
         L"PROFILES (Settings tab)\n"
         L"Save how you sound as a named profile (Gaming, Streaming, Trolling...) and switch by picking it or with its hotkey. "
-        L"Effect hotkeys can be Hold: the effect is on only while you hold the key.\n\n"
+        L"Effect hotkeys can be Hold: the effect is on only while you hold the key. With Voice effects off, an effect's hotkey "
+        L"(or voice command) turns on just that effect; turning it off puts your other effects back as they were.\n\n"
         L"PLUGINS (Mic tab > Plugins; switch it on in Settings > Features)\n"
         L"Up to 4 VST3 or CLAP effect plugins on your mic, after Cleanup and Tone and before the voice effects. Click a slot to pick a plugin, "
         L"Open shows the plugin's own window, On switches it in and out without a click, and each slot can have a hotkey that does "
@@ -18637,7 +18779,8 @@ static void ShowHelp()
         L"SPEECH (Mic tab, Settings > Features > Speech)\n"
         L"Whisper (speech recognition that runs on this PC; its model is downloaded once) listens to your mic. Voice commands: say a phrase, it does what a hotkey would. "
         L"Bleep: your voice on the outputs you pick runs a little behind, so words from your list are bleeped before they're heard; "
-        L"hold the bleep key to bleep anything (it reaches back a little). TTS voice: what you say is spoken by a text-to-speech voice "
+        L"hold the bleep key to bleep anything (it reaches back a little). Sound: a beep (pitch, volume), silence, static, muffled, "
+        L"the word backwards, or your own sound files (one, or a random one each time); Hear it plays a sample. TTS voice: what you say is spoken by a text-to-speech voice "
         L"and your own is muted.\n\n"
         L"BEATBOX TO DRUMS (Soundboard tab)\n"
         L"Tick Drums on and beatbox: kick (\"b\"), snare (\"pf\", \"k\") and hi-hat (\"ts\") sounds play a drum kit, about 8 ms after you. "
@@ -20338,9 +20481,12 @@ static void BugInfoBuild(wchar_t* o, int cap)
         BugAdd(o, cap, L"Looper: %ls, %d layer(s), %d ms; beatbox %ls (mode %d, kit %d, sensitivity %d, volume %d, taught %u)",
                LS[Iclamp(gLpState.load(), 0, 4)], gLpLayers.load(), (int)(gLpLen.load() * 1000LL / RATE), gBbOn.load() ? L"on" : L"off",
                gBbMode.load(), gBbKit.load(), gBbSens.load(), gBbVolPct.load(), gBbTaught);
-        BugAdd(o, cap, L"Speech: %ls; recognizer %ls%ls%ls; commands %ls (%d); bleep %ls (outputs %u, %d ms, %d words chars, key reach %d ms); TTS voice %ls",
+        int nf = 0; for (int i = 0; i < BL_CLIPS; i++) if (gBlClip[i].load()) nf++;
+        BugAdd(o, cap, L"Speech: %ls; recognizer %ls%ls%ls; commands %ls (%d); bleep %ls (outputs %u, %d ms, %d words chars, key reach %d ms, "
+               L"sound %d, %d Hz, %d%%, cover %d, %d files, pick %d, %ls); TTS voice %ls",
                gFeatSpeech ? L"on" : L"off", SpeechRunning() ? L"running" : L"not running", gSpEngine[0] ? L", " : L"", gSpEngine,
-               gSpCmdOn ? L"on" : L"off", gVcN, gBlOn.load() ? L"on" : L"off", gBlOuts.load(), gBlDelayMs, lstrlenW(gBlWords), gBlBackMs, gSpTts ? L"on" : L"off");
+               gSpCmdOn ? L"on" : L"off", gVcN, gBlOn.load() ? L"on" : L"off", gBlOuts.load(), gBlDelayMs, lstrlenW(gBlWords), gBlBackMs,
+               gBlSound.load(), gBlHz.load(), gBlVolPc.load(), gBlCover, nf, gBlClipSel.load(), gBlFinish.load() ? L"finish" : L"cut", gSpTts ? L"on" : L"off");
         SpeechBugInfo(o, cap);
         if (gSpErr[0]) BugAdd(o, cap, L"Speech problem: %ls", gSpErr);
     }
@@ -21590,6 +21736,7 @@ static void SpeechTick()                        // every 50 ms (PadTick): keep i
         if (!SpeechStart()) gSpRetryAt = GetTickCount() + 30000;
         SpeechStatus();
     }
+    BlRetireTick();
     static DWORD lastShown = 0;                 // the page's status line (and the lists, which name channels and outputs)
     if (gPage == PAGE_MIC && gMicSub == 4 && !gCompact && GetTickCount() - lastShown > 500) { lastShown = GetTickCount(); SpeechStatus(); BlOutsText(); }
 }
@@ -21665,7 +21812,7 @@ static void SpeechResult(const WsResult* r)     // WM_APP + 21: what Whisper hea
         for (int i = 0; i < r->n; i++) {
             wchar_t w[48]; MultiByteToWideChar(CP_UTF8, 0, r->w[i].text, -1, w, 48);
             if (!BlWordMatch(w)) continue;
-            const long long a = r->w[i].a - RATE * 150 / 1000, b = r->w[i].b + RATE * 120 / 1000;   // (Whisper's word times are rough)
+            const long long a = r->w[i].a - RATE * BL_COVER_PRE[gBlCover] / 1000, b = r->w[i].b + RATE * BL_COVER_POST[gBlCover] / 1000;
             bool dup = false;
             const unsigned rn = gBlRN.load();
             for (unsigned k = 0; k < 16 && k < rn; k++) { const BlRange& g = gBlR[(rn - 1 - k) % BL_RANGES]; if (g.a.load() <= a + RATE / 10 && g.b.load() >= b - RATE / 10) dup = true; }
@@ -21791,6 +21938,196 @@ static void BlOutsMenu()
     const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
     DestroyMenu(m);
     if (c >= 1 && c <= MAX_OUT) { gBlOuts.fetch_xor(1u << (c - 1)); BlOutsText(); SaveSettings(); }
+}
+// ---- bleep sounds (1.59.0): your files, the Sound menu, Hear it ----
+// A file is decoded here (its first 5 s, 48 kHz mono) and handed to the audio thread through gBlClip. One that's
+// replaced or removed is freed only after two more audio blocks have started (the one using it has finished by then).
+struct BlRetired { BlClip* c; unsigned seq; };
+static BlRetired gBlRet[16]; static int gBlRetN = 0;
+static void BlClipFree(BlClip* c) { if (c) { free(c->d); delete c; } }
+static void BlRetireTick()                      // (SpeechTick, 50 ms)
+{
+    const unsigned now = gRcdCbSeq.load();
+    for (int i = 0; i < gBlRetN; ) {
+        if (!gRunning || now - gBlRet[i].seq >= 2) { BlClipFree(gBlRet[i].c); gBlRet[i] = gBlRet[--gBlRetN]; }
+        else i++;
+    }
+}
+static void BlClipSet(int i, BlClip* c)
+{
+    BlClip* old = gBlClip[i].exchange(c);
+    if (!old) return;
+    if (gBlRetN == 16) { Sleep(30); gBlRetN = 0; for (int k = 0; k < 16; k++) BlClipFree(gBlRet[k].c); }   // (16 waiting: rare; blocks are < 30 ms)
+    gBlRet[gBlRetN++] = { old, gRcdCbSeq.load() };
+}
+static BlClip* BlDecode(const wchar_t* path)
+{
+    ma_decoder_config dc = ma_decoder_config_init(ma_format_f32, 1, RATE);
+    ma_decoder dec;
+    if (ma_decoder_init_file_w(path, &dc, &dec) != MA_SUCCESS) return nullptr;
+    const int cap = RATE * 5;
+    float* d = (float*)malloc(sizeof(float) * cap);
+    int n = 0;
+    while (d && n < cap) {
+        ma_uint64 got = 0; const ma_uint64 want = (ma_uint64)Imin(8192, cap - n);
+        if (ma_decoder_read_pcm_frames(&dec, d + n, want, &got) != MA_SUCCESS || got == 0) break;
+        n += (int)got;
+    }
+    ma_decoder_uninit(&dec);
+    if (!d) return nullptr;
+    int a = 0, end = n;                          // (no silence at either end: it starts at once, and doesn't hold the voice back)
+    while (a < end && fabsf(d[a]) < 0.0005f) a++;
+    while (end > a && fabsf(d[end - 1]) < 0.0005f) end--;
+    if (end - a < RATE / 100) { free(d); return nullptr; }
+    if (a) memmove(d, d + a, sizeof(float) * (end - a));
+    end -= a;
+    for (int k = 0; k < 96 && k < end; k++) d[end - 1 - k] *= k / 96.0f;   // (2 ms fade at its end: no click)
+    return new BlClip{ d, end };
+}
+static void BlFilesLoad()                       // (SpeechLoad) the files saved in the INI
+{
+    for (int i = 0; i < BL_CLIPS; i++) BlClipSet(i, gBlFile[i][0] ? BlDecode(gBlFile[i]) : nullptr);
+}
+static void BlFileName(int i, wchar_t* out, int cap)   // "C:\x\Quack.wav" -> "Quack"
+{
+    const wchar_t* b = wcsrchr(gBlFile[i], L'\\'); lstrcpynW(out, b ? b + 1 : gBlFile[i], cap);
+    wchar_t* dot = wcsrchr(out, L'.'); if (dot && dot != out) *dot = 0;
+}
+static int BlFileCount() { int n = 0; for (int i = 0; i < BL_CLIPS; i++) if (gBlFile[i][0]) n++; return n; }
+static void BlSoundText()
+{
+    if (!gWnd) return;
+    wchar_t t[160]; const int s = gBlSound.load(), v = gBlVolPc.load();
+    static const wchar_t* NM[BLS_N] = { L"Beep", L"Silence", L"Static", L"Muffled", L"Backwards", L"" };
+    if (s == BLS_BEEP) swprintf(t, 160, L"Beep, %d Hz", gBlHz.load());
+    else if (s == BLS_FILE) {
+        const int sel = gBlClipSel.load();
+        if (sel < 0) swprintf(t, 160, L"A random one of your %d sounds", BlFileCount());
+        else if (gBlFile[sel][0]) BlFileName(sel, t, 120);
+        else lstrcpyW(t, L"Your sound (missing: pick one)");
+    } else lstrcpyW(t, NM[s]);
+    if (s != BLS_SILENCE && v != 100) { wchar_t p[16]; swprintf(p, 16, L", %d%%", v); lstrcatW(t, p); }
+    lstrcatW(t, L"  \x25BE");
+    SetTextIfChanged(gWnd, IDC_BLSOUND, t);
+}
+static void BlAddFile()
+{
+    int slot = -1; for (int i = 0; i < BL_CLIPS && slot < 0; i++) if (!gBlFile[i][0]) slot = i;
+    if (slot < 0) { MessageBoxW(gWnd, L"You have 8 bleep sounds already. Remove one first (Sound > Remove).", L"Lag Effect - Bleep", MB_ICONINFORMATION); return; }
+    wchar_t path[MAX_PATH] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o); o.hwndOwner = gWnd;
+    o.lpstrFilter = L"Audio files (MP3, WAV, FLAC)\0*.mp3;*.wav;*.flac\0All files\0*.*\0";
+    o.lpstrFile = path; o.nMaxFile = MAX_PATH;
+    o.lpstrTitle = L"Pick a bleep sound (short is best: the first 5 seconds are used)";
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&o)) return;
+    BlClip* c = BlDecode(path);
+    if (!c) { MessageBoxW(gWnd, L"That file couldn't be read as sound (or it's silent). MP3, WAV and FLAC work.", L"Lag Effect - Bleep", MB_ICONWARNING); return; }
+    lstrcpynW(gBlFile[slot], path, MAX_PATH);
+    BlClipSet(slot, c);
+    gBlSound = BLS_FILE; gBlClipSel = slot;
+    BlSoundText(); SaveSettings();
+}
+static void BlRemoveFile(int i)
+{
+    gBlFile[i][0] = 0; BlClipSet(i, nullptr);
+    if (gBlClipSel.load() == i || (gBlClipSel.load() < 0 && BlFileCount() < 2)) {
+        int other = -1; for (int k = 0; k < BL_CLIPS && other < 0; k++) if (gBlFile[k][0]) other = k;
+        if (other >= 0) gBlClipSel = other; else { gBlClipSel = 0; if (gBlSound.load() == BLS_FILE) gBlSound = BLS_BEEP; }
+    }
+    BlSoundText(); SaveSettings();
+}
+static void BlHear();
+static void BlSoundMenu()
+{
+    HMENU m = CreatePopupMenu(), mrm = CreatePopupMenu(), mp = CreatePopupMenu(), mv = CreatePopupMenu(), mc = CreatePopupMenu();
+    const int s = gBlSound.load(), sel = gBlClipSel.load();
+    static const wchar_t* NM[5] = { L"Beep", L"Silence", L"Static (TV noise)", L"Muffled (your word, dull: like through a wall)", L"Backwards (your word, reversed)" };
+    for (int i = 0; i < 5; i++) AppendMenuW(m, MF_STRING | (s == i ? MF_CHECKED : 0), 1 + i, NM[i]);
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    const int nf = BlFileCount();
+    for (int i = 0; i < BL_CLIPS; i++) if (gBlFile[i][0]) {
+        wchar_t nm[120], t[140]; BlFileName(i, nm, 120); swprintf(t, 140, L"%ls%ls", nm, gBlClip[i].load() ? L"" : L"   (can't be read)");
+        AppendMenuW(m, MF_STRING | (s == BLS_FILE && sel == i ? MF_CHECKED : 0), 10 + i, t);
+        AppendMenuW(mrm, MF_STRING, 30 + i, nm);
+    }
+    if (nf >= 2) AppendMenuW(m, MF_STRING | (s == BLS_FILE && sel < 0 ? MF_CHECKED : 0), 19, L"A random one of your sounds each time");
+    AppendMenuW(m, MF_STRING, 20, L"Add a sound file...");
+    if (nf) AppendMenuW(m, MF_POPUP, (UINT_PTR)mrm, L"Remove a sound file"); else DestroyMenu(mrm);
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    static const int HZ[5] = { 300, 600, 1000, 1500, 2500 };
+    static const wchar_t* HZN[5] = { L"300 Hz (low)", L"600 Hz", L"1000 Hz (the TV one)", L"1500 Hz", L"2500 Hz (high)" };
+    for (int i = 0; i < 5; i++) AppendMenuW(mp, MF_STRING | (gBlHz.load() == HZ[i] ? MF_CHECKED : 0), 40 + i, HZN[i]);
+    AppendMenuW(m, MF_POPUP | (s == BLS_BEEP ? 0 : MF_GRAYED), (UINT_PTR)mp, L"Beep pitch");
+    static const int VOL[6] = { 25, 50, 75, 100, 150, 200 };
+    for (int i = 0; i < 6; i++) { wchar_t t[16]; swprintf(t, 16, L"%d%%", VOL[i]); AppendMenuW(mv, MF_STRING | (gBlVolPc.load() == VOL[i] ? MF_CHECKED : 0), 50 + i, t); }
+    AppendMenuW(m, MF_POPUP | (s == BLS_SILENCE ? MF_GRAYED : 0), (UINT_PTR)mv, L"Volume");
+    static const wchar_t* CV[3] = { L"Tight: just the word (may let its edges through)", L"Normal", L"Wide: a little before and after (surest)" };
+    for (int i = 0; i < 3; i++) AppendMenuW(mc, MF_STRING | (gBlCover == i ? MF_CHECKED : 0), 60 + i, CV[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mc, L"Around each word");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (gBlFinish.load() ? MF_CHECKED : 0) | (nf ? 0 : MF_GRAYED), 70, L"Sound files play to their end (else they stop with the word)");
+    RECT r; GetWindowRect(GetDlgItem(gWnd, IDC_BLSOUND), &r);
+    const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);   // (destroys the submenus too)
+    if (c >= 1 && c <= 5) gBlSound = c - 1;
+    else if (c >= 10 && c < 10 + BL_CLIPS) { gBlSound = BLS_FILE; gBlClipSel = c - 10; }
+    else if (c == 19) { gBlSound = BLS_FILE; gBlClipSel = -1; }
+    else if (c == 20) { BlAddFile(); return; }
+    else if (c >= 30 && c < 30 + BL_CLIPS) { BlRemoveFile(c - 30); return; }
+    else if (c >= 40 && c < 45) gBlHz = HZ[c - 40];
+    else if (c >= 50 && c < 56) gBlVolPc = VOL[c - 50];
+    else if (c >= 60 && c < 63) gBlCover = c - 60;
+    else if (c == 70) gBlFinish = !gBlFinish.load();
+    else return;
+    BlSoundText(); SaveSettings();
+    if ((c >= 1 && c <= 5) || (c >= 10 && c <= 19) || (c >= 40 && c < 56)) BlHear();   // (so you know what you picked)
+}
+// Hear it: the bleep, as a short sample on Windows' default speakers. With Bleep on and talking, it's your own last
+// 1.5 s with a word in the middle bleeped; otherwise the sound alone (Muffled and Backwards need your voice).
+static void BlHear()
+{
+    typedef BOOL (WINAPI* PPlaySound)(LPCWSTR, HMODULE, DWORD);
+    static HMODULE wm = LoadLibraryW(L"winmm.dll");
+    static PPlaySound play = wm ? (PPlaySound)(void*)GetProcAddress(wm, "PlaySoundW") : nullptr;
+    if (!play) return;
+    const int s = gBlSound.load();
+    int src = -1;                               // a bleeped output with your voice in its ring
+    if (gRunning && gFeatSpeech && gBlOn.load()) for (int k = 0; k < MAX_OUT && src < 0; k++) if (gBlOuts.load() >> k & 1) src = k;
+    if (src < 0 && (s == BLS_MUFFLE || s == BLS_BACK)) {
+        MessageBoxW(gWnd, L"Muffled and Backwards are made from your own words. Switch Bleep on (with an output), say something, "
+                          L"then press Hear it: you'll hear your last moment with a word bleeped.", L"Lag Effect - Bleep", MB_ICONINFORMATION);
+        return;
+    }
+    play(nullptr, nullptr, 0);                  // (stop the last one: its memory is about to be reused)
+    const int pre = RATE * 4 / 10, word = RATE * 6 / 10;
+    int longest = 0; for (int i = 0; i < BL_CLIPS; i++) { const BlClip* c = gBlClip[i].load(); if (c && c->n > longest) longest = c->n; }
+    const int n = pre + word + Imax(RATE / 2, s == BLS_FILE && gBlFinish.load() ? longest : 0);
+    static float* ring = nullptr; if (!ring) ring = (float*)calloc(BL_RING, sizeof(float));
+    static short* wav = nullptr; static int wavCap = 0;
+    if (!ring) return;
+    if (src >= 0) {                             // your last moment (the ring is written up to the clock)
+        const long long t = gAudT.load();
+        for (int i = 0; i < n; i++) ring[i] = i < RATE * 3 / 2 ? gBlBuf[src][(unsigned long long)(t - RATE * 3 / 2 + i) & (BL_RING - 1)] : 0.0f;
+    } else memset(ring, 0, sizeof(float) * n);
+    BlOutState st; st.seed = GetTickCount() | 1;
+    BlParams p = { s, n, (float)gBlHz.load(), gBlVolPc.load() * 0.01f, gBlFinish.load(), gBlClipSel.load() };
+    const long long A = pre, B = pre + word;
+    const int bytes = 44 + n * 2;
+    if (wavCap < bytes) { free(wav); wav = (short*)malloc(bytes); wavCap = wav ? bytes : 0; }
+    if (!wav) return;
+    BYTE* h = (BYTE*)wav;
+    auto u32 = [&](int at, DWORD v) { memcpy(h + at, &v, 4); }; auto u16 = [&](int at, WORD v) { memcpy(h + at, &v, 2); };
+    memcpy(h, "RIFF", 4); u32(4, bytes - 8); memcpy(h + 8, "WAVEfmt ", 8); u32(16, 16); u16(20, 1); u16(22, 1);
+    u32(24, RATE); u32(28, RATE * 2); u16(32, 2); u16(34, 16); memcpy(h + 36, "data", 4); u32(40, n * 2);
+    short* pcm = (short*)(h + 44);
+    for (int i = 0; i < n; i++) {
+        float y = BlOut(st, ring, n, i, ring[i], &A, &B, 1, p) * 0.8f;
+        y = y > 1.0f ? 1.0f : y < -1.0f ? -1.0f : y;
+        pcm[i] = (short)lrintf(y * 32767.0f);
+    }
+    play((LPCWSTR)wav, nullptr, 0x0004 | 0x0001 | 0x0002);   // SND_MEMORY | SND_ASYNC | SND_NODEFAULT
 }
 static void SpCmdList()                         // the list box: "say" > what it does
 {
@@ -21921,6 +22258,9 @@ static void SpeechSave()                        // (SaveSettings)
     }
     SaveInt(L"bleep_on", gBlOn.load()); SaveInt(L"bleep_outputs", (int)gBlOuts.load()); SaveInt(L"bleep_delay_ms", gBlDelayMs);
     SaveInt(L"bleep_sound", gBlSound.load()); SaveInt(L"bleep_reach_back_ms", gBlBackMs); IniSet(L"bleep_words", gBlWords);
+    SaveInt(L"bleep_pitch_hz", gBlHz.load()); SaveInt(L"bleep_volume", gBlVolPc.load()); SaveInt(L"bleep_cover", gBlCover);
+    SaveInt(L"bleep_files_finish", gBlFinish.load()); SaveInt(L"bleep_file_pick", gBlClipSel.load());
+    for (int i = 0; i < BL_CLIPS; i++) { wchar_t k[32]; swprintf(k, 32, L"bleep_file%d", i + 1); IniSet(k, gBlFile[i][0] ? gBlFile[i] : nullptr); }
 }
 static void SpeechLoad()                        // (LoadSettings)
 {
@@ -21942,7 +22282,14 @@ static void SpeechLoad()                        // (LoadSettings)
     gBlOuts = (unsigned)GetPrivateProfileIntW(L"settings", L"bleep_outputs", 1, gIni) & ((1u << MAX_OUT) - 1);
     gBlDelayMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_delay_ms", 3000, gIni), 0, 3000);   // (3 s: Whisper needs 1-2)
     gBlDelayF = gBlDelayMs * RATE / 1000;
-    gBlSound = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_sound", 0, gIni), 0, 1);
+    gBlSound = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_sound", 0, gIni), 0, BLS_N - 1);
+    gBlHz = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_pitch_hz", 1000, gIni), 100, 5000);
+    gBlVolPc = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_volume", 100, gIni), 0, 300);
+    gBlCover = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_cover", 1, gIni), 0, 2);
+    gBlFinish = GetPrivateProfileIntW(L"settings", L"bleep_files_finish", 1, gIni) != 0;
+    gBlClipSel = Iclamp((int)GetPrivateProfileIntW(L"settings", L"bleep_file_pick", 0, gIni), -1, BL_CLIPS - 1);
+    for (int i = 0; i < BL_CLIPS; i++) { wchar_t k[32]; swprintf(k, 32, L"bleep_file%d", i + 1); GetPrivateProfileStringW(L"settings", k, L"", gBlFile[i], MAX_PATH, gIni); }
+    BlFilesLoad();
     gBlBackMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_reach_back_ms", 600, gIni), 0, 2000);
     GetPrivateProfileStringW(L"settings", L"bleep_words", L"", gBlWords, 600, gIni);
 }
@@ -22620,10 +22967,8 @@ static void CreateUI()
             static const wchar_t* DN[5] = { L"0 (key only)", L"1 s", L"1.5 s", L"2 s", L"3 s" };
             int sel = 3; for (int i = 0; i < 5; i++) { SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)DN[i]); if (BL_DELAYS[i] == gBlDelayMs) sel = i; }
             SendMessageW(c, CB_SETCURSEL, sel, 0);
-            HWND d = Ctl(L"COMBOBOX", L"", COMBO | WS_TABSTOP, 432, 364, 98, 200, IDC_BLSOUND);
-            SendMessageW(d, CB_ADDSTRING, 0, (LPARAM)L"Bleep tone"); SendMessageW(d, CB_ADDSTRING, 0, (LPARAM)L"Silence");
-            SendMessageW(d, CB_SETCURSEL, gBlSound.load(), 0);
         }
+        Ctl(L"BUTTON", L"\x25B6  Hear it", WS_TABSTOP, 432, 362, 98, 28, IDC_BLHEAR);
         Ctl(L"STATIC", L"Words:", 0, 30, 402, 52, 20, -1);
         Ctl(L"EDIT", gBlWords, ES_AUTOHSCROLL | WS_TABSTOP, 84, 398, 386, 23, IDC_BLWORDS, WS_EX_CLIENTEDGE);
         SendDlgItemMessageW(gWnd, IDC_BLWORDS, EM_LIMITTEXT, 590, 0);
@@ -22633,14 +22978,14 @@ static void CreateUI()
         Ctl(L"STATIC", L"Reach back:", 0, 250, 434, 76, 20, -1);
         Spin(IDC_BLBACK, 328, 430, 64, 0, 2000, gBlBackMs);
         Ctl(L"STATIC", L"ms", 0, 398, 434, 24, 20, -1);
-        Ctl(L"STATIC", L"Your voice on these outputs runs behind, so a word is caught before it's heard. The others stay live.",
-            0, 30, 464, 500, 16, IDC_HDR);
+        Ctl(L"STATIC", L"Sound:", 0, 30, 466, 52, 20, IDC_BLSNDLBL);
+        Ctl(L"BUTTON", L"Beep  \x25BE", WS_TABSTOP, 84, 460, 446, 28, IDC_BLSOUND);
         AddSection(14, 502, 532, 44, L"TTS voice");
         Ctl(L"BUTTON", L"Talk through a TTS voice: it says what you say, your own voice is muted",
             BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 518, 398, 20, IDC_SPTTS);
         { wchar_t kn[120]; FxKeyButtonText(SLOT_SPTTS, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 434, 514, 96, 26, IDC_SPTTSKEY); }
         gBuildSub = -1; gBuildFeat = 0;
-        SpCmdList(); BlOutsText(); SpActFill();
+        SpCmdList(); BlOutsText(); SpActFill(); BlSoundText();
     }
     gBuildSub = -1;
     Ctl(L"BUTTON", L"\x25CF  Record 5 s", WS_TABSTOP | WS_GROUP, 14, 556, 128, 30, IDC_MICTEST);
@@ -23610,7 +23955,8 @@ static void OnCommand(int id, int code)
         if (code == CBN_SELCHANGE) { gBlDelayMs = BL_DELAYS[Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 4)]; gBlDelayF = gBlDelayMs * RATE / 1000; SaveSettings(); }
         return;
     }
-    if (id == IDC_BLSOUND) { if (code == CBN_SELCHANGE) { gBlSound = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 1); SaveSettings(); } return; }
+    if (id == IDC_BLSOUND) { if (code == BN_CLICKED) BlSoundMenu(); return; }
+    if (id == IDC_BLHEAR)  { if (code == BN_CLICKED) BlHear(); return; }
     if (id == IDC_BLWORDS) {
         if (code == EN_KILLFOCUS) { GetDlgItemTextW(gWnd, id, gBlWords, 600); SaveSettings(); SpeechApply(); }
         return;

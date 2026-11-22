@@ -92,6 +92,79 @@ int main()
       double e = 0; for (size_t i = a + 480; i < a + 4320; i++) e += rec[i] * rec[i];
       check("silence instead of a bleep", sqrt(e / 3840) < 0.005); }
     gBlSound = 0;
+    // 1.59.0: more sounds. bleepAt: a 0.1 s "word" C2 .. C2 + 4800, then where it comes out in rec
+    auto bleepAt = [&](Src src, long long len = 4800, int blocks = 100) -> size_t {
+        const long long c2 = gAudT.load() + 4800; BlAdd(c2, c2 + len);
+        rec.clear(); const long long rc = gAudT.load(); run(blocks, src);
+        return (size_t)(c2 + R / 2 - rc);
+    };
+    printf("Bleep sounds (1.59.0)\n");
+    gBlHz = 500;
+    { const size_t a = bleepAt(tone300);
+      check("the beep's pitch can be changed (500 Hz)", goertzel(rec, a + 480, 3840, 500) > 0.18 && goertzel(rec, a + 480, 3840, 1000) < 0.01); }
+    gBlHz = 1000; gBlVolPc = 50;
+    { const size_t a = bleepAt(tone300); const double v = goertzel(rec, a + 480, 3840, 1000);
+      printf("  at 50%%: %.3f\n", v); check("its volume (50%: half)", v > 0.09 && v < 0.13); }
+    gBlVolPc = 100;
+    gBlSound = BLS_STATIC;
+    { const size_t a = bleepAt(tone300); double e = 0; for (size_t i = a + 480; i < a + 4320; i++) e += rec[i] * rec[i];
+      const double rms = sqrt(e / 3840), v = goertzel(rec, a + 480, 3840, 300);
+      printf("  static: rms %.3f, voice %.3f\n", rms, v); check("static: noise, no voice", rms > 0.03 && v < 0.01); }
+    gBlSound = BLS_MUFFLE;
+    {   // a low and a high tone together: muffled keeps the low one, loses the high one
+        auto lowhigh = [](long n) { return 0.15f * (float)sin(2 * M_PI * 150 * n / R) + 0.15f * (float)sin(2 * M_PI * 3000 * n / R); };
+        const size_t a = bleepAt(lowhigh);
+        const double lo = goertzel(rec, a + 960, 2880, 150), hi = goertzel(rec, a + 960, 2880, 3000), hiB = goertzel(rec, a + 7200, 2400, 3000);
+        printf("  muffled: 150 Hz %.3f, 3 kHz %.4f (after the word %.3f)\n", lo, hi, hiB);
+        check("muffled: the word is still there but dull", lo > 0.07 && hi < 0.01 && hiB > 0.13);
+    }
+    gBlSound = BLS_BACK;
+    {   // a rising sweep (200 Hz -> 2 kHz over each 0.2 s) comes out falling
+        auto sweep = [](long n) { const double ph = (double)(n % 9600) / R; return 0.2f * (float)sin(2 * M_PI * (200 * ph + 0.5 * (1800 / 0.2) * ph * ph)); };
+        const long long c2 = gAudT.load() + 9600 - (long long)(pos % 9600);   // (starts with a sweep)
+        BlAdd(c2, c2 + 9600);
+        rec.clear(); const long long rc = gAudT.load(); run(100, sweep);
+        const size_t a = (size_t)(c2 + R / 2 - rc);
+        const double hiFirst = goertzel(rec, a + 480, 1920, 1800), loFirst = goertzel(rec, a + 480, 1920, 300);
+        const double hiLast = goertzel(rec, a + 7200, 1920, 1800), loLast = goertzel(rec, a + 7200, 1920, 300);
+        printf("  backwards: start 1.8k %.3f / 300 %.3f, end 1.8k %.3f / 300 %.3f\n", hiFirst, loFirst, hiLast, loLast);
+        check("backwards: the word is played in reverse (high first)", hiFirst > 2 * loFirst && loLast > 2 * hiLast);
+    }
+    {   // the key held (end not known yet): reversed in 250 ms pieces, still not your voice forwards
+        const long long press = gAudT.load(); const unsigned slot = BlAdd(press, LLONG_MAX);
+        rec.clear(); const long long rc = gAudT.load(); run(60, tone300);
+        gBlR[slot].b.store(gAudT.load()); run(60, tone300);
+        const size_t a = (size_t)(press + R / 2 - rc);
+        check("backwards with the key: plays (no gap, no click)", goertzel(rec, a + 2400, 9600, 300) > 0.15);
+    }
+    gBlSound = BLS_FILE;
+    std::vector<float> c700(R * 3 / 10), c1500(R / 20);   // a 0.3 s 700 Hz and a 50 ms 1.5 kHz sound file
+    for (size_t i = 0; i < c700.size(); i++) c700[i] = 0.3f * (float)sin(2 * M_PI * 700 * i / R);
+    for (size_t i = 0; i < c1500.size(); i++) c1500[i] = 0.3f * (float)sin(2 * M_PI * 1500 * i / R);
+    BlClip k700 = { c700.data(), (int)c700.size() }, k1500 = { c1500.data(), (int)c1500.size() };
+    gBlClip[0] = &k700; gBlClip[1] = &k1500;
+    gBlClipSel = 1; gBlFinish = true;
+    { const size_t a = bleepAt(tone300);
+      check("your sound file, looped while the word lasts", goertzel(rec, a + 480, 3840, 1500) > 0.25 && goertzel(rec, a + 480, 3840, 300) < 0.01); }
+    gBlClipSel = 0;
+    { const size_t a = bleepAt(tone300);
+      const double during = goertzel(rec, a + 480, 3840, 700), after = goertzel(rec, a + 5280, 4800, 700), voice = goertzel(rec, a + 5280, 4800, 300);
+      printf("  play to the end: 700 Hz during %.3f, after %.3f, voice after %.3f\n", during, after, voice);
+      check("plays to its end over your voice after the word", during > 0.25 && after > 0.25 && voice > 0.17); }
+    gBlFinish = false;
+    { const size_t a = bleepAt(tone300);
+      const double after = goertzel(rec, a + 5280, 4800, 700), voice = goertzel(rec, a + 5280, 4800, 300);
+      check("or stops with the word", after < 0.01 && voice > 0.17); }
+    gBlFinish = true; gBlClipSel = -1;
+    {   int n7 = 0, n15 = 0;
+        for (int i = 0; i < 12; i++) { const size_t a = bleepAt(tone300, 4800, 70);
+            if (goertzel(rec, a + 480, 1920, 700) > 0.2) n7++; if (goertzel(rec, a + 480, 1920, 1500) > 0.2) n15++; }
+        printf("  random: 700 Hz %d times, 1.5 kHz %d times\n", n7, n15);
+        check("a random one of your files each time", n7 > 0 && n15 > 0 && n7 + n15 == 12); }
+    gBlClip[1] = nullptr; gBlClipSel = 1;
+    { const size_t a = bleepAt(tone300); check("a removed file: silence, nothing breaks", goertzel(rec, a + 480, 3840, 300) < 0.01); }
+    gBlClip[0] = nullptr; gBlSound = 0; gBlClipSel = 0;
+    run(100, tone300);
     {   // the key: from a little before it was pressed until it's let go
         const long long press = gAudT.load(); const unsigned slot = BlAdd(press - 9600, LLONG_MAX);
         rec.clear(); const long long rc3 = gAudT.load(); run(30, tone300);
