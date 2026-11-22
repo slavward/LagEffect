@@ -65,7 +65,7 @@ if [ -n "${WHISPER_DIR:-}" ] && [ -n "${WHISPER_MODELS:-}" ]; then
   W="$WHISPER_DIR"
   "$CXX" "${CF[@]}" -I "$W/include" -I "$W/ggml/include" -DAUDIO="\"$B/audio.inc\"" -DWS="\"$B/ws.inc\"" -o "$B/whisper" "$T/whisper.cpp" \
     "$W/build/src/libwhisper.a" "$W/build/ggml/src/libggml.a" "$W/build/ggml/src/libggml-cpu.a" "$W/build/ggml/src/libggml-base.a" "$B/rn.a" -lm -ldl
-  for m in $WHISPER_MODELS; do run "Mic > Speech: Whisper on a real recording (JFK), $(basename "$m")" "$B/whisper" "$m" "$W/samples/jfk.wav"; done
+  for m in $WHISPER_MODELS; do run "Mic > Speech: Whisper on a real recording (JFK), $(basename "$m")" "$B/whisper" "$m" "$W/samples/jfk.wav" ${NOISE_CLIPS:-}; done
 else
   echo; echo "== (Whisper on a real recording: skipped, no WHISPER_DIR / WHISPER_MODELS)"
 fi

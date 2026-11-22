@@ -21542,7 +21542,8 @@ static void DrawBbView(DRAWITEMSTRUCT* d)       // a light per drum: lit when yo
 // when you stop or after 10 s (the final text: commands, the TTS voice). Words come with their place on the audio clock.
 #define WS_RATE   16000
 #define WS_MAXSEG (10 * WS_RATE)
-struct WsWord { char text[48]; long long a, b; };     // a word, and where it is on the audio clock (gAudT frames)
+struct WsWord { char text[48]; long long a, b; float p; };   // a word, where it is on the audio clock (gAudT frames), how sure (0-1)
+static void (*gWsSegDebug)(const char* text, float noSpeech, float avgP, float minP, bool final) = nullptr;   // (tests: every segment)
 struct WsResult { int kind; int n; WsWord w[96]; char text[1024]; int ms; };   // kind 0 a quick guess, 1 final, 2 an error (text)
 typedef void (*WsCallback)(const WsResult* r, void* user);
 struct WsEngine {
@@ -21588,6 +21589,14 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
     const int ns = whisper_full_n_segments(E.ctx);
     const whisper_token eot = whisper_token_eot(E.ctx);
     for (int s = 0; s < ns; s++) {
+        if (gWsSegDebug) {                       // (tests: how sure it was of each segment)
+            float sum = 0, mn = 1; int k = 0;
+            for (int t = 0; t < whisper_full_n_tokens(E.ctx, s); t++) {
+                if (whisper_full_get_token_id(E.ctx, s, t) >= eot) continue;
+                const float tp = whisper_full_get_token_p(E.ctx, s, t); sum += tp; k++; if (tp < mn) mn = tp;
+            }
+            gWsSegDebug(whisper_full_get_segment_text(E.ctx, s), whisper_full_get_segment_no_speech_prob(E.ctx, s), k ? sum / k : 0.0f, mn, final);
+        }
         if (whisper_full_get_segment_no_speech_prob(E.ctx, s) > 0.6f) continue;   // (not speech: Whisper would make something up)
         const char* st = whisper_full_get_segment_text(E.ctx, s);
         if (st) {
@@ -21605,7 +21614,7 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
             const bool fresh = tt[0] == ' ' || r.n == 0;
             if (fresh) {
                 if (r.n >= 96) break;
-                WsWord& w = r.w[r.n++]; w.text[0] = 0;
+                WsWord& w = r.w[r.n++]; w.text[0] = 0; w.p = 1.0f;
                 w.a = clock0 + d.t0 * 480; w.b = clock0 + d.t1 * 480;   // (Whisper counts in 10 ms; the clock in 48 kHz frames)
             }
             WsWord& w = r.w[r.n - 1];
@@ -21613,6 +21622,7 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
             const size_t wl = strlen(w.text), sl = strlen(src);
             if (wl + sl < sizeof(w.text)) memcpy(w.text + wl, src, sl + 1);
             const long long b = clock0 + d.t1 * 480; if (b > w.b) w.b = b;
+            if (d.p < w.p) w.p = d.p;            // (a word is as sure as its least sure piece)
         }
     }
     { size_t i = 0; while (r.text[i] == ' ') i++; if (i) memmove(r.text, r.text + i, strlen(r.text + i) + 1); }
