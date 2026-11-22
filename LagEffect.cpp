@@ -4037,7 +4037,7 @@ static void LoopCmd(LoopCore& L, float* mem, unsigned cmd, int latF)
     }
 }
 // One frame: `in` is what's being recorded, returns what the loop plays. mute: layer bits; vol: loop volume.
-// ======================= Music (1.61.0, Soundboard > Music): the audio side =======================
+// ======================= Music (1.61.0, Mic > Music): the audio side =======================
 // A decoder thread (the window's side) writes the playing song, 48 kHz stereo, into gMusRing; the audio thread reads
 // it and adds it to the outputs you picked (after the Mixer's channels, so it goes through those outputs' plugins,
 // volume and limiter). Pause / play glide 5 ms. A new song or a seek: the decoder writes it from gMusJump on and
@@ -4924,7 +4924,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool lpVoice = gLpVoiceOnly.load(std::memory_order_relaxed);
     const int lpCh = gLpSrcCh.load(std::memory_order_relaxed);
     static MusState mus;                         // Music (1.61.0): only while playing or fading
-    const bool musPlay = gFeatSound && gMusPlay.load(std::memory_order_relaxed);
+    const bool musPlay = gMusPlay.load(std::memory_order_relaxed);   // (Mic > Music since 1.63.0: no feature switch; it only runs while playing)
     const bool musRun = musPlay || mus.g > 0.0f || mus.jumping || gMusJumpGen.load(std::memory_order_relaxed) != mus.gen;   // (a jump while paused: done at once)
     const float musVol = Iclamp(gMusVolPc.load(std::memory_order_relaxed), 0, 200) * 0.01f;
     const unsigned musOuts = gMusOuts.load(std::memory_order_relaxed);
@@ -5430,9 +5430,10 @@ enum {
     IDC_AVPIC0, IDC_AVPIC1, IDC_AVPIC2, IDC_AVPIC3, IDC_AVPIC4, IDC_AVTALK, IDC_AVLOUD, IDC_AVMETER, IDC_AVBG, IDC_AVBOUNCE, IDC_AVOPEN,
     IDC_CAPON, IDC_CAPMASK, IDC_CAPOPEN, IDC_CAPLINES, IDC_CAPSIZE, IDC_CAPCLEAR, IDC_CAPFILE, IDC_CAPFOLDER, IDC_CAPBG,
     IDC_CBACT, IDC_CBTGT, IDC_CBOPT, IDC_CBVAL, IDC_CBLINE, IDC_CBCOPY, IDC_CBTEST, IDC_CBSTAT,
-    IDC_SBSUB3, IDC_MUSVIEW, IDC_MUSPREV, IDC_MUSPLAY, IDC_MUSNEXT, IDC_MUSSTOP, IDC_MUSSHUF, IDC_MUSREP, IDC_MUSOUTS, IDC_MUSVOL,   // (1.61.0: Soundboard > Music)
+    IDC_SBSUB3, IDC_MUSVIEW, IDC_MUSPREV, IDC_MUSPLAY, IDC_MUSNEXT, IDC_MUSSTOP, IDC_MUSSHUF, IDC_MUSREP, IDC_MUSOUTS, IDC_MUSVOL,   // (1.61.0: Mic > Music)
     IDC_MUSLIST, IDC_MUSADD, IDC_MUSFOLDER, IDC_MUSDEL, IDC_MUSCLEAR, IDC_MUSKEYPLAY, IDC_MUSKEYNEXT,
     IDC_VOLSTYLE,                               // (1.63.0: Settings > Look > Volume controls)
+    IDC_MICSUB5,                                // (1.63.0: Mic > Music, moved from the Soundboard)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5691,17 +5692,17 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 #define FX_SUBS 8
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun", L"Whisper" };
-static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume
-static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : id == IDC_MICSUB4 ? 4 : -1; }
+static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume, 4 = Speech, 5 = Music (1.63.0)
+static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : id == IDC_MICSUB4 ? 4 : id == IDC_MICSUB5 ? 5 : -1; }
 static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features, 4 = Stream (1.60.0)
 static int SetSubOf(int id) { return id >= IDC_SETSUB0 && id <= IDC_SETSUB3 ? id - IDC_SETSUB0 : id == IDC_SETSUB4 ? 4 : -1; }
-static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox, 3 = Music (1.61.0)
-static const wchar_t* SB_SUB_NAMES[4] = { L"Pads", L"Looper", L"Beatbox", L"Music" };
+static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox (Music moved to the Mic tab in 1.63.0)
+static const wchar_t* SB_SUB_NAMES[3] = { L"Pads", L"Looper", L"Beatbox" };
 static wchar_t gLpSrcKey[140] = L"";            // the looper records this Mixer channel (its VstChanKey; "" = not a channel; 1.61.0)
 static void LpSrcFill(); static void MusOutsText(); static void MusTick();
-static int gMusN = 0, gMusCur = -1, gMusRepeat = 1;   // Soundboard > Music: songs, the one chosen; repeat 0 off, 1 the list, 2 this song
+static int gMusN = 0, gMusCur = -1, gMusRepeat = 1;   // Mic > Music: songs, the one chosen; repeat 0 off, 1 the list, 2 this song
 static bool gMusShuffle = false;
-static int SbSubOf(int id) { return id >= IDC_SBSUB0 && id <= IDC_SBSUB2 ? id - IDC_SBSUB0 : id == IDC_SBSUB3 ? 3 : -1; }
+static int SbSubOf(int id) { return id >= IDC_SBSUB0 && id <= IDC_SBSUB2 ? id - IDC_SBSUB0 : -1; }
 static bool gLpSync = true;                     // Looper: line layers up with what you heard (moved earlier by the delay)
 static unsigned gBbTaught = 0;                  // Beatbox: sounds you taught it (bits: kick, snare, hi-hat)
 static const wchar_t* BB_KEYS[BB_SOUNDS] = { L"beatbox_sound_kick", L"beatbox_sound_snare", L"beatbox_sound_hihat" };
@@ -5821,7 +5822,7 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_BLEEP   (SLOT_RECORD + 6)           // Mic > Speech (1.57.0): bleep while held
 #define SLOT_SPTTS   (SLOT_RECORD + 7)           //   the TTS voice on / off
 #define SLOT_BLLIVE  (SLOT_RECORD + 8)           // Mic > Cleanup (1.59.1): live bleep while held (no delay)
-#define SLOT_MUSPLAY (SLOT_RECORD + 9)           // Soundboard > Music (1.61.0): play / pause
+#define SLOT_MUSPLAY (SLOT_RECORD + 9)           // Mic > Music (1.61.0): play / pause
 #define SLOT_MUSNEXT (SLOT_RECORD + 10)          //   the next song
 #define SLOT_NEW0    SLOT_LPREC                  // (slots after the plugins' and the recorder's)
 #define KEY_SLOTS    (SLOT_MUSNEXT + 1)
@@ -6847,8 +6848,8 @@ static void LoadSettings()
     gDiveSemis = Iclamp(INI_INT(L"pitch_dive_semitones", -12), -12, 12);
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
     gHarmMute = INI_INT(L"fx_harm_mute", 0) != 0;
-    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 4);
-    gSbSub     = Iclamp(INI_INT(L"sound_subtab", 0), 0, 3);
+    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 5);
+    gSbSub     = Iclamp(INI_INT(L"sound_subtab", 0), 0, 2);
     if (gMicSub == 2 && !gFeatVst) gMicSub = 0;
     if (gMicSub == 4 && !gFeatSpeech) gMicSub = 0;
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
@@ -15058,7 +15059,7 @@ static void AddTips()
     TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
     TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
     TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard, clips, plugins, speech, the avatar and captions.");
-    TipId(IDC_SBSUB3,  L"Music: a playlist that plays on the outputs you pick (your mic's output for Discord, your headphones...).");
+    TipId(IDC_MICSUB5, L"Music: a playlist that plays on the outputs you pick (your mic's output for Discord, your headphones...).");
     TipId(IDC_MUSVIEW, L"The song playing. Click the bar to jump to that point.");
     TipId(IDC_MUSPLAY, L"Play / pause.");
     TipId(IDC_MUSPREV, L"Back to the start of the song (or the one before, if it's only just started).");
@@ -15436,7 +15437,7 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 }
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
-static const wchar_t* MIC_SUB_NAMES[5] = { L"Cleanup", L"Tone", L"Plugins", L"Volume", L"Speech" };
+static const wchar_t* MIC_SUB_NAMES[6] = { L"Cleanup", L"Tone", L"Plugins", L"Volume", L"Speech", L"Music" };
 static const wchar_t* SET_SUB_NAMES[5] = { L"General", L"Look", L"Pictures", L"Features", L"Stream" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic, Settings and Soundboard sub-tabs
 {
@@ -15913,7 +15914,7 @@ static void VstKeyEdge(int k, bool pressed, bool released);   // (plugins: defin
 static void RcdToggle();
 static void LoopKey(int slot); static void BbSetOn(bool on, bool fromKey);   // (Soundboard > Looper / Beatbox)
 static void BlKey(bool down); static void SpTtsSet(bool on, bool fromKey); static void BlLiveKey(bool down);   // (Mic > Speech)
-static void MusToggle(); static void MusNext(); static void MusPrev(); static void MusStop(); static void MusUi();   // (Soundboard > Music, 1.61.0)
+static void MusToggle(); static void MusNext(); static void MusPrev(); static void MusStop(); static void MusUi();   // (Mic > Music, 1.61.0)
 static bool MusActive();
 static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a hotkey: seen down for one tick, then let go
 static bool gSpTts = false;
@@ -15927,7 +15928,7 @@ static void PollFxKeys()
                          ((slot == SLOT_CLIPNOW || (slot >= SLOT_CLIP0 && slot < SLOT_CLIP0 + CLIPS)) && !gFeatClips) ||
                          ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag) ||
                          (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst) ||
-                         (((slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX) || slot == SLOT_MUSPLAY || slot == SLOT_MUSNEXT) && !gFeatSound) ||
+                         ((slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX) && !gFeatSound) ||
                          ((slot == SLOT_BLEEP || slot == SLOT_SPTTS) && !gFeatSpeech);
         if (off) { gVoiceTap[slot] = 0; gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
@@ -19129,7 +19130,7 @@ static void ShowHelp()
         L"Talk + blink and Loud are optional); its window shows them as you talk, hops and blinks: capture it in OBS (Window Capture, "
         L"then a Chroma Key filter). Live captions: what you say, from the Speech model, in a window for OBS or a text file "
         L"(OBS Text source: Read from file). Right-click either window for its settings.\n\n"
-        L"MUSIC (Soundboard tab)\n"
+        L"MUSIC (Mic tab > Music)\n"
         L"A playlist (MP3, FLAC, WAV) with play / pause, next, shuffle and repeat. Pick the outputs it plays on: your mic's output "
         L"so Discord hears it, your headphones' to hear it yourself, or both. Hotkeys for play / pause and next.\n\n"
         L"BEATBOX TO DRUMS (Soundboard tab)\n"
@@ -20118,7 +20119,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    scene Gaming   \x2014   switch to a scene\n"
         L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
         L"    talkback on 2   \x2014   only output 2 hears your mic;  talkback off\n\n"
-        L"Music (Soundboard > Music)\n"
+        L"Music (Mic > Music)\n"
         L"    music toggle   \x2014   play / pause (also: play, pause, next, prev, stop);  music volume 60\n\n"
         L"Stream (Settings > Stream)\n"
         L"    captions on   \x2014   live captions (off, toggle);  captions clear  empties them\n"
@@ -20268,10 +20269,10 @@ static int PagedFeatOf(HWND h) { if (h) for (int i = 0; i < gPagedN; i++) if (gP
 static const wchar_t* SubName(int page, int sub)
 {
     if (sub < 0) return nullptr;
-    if (page == PAGE_MIC && sub < 5) return MIC_SUB_NAMES[sub];
+    if (page == PAGE_MIC && sub < 6) return MIC_SUB_NAMES[sub];
     if (page == PAGE_FX && sub < FX_SUBS) return FX_SUB_NAMES[sub];
     if (page == PAGE_SETTINGS && sub < 5) return SET_SUB_NAMES[sub];
-    if (page == PAGE_SOUND && sub < 4) return SB_SUB_NAMES[sub];
+    if (page == PAGE_SOUND && sub < 3) return SB_SUB_NAMES[sub];
     if (page == PAGE_MIXER && sub == 1) return L"Hotkeys";
     return nullptr;
 }
@@ -20470,11 +20471,10 @@ static void GoTo(int page, int sub, HWND target, const wchar_t* title = nullptr,
     SetPage(page);
     if (sub >= 0) {
         int id = 0;
-        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : sub == 4 ? IDC_MICSUB4 : IDC_MICSUB3;
+        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : sub == 4 ? IDC_MICSUB4 : sub == 5 ? IDC_MICSUB5 : IDC_MICSUB3;
         if (page == PAGE_SETTINGS && sub <= 3) id = IDC_SETSUB0 + sub;
         if (page == PAGE_SETTINGS && sub == 4) id = IDC_SETSUB4;
         if (page == PAGE_SOUND && sub <= 2) id = IDC_SBSUB0 + sub;
-        if (page == PAGE_SOUND && sub == 3) id = IDC_SBSUB3;
         if (page == PAGE_MIXER && sub != gMixSub) id = IDC_MIXKEYSBTN;
         if (page == PAGE_FX && sub < FX_SUBS) SetFxSub(sub);
         HWND b = id ? GetDlgItem(gWnd, id) : nullptr;
@@ -20889,7 +20889,7 @@ static void BugInfoBuild(wchar_t* o, int cap)
         SpeechBugInfo(o, cap);
         if (gSpErr[0]) BugAdd(o, cap, L"Speech problem: %ls", gSpErr);
     }
-    if (gFeatSound) BugAdd(o, cap, L"Music: %d songs, %ls, outputs %u, %d%%, shuffle %ls, repeat %d; looper source %ls",
+    BugAdd(o, cap, L"Music: %d songs, %ls, outputs %u, %d%%, shuffle %ls, repeat %d; looper source %ls",
                            gMusN, gMusPlay.load() ? L"playing" : L"not playing", gMusOuts.load(), gMusVolPc.load(), gMusShuffle ? L"on" : L"off", gMusRepeat,
                            gLpSrcKey[0] ? (gLpSrcCh.load() >= 0 ? L"a Mixer channel" : L"a Mixer channel (missing)") : gLpVoiceOnly ? L"voice" : L"what others hear");
     if (gFeatAvatar || gFeatCaptions) {         // Settings > Stream (1.60.0)
@@ -21070,7 +21070,7 @@ static int ChipsBuild(Chip* c)
     }
     if (gFeatCaptions && gCapOn && gFeatSpeech) add(L"Captions", 0, PAGE_SETTINGS, 4);   // (1.60.0)
     if (gFeatAvatar && gAvOpen) add(L"Avatar", 0, PAGE_SETTINGS, 4);
-    if (gFeatSound && gMusPlay.load()) add(L"\x266B Music", 0, PAGE_SOUND, 3);   // (1.61.0)
+    if (gMusPlay.load()) add(L"\x266B Music", 0, PAGE_MIC, 5);   // (1.61.0; Mic > Music since 1.63.0)
     return n;
 }
 static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
@@ -21207,8 +21207,8 @@ static void SrchBuild()                         // (again each time the box gets
 {
     gSrchN = 0;
     for (int t = 0; t < TAB_COUNT; t++) SrchAdd(PAGE_NAMES[t], GetDlgItem(gWnd, IDC_TAB0 + t), t, -1, -1, 0, SK_TAB);
-    for (int s = 0; s < 5; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : s == 4 ? FEAT_SPEECH : 0, SK_SUB);
-    for (int s = 0; s < 4; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
+    for (int s = 0; s < 6; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : s == 4 ? FEAT_SPEECH : 0, SK_SUB);
+    for (int s = 0; s < 3; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
     for (int s = 0; s < FX_SUBS; s++) SrchAdd(FX_SUB_NAMES[s], nullptr, PAGE_FX, s, -1, 0, SK_SUB);
     for (int s = 0; s < 5; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
     SrchAdd(L"Mixer hotkeys", nullptr, PAGE_MIXER, 1, -1, 0, SK_SUB);
@@ -22384,7 +22384,7 @@ static int VcActions(int* out, int cap)          // the actions a command can pi
     for (int i = 0; i < gSceneN; i++) add(SLOT_SCENE0 + i);
     if (gFeatVst) for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0]) add(SLOT_VST0 + k);
     add(SLOT_RECORD); add(SLOT_SPTTS);
-    if (gFeatSound) { add(SLOT_MUSPLAY); add(SLOT_MUSNEXT); }
+    add(SLOT_MUSPLAY); add(SLOT_MUSNEXT);       // (Mic > Music: no feature switch since 1.63.0)
     return n;
 }
 static void VoiceCmdRun(int i)
@@ -22857,7 +22857,7 @@ static void SetFeatSpeech(bool on)
     SpeechApply();
 }
 
-// ======================= Music (1.61.0, Soundboard > Music): the player =======================
+// ======================= Music (1.61.0, Mic > Music): the player =======================
 // A playlist (kept in Music.m3u next to the settings); the decoder thread opens one song at a time with miniaudio
 // (MP3, FLAC, WAV), writes it into gMusRing (see the audio side) and goes straight on to the next. The window sends it
 // commands (play a song from a point, stop) and reads where the audio is from the song "segments" it notes down.
@@ -23126,8 +23126,8 @@ static void MusUi()                             // buttons and the list's ▶
 }
 static void MusTick()                           // (PadTick, 50 ms) the view while it plays
 {
-    if (gPage == PAGE_SOUND && gSbSub == 3 && (gMusPlay.load() || gMusErr[0])) MusUi();
-    if (gMusPlay.load() && !MusActive()) { gMusPlay = false; if (gPage == PAGE_SOUND && gSbSub == 3) MusUi(); }   // (the end of the list)
+    if (gPage == PAGE_MIC && gMicSub == 5 && (gMusPlay.load() || gMusErr[0])) MusUi();
+    if (gMusPlay.load() && !MusActive()) { gMusPlay = false; if (gPage == PAGE_MIC && gMicSub == 5) MusUi(); }   // (the end of the list)
 }
 static void FmtTime(long long frames, wchar_t* out) { const long long s = frames / RATE; swprintf(out, 16, L"%lld:%02lld", s / 60, s % 60); }
 static void DrawMusView(DRAWITEMSTRUCT* d)      // the song's name, a bar of where it is (click to go there), times
@@ -23975,7 +23975,7 @@ static void StreamStartup()                     // (after the window is made) la
 static void StreamSave()
 {
     SaveInt(L"feat_avatar", gFeatAvatar); SaveInt(L"feat_captions", gFeatCaptions);
-    SaveInt(L"music_volume", gMusVolPc.load()); SaveInt(L"music_outputs", (int)gMusOuts.load());   // (Soundboard > Music, 1.61.0)
+    SaveInt(L"music_volume", gMusVolPc.load()); SaveInt(L"music_outputs", (int)gMusOuts.load());   // (Mic > Music, 1.61.0)
     SaveInt(L"music_shuffle", gMusShuffle); SaveInt(L"music_repeat", gMusRepeat); SaveInt(L"music_song", gMusCur);
     for (int i = 0; i < AV_PICS; i++) { wchar_t k[24]; swprintf(k, 24, L"avatar_pic%d", i + 1); IniSet(k, gAvFile[i][0] ? gAvFile[i] : nullptr); }
     SaveInt(L"avatar_talk_db", gAvTalkDb); SaveInt(L"avatar_loud_db", gAvLoudDb); SaveInt(L"avatar_bg", gAvBg); SaveInt(L"avatar_bg_rgb", (int)gAvBgCustom);
@@ -24487,13 +24487,15 @@ static void CreateUI()
     // Live meter, then AI noise suppression, noise gate and voice quality sections.
     gBuildPage = PAGE_MIC;
     Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 48, 532, 62, IDC_METER);   // (the bottom line: too loud / too quiet)
-    Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 62, 28, IDC_MICSUB0);   // (62 wide since 1.57.0: room for Speech)
-    Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 78, 116, 62, 28, IDC_MICSUB1);
-    Ctl(L"BUTTON", L"Volume", BS_OWNERDRAW | WS_TABSTOP, 142, 116, 62, 28, IDC_MICSUB3);
+    Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 53, 28, IDC_MICSUB0);   // (53 wide since 1.63.0: room for Music)
+    Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 68, 116, 53, 28, IDC_MICSUB1);
+    Ctl(L"BUTTON", L"Volume", BS_OWNERDRAW | WS_TABSTOP, 122, 116, 53, 28, IDC_MICSUB3);
     gBuildFeat = FEAT_VST;                      // (Settings > Features > Plugins: this sub-tab only exists while it's on)
-    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 206, 116, 62, 28, IDC_MICSUB2);
+    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 176, 116, 53, 28, IDC_MICSUB2);
     gBuildFeat = FEAT_SPEECH;                   // (Settings > Features > Speech: this sub-tab only exists while it's on)
-    Ctl(L"BUTTON", L"Speech", BS_OWNERDRAW | WS_TABSTOP, 270, 116, 62, 28, IDC_MICSUB4);
+    Ctl(L"BUTTON", L"Speech", BS_OWNERDRAW | WS_TABSTOP, 230, 116, 53, 28, IDC_MICSUB4);
+    gBuildFeat = 0;
+    Ctl(L"BUTTON", L"Music", BS_OWNERDRAW | WS_TABSTOP, 284, 116, 53, 28, IDC_MICSUB5);
     gBuildFeat = FEAT_VST;
     {
         gBuildSub = 2;
@@ -24702,13 +24704,34 @@ static void CreateUI()
         gBuildSub = -1; gBuildFeat = 0;
         SpCmdList(); BlOutsText(); SpActFill(); BlSoundText();
     }
+    // ---- Music (1.61.0 on the Soundboard; Mic > Music since 1.63.0) ----
+    gBuildSub = 5; gBuildFeat = 0;
+    AddSection(14, 160, 532, 384, L"Music");
+    SetWindowSubclass(Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 30, 180, 500, 48, IDC_MUSVIEW), MusViewProc, 1, 0);
+    Ctl(L"BUTTON", L"\x23EE", WS_TABSTOP | WS_GROUP, 30, 236, 50, 30, IDC_MUSPREV);
+    Ctl(L"BUTTON", L"\x25B6  Play", WS_TABSTOP, 86, 236, 104, 30, IDC_MUSPLAY);
+    Ctl(L"BUTTON", L"\x23ED", WS_TABSTOP, 196, 236, 50, 30, IDC_MUSNEXT);
+    Ctl(L"BUTTON", L"\x25A0", WS_TABSTOP, 252, 236, 50, 30, IDC_MUSSTOP);
+    Ctl(L"BUTTON", L"Shuffle", BS_AUTOCHECKBOX | WS_TABSTOP, 316, 241, 80, 20, IDC_MUSSHUF);
+    Ctl(L"BUTTON", L"Repeat: all", WS_TABSTOP, 400, 236, 130, 30, IDC_MUSREP);
+    Ctl(L"BUTTON", L"Plays on: pick...", WS_TABSTOP, 30, 276, 342, 28, IDC_MUSOUTS);
+    Ctl(L"STATIC", L"Volume", 0, 384, 281, 52, 18, -1);
+    MiniVol(IDC_MUSVOL, 438, 278, 64, gMusVolPc.load());
+    Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP,
+        30, 314, 500, 150, IDC_MUSLIST, WS_EX_CLIENTEDGE);
+    Ctl(L"BUTTON", L"Add files...", WS_TABSTOP, 30, 472, 110, 28, IDC_MUSADD);
+    Ctl(L"BUTTON", L"Add folder...", WS_TABSTOP, 146, 472, 110, 28, IDC_MUSFOLDER);
+    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 262, 472, 90, 28, IDC_MUSDEL);
+    Ctl(L"BUTTON", L"Clear", WS_TABSTOP, 358, 472, 80, 28, IDC_MUSCLEAR);
+    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSPLAY, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 30, 506, 200, 28, IDC_MUSKEYPLAY); }
+    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSNEXT, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 236, 506, 200, 28, IDC_MUSKEYNEXT); }
     gBuildSub = -1;
     Ctl(L"BUTTON", L"\x25CF  Record 5 s", WS_TABSTOP | WS_GROUP, 14, 556, 128, 30, IDC_MICTEST);
     Ctl(L"BUTTON", L"\x25B6  Play again", WS_TABSTOP, 148, 556, 110, 30, IDC_MICPLAY);
     EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), FALSE);
     Ctl(L"STATIC", MICTEST_INFO, 0, 268, 556, 278, 32, IDC_MICTESTINFO);
-    Ctl(L"BUTTON", L"Set up my mic", WS_TABSTOP | WS_GROUP, 338, 116, 104, 28, IDC_MICSETUP);
-    Ctl(L"BUTTON", L"Mic type  \x25BE", WS_TABSTOP, 446, 116, 100, 28, IDC_MICTYPE);
+    Ctl(L"BUTTON", L"Set up my mic", WS_TABSTOP | WS_GROUP, 342, 116, 102, 28, IDC_MICSETUP);
+    Ctl(L"BUTTON", L"Mic type  \x25BE", WS_TABSTOP, 448, 116, 98, 28, IDC_MICTYPE);
 
     // ---------------- Voice FX page ----------------
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
@@ -24910,7 +24933,6 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Pads", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 58, 62, 28, IDC_SBSUB0);   // sub-tabs (1.56.0; Music 1.61.0)
     Ctl(L"BUTTON", L"Looper", BS_OWNERDRAW | WS_TABSTOP, 80, 58, 62, 28, IDC_SBSUB1);
     Ctl(L"BUTTON", L"Beatbox", BS_OWNERDRAW | WS_TABSTOP, 146, 58, 62, 28, IDC_SBSUB2);
-    Ctl(L"BUTTON", L"Music", BS_OWNERDRAW | WS_TABSTOP, 212, 58, 62, 28, IDC_SBSUB3);
     gBuildSub = 0;                              // Pads
     for (int b2 = 0; b2 < PAD_BANKS; b2++)      // pages A-D (beside the sub-tabs since 1.56.0)
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 280 + b2 * 33, 58, 30, 28, IDC_PADBANK0 + b2);
@@ -25033,27 +25055,6 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Teach hi-hat", WS_TABSTOP, 282, 404, 120, 30, IDC_BBTEACH2);
     Ctl(L"BUTTON", L"Forget", WS_TABSTOP, 408, 404, 122, 30, IDC_BBFORGET);
     Ctl(L"STATIC", L"", SS_NOPREFIX, 30, 444, 500, 20, IDC_BBSTAT);
-    // ---- Music (1.61.0) ----
-    gBuildSub = 3;
-    AddSection(14, 98, 532, 456, L"Music");
-    SetWindowSubclass(Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 30, 118, 500, 48, IDC_MUSVIEW), MusViewProc, 1, 0);
-    Ctl(L"BUTTON", L"\x23EE", WS_TABSTOP | WS_GROUP, 30, 174, 50, 30, IDC_MUSPREV);
-    Ctl(L"BUTTON", L"\x25B6  Play", WS_TABSTOP, 86, 174, 104, 30, IDC_MUSPLAY);
-    Ctl(L"BUTTON", L"\x23ED", WS_TABSTOP, 196, 174, 50, 30, IDC_MUSNEXT);
-    Ctl(L"BUTTON", L"\x25A0", WS_TABSTOP, 252, 174, 50, 30, IDC_MUSSTOP);
-    Ctl(L"BUTTON", L"Shuffle", BS_AUTOCHECKBOX | WS_TABSTOP, 316, 179, 80, 20, IDC_MUSSHUF);
-    Ctl(L"BUTTON", L"Repeat: all", WS_TABSTOP, 400, 174, 130, 30, IDC_MUSREP);
-    Ctl(L"BUTTON", L"Plays on: pick...", WS_TABSTOP, 30, 214, 342, 28, IDC_MUSOUTS);
-    Ctl(L"STATIC", L"Volume", 0, 384, 219, 52, 18, -1);
-    MiniVol(IDC_MUSVOL, 438, 216, 64, gMusVolPc.load());
-    Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP,
-        30, 252, 500, 210, IDC_MUSLIST, WS_EX_CLIENTEDGE);
-    Ctl(L"BUTTON", L"Add files...", WS_TABSTOP, 30, 470, 110, 28, IDC_MUSADD);
-    Ctl(L"BUTTON", L"Add folder...", WS_TABSTOP, 146, 470, 110, 28, IDC_MUSFOLDER);
-    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 262, 470, 90, 28, IDC_MUSDEL);
-    Ctl(L"BUTTON", L"Clear", WS_TABSTOP, 358, 470, 80, 28, IDC_MUSCLEAR);
-    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSPLAY, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 30, 510, 200, 28, IDC_MUSKEYPLAY); }
-    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSNEXT, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 236, 510, 200, 28, IDC_MUSKEYNEXT); }
     gBuildSub = -1;
 
     // ---------------- Clips page ----------------
@@ -25741,7 +25742,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_SPMODEL) { if (code == BN_CLICKED) WsModelMenu(); return; }
     if (id == IDC_SPADD)  { if (code == BN_CLICKED) SpCmdAdd(); return; }
     if (id == IDC_SPDEL)  { if (code == BN_CLICKED) SpCmdDel(); return; }
-    // ---- Soundboard > Music (1.61.0) ----
+    // ---- Mic > Music (1.61.0) ----
     if (id == IDC_MUSPLAY)   { if (code == BN_CLICKED) MusToggle(); return; }
     if (id == IDC_MUSNEXT)   { if (code == BN_CLICKED) MusNext(); return; }
     if (id == IDC_MUSPREV)   { if (code == BN_CLICKED) MusPrev(); return; }
@@ -26111,10 +26112,8 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED && gSbSub != SbSubOf(id)) {
             gSbSub = SbSubOf(id); Layout();
             for (int k = IDC_SBSUB0; k <= IDC_SBSUB2; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
-            InvalidateRect(GetDlgItem(gWnd, IDC_SBSUB3), nullptr, FALSE);
             if (gSbSub == 1) { LpSrcFill(); LoopTick(true); }
             if (gSbSub == 2) BbStatus();
-            if (gSbSub == 3) { MusOutsText(); MusUi(); }
         }
         return;
     }
@@ -26534,13 +26533,14 @@ static void OnCommand(int id, int code)
     case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6: case IDC_FXSUB7:
         if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
         break;
-    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2: case IDC_MICSUB3: case IDC_MICSUB4:
+    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2: case IDC_MICSUB3: case IDC_MICSUB4: case IDC_MICSUB5:
         if (code == BN_CLICKED && gMicSub != MicSubOf(id)) {
             gMicSub = MicSubOf(id);
             Layout();
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB1), nullptr, FALSE);
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB2), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB3), nullptr, FALSE);
-            InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB4), nullptr, FALSE);
+            InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB4), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB5), nullptr, FALSE);
+            if (gMicSub == 5) { MusOutsText(); MusUi(); }
             if (gMicSub == 4) { SpActFill(); SpCmdList(); BlOutsText(); SpeechStatus(); }
             if (gMicSub == 3) MicVolRefresh(true);
             if (gMicSub == 2) VstRefreshUi();
@@ -27027,7 +27027,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     }
-    case WM_APP + 31:                           // Soundboard > Music: the decoder started / finished a song
+    case WM_APP + 31:                           // Mic > Music: the decoder started / finished a song
         MusUi();
         return 0;
     case WM_APP + 21:                           // Mic > Speech: Whisper heard something (lParam: a WsResult to free)
