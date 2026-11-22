@@ -109,6 +109,7 @@ int main(int argc, char** argv)
     if (argc > 3) {                             // laughing, coughing, breathing (ESC-50): Whisper shouldn't hear words in them
         printf("Not speech (laughing / coughing / breathing):\n");
         got.clear();
+        gSpBaseW = gSpW.load(); gSpT0 = fed.load();   // (the engine starts reading where the ring is now, not from the start)
         WsStart(E, argv[1], cb, nullptr);
         for (int i = 0; i < 500 && E.running.load() && E.state.load() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         int madeUp = 0, clips = 0;

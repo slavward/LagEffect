@@ -21752,7 +21752,7 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
     // Not speech (laughing, coughing, breathing) makes Whisper "hear" words (1.61.0; measured on ESC-50 clips, tests/whisper.cpp).
     // What it makes up is unsure (its pieces' average chance under 0.5, where real speech is 0.6-0.9), loops ("a little bit
     // like a little bit like..."), has no letters ("♪"), is flagged as no speech (over 0.5), or is one long "-ly" word
-    // ("effortlessly", "consequently"). Those segments are dropped; a word said over and over is kept 3 times.
+    // ("effortlessly", "consequently") or a lone letter. Those segments are dropped; a word said over and over is kept 3 times.
     for (int s = 0; s < ns; s++) {
         const float noSp = whisper_full_get_segment_no_speech_prob(E.ctx, s);
         WsWord sw[96]; int sn = 0; float sum = 0; int nt2 = 0;
@@ -21784,9 +21784,9 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
             for (const char* q = sw[i].text; *q && k < 23; q++) { const char c = *q; if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) key[i][k++] = c; else if (c >= 'A' && c <= 'Z') key[i][k++] = (char)(c + 32); }
             key[i][k] = 0; letters += k;
         }
-        if (noSp > 0.5f || avgP < 0.5f || !letters) continue;
+        if (noSp > 0.5f || avgP < (final ? 0.5f : 0.55f) || !letters) continue;   // (quick guesses: a little stricter; the final text follows)
         if (sn && (sw[0].text[0] == '[' || sw[0].text[0] == '(')) continue;   // "[BLANK_AUDIO]", "(music)"
-        if (sn == 1) { const size_t L = strlen(key[0]); if (L >= 8 && key[0][L - 2] == 'l' && key[0][L - 1] == 'y') continue; }
+        if (sn == 1) { const size_t L = strlen(key[0]); if ((L >= 8 && key[0][L - 2] == 'l' && key[0][L - 1] == 'y') || L <= 1) continue; }   // (also a lone "I" / "a")
         bool loop = false;                      // a phrase of 2-4 words three times in a row
         for (int n = 2; n <= 4 && !loop; n++)
             for (int i = 0; i + 3 * n <= sn && !loop; i++) {
