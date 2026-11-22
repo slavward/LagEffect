@@ -21705,6 +21705,7 @@ static void DrawBbView(DRAWITEMSTRUCT* d)       // a light per drum: lit when yo
 #define WS_MAXSEG (10 * WS_RATE)
 struct WsWord { char text[48]; long long a, b; float p; };   // a word, where it is on the audio clock (gAudT frames), how sure (0-1)
 static void (*gWsSegDebug)(const char* text, float noSpeech, float avgP, float minP, bool final) = nullptr;   // (tests: every segment)
+static bool gWsNoFilter = false;                // (tests: everything Whisper says, to compare with the filter)
 struct WsResult { int kind; int n; WsWord w[96]; char text[1024]; int ms; };   // kind 0 a quick guess, 1 final, 2 an error (text)
 typedef void (*WsCallback)(const WsResult* r, void* user);
 struct WsEngine {
@@ -21753,6 +21754,7 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
     // What it makes up is unsure (its pieces' average chance under 0.5, where real speech is 0.6-0.9), loops ("a little bit
     // like a little bit like..."), has no letters ("♪"), is flagged as no speech (over 0.5), or is one long "-ly" word
     // ("effortlessly", "consequently") or a lone letter. Those segments are dropped; a word said over and over is kept 3 times.
+    char prevKey[600] = "";                     // (the last segment kept, to drop the same sentence again)
     for (int s = 0; s < ns; s++) {
         const float noSp = whisper_full_get_segment_no_speech_prob(E.ctx, s);
         WsWord sw[96]; int sn = 0; float sum = 0; int nt2 = 0;
@@ -21784,17 +21786,33 @@ static void WsPass(WsEngine& E, const std::vector<float>& a, long long clock0, b
             for (const char* q = sw[i].text; *q && k < 23; q++) { const char c = *q; if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) key[i][k++] = c; else if (c >= 'A' && c <= 'Z') key[i][k++] = (char)(c + 32); }
             key[i][k] = 0; letters += k;
         }
+        if (!gWsNoFilter) {
         if (noSp > 0.5f || avgP < (final ? 0.5f : 0.55f) || !letters) continue;   // (quick guesses: a little stricter; the final text follows)
         if (sn && (sw[0].text[0] == '[' || sw[0].text[0] == '(')) continue;   // "[BLANK_AUDIO]", "(music)"
         if (sn == 1) { const size_t L = strlen(key[0]); if ((L >= 8 && key[0][L - 2] == 'l' && key[0][L - 1] == 'y') || L <= 1) continue; }   // (also a lone "I" / "a")
-        bool loop = false;                      // a phrase of 2-4 words three times in a row
-        for (int n = 2; n <= 4 && !loop; n++)
-            for (int i = 0; i + 3 * n <= sn && !loop; i++) {
+        bool odd = false;                       // "P-P-P-P-P..." (one letter over and over), or a "word" far too long
+        for (int i = 0; i < sn && !odd; i++) {
+            const size_t L = strlen(key[i]); bool one = L >= 4;
+            for (size_t j = 1; j < L && one; j++) one = key[i][j] == key[i][0];
+            odd = one || L >= 18;
+        }
+        if (odd) continue;
+        bool loop = false;                      // a phrase of 2-10 words three times in a row (twice for 5+ words)
+        for (int n = 2; n <= 10 && !loop; n++) {
+            const int times = n >= 5 ? 2 : 3;
+            for (int i = 0; i + times * n <= sn && !loop; i++) {
                 bool same = true;
-                for (int j = 0; j < n && same; j++) same = !strcmp(key[i + j], key[i + n + j]) && !strcmp(key[i + j], key[i + 2 * n + j]);
+                for (int j = 0; j < n && same; j++) for (int t = 1; t < times && same; t++) same = !strcmp(key[i + j], key[i + t * n + j]);
                 loop = same;
             }
+        }
         if (loop) continue;
+        char sk[600]; size_t skl = 0;           // the same sentence as the segment before: a loop across segments
+        for (int i = 0; i < sn && skl + 26 < sizeof(sk); i++) { const size_t l = strlen(key[i]); memcpy(sk + skl, key[i], l); skl += l; sk[skl++] = ' '; }
+        sk[skl] = 0;
+        if (skl > 8 && !strcmp(sk, prevKey)) continue;
+        memcpy(prevKey, sk, skl + 1);
+        }
         int run = 0;
         for (int i = 0; i < sn; i++) {
             run = i > 0 && key[i][0] && !strcmp(key[i], key[i - 1]) ? run + 1 : 0;

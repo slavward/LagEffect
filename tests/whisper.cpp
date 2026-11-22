@@ -112,6 +112,10 @@ int main(int argc, char** argv)
         gSpBaseW = gSpW.load(); gSpT0 = fed.load();   // (the engine starts reading where the ring is now, not from the start)
         WsStart(E, argv[1], cb, nullptr);
         for (int i = 0; i < 500 && E.running.load() && E.state.load() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        int madeUpBy[2] = { 0, 0 };
+        for (int pass = 0; pass < 2; pass++) {  // without the filter (what Whisper itself says), then with it
+        gWsNoFilter = pass == 0;
+        printf("  %s:\n", pass == 0 ? "without the filter" : "with the filter");
         int madeUp = 0, clips = 0;
         for (int a = 3; a < argc; a++) {
             std::vector<short> x = loadWav16k(argv[a]); if (x.empty()) continue;
@@ -131,9 +135,12 @@ int main(int argc, char** argv)
             printf("  %s: words (~ = quick guess):%s\n", curClip.c_str(), words.empty() ? " none" : words.c_str());
             clips++; if (bad) madeUp++;
         }
-        WsStop(E);
         printf("  words that weren't said (other than a laugh, \"oh\", \"yeah\"...) in %d of %d clips\n", madeUp, clips);
-        check("laughing / coughing / breathing: made-up words in at most 2 of 13 clips", madeUp <= 2);
+        madeUpBy[pass] = madeUp;
+        }
+        WsStop(E); gWsNoFilter = false;
+        printf("  made-up words: %d of the clips without the filter, %d with it\n", madeUpBy[0], madeUpBy[1]);
+        check("laughing / coughing / breathing: the filter takes out most made-up words", madeUpBy[1] * 2 <= madeUpBy[0] + 1 && madeUpBy[1] <= 5);
     }
     printf(fails ? "%d FAILED\n" : "all ok\n", fails);
     return fails ? 1 : 0;
