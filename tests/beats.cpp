@@ -193,9 +193,9 @@ int main()
         gMusOuts = 1; gMusVolPc = 50; rec.clear(); run(50, silence);
         const double half = goertzel(rec, 2400, 19200, 660);
         printf("  660 Hz on output 1: %.3f; only on output 2: %.3f; at 50%%: %.3f\n", on, other, half);
-        check("plays on the output picked", on > 0.23 && on < 0.27);
+        check("plays on the output picked (100% = 9 dB under the file, 1.64.0)", on > 0.25 * 0.33 && on < 0.25 * 0.37);
         check("not on an output that isn't picked", other < 0.001);
-        check("its volume", half > 0.11 && half < 0.14);
+        check("its volume (50% = a quarter of 100%: the ear's scale)", half > on * 0.23 && half < on * 0.27);
         const unsigned at = gMusR.load();
         gMusPlay = false; rec.clear(); run(50, silence);
         check("pause: silent, and it keeps its place", goertzel(rec, 2400, 19200, 660) < 0.001 && gMusR.load() - at < 3000);
@@ -204,7 +204,19 @@ int main()
             gMusJump.store(gMusR.load() + 30000); gMusJumpGen.fetch_add(1);
             rec.clear(); run(20, silence);
             double worst = 0; for (size_t i = 1; i < rec.size(); i++) worst = std::max(worst, (double)fabs(rec[i] - rec[i - 1]));
-            check("a jump fades out and in (no click)", worst < 2 * M_PI * 660 / R * 0.125 * 1.3 && gMusR.load() > at + 30000);
+            check("a jump fades out and in (no click)", worst < 2 * M_PI * 660 / R * 0.25 * MusGain(50) * 1.3 && gMusR.load() > at + 30000);
+        }
+        {   // 1.64.0: the music as a Mixer channel: through its fader and routes, not on "Plays on" as well
+            gMusOuts = 2; gMusVolPc = 100; gMusR = 0; gMusW = MUS_RING - 1;   // (the song again from the top)
+            gCh[1].type = CH_MUS; gCh[1].db10 = 0; gCh[1].routes = 1; gCh[1].mute = false; gChA[1].w = gChA[1].r = 0; gChA[1].primed = false; gChA[1].live = true;
+            run(20, silence); rec.clear(); run(50, silence);
+            const double viaCh = goertzel(rec, 2400, 19200, 660);
+            gCh[1].db10 = -60; run(20, silence); rec.clear(); run(50, silence);
+            const double down6 = goertzel(rec, 2400, 19200, 660);
+            printf("  as a Mixer channel on output 1: %.3f; its fader at -6 dB: %.3f\n", viaCh, down6);
+            check("the Mixer's Music channel plays it (100%)", viaCh > 0.25 * 0.33 && viaCh < 0.25 * 0.37);
+            check("its fader works on it", down6 > viaCh * 0.45 && down6 < viaCh * 0.55);
+            gCh[1].type = CH_NONE; gChA[1].live = false; gCh[1].db10 = 0; gMusOuts = 1;
         }
         gMusPlay = false; run(10, silence); gMusR = 0; gMusW = 0; gMicMuted = false;
     }
