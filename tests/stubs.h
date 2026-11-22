@@ -38,12 +38,13 @@ static wchar_t* lstrcpynW(wchar_t* d, const wchar_t* s, int n){ wcsncpy(d,s,n-1)
 #define VST_OUTS 5
 #define VST_CH0 VST_MIC
 #define VST_OUT0 (VST_CH0 + VST_RACKS * VST_PER)
-struct VstLiveStub { int v; int load() const { return v; } };
+struct VstLiveStub { int v; int load() const { return v; } };   // (v: plugins loaded; tests can set it)
 static VstLiveStub gVstLive = { 0 };
 static VstLiveStub gVstChMap[VST_CHANS];
-static bool VstRangeOn(int, int, int = -1) { return false; }
+static bool gStubMicPlug = false; static float gStubPlugGain = 1.0f;   // (tests/beats.cpp: a fake mic plugin before the voice effects)
+static bool VstRangeOn(int first, int, int post = -1) { return gStubMicPlug && first == 0 && post == 0; }
 static void VstRunRange(int, int, float*, float*, int, int = -1) {}
-static void VstRun(float*, int) {}
+static void VstRun(float* b, int n) { for (int i = 0; i < n; i++) b[i] *= gStubPlugGain; }
 #endif
 static bool gStubFxAny = false;
 static bool FxAnyOn() { return gStubFxAny; }

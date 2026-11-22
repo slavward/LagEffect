@@ -17,6 +17,27 @@ static std::vector<Got> got;
 static std::atomic<long long> fed{ 0 };         // the clock of the audio fed so far
 static const long long T0 = 480000;             // (the clock when feeding starts: any number)
 static void cb(const WsResult* r, void*) { std::lock_guard<std::mutex> g(mu); got.push_back({ *r, fed.load() }); }
+static std::string curClip = "jfk";
+static void segDbg(const char* t, float ns, float ap, float mp, bool fin)
+{
+    std::lock_guard<std::mutex> g(mu);
+    printf("    seg [%s] %s ns %.2f avgP %.2f minP %.2f: %s\n", curClip.c_str(), fin ? "final" : "quick", ns, ap, mp, t ? t : "");
+}
+static std::vector<short> loadWav16k(const char* path)   // a WAV (16-bit, any rate, mono / stereo), as 16 kHz mono
+{
+    std::vector<short> out; FILE* f = fopen(path, "rb"); if (!f) return out;
+    std::vector<unsigned char> b; { unsigned char t[65536]; size_t n; while ((n = fread(t, 1, sizeof t, f)) > 0) b.insert(b.end(), t, t + n); } fclose(f);
+    size_t p = 12, dataAt = 0, dataLen = 0; unsigned rate = 16000, ch = 1;
+    while (p + 8 <= b.size()) { const unsigned len = b[p + 4] | b[p + 5] << 8 | b[p + 6] << 16 | (unsigned)b[p + 7] << 24;
+        if (!memcmp(&b[p], "fmt ", 4)) { ch = b[p + 10] | b[p + 11] << 8; rate = b[p + 12] | b[p + 13] << 8 | b[p + 14] << 16 | (unsigned)b[p + 15] << 24; }
+        if (!memcmp(&b[p], "data", 4)) { dataAt = p + 8; dataLen = len; break; } p += 8 + len + (len & 1); }
+    if (!dataAt) return out;
+    const size_t n = dataLen / 2 / ch; std::vector<float> x(n);
+    for (size_t i = 0; i < n; i++) { float v = 0; for (unsigned c = 0; c < ch; c++) { short s; memcpy(&s, &b[dataAt + (i * ch + c) * 2], 2); v += s; } x[i] = v / ch; }
+    const double step = rate / 16000.0;
+    for (double q = 0; q + 1 < n; q += step) { const size_t i = (size_t)q; const double fr = q - i; out.push_back((short)(x[i] * (1 - fr) + x[i + 1] * fr)); }
+    return out;
+}
 static std::string norm(const char* s)          // lower case, letters and spaces
 {
     std::string o; for (; *s; s++) { char c = *s; if (c >= 'A' && c <= 'Z') c += 32; if ((c >= 'a' && c <= 'z') || c == ' ') o += c; else if (c == '\'') continue; else o += ' '; }
@@ -46,6 +67,7 @@ int main(int argc, char** argv)
     printf("JFK: %.2f s\n", pcm.size() / 16000.0);
     gSpW = 0; gSpRead = 0; gSpBaseW = 0; gSpT0 = T0; gSpStartReq = false; fed = T0;
     static WsEngine E;
+    gWsSegDebug = segDbg;
     WsStart(E, argv[1], cb, nullptr);
     for (int i = 0; i < 500 && E.running.load() && E.state.load() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     check("the model loads", E.running.load() && E.state.load() == 2);
@@ -55,7 +77,7 @@ int main(int argc, char** argv)
     { std::lock_guard<std::mutex> g(mu); check("a quiet room: nothing heard (no made-up words)", got.empty()); }
     const long long speechAt = fed.load();
     feed(pcm.data(), pcm.size());
-    std::vector<short> sil(16000 * 3, 0); feed(sil.data(), sil.size());
+    static std::vector<short> sil(16000 * 3, 0); feed(sil.data(), sil.size());
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     WsStop(E);
     std::string all; int finals = 0, quick = 0;
@@ -84,6 +106,44 @@ int main(int argc, char** argv)
     const double lag = countryKnown >= 0 ? (countryKnown - countryB) / 48000.0 : 99;
     printf("  \"country\" was known %.2f s after it was said\n", lag);
     check("a word is known within 2 s (so a 3 s bleep delay catches it)", lag < 2.0);
+    if (argc > 3) {                             // laughing, coughing, breathing (ESC-50): Whisper shouldn't hear words in them
+        printf("Not speech (laughing / coughing / breathing):\n");
+        got.clear();
+        gSpBaseW = gSpW.load(); gSpT0 = fed.load();   // (the engine starts reading where the ring is now, not from the start)
+        WsStart(E, argv[1], cb, nullptr);
+        for (int i = 0; i < 500 && E.running.load() && E.state.load() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        int madeUpBy[2] = { 0, 0 };
+        for (int pass = 0; pass < 2; pass++) {  // without the filter (what Whisper itself says), then with it
+        gWsNoFilter = pass == 0;
+        printf("  %s:\n", pass == 0 ? "without the filter" : "with the filter");
+        int madeUp = 0, clips = 0;
+        for (int a = 3; a < argc; a++) {
+            std::vector<short> x = loadWav16k(argv[a]); if (x.empty()) continue;
+            { std::lock_guard<std::mutex> g(mu); curClip = strrchr(argv[a], '/') ? strrchr(argv[a], '/') + 1 : argv[a]; got.clear(); }
+            feed(x.data(), x.size()); feed(sil.data(), sil.size());
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            std::lock_guard<std::mutex> g(mu);
+            std::string words; bool bad = false;
+            for (const Got& g2 : got) for (int i = 0; i < g2.r.n; i++) {   // (quick guesses too: the captions show them)
+                char t[80]; snprintf(t, 80, " %s%s(%.2f)", g2.r.kind == 1 ? "" : "~", g2.r.w[i].text, g2.r.w[i].p); words += t;
+                static const char* ok[] = { "ha", "haha", "hahaha", "hahahaha", "heh", "hehe", "hehehe", "he", "oh", "ah", "uh", "um", "ugh",
+                                            "yeah", "mm", "hmm", "huh", "ow", "aw", "wow", "whoa", "ooh", "eh", "ahem" };
+                const std::string w = norm(g2.r.w[i].text); std::string k; for (char c : w) if (c != ' ') k += c;
+                bool fine = k.empty(); for (const char* o : ok) if (k == o) fine = true;
+                bool laugh = k.size() >= 2 && k[0] == 'h'; for (char c : k) if (c != 'h' && c != 'a' && c != 'e') laugh = false;
+                if (laugh) fine = true;         // "hahahaha", "heheheh": a laugh written down, not a made-up word
+                if (!fine) bad = true;
+            }
+            printf("  %s: words (~ = quick guess):%s\n", curClip.c_str(), words.empty() ? " none" : words.c_str());
+            clips++; if (bad) madeUp++;
+        }
+        printf("  words that weren't said (other than a laugh, \"oh\", \"yeah\"...) in %d of %d clips\n", madeUp, clips);
+        madeUpBy[pass] = madeUp;
+        }
+        WsStop(E); gWsNoFilter = false;
+        printf("  made-up words: %d of the clips without the filter, %d with it\n", madeUpBy[0], madeUpBy[1]);
+        check("laughing / coughing / breathing: the filter takes out most made-up words", madeUpBy[1] * 2 <= madeUpBy[0] + 1 && madeUpBy[1] <= 5);   // (base sometimes makes up a whole sentence it's sure of: nothing to filter on)
+    }
     printf(fails ? "%d FAILED\n" : "all ok\n", fails);
     return fails ? 1 : 0;
 }

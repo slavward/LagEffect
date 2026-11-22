@@ -44,11 +44,23 @@ jobs:
             echo "$f: LagEffect.cpp has $want, the file is $got"; [ "$want" = "$got" ]
           done
 
+      # Laughing / coughing / breathing (ESC-50, CC BY-NC 3.0, test use only): Whisper mustn't make up words from them
+      - name: Download sounds that aren't speech
+        run: |
+          mkdir -p "$RUNNER_TEMP/esc"
+          for f in 1-1791-A-26 1-30039-A-26 1-30043-A-26 1-33658-A-26 1-36164-A-26 1-72695-A-26 1-73123-A-26 2-109759-A-26 2-60791-A-26 \
+                   1-19111-A-24 1-52266-A-24 1-18631-A-23 1-36393-A-23; do
+            curl -sSfL -o "$RUNNER_TEMP/esc/$f.wav" "https://raw.githubusercontent.com/karolpiczak/ESC-50/master/audio/$f.wav"
+          done
+          ls "$RUNNER_TEMP/esc" | wc -l
+
       - name: Run the tests
         env:
           WHISPER_DIR: ${{ runner.temp }}/whisper.cpp
           WHISPER_MODELS: ${{ runner.temp }}/ggml-tiny.en-q5_1.bin ${{ runner.temp }}/ggml-base.en-q5_1.bin
+          NOISE_DIR: ${{ runner.temp }}/esc
           MSG: ${{ github.event.head_commit.message || github.event.pull_request.title }}
         run: |
           case "$MSG" in *"[audio-change]"*) export AUDIO_CHANGE=1 ;; esac
+          export NOISE_CLIPS="$(ls "$NOISE_DIR"/*.wav | tr '\n' ' ')"
           bash tests/run.sh "$RUNNER_TEMP/main.cpp"
