@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.62.0"
+#define APP_VERSION L"1.63.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4037,7 +4037,7 @@ static void LoopCmd(LoopCore& L, float* mem, unsigned cmd, int latF)
     }
 }
 // One frame: `in` is what's being recorded, returns what the loop plays. mute: layer bits; vol: loop volume.
-// ======================= Music (1.61.0, Soundboard > Music): the audio side =======================
+// ======================= Music (1.61.0, Mic > Music): the audio side =======================
 // A decoder thread (the window's side) writes the playing song, 48 kHz stereo, into gMusRing; the audio thread reads
 // it and adds it to the outputs you picked (after the Mixer's channels, so it goes through those outputs' plugins,
 // volume and limiter). Pause / play glide 5 ms. A new song or a seek: the decoder writes it from gMusJump on and
@@ -4924,7 +4924,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool lpVoice = gLpVoiceOnly.load(std::memory_order_relaxed);
     const int lpCh = gLpSrcCh.load(std::memory_order_relaxed);
     static MusState mus;                         // Music (1.61.0): only while playing or fading
-    const bool musPlay = gFeatSound && gMusPlay.load(std::memory_order_relaxed);
+    const bool musPlay = gMusPlay.load(std::memory_order_relaxed);   // (Mic > Music since 1.63.0: no feature switch; it only runs while playing)
     const bool musRun = musPlay || mus.g > 0.0f || mus.jumping || gMusJumpGen.load(std::memory_order_relaxed) != mus.gen;   // (a jump while paused: done at once)
     const float musVol = Iclamp(gMusVolPc.load(std::memory_order_relaxed), 0, 200) * 0.01f;
     const unsigned musOuts = gMusOuts.load(std::memory_order_relaxed);
@@ -5430,8 +5430,10 @@ enum {
     IDC_AVPIC0, IDC_AVPIC1, IDC_AVPIC2, IDC_AVPIC3, IDC_AVPIC4, IDC_AVTALK, IDC_AVLOUD, IDC_AVMETER, IDC_AVBG, IDC_AVBOUNCE, IDC_AVOPEN,
     IDC_CAPON, IDC_CAPMASK, IDC_CAPOPEN, IDC_CAPLINES, IDC_CAPSIZE, IDC_CAPCLEAR, IDC_CAPFILE, IDC_CAPFOLDER, IDC_CAPBG,
     IDC_CBACT, IDC_CBTGT, IDC_CBOPT, IDC_CBVAL, IDC_CBLINE, IDC_CBCOPY, IDC_CBTEST, IDC_CBSTAT,
-    IDC_SBSUB3, IDC_MUSVIEW, IDC_MUSPREV, IDC_MUSPLAY, IDC_MUSNEXT, IDC_MUSSTOP, IDC_MUSSHUF, IDC_MUSREP, IDC_MUSOUTS, IDC_MUSVOL,   // (1.61.0: Soundboard > Music)
+    IDC_SBSUB3, IDC_MUSVIEW, IDC_MUSPREV, IDC_MUSPLAY, IDC_MUSNEXT, IDC_MUSSTOP, IDC_MUSSHUF, IDC_MUSREP, IDC_MUSOUTS, IDC_MUSVOL,   // (1.61.0: Mic > Music)
     IDC_MUSLIST, IDC_MUSADD, IDC_MUSFOLDER, IDC_MUSDEL, IDC_MUSCLEAR, IDC_MUSKEYPLAY, IDC_MUSKEYNEXT,
+    IDC_VOLSTYLE,                               // (1.63.0: Settings > Look > Volume controls)
+    IDC_MICSUB5,                                // (1.63.0: Mic > Music, moved from the Soundboard)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5690,17 +5692,17 @@ struct FxGroup { const wchar_t* title; volatile bool* on; const wchar_t* key; bo
 #define FX_SUBS 8
 static int gFxSub = 0;                          // which Voice FX sub-tab is showing
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun", L"Whisper" };
-static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume
-static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : id == IDC_MICSUB4 ? 4 : -1; }
+static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume, 4 = Speech, 5 = Music (1.63.0)
+static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : id == IDC_MICSUB4 ? 4 : id == IDC_MICSUB5 ? 5 : -1; }
 static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features, 4 = Stream (1.60.0)
 static int SetSubOf(int id) { return id >= IDC_SETSUB0 && id <= IDC_SETSUB3 ? id - IDC_SETSUB0 : id == IDC_SETSUB4 ? 4 : -1; }
-static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox, 3 = Music (1.61.0)
-static const wchar_t* SB_SUB_NAMES[4] = { L"Pads", L"Looper", L"Beatbox", L"Music" };
+static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox (Music moved to the Mic tab in 1.63.0)
+static const wchar_t* SB_SUB_NAMES[3] = { L"Pads", L"Looper", L"Beatbox" };
 static wchar_t gLpSrcKey[140] = L"";            // the looper records this Mixer channel (its VstChanKey; "" = not a channel; 1.61.0)
 static void LpSrcFill(); static void MusOutsText(); static void MusTick();
-static int gMusN = 0, gMusCur = -1, gMusRepeat = 1;   // Soundboard > Music: songs, the one chosen; repeat 0 off, 1 the list, 2 this song
+static int gMusN = 0, gMusCur = -1, gMusRepeat = 1;   // Mic > Music: songs, the one chosen; repeat 0 off, 1 the list, 2 this song
 static bool gMusShuffle = false;
-static int SbSubOf(int id) { return id >= IDC_SBSUB0 && id <= IDC_SBSUB2 ? id - IDC_SBSUB0 : id == IDC_SBSUB3 ? 3 : -1; }
+static int SbSubOf(int id) { return id >= IDC_SBSUB0 && id <= IDC_SBSUB2 ? id - IDC_SBSUB0 : -1; }
 static bool gLpSync = true;                     // Looper: line layers up with what you heard (moved earlier by the delay)
 static unsigned gBbTaught = 0;                  // Beatbox: sounds you taught it (bits: kick, snare, hi-hat)
 static const wchar_t* BB_KEYS[BB_SOUNDS] = { L"beatbox_sound_kick", L"beatbox_sound_snare", L"beatbox_sound_hihat" };
@@ -5820,7 +5822,7 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_BLEEP   (SLOT_RECORD + 6)           // Mic > Speech (1.57.0): bleep while held
 #define SLOT_SPTTS   (SLOT_RECORD + 7)           //   the TTS voice on / off
 #define SLOT_BLLIVE  (SLOT_RECORD + 8)           // Mic > Cleanup (1.59.1): live bleep while held (no delay)
-#define SLOT_MUSPLAY (SLOT_RECORD + 9)           // Soundboard > Music (1.61.0): play / pause
+#define SLOT_MUSPLAY (SLOT_RECORD + 9)           // Mic > Music (1.61.0): play / pause
 #define SLOT_MUSNEXT (SLOT_RECORD + 10)          //   the next song
 #define SLOT_NEW0    SLOT_LPREC                  // (slots after the plugins' and the recorder's)
 #define KEY_SLOTS    (SLOT_MUSNEXT + 1)
@@ -6030,6 +6032,7 @@ static bool     gGifPauseBg = false;             // pause GIFs while another win
 static HBRUSH   gBrPicture = nullptr;            // the picture, sized to the window and dimmed (a pattern brush)
 static wchar_t  gFontName[40] = L"Segoe UI";
 static int      gOpacity = 100;
+static int      gVolStyle = 0;                  // volume boxes (pads, clips, music, TTS): 0 a number you drag, 1 a small knob (1.63.0)
 static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
 #define DK_BG      gDkBg
 #define DK_CTL     gDkCtl
@@ -6746,6 +6749,7 @@ static void LoadSettings()
     GetPrivateProfileStringW(L"settings", L"font", L"Segoe UI", gFontName, 40, gIni);
     gFontPx = Iclamp(INI_INT(L"font_px", 13), 10, 20);
     gOpacity      = Iclamp(INI_INT(L"window_opacity", 100), 40, 100);
+    gVolStyle     = Iclamp(INI_INT(L"volume_control_style", 0), 0, 1);
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
     gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
@@ -6844,8 +6848,8 @@ static void LoadSettings()
     gDiveSemis = Iclamp(INI_INT(L"pitch_dive_semitones", -12), -12, 12);
     gBroadcast = INI_INT(L"broadcast_voice", 0) != 0;
     gHarmMute = INI_INT(L"fx_harm_mute", 0) != 0;
-    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 4);
-    gSbSub     = Iclamp(INI_INT(L"sound_subtab", 0), 0, 3);
+    gMicSub    = Iclamp(INI_INT(L"mic_subtab", 0), 0, 5);
+    gSbSub     = Iclamp(INI_INT(L"sound_subtab", 0), 0, 2);
     if (gMicSub == 2 && !gFeatVst) gMicSub = 0;
     if (gMicSub == 4 && !gFeatSpeech) gMicSub = 0;
     gDistStyle = Iclamp(INI_INT(L"fx_dist_style", 0), 0, DIST_N - 1);
@@ -7703,6 +7707,7 @@ static void SaveSettings()
     IniSet(L"font", gFontName);
     SaveInt(L"font_px", gFontPx);
     SaveInt(L"window_opacity", gOpacity);
+    SaveInt(L"volume_control_style", gVolStyle);
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); SaveInt(k, gFxHold[1 + g]); }
     ProfileKeysSave();
@@ -8104,11 +8109,12 @@ static HWND Spin(int id, int x, int y, int w, int lo, int hi, int val)
     return u;
 }
 
-// ======================= small volume knob (1.62.0: pads, clips, music, TTS, the masters) =======================
-// A 0-200% knob with its value beside it. Drag up / down (Shift = fine), scroll (Shift = 1%), arrow keys;
-// double-click or Delete = 100%; right-click or Enter = type a value. A change sends WM_COMMAND (id, EN_CHANGE)
+// ======================= volume box (1.62.0 a small knob; 1.63.0 a number you drag) =======================
+// "100%" in a box: pads, clips, music, TTS, the masters. Drag left / right (Shift = fine), scroll (Shift = 1%),
+// arrow keys; click = type a value; double-click or Delete = 100%. A change sends WM_COMMAND (id, EN_CHANGE)
 // to the window, which reads it back with MiniGet. The value lives in the control (GWLP_USERDATA).
-static int gMiniY = 0; static double gMiniAcc = 0; static int gMiniWheel = 0;
+static int gMiniX = 0, gMiniX0 = 0; static double gMiniAcc = 0; static int gMiniWheel = 0;
+static bool gMiniMoved = false, gMiniDbl = false; static HWND gMiniHot = nullptr;
 static int  MiniGetH(HWND h) { return (int)GetWindowLongPtrW(h, GWLP_USERDATA); }
 static int  MiniGet(int id)  { HWND h = GetDlgItem(gWnd, id); return h ? MiniGetH(h) : 0; }
 static void MiniSet(int id, int v)              // (no WM_COMMAND: for the code putting a saved value back)
@@ -8135,12 +8141,11 @@ static void MiniType(HWND h)
 }
 static void KnobPoint(int cx, int cy, int r, double deg, int* x, int* y);
 static void KnobArc(HDC dc, int cx, int cy, int r, double from, double to, COLORREF c, int width);
-static void PaintMini(HWND h, HDC dc)
+static void PaintMiniKnob(HWND h, HDC dc)       // the knob look (Settings > Look): knob the box's height, "N%" beside it
 {
     RECT rc; GetClientRect(h, &rc);
-    FillRect(dc, &rc, BgBrush());
     const int v = MiniGetH(h); const bool focus = GetFocus() == h;
-    const int d = rc.bottom, cx = d / 2, cy = d / 2, r = d / 2 - SC(3), th = Imax(2, SC(3));
+    const int d = rc.bottom, cx = d / 2, cy = d / 2, r = d / 2 - SC(2), th = Imax(2, SC(3));
     const double ang = 225.0 - 270.0 * v / 200.0;
     KnobArc(dc, cx, cy, r, 225.0, -45.0, gDark ? DK_TRACK : LT_TRACK, th);
     KnobArc(dc, cx, cy, r, 225.0, ang, ACCENT, th);
@@ -8157,27 +8162,64 @@ static void PaintMini(HWND h, HDC dc)
     wchar_t t[8]; wsprintfW(t, L"%d%%", v);
     SetBkMode(dc, TRANSPARENT); HGDIOBJ of = SelectObject(dc, gFont);
     SetTextColor(dc, focus ? ACCENT : TXT_C);
-    RECT tr = { d + SC(4), 0, rc.right, rc.bottom };
+    RECT tr = { d + SC(3), 0, rc.right, rc.bottom };
     DrawTextW(dc, t, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+    SelectObject(dc, of);
+}
+static void PaintMini(HWND h, HDC dc)
+{
+    RECT rc; GetClientRect(h, &rc);
+    FillRect(dc, &rc, BgBrush());
+    if (gVolStyle == 1) { PaintMiniKnob(h, dc); return; }
+    const int v = MiniGetH(h); const bool focus = GetFocus() == h, hot = gMiniHot == h || GetCapture() == h;
+    const COLORREF field = gDark ? DK_CTL : GetSysColor(COLOR_WINDOW);
+    HBRUSH body = CreateSolidBrush(hot ? Mix(field, ACCENT, gDark ? 0.18f : 0.10f) : field);
+    HPEN edge = CreatePen(PS_SOLID, 1, focus || hot ? ACCENT : gDark ? RGB(88, 88, 88) : RGB(186, 186, 186));
+    HGDIOBJ ob = SelectObject(dc, body), op = SelectObject(dc, edge);
+    RoundRect(dc, 0, 0, rc.right, rc.bottom, SC(8), SC(8));
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(body); DeleteObject(edge);
+    wchar_t t[8]; wsprintfW(t, L"%d%%", v);
+    SetBkMode(dc, TRANSPARENT); HGDIOBJ of = SelectObject(dc, gFont);
+    SetTextColor(dc, TXT_C);
+    DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
     SelectObject(dc, of);
 }
 static LRESULT CALLBACK MiniProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
     case WM_GETDLGCODE: return DLGC_WANTARROWS;
-    case WM_LBUTTONDOWN: SetFocus(h); SetCapture(h); gMiniY = (short)HIWORD(l); gMiniAcc = MiniGetH(h); return 0;
+    case WM_SETCURSOR: SetCursor(LoadCursorW(nullptr, gVolStyle == 1 ? IDC_SIZENS : IDC_SIZEWE)); return TRUE;
+    case WM_LBUTTONDOWN:
+        SetFocus(h); SetCapture(h);
+        gMiniX = gMiniX0 = gVolStyle == 1 ? -(short)HIWORD(l) : (short)LOWORD(l);   // (the knob: up = more)
+        gMiniAcc = MiniGetH(h); gMiniMoved = false;
+        return 0;
     case WM_MOUSEMOVE:
         if (GetCapture() == h) {
-            const int y = (short)HIWORD(l);
-            gMiniAcc += (gMiniY - y) * 200.0 / ((w & MK_SHIFT) ? SC(600) : SC(150)); gMiniY = y;
+            const bool knob = gVolStyle == 1;
+            const int x = knob ? -(short)HIWORD(l) : (short)LOWORD(l);
+            if (!gMiniMoved && abs(x - gMiniX0) < SC(3)) return 0;   // (a click wobbles a little)
+            gMiniMoved = true; KillTimer(h, 1);
+            gMiniAcc += (x - gMiniX) * 200.0 / (knob ? ((w & MK_SHIFT) ? SC(600) : SC(150)) : ((w & MK_SHIFT) ? SC(800) : SC(200))); gMiniX = x;
             gMiniAcc = gMiniAcc < 0 ? 0 : gMiniAcc > 200 ? 200 : gMiniAcc;
             MiniChange(h, (int)floor(gMiniAcc + 0.5));
+        } else if (gMiniHot != h) {             // hover: lights up
+            HWND old = gMiniHot; gMiniHot = h; if (old) InvalidateRect(old, nullptr, FALSE);
+            TRACKMOUSEEVENT te = { sizeof(te), TME_LEAVE, h, 0 }; TrackMouseEvent(&te);
+            InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
-    case WM_LBUTTONUP: if (GetCapture() == h) ReleaseCapture(); return 0;
-    case WM_LBUTTONDBLCLK: SetFocus(h); MiniChange(h, 100); return 0;
+    case WM_MOUSELEAVE: if (gMiniHot == h) { gMiniHot = nullptr; InvalidateRect(h, nullptr, FALSE); } return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == h) ReleaseCapture();
+        if (gMiniDbl) gMiniDbl = false;         // (the end of a double-click)
+        else if (!gMiniMoved && gVolStyle == 0) SetTimer(h, 1, GetDoubleClickTime(), nullptr);   // a click on the number: type, unless a double-click follows
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+    case WM_TIMER: if (w == 1) { KillTimer(h, 1); MiniType(h); } return 0;
+    case WM_LBUTTONDBLCLK: KillTimer(h, 1); gMiniDbl = true; SetFocus(h); MiniChange(h, 100); return 0;
     case WM_RBUTTONUP: MiniType(h); return 0;
-    case WM_CONTEXTMENU: return 0;              // (right-click types a value; no menu)
+    case WM_CONTEXTMENU: return 0;              // (right-click types a value too; no menu)
     case WM_MOUSEWHEEL: {
         gMiniWheel += GET_WHEEL_DELTA_WPARAM(w);
         const int n = gMiniWheel / WHEEL_DELTA; gMiniWheel -= n * WHEEL_DELTA;
@@ -8212,12 +8254,13 @@ static LRESULT CALLBACK MiniProc(HWND h, UINT m, WPARAM w, LPARAM l)
         EndPaint(h, &ps);
         return 0;
     }
+    case WM_DESTROY: KillTimer(h, 1); if (gMiniHot == h) gMiniHot = nullptr; break;
     }
     return DefWindowProcW(h, m, w, l);
 }
-static HWND MiniKnob(int id, int x, int y, int w, int val)   // (26 px tall)
+static HWND MiniVol(int id, int x, int y, int w, int val)   // (24 px tall)
 {
-    HWND h = Ctl(L"LagMini", L"", WS_TABSTOP, x, y, w, 26, id);
+    HWND h = Ctl(L"LagMini", L"", WS_TABSTOP, x, y, w, 24, id);
     if (h) SetWindowLongPtrW(h, GWLP_USERDATA, val < 0 ? 0 : val > 200 ? 200 : val);
     return h;
 }
@@ -14934,7 +14977,7 @@ static void AddTips()
     TipId(IDC_RECSECS,    L"How many seconds each clip saves (3 to 60).");
     TipId(IDC_RECSRC,     L"What's kept for clips: your voice as Discord hears it, the sound playing on your PC (friends, game, music), "
                           L"just Discord (your friends' voices, no game or music), or a mix. It's only held in memory until you clip.");
-    TipId(IDC_CLIPMASTER, L"Volume of all the clips when they're played. Drag up / down or scroll; double-click = 100%; right-click to type.");
+    TipId(IDC_CLIPMASTER, L"Volume of all the clips when they're played. Drag or scroll to change it; double-click = 100%; right-click to type. (Its look: Settings > Look.)");
     TipId(IDC_CLIPFOLDER, L"Open the folder where clips are saved as WAV files.");
     TipId(IDC_CLIPSTOP,   L"Stop every clip that's playing.");
     for (int i = 0; i < PADS; i++) TipId(IDC_PADMORE + i, L"Options for this pad: play mode (one-shot, loop, hold, toggle), "
@@ -14950,19 +14993,19 @@ static void AddTips()
     for (int i = 0; i < CLIPS; i++) {
         TipId(IDC_CLIPMORE + i, L"Copy (paste straight into Discord), save as MP3, show in folder, rename, pin, trim.");
         TipId(IDC_CLIPPLAY + i, L"Click to play this clip on your outputs (Discord hears it). Right-click to stop.");
-        TipId(IDC_CLIPVOL + i,  L"This clip's volume. 100% = as recorded, up to 200%. Drag up / down or scroll; double-click = 100%; right-click to type.");
+        TipId(IDC_CLIPVOL + i,  L"This clip's volume. 100% = as recorded, up to 200%. Drag or scroll to change it; double-click = 100%; right-click to type. (Its look: Settings > Look.)");
         TipId(IDC_CLIPKEY + i,  L"A hotkey that plays this clip from anywhere. Right-click to clear it.");
         TipId(IDC_CLIPTRIM + i, L"Listen back (only you hear it), trim the start and end, rename or export. Undo any time.");
         TipId(IDC_CLIPCLR + i,  L"Remove this clip. Its file goes to the Recycle Bin, in case you want it back.");
     }
     for (int i = 0; i < PADS; i++) {
         TipId(IDC_PADPLAY + i, L"Click to play (click again to restart). Right-click to stop. Empty? Click to pick a sound, or drop a file here.");
-        TipId(IDC_PADVOL + i,  L"This pad's volume. 100% = as recorded, up to 200%. Drag up / down or scroll; double-click = 100%; right-click to type.");
+        TipId(IDC_PADVOL + i,  L"This pad's volume. 100% = as recorded, up to 200%. Drag or scroll to change it; double-click = 100%; right-click to type. (Its look: Settings > Look.)");
         TipId(IDC_PADKEY + i,  L"A hotkey that plays this pad from anywhere, even in a game. Right-click to clear it.");
         TipId(IDC_PADLOAD + i, L"Pick an MP3, WAV or FLAC file for this pad (up to 60 seconds are used).");
         TipId(IDC_PADCLR + i,  L"Remove this pad's sound.");
     }
-    TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech). Drag up / down or scroll; double-click = 100%; right-click to type.");
+    TipId(IDC_PADMASTER, L"Volume of the whole soundboard (and text to speech). Drag or scroll to change it; double-click = 100%; right-click to type. (Its look: Settings > Look.)");
     TipId(IDC_SBSUB0, L"Pads: sounds on hotkeys, and text to speech.");
     TipId(IDC_MICSUB4, L"Speech: voice commands, bleeping words, talking through a TTS voice.");
     TipId(IDC_SPCMDON, L"Say a phrase from the list and it does its action, like pressing that hotkey. Whisper listens to your mic (on this PC, not online).");
@@ -15016,7 +15059,7 @@ static void AddTips()
     TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
     TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
     TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard, clips, plugins, speech, the avatar and captions.");
-    TipId(IDC_SBSUB3,  L"Music: a playlist that plays on the outputs you pick (your mic's output for Discord, your headphones...).");
+    TipId(IDC_MICSUB5, L"Music: a playlist that plays on the outputs you pick (your mic's output for Discord, your headphones...).");
     TipId(IDC_MUSVIEW, L"The song playing. Click the bar to jump to that point.");
     TipId(IDC_MUSPLAY, L"Play / pause.");
     TipId(IDC_MUSPREV, L"Back to the start of the song (or the one before, if it's only just started).");
@@ -15025,7 +15068,7 @@ static void AddTips()
     TipId(IDC_MUSSHUF, L"Play the list in a random order.");
     TipId(IDC_MUSREP,  L"At the end: stop, start the list again, or play the same song again.");
     TipId(IDC_MUSOUTS, L"Which outputs the music plays on: tick your mic's output so Discord hears it, your headphones' output to hear it yourself, or both.");
-    TipId(IDC_MUSVOL,  L"The music's volume. Drag up / down or scroll; double-click = 100%; right-click to type.");
+    TipId(IDC_MUSVOL,  L"The music's volume. Drag or scroll to change it; double-click = 100%; right-click to type. (Its look: Settings > Look.)");
     TipId(IDC_MUSLIST, L"Your playlist (MP3, FLAC, WAV). Double-click a song to play it; right-click (or F2) to rename it.");
     TipId(IDC_MUSADD,  L"Add songs (pick several at once).");
     TipId(IDC_MUSFOLDER, L"Add every song in a folder (and the folders in it).");
@@ -15067,6 +15110,7 @@ static void AddTips()
     TipId(IDC_WSGUIDE, L"Step by step: setting up Streamer.bot, and every command you can send.");
     TipId(IDC_WSHELP,  L"Copies C# code to paste into a Streamer.bot action (Execute C# Code).");
     TipId(IDC_FONT,    L"The font for the whole window.");
+    TipId(IDC_VOLSTYLE, L"How the volume controls for pads, clips, music and text to speech look: a number you drag left / right (click it to type), or a small knob you drag up / down.");
     TipId(IDC_OPACITY, L"See-through window: 100% = solid. Lower lets what's behind show through.");
     TipId(IDC_COLRESET, L"Go back to the theme's colours.");
     for (int i = 0; i < USERCOL_N; i++) TipId(IDC_COLSW0 + i, L"Click to pick this colour; right-click to use the theme's again. Bold = your own colour.");
@@ -15142,7 +15186,7 @@ static void AddTips()
     TipId(IDC_TTSACCENT,  L"Read your words with an accent: a Windows voice from that country (installed for you if it's missing), "
                           L"its own pace, and some of its own words, mixed up every time. American and Canadian are stereotypical.");
     TipId(IDC_TTSMORE,    L"Voice settings: speed, pitch, room sound, pauses, natural sound, and a quick test.");
-    TipId(IDC_TTSVOL,     L"Text-to-speech volume, % (100 = normal, up to 200). Also changes a line that's already speaking. Drag up / down or scroll; double-click = 100%; right-click to type.");
+    TipId(IDC_TTSVOL,     L"Text-to-speech volume, % (100 = normal, up to 200). Also changes a line that's already speaking. Drag or scroll to change it; double-click = 100%; right-click to type. (Its look: Settings > Look.)");
     TipId(IDC_FONTSIZE,   L"How big the text is, in pixels (at 100% size).");
     TipId(IDC_LAYEDIT,    L"Drag any control or box to where you want it. Saved for the profile you're using.");
     TipId(IDC_LAYRESET,   L"Put every control and box back where it started.");
@@ -15393,7 +15437,7 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 }
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
-static const wchar_t* MIC_SUB_NAMES[5] = { L"Cleanup", L"Tone", L"Plugins", L"Volume", L"Speech" };
+static const wchar_t* MIC_SUB_NAMES[6] = { L"Cleanup", L"Tone", L"Plugins", L"Volume", L"Speech", L"Music" };
 static const wchar_t* SET_SUB_NAMES[5] = { L"General", L"Look", L"Pictures", L"Features", L"Stream" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic, Settings and Soundboard sub-tabs
 {
@@ -15870,7 +15914,7 @@ static void VstKeyEdge(int k, bool pressed, bool released);   // (plugins: defin
 static void RcdToggle();
 static void LoopKey(int slot); static void BbSetOn(bool on, bool fromKey);   // (Soundboard > Looper / Beatbox)
 static void BlKey(bool down); static void SpTtsSet(bool on, bool fromKey); static void BlLiveKey(bool down);   // (Mic > Speech)
-static void MusToggle(); static void MusNext(); static void MusPrev(); static void MusStop(); static void MusUi();   // (Soundboard > Music, 1.61.0)
+static void MusToggle(); static void MusNext(); static void MusPrev(); static void MusStop(); static void MusUi();   // (Mic > Music, 1.61.0)
 static bool MusActive();
 static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a hotkey: seen down for one tick, then let go
 static bool gSpTts = false;
@@ -15884,7 +15928,7 @@ static void PollFxKeys()
                          ((slot == SLOT_CLIPNOW || (slot >= SLOT_CLIP0 && slot < SLOT_CLIP0 + CLIPS)) && !gFeatClips) ||
                          ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag) ||
                          (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst) ||
-                         (((slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX) || slot == SLOT_MUSPLAY || slot == SLOT_MUSNEXT) && !gFeatSound) ||
+                         ((slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX) && !gFeatSound) ||
                          ((slot == SLOT_BLEEP || slot == SLOT_SPTTS) && !gFeatSpeech);
         if (off) { gVoiceTap[slot] = 0; gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
@@ -19086,7 +19130,7 @@ static void ShowHelp()
         L"Talk + blink and Loud are optional); its window shows them as you talk, hops and blinks: capture it in OBS (Window Capture, "
         L"then a Chroma Key filter). Live captions: what you say, from the Speech model, in a window for OBS or a text file "
         L"(OBS Text source: Read from file). Right-click either window for its settings.\n\n"
-        L"MUSIC (Soundboard tab)\n"
+        L"MUSIC (Mic tab > Music)\n"
         L"A playlist (MP3, FLAC, WAV) with play / pause, next, shuffle and repeat. Pick the outputs it plays on: your mic's output "
         L"so Discord hears it, your headphones' to hear it yourself, or both. Hotkeys for play / pause and next.\n\n"
         L"BEATBOX TO DRUMS (Soundboard tab)\n"
@@ -20075,7 +20119,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    scene Gaming   \x2014   switch to a scene\n"
         L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
         L"    talkback on 2   \x2014   only output 2 hears your mic;  talkback off\n\n"
-        L"Music (Soundboard > Music)\n"
+        L"Music (Mic > Music)\n"
         L"    music toggle   \x2014   play / pause (also: play, pause, next, prev, stop);  music volume 60\n\n"
         L"Stream (Settings > Stream)\n"
         L"    captions on   \x2014   live captions (off, toggle);  captions clear  empties them\n"
@@ -20225,10 +20269,10 @@ static int PagedFeatOf(HWND h) { if (h) for (int i = 0; i < gPagedN; i++) if (gP
 static const wchar_t* SubName(int page, int sub)
 {
     if (sub < 0) return nullptr;
-    if (page == PAGE_MIC && sub < 5) return MIC_SUB_NAMES[sub];
+    if (page == PAGE_MIC && sub < 6) return MIC_SUB_NAMES[sub];
     if (page == PAGE_FX && sub < FX_SUBS) return FX_SUB_NAMES[sub];
     if (page == PAGE_SETTINGS && sub < 5) return SET_SUB_NAMES[sub];
-    if (page == PAGE_SOUND && sub < 4) return SB_SUB_NAMES[sub];
+    if (page == PAGE_SOUND && sub < 3) return SB_SUB_NAMES[sub];
     if (page == PAGE_MIXER && sub == 1) return L"Hotkeys";
     return nullptr;
 }
@@ -20427,11 +20471,10 @@ static void GoTo(int page, int sub, HWND target, const wchar_t* title = nullptr,
     SetPage(page);
     if (sub >= 0) {
         int id = 0;
-        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : sub == 4 ? IDC_MICSUB4 : IDC_MICSUB3;
+        if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : sub == 4 ? IDC_MICSUB4 : sub == 5 ? IDC_MICSUB5 : IDC_MICSUB3;
         if (page == PAGE_SETTINGS && sub <= 3) id = IDC_SETSUB0 + sub;
         if (page == PAGE_SETTINGS && sub == 4) id = IDC_SETSUB4;
         if (page == PAGE_SOUND && sub <= 2) id = IDC_SBSUB0 + sub;
-        if (page == PAGE_SOUND && sub == 3) id = IDC_SBSUB3;
         if (page == PAGE_MIXER && sub != gMixSub) id = IDC_MIXKEYSBTN;
         if (page == PAGE_FX && sub < FX_SUBS) SetFxSub(sub);
         HWND b = id ? GetDlgItem(gWnd, id) : nullptr;
@@ -20846,7 +20889,7 @@ static void BugInfoBuild(wchar_t* o, int cap)
         SpeechBugInfo(o, cap);
         if (gSpErr[0]) BugAdd(o, cap, L"Speech problem: %ls", gSpErr);
     }
-    if (gFeatSound) BugAdd(o, cap, L"Music: %d songs, %ls, outputs %u, %d%%, shuffle %ls, repeat %d; looper source %ls",
+    BugAdd(o, cap, L"Music: %d songs, %ls, outputs %u, %d%%, shuffle %ls, repeat %d; looper source %ls",
                            gMusN, gMusPlay.load() ? L"playing" : L"not playing", gMusOuts.load(), gMusVolPc.load(), gMusShuffle ? L"on" : L"off", gMusRepeat,
                            gLpSrcKey[0] ? (gLpSrcCh.load() >= 0 ? L"a Mixer channel" : L"a Mixer channel (missing)") : gLpVoiceOnly ? L"voice" : L"what others hear");
     if (gFeatAvatar || gFeatCaptions) {         // Settings > Stream (1.60.0)
@@ -21027,7 +21070,7 @@ static int ChipsBuild(Chip* c)
     }
     if (gFeatCaptions && gCapOn && gFeatSpeech) add(L"Captions", 0, PAGE_SETTINGS, 4);   // (1.60.0)
     if (gFeatAvatar && gAvOpen) add(L"Avatar", 0, PAGE_SETTINGS, 4);
-    if (gFeatSound && gMusPlay.load()) add(L"\x266B Music", 0, PAGE_SOUND, 3);   // (1.61.0)
+    if (gMusPlay.load()) add(L"\x266B Music", 0, PAGE_MIC, 5);   // (1.61.0; Mic > Music since 1.63.0)
     return n;
 }
 static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
@@ -21164,8 +21207,8 @@ static void SrchBuild()                         // (again each time the box gets
 {
     gSrchN = 0;
     for (int t = 0; t < TAB_COUNT; t++) SrchAdd(PAGE_NAMES[t], GetDlgItem(gWnd, IDC_TAB0 + t), t, -1, -1, 0, SK_TAB);
-    for (int s = 0; s < 5; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : s == 4 ? FEAT_SPEECH : 0, SK_SUB);
-    for (int s = 0; s < 4; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
+    for (int s = 0; s < 6; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : s == 4 ? FEAT_SPEECH : 0, SK_SUB);
+    for (int s = 0; s < 3; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
     for (int s = 0; s < FX_SUBS; s++) SrchAdd(FX_SUB_NAMES[s], nullptr, PAGE_FX, s, -1, 0, SK_SUB);
     for (int s = 0; s < 5; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
     SrchAdd(L"Mixer hotkeys", nullptr, PAGE_MIXER, 1, -1, 0, SK_SUB);
@@ -22341,7 +22384,7 @@ static int VcActions(int* out, int cap)          // the actions a command can pi
     for (int i = 0; i < gSceneN; i++) add(SLOT_SCENE0 + i);
     if (gFeatVst) for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0]) add(SLOT_VST0 + k);
     add(SLOT_RECORD); add(SLOT_SPTTS);
-    if (gFeatSound) { add(SLOT_MUSPLAY); add(SLOT_MUSNEXT); }
+    add(SLOT_MUSPLAY); add(SLOT_MUSNEXT);       // (Mic > Music: no feature switch since 1.63.0)
     return n;
 }
 static void VoiceCmdRun(int i)
@@ -22814,7 +22857,7 @@ static void SetFeatSpeech(bool on)
     SpeechApply();
 }
 
-// ======================= Music (1.61.0, Soundboard > Music): the player =======================
+// ======================= Music (1.61.0, Mic > Music): the player =======================
 // A playlist (kept in Music.m3u next to the settings); the decoder thread opens one song at a time with miniaudio
 // (MP3, FLAC, WAV), writes it into gMusRing (see the audio side) and goes straight on to the next. The window sends it
 // commands (play a song from a point, stop) and reads where the audio is from the song "segments" it notes down.
@@ -23083,8 +23126,8 @@ static void MusUi()                             // buttons and the list's ▶
 }
 static void MusTick()                           // (PadTick, 50 ms) the view while it plays
 {
-    if (gPage == PAGE_SOUND && gSbSub == 3 && (gMusPlay.load() || gMusErr[0])) MusUi();
-    if (gMusPlay.load() && !MusActive()) { gMusPlay = false; if (gPage == PAGE_SOUND && gSbSub == 3) MusUi(); }   // (the end of the list)
+    if (gPage == PAGE_MIC && gMicSub == 5 && (gMusPlay.load() || gMusErr[0])) MusUi();
+    if (gMusPlay.load() && !MusActive()) { gMusPlay = false; if (gPage == PAGE_MIC && gMicSub == 5) MusUi(); }   // (the end of the list)
 }
 static void FmtTime(long long frames, wchar_t* out) { const long long s = frames / RATE; swprintf(out, 16, L"%lld:%02lld", s / 60, s % 60); }
 static void DrawMusView(DRAWITEMSTRUCT* d)      // the song's name, a bar of where it is (click to go there), times
@@ -23932,7 +23975,7 @@ static void StreamStartup()                     // (after the window is made) la
 static void StreamSave()
 {
     SaveInt(L"feat_avatar", gFeatAvatar); SaveInt(L"feat_captions", gFeatCaptions);
-    SaveInt(L"music_volume", gMusVolPc.load()); SaveInt(L"music_outputs", (int)gMusOuts.load());   // (Soundboard > Music, 1.61.0)
+    SaveInt(L"music_volume", gMusVolPc.load()); SaveInt(L"music_outputs", (int)gMusOuts.load());   // (Mic > Music, 1.61.0)
     SaveInt(L"music_shuffle", gMusShuffle); SaveInt(L"music_repeat", gMusRepeat); SaveInt(L"music_song", gMusCur);
     for (int i = 0; i < AV_PICS; i++) { wchar_t k[24]; swprintf(k, 24, L"avatar_pic%d", i + 1); IniSet(k, gAvFile[i][0] ? gAvFile[i] : nullptr); }
     SaveInt(L"avatar_talk_db", gAvTalkDb); SaveInt(L"avatar_loud_db", gAvLoudDb); SaveInt(L"avatar_bg", gAvBg); SaveInt(L"avatar_bg_rgb", (int)gAvBgCustom);
@@ -24444,13 +24487,15 @@ static void CreateUI()
     // Live meter, then AI noise suppression, noise gate and voice quality sections.
     gBuildPage = PAGE_MIC;
     Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, 48, 532, 62, IDC_METER);   // (the bottom line: too loud / too quiet)
-    Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 62, 28, IDC_MICSUB0);   // (62 wide since 1.57.0: room for Speech)
-    Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 78, 116, 62, 28, IDC_MICSUB1);
-    Ctl(L"BUTTON", L"Volume", BS_OWNERDRAW | WS_TABSTOP, 142, 116, 62, 28, IDC_MICSUB3);
+    Ctl(L"BUTTON", L"Cleanup", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 116, 53, 28, IDC_MICSUB0);   // (53 wide since 1.63.0: room for Music)
+    Ctl(L"BUTTON", L"Tone", BS_OWNERDRAW | WS_TABSTOP, 68, 116, 53, 28, IDC_MICSUB1);
+    Ctl(L"BUTTON", L"Volume", BS_OWNERDRAW | WS_TABSTOP, 122, 116, 53, 28, IDC_MICSUB3);
     gBuildFeat = FEAT_VST;                      // (Settings > Features > Plugins: this sub-tab only exists while it's on)
-    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 206, 116, 62, 28, IDC_MICSUB2);
+    Ctl(L"BUTTON", L"Plugins", BS_OWNERDRAW | WS_TABSTOP, 176, 116, 53, 28, IDC_MICSUB2);
     gBuildFeat = FEAT_SPEECH;                   // (Settings > Features > Speech: this sub-tab only exists while it's on)
-    Ctl(L"BUTTON", L"Speech", BS_OWNERDRAW | WS_TABSTOP, 270, 116, 62, 28, IDC_MICSUB4);
+    Ctl(L"BUTTON", L"Speech", BS_OWNERDRAW | WS_TABSTOP, 230, 116, 53, 28, IDC_MICSUB4);
+    gBuildFeat = 0;
+    Ctl(L"BUTTON", L"Music", BS_OWNERDRAW | WS_TABSTOP, 284, 116, 53, 28, IDC_MICSUB5);
     gBuildFeat = FEAT_VST;
     {
         gBuildSub = 2;
@@ -24659,13 +24704,34 @@ static void CreateUI()
         gBuildSub = -1; gBuildFeat = 0;
         SpCmdList(); BlOutsText(); SpActFill(); BlSoundText();
     }
+    // ---- Music (1.61.0 on the Soundboard; Mic > Music since 1.63.0) ----
+    gBuildSub = 5; gBuildFeat = 0;
+    AddSection(14, 160, 532, 384, L"Music");
+    SetWindowSubclass(Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 30, 180, 500, 48, IDC_MUSVIEW), MusViewProc, 1, 0);
+    Ctl(L"BUTTON", L"\x23EE", WS_TABSTOP | WS_GROUP, 30, 236, 50, 30, IDC_MUSPREV);
+    Ctl(L"BUTTON", L"\x25B6  Play", WS_TABSTOP, 86, 236, 104, 30, IDC_MUSPLAY);
+    Ctl(L"BUTTON", L"\x23ED", WS_TABSTOP, 196, 236, 50, 30, IDC_MUSNEXT);
+    Ctl(L"BUTTON", L"\x25A0", WS_TABSTOP, 252, 236, 50, 30, IDC_MUSSTOP);
+    Ctl(L"BUTTON", L"Shuffle", BS_AUTOCHECKBOX | WS_TABSTOP, 316, 241, 80, 20, IDC_MUSSHUF);
+    Ctl(L"BUTTON", L"Repeat: all", WS_TABSTOP, 400, 236, 130, 30, IDC_MUSREP);
+    Ctl(L"BUTTON", L"Plays on: pick...", WS_TABSTOP, 30, 276, 342, 28, IDC_MUSOUTS);
+    Ctl(L"STATIC", L"Volume", 0, 384, 281, 52, 18, -1);
+    MiniVol(IDC_MUSVOL, 438, 278, 64, gMusVolPc.load());
+    Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP,
+        30, 314, 500, 150, IDC_MUSLIST, WS_EX_CLIENTEDGE);
+    Ctl(L"BUTTON", L"Add files...", WS_TABSTOP, 30, 472, 110, 28, IDC_MUSADD);
+    Ctl(L"BUTTON", L"Add folder...", WS_TABSTOP, 146, 472, 110, 28, IDC_MUSFOLDER);
+    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 262, 472, 90, 28, IDC_MUSDEL);
+    Ctl(L"BUTTON", L"Clear", WS_TABSTOP, 358, 472, 80, 28, IDC_MUSCLEAR);
+    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSPLAY, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 30, 506, 200, 28, IDC_MUSKEYPLAY); }
+    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSNEXT, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 236, 506, 200, 28, IDC_MUSKEYNEXT); }
     gBuildSub = -1;
     Ctl(L"BUTTON", L"\x25CF  Record 5 s", WS_TABSTOP | WS_GROUP, 14, 556, 128, 30, IDC_MICTEST);
     Ctl(L"BUTTON", L"\x25B6  Play again", WS_TABSTOP, 148, 556, 110, 30, IDC_MICPLAY);
     EnableWindow(GetDlgItem(gWnd, IDC_MICPLAY), FALSE);
     Ctl(L"STATIC", MICTEST_INFO, 0, 268, 556, 278, 32, IDC_MICTESTINFO);
-    Ctl(L"BUTTON", L"Set up my mic", WS_TABSTOP | WS_GROUP, 338, 116, 104, 28, IDC_MICSETUP);
-    Ctl(L"BUTTON", L"Mic type  \x25BE", WS_TABSTOP, 446, 116, 100, 28, IDC_MICTYPE);
+    Ctl(L"BUTTON", L"Set up my mic", WS_TABSTOP | WS_GROUP, 342, 116, 102, 28, IDC_MICSETUP);
+    Ctl(L"BUTTON", L"Mic type  \x25BE", WS_TABSTOP, 448, 116, 98, 28, IDC_MICTYPE);
 
     // ---------------- Voice FX page ----------------
     // Master switch, then one section per effect: knobs on the left, on/off + reset on the right.
@@ -24867,7 +24933,6 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Pads", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 14, 58, 62, 28, IDC_SBSUB0);   // sub-tabs (1.56.0; Music 1.61.0)
     Ctl(L"BUTTON", L"Looper", BS_OWNERDRAW | WS_TABSTOP, 80, 58, 62, 28, IDC_SBSUB1);
     Ctl(L"BUTTON", L"Beatbox", BS_OWNERDRAW | WS_TABSTOP, 146, 58, 62, 28, IDC_SBSUB2);
-    Ctl(L"BUTTON", L"Music", BS_OWNERDRAW | WS_TABSTOP, 212, 58, 62, 28, IDC_SBSUB3);
     gBuildSub = 0;                              // Pads
     for (int b2 = 0; b2 < PAD_BANKS; b2++)      // pages A-D (beside the sub-tabs since 1.56.0)
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 280 + b2 * 33, 58, 30, 28, IDC_PADBANK0 + b2);
@@ -24882,7 +24947,7 @@ static void CreateUI()
     for (int i = 0; i < PADS; i++) {
         int y = 130 + i * 36;
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 30, y, 174, 30, IDC_PADPLAY + i);
-        MiniKnob(IDC_PADVOL + i, 212, y + 2, 72, gPads[PadSlot(i)].vol);
+        MiniVol(IDC_PADVOL + i, 212, y + 3, 64, gPads[PadSlot(i)].vol);
         wchar_t kn[120]; FxKeyButtonText(SLOT_PAD0 + i, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 1, 110, 28, IDC_PADKEY + i);
         Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 406, y + 1, 28, 28, IDC_PADMORE + i);
@@ -24894,7 +24959,7 @@ static void CreateUI()
     AddSection(14, 436, 532, 60, L"Text to speech");
     {
         HWND te = Ctl(L"EDIT", L"", WS_TABSTOP | ES_AUTOHSCROLL, 30, 457, 116, 24, IDC_TTSTEXT, WS_EX_CLIENTEDGE);
-        MiniKnob(IDC_TTSVOL, 150, 456, 58, gTtsVol);
+        MiniVol(IDC_TTSVOL, 150, 457, 56, gTtsVol);
         SendMessageW(te, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type, then Enter");
         SendMessageW(te, EM_LIMITTEXT, 500, 0);
         HWND ta = Ctl(L"COMBOBOX", L"", COMBO, 212, 457, 104, 400, IDC_TTSACCENT);
@@ -24914,7 +24979,7 @@ static void CreateUI()
     }
     AddSection(14, 508, 532, 76, L"Playback");
     Ctl(L"STATIC", L"Volume:", 0, 30, 529, 56, 20, -1);
-    MiniKnob(IDC_PADMASTER, 88, 526, 90, gPadMaster);
+    MiniVol(IDC_PADMASTER, 88, 526, 64, gPadMaster);
     Ctl(L"BUTTON", L"Play through my voice effects", BS_AUTOCHECKBOX | WS_TABSTOP, 186, 529, 220, 20, IDC_PADFX);
     CheckDlgButton(gWnd, IDC_PADFX, gPadsFx ? BST_CHECKED : BST_UNCHECKED);
     Ctl(L"BUTTON", L"Stop all", WS_TABSTOP, 424, 524, 106, 26, IDC_PADSTOP);
@@ -24990,27 +25055,6 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Teach hi-hat", WS_TABSTOP, 282, 404, 120, 30, IDC_BBTEACH2);
     Ctl(L"BUTTON", L"Forget", WS_TABSTOP, 408, 404, 122, 30, IDC_BBFORGET);
     Ctl(L"STATIC", L"", SS_NOPREFIX, 30, 444, 500, 20, IDC_BBSTAT);
-    // ---- Music (1.61.0) ----
-    gBuildSub = 3;
-    AddSection(14, 98, 532, 456, L"Music");
-    SetWindowSubclass(Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 30, 118, 500, 48, IDC_MUSVIEW), MusViewProc, 1, 0);
-    Ctl(L"BUTTON", L"\x23EE", WS_TABSTOP | WS_GROUP, 30, 174, 50, 30, IDC_MUSPREV);
-    Ctl(L"BUTTON", L"\x25B6  Play", WS_TABSTOP, 86, 174, 104, 30, IDC_MUSPLAY);
-    Ctl(L"BUTTON", L"\x23ED", WS_TABSTOP, 196, 174, 50, 30, IDC_MUSNEXT);
-    Ctl(L"BUTTON", L"\x25A0", WS_TABSTOP, 252, 174, 50, 30, IDC_MUSSTOP);
-    Ctl(L"BUTTON", L"Shuffle", BS_AUTOCHECKBOX | WS_TABSTOP, 316, 179, 80, 20, IDC_MUSSHUF);
-    Ctl(L"BUTTON", L"Repeat: all", WS_TABSTOP, 400, 174, 130, 30, IDC_MUSREP);
-    Ctl(L"BUTTON", L"Plays on: pick...", WS_TABSTOP, 30, 214, 342, 28, IDC_MUSOUTS);
-    Ctl(L"STATIC", L"Volume", 0, 384, 219, 52, 18, -1);
-    MiniKnob(IDC_MUSVOL, 438, 215, 92, gMusVolPc.load());
-    Ctl(L"LISTBOX", L"", LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP,
-        30, 252, 500, 210, IDC_MUSLIST, WS_EX_CLIENTEDGE);
-    Ctl(L"BUTTON", L"Add files...", WS_TABSTOP, 30, 470, 110, 28, IDC_MUSADD);
-    Ctl(L"BUTTON", L"Add folder...", WS_TABSTOP, 146, 470, 110, 28, IDC_MUSFOLDER);
-    Ctl(L"BUTTON", L"Remove", WS_TABSTOP, 262, 470, 90, 28, IDC_MUSDEL);
-    Ctl(L"BUTTON", L"Clear", WS_TABSTOP, 358, 470, 80, 28, IDC_MUSCLEAR);
-    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSPLAY, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 30, 510, 200, 28, IDC_MUSKEYPLAY); }
-    { wchar_t kn[120]; FxKeyButtonText(SLOT_MUSNEXT, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 236, 510, 200, 28, IDC_MUSKEYNEXT); }
     gBuildSub = -1;
 
     // ---------------- Clips page ----------------
@@ -25036,7 +25080,7 @@ static void CreateUI()
         SendMessageW(rs, CB_SETCURSEL, sel, 0);
     }
     Ctl(L"STATIC", L"Volume:", 0, 266, 126, 52, 20, -1);
-    MiniKnob(IDC_CLIPMASTER, 320, 123, 90, gClipMaster);
+    MiniVol(IDC_CLIPMASTER, 320, 124, 64, gClipMaster);
     Ctl(L"BUTTON", L"History...", WS_TABSTOP, 424, 121, 106, 28, IDC_CLIPHIST);
     Ctl(L"STATIC", L"", 0, 30, 156, 500, 34, IDC_RECSTATUS);
     Ctl(L"BUTTON", L"Cut silence off new clips", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 196, 190, 20, IDC_CLIPAUTOTRIM);
@@ -25056,7 +25100,7 @@ static void CreateUI()
     for (int i = 0; i < CLIPS; i++) {
         int y = 292 + i * 36;
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
-        MiniKnob(IDC_CLIPVOL + i, 212, y + 2, 72, gPads[CLIP0 + ClipSlot(i)].vol);
+        MiniVol(IDC_CLIPVOL + i, 212, y + 3, 64, gPads[CLIP0 + ClipSlot(i)].vol);
         wchar_t kn[120]; FxKeyButtonText(SLOT_CLIP0 + i, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 290, y + 1, 110, 28, IDC_CLIPKEY + i);
         Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 406, y + 1, 28, 28, IDC_CLIPMORE + i);
@@ -25249,7 +25293,7 @@ static void CreateUI()
 
     // ---- Look ----
     gBuildSub = 1;
-    AddSection(14, 88, 532, 96, L"Theme");
+    AddSection(14, 88, 532, 128, L"Theme");
     Ctl(L"STATIC", L"Theme:", 0, 30, 111, 50, 20, -1);
     HWND th = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 82, 107, 92, 200, IDC_THEME);
     const wchar_t* themeNames[] = { L"System", L"Light", L"Dark" };
@@ -25280,17 +25324,25 @@ static void CreateUI()
     Ctl(L"STATIC", L"Opacity:", 0, 380, 147, 58, 20, -1);
     Spin(IDC_OPACITY, 440, 144, 60, 40, 100, gOpacity);
     Ctl(L"STATIC", L"%", 0, 504, 147, 16, 20, -1);
+    Ctl(L"STATIC", L"Volume controls:", 0, 30, 183, 110, 20, -1);   // (1.63.0: pads, clips, music, TTS)
+    {
+        HWND vs = Ctl(L"COMBOBOX", L"", COMBO, 142, 179, 160, 200, IDC_VOLSTYLE);
+        SendMessageW(vs, CB_ADDSTRING, 0, (LPARAM)L"Number (drag it)");
+        SendMessageW(vs, CB_ADDSTRING, 0, (LPARAM)L"Small knob");
+        SendMessageW(vs, CB_SETCURSEL, gVolStyle, 0);
+    }
+    Ctl(L"STATIC", L"Pads, clips, music and text to speech.", 0, 312, 183, 218, 20, IDC_HDR);
 
-    AddSection(14, 198, 532, 148, L"Your colours");
+    AddSection(14, 230, 532, 148, L"Your colours");
     for (int i = 0; i < USERCOL_N; i++)
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + (i % 4) * 126, 218 + (i / 4) * 32, 120, 28, IDC_COLSW0 + i);
-    Ctl(L"STATIC", L"Click: change it. Right-click: theme's colour.", 0, 30, 318, 390, 18, IDC_HDR);
-    Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 314, 100, 26, IDC_COLRESET);
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + (i % 4) * 126, 250 + (i / 4) * 32, 120, 28, IDC_COLSW0 + i);
+    Ctl(L"STATIC", L"Click: change it. Right-click: theme's colour.", 0, 30, 350, 390, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 346, 100, 26, IDC_COLRESET);
 
-    AddSection(14, 360, 532, 84, L"Layout");
-    Ctl(L"BUTTON", L"Move things around...", WS_TABSTOP | WS_GROUP, 30, 382, 180, 28, IDC_LAYEDIT);
-    Ctl(L"BUTTON", L"Put everything back", WS_TABSTOP, 218, 382, 160, 28, IDC_LAYRESET);
-    Ctl(L"STATIC", L"Saved per profile: each one can have its own layout.", 0, 30, 418, 500, 18, IDC_HDR);
+    AddSection(14, 392, 532, 84, L"Layout");
+    Ctl(L"BUTTON", L"Move things around...", WS_TABSTOP | WS_GROUP, 30, 414, 180, 28, IDC_LAYEDIT);
+    Ctl(L"BUTTON", L"Put everything back", WS_TABSTOP, 218, 414, 160, 28, IDC_LAYRESET);
+    Ctl(L"STATIC", L"Saved per profile: each one can have its own layout.", 0, 30, 450, 500, 18, IDC_HDR);
     gBuildSub = -1;
 
     // ---- Pictures ----
@@ -25690,7 +25742,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_SPMODEL) { if (code == BN_CLICKED) WsModelMenu(); return; }
     if (id == IDC_SPADD)  { if (code == BN_CLICKED) SpCmdAdd(); return; }
     if (id == IDC_SPDEL)  { if (code == BN_CLICKED) SpCmdDel(); return; }
-    // ---- Soundboard > Music (1.61.0) ----
+    // ---- Mic > Music (1.61.0) ----
     if (id == IDC_MUSPLAY)   { if (code == BN_CLICKED) MusToggle(); return; }
     if (id == IDC_MUSNEXT)   { if (code == BN_CLICKED) MusNext(); return; }
     if (id == IDC_MUSPREV)   { if (code == BN_CLICKED) MusPrev(); return; }
@@ -26060,10 +26112,8 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED && gSbSub != SbSubOf(id)) {
             gSbSub = SbSubOf(id); Layout();
             for (int k = IDC_SBSUB0; k <= IDC_SBSUB2; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
-            InvalidateRect(GetDlgItem(gWnd, IDC_SBSUB3), nullptr, FALSE);
             if (gSbSub == 1) { LpSrcFill(); LoopTick(true); }
             if (gSbSub == 2) BbStatus();
-            if (gSbSub == 3) { MusOutsText(); MusUi(); }
         }
         return;
     }
@@ -26141,6 +26191,13 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_PICPLACE) { if (code == BN_CLICKED && gBase.gp && gPicFit == 4) EdBegin(ED_PICS); return; }
+    if (id == IDC_VOLSTYLE) {
+        if (code == CBN_SELCHANGE) {
+            gVolStyle = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 1); SaveSettings();
+            EnumChildWindows(gWnd, [](HWND c, LPARAM) -> BOOL { wchar_t cl[16]; GetClassNameW(c, cl, 16); if (!lstrcmpW(cl, L"LagMini")) InvalidateRect(c, nullptr, FALSE); return TRUE; }, 0);
+        }
+        return;
+    }
     if (id == IDC_FONTSIZE) {
         if (code == CBN_SELCHANGE) {
             gFontPx = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) + 11, 11, 18);
@@ -26476,13 +26533,14 @@ static void OnCommand(int id, int code)
     case IDC_FXSUB0: case IDC_FXSUB1: case IDC_FXSUB2: case IDC_FXSUB3: case IDC_FXSUB4: case IDC_FXSUB5: case IDC_FXSUB6: case IDC_FXSUB7:
         if (code == BN_CLICKED) SetFxSub(id - IDC_FXSUB0);
         break;
-    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2: case IDC_MICSUB3: case IDC_MICSUB4:
+    case IDC_MICSUB0: case IDC_MICSUB1: case IDC_MICSUB2: case IDC_MICSUB3: case IDC_MICSUB4: case IDC_MICSUB5:
         if (code == BN_CLICKED && gMicSub != MicSubOf(id)) {
             gMicSub = MicSubOf(id);
             Layout();
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB0), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB1), nullptr, FALSE);
             InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB2), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB3), nullptr, FALSE);
-            InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB4), nullptr, FALSE);
+            InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB4), nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_MICSUB5), nullptr, FALSE);
+            if (gMicSub == 5) { MusOutsText(); MusUi(); }
             if (gMicSub == 4) { SpActFill(); SpCmdList(); BlOutsText(); SpeechStatus(); }
             if (gMicSub == 3) MicVolRefresh(true);
             if (gMicSub == 2) VstRefreshUi();
@@ -26969,7 +27027,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     }
-    case WM_APP + 31:                           // Soundboard > Music: the decoder started / finished a song
+    case WM_APP + 31:                           // Mic > Music: the decoder started / finished a song
         MusUi();
         return 0;
     case WM_APP + 21:                           // Mic > Speech: Whisper heard something (lParam: a WsResult to free)
@@ -27289,8 +27347,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     kc.hCursor       = LoadCursorW(nullptr, IDC_SIZENS);
     kc.lpszClassName = L"LagKnob";
     RegisterClassW(&kc);
-    kc.lpfnWndProc   = MiniProc;                         // small volume knobs (1.62.0)
+    kc.lpfnWndProc   = MiniProc;                         // volume boxes (1.62.0 knobs, 1.63.0 drag the number)
     kc.lpszClassName = L"LagMini";
+    kc.hCursor       = LoadCursorW(nullptr, IDC_SIZEWE);
     RegisterClassW(&kc);
 
     WNDCLASSW oc = {};                                   // hotkey pop-up
