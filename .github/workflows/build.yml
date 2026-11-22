@@ -69,7 +69,7 @@ jobs:
           set /p WLIBS=<wlibs.txt
           set RN=rnnoise\src\denoise.c rnnoise\src\rnn.c rnnoise\src\rnn_data.c rnnoise\src\pitch.c rnnoise\src\kiss_fft.c rnnoise\src\celt_lpc.c
           set R2=rnnoise2\rnnoise-0.2\src
-          set D2=/nologo /c /O2 /MT /W0 /DRNN_ENABLE_X86_RTCD /D__SSE2__ /FI rnnoise2\names.h /I rnnoise2\rnnoise-0.2\include /I %R2% /Forn2\
+          set D2=/nologo /c /O2 /MT /W0 /DRNN_ENABLE_X86_RTCD /D__SSE2__ /FI "%CD%\rnnoise2\names.h" /I rnnoise2\rnnoise-0.2\include /I %R2% /Forn2\
           mkdir rn2
           cl %D2% %R2%\denoise.c %R2%\rnn.c %R2%\rnnoise_data.c %R2%\rnnoise_tables.c %R2%\pitch.c %R2%\kiss_fft.c %R2%\celt_lpc.c %R2%\nnet.c %R2%\nnet_default.c %R2%\parse_lpcnet_weights.c %R2%\x86\x86cpu.c %R2%\x86\x86_dnn_map.c > build.log 2>&1 || (type build.log & exit /b 1)
           cl %D2% /D__SSSE3__ /D__SSE4_1__ %R2%\x86\nnet_sse4_1.c >> build.log 2>&1 || (type build.log & exit /b 1)
