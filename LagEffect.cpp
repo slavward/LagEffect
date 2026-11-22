@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.59.1"
+#define APP_VERSION L"1.60.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1264,6 +1264,7 @@ static volatile bool gRandLagOn = false, gRewindReq = false, gRepeatReq = false;
 // Settings > Features: each of these is hidden and doesn't run at all while it's off (new installs: all off).
 static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFeatClips = false, gFeatVst = false;
 static volatile bool gFeatSpeech = false;          // Mic > Speech (1.57.0): voice commands, bleep, the TTS voice
+static volatile bool gFeatAvatar = false, gFeatCaptions = false;   // Settings > Stream (1.60.0): the PNGtuber avatar, live captions
 static bool gSafe = false;                      // safe start (Shift held while starting): plugins, Voice FX, remote control off for this run
 static bool gSafeVst = false, gSafeFx = false, gSafeWs = false;   // (what they were: saved back unless you switch them on)
 static unsigned long long gStartTick = 0;       // when Lag Effect started (bug report info: uptime)
@@ -1292,8 +1293,9 @@ static bool    gWsOn = false;
 static int     gWsPort = 7600;
 static wchar_t gWsPass[64] = L"";
 static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutter until then
-enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16, FEAT_SPEECH = 32 };
-static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst) || (mask & FEAT_SPEECH && gFeatSpeech); }
+enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16, FEAT_SPEECH = 32, FEAT_AVATAR = 64, FEAT_CAPTIONS = 128 };
+static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst) || (mask & FEAT_SPEECH && gFeatSpeech)
+                                   || (mask & FEAT_AVATAR && gFeatAvatar) || (mask & FEAT_CAPTIONS && gFeatCaptions); }
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
 static int  gBuildCond = 0;                     // (...and when they show: 0 always, 1 vocoder style isn't Synth plugin, 2 it is)
 static bool CondOn(int c);
@@ -1472,6 +1474,7 @@ static volatile unsigned gMainBlocks = 0, gExtBlocks[8];   // blocks run: the ma
 // own stages, so you're louder without clipping. Both 0 = off (then the audio is exactly as before).
 static volatile int   gAgcMaxDb = 0, gLoudDb = 0;
 static volatile float gAgcNowDb = 0, gLimGrDb = 0, gMicOutPk = 0;   // (UI reads; the last two it clears)
+static volatile float gAvPk = 0;                   // the same, for the avatar (1.60.0; it clears it)
 #define AG_TARGET (-22.0f)                      // where Auto volume puts your speech (its average while talking)
 #define LD_CEIL   0.891f                        // -1 dBFS
 #define LD_LA     64                            // the limiter looks 1.3 ms ahead
@@ -5219,6 +5222,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     if (lvGrMax > gLvGrDb) gLvGrDb = lvGrMax;
     if (ldGrMax > gLimGrDb) gLimGrDb = ldGrMax;
     if (micOutPk > gMicOutPk) gMicOutPk = micOutPk;
+    if (micOutPk > gAvPk) gAvPk = micOutPk;
     gAgcNowDb = agRun ? agGain : 0.0f;
     for (int k = 0; k < MAX_OUT && k < 8; k++) if (outPk[k] > gOutPeak[k]) gOutPeak[k] = outPk[k];
     for (int k = 0; k < MAX_OUT; k++) if (outPk[k] > gOutPeakMix[k]) gOutPeakMix[k] = outPk[k];
@@ -5370,6 +5374,10 @@ enum {
     IDC_BLHEAR, IDC_BLSNDLBL,                   // (1.59.0: bleep sounds)
     IDC_BLLIVEKEY,                              // (1.59.1: Mic > Cleanup, live bleep key)
     IDC_NSMODEL,                                // (1.60.0: Classic / New noise model)
+    IDC_SETSUB4 = 4700, IDC_FEATAVATAR, IDC_FEATCAPS,   // (1.60.0: Settings > Stream)
+    IDC_AVPIC0, IDC_AVPIC1, IDC_AVPIC2, IDC_AVPIC3, IDC_AVPIC4, IDC_AVTALK, IDC_AVLOUD, IDC_AVMETER, IDC_AVBG, IDC_AVBOUNCE, IDC_AVOPEN,
+    IDC_CAPON, IDC_CAPMASK, IDC_CAPOPEN, IDC_CAPLINES, IDC_CAPSIZE, IDC_CAPCLEAR, IDC_CAPFILE, IDC_CAPFOLDER, IDC_CAPBG,
+    IDC_CBACT, IDC_CBTGT, IDC_CBOPT, IDC_CBVAL, IDC_CBLINE, IDC_CBCOPY, IDC_CBTEST, IDC_CBSTAT,
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5630,7 +5638,8 @@ static int gFxSub = 0;                          // which Voice FX sub-tab is sho
 static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L"Space", L"Motion", L"Filter", L"Fun", L"Whisper" };
 static int gMicSub = 0;                         // Mic tab: 0 = Cleanup, 1 = Tone, 2 = Plugins (only with Plugins on in Settings > Features), 3 = Volume
 static int MicSubOf(int id) { return id == IDC_MICSUB0 ? 0 : id == IDC_MICSUB1 ? 1 : id == IDC_MICSUB2 ? 2 : id == IDC_MICSUB3 ? 3 : id == IDC_MICSUB4 ? 4 : -1; }
-static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features
+static int gSetSub = 0;                         // Settings tab: 0 = General, 1 = Look, 2 = Pictures, 3 = Features, 4 = Stream (1.60.0)
+static int SetSubOf(int id) { return id >= IDC_SETSUB0 && id <= IDC_SETSUB3 ? id - IDC_SETSUB0 : id == IDC_SETSUB4 ? 4 : -1; }
 static int gSbSub = 0;                          // Soundboard tab (1.56.0): 0 = Pads, 1 = Looper, 2 = Beatbox
 static const wchar_t* SB_SUB_NAMES[3] = { L"Pads", L"Looper", L"Beatbox" };
 static bool gLpSync = true;                     // Looper: line layers up with what you heard (moved earlier by the delay)
@@ -5638,7 +5647,19 @@ static unsigned gBbTaught = 0;                  // Beatbox: sounds you taught it
 static const wchar_t* BB_KEYS[BB_SOUNDS] = { L"beatbox_sound_kick", L"beatbox_sound_snare", L"beatbox_sound_hihat" };
 static void LoopBbSave(); static void LoopTick(bool force = false); static void BbTick(); static void BbStatus();
 static void SpeechSave(); static void SpeechLoad(); static void SpeechTick(); static void SpeechStatus(); static void SpActFill();
-struct WsResult; static void SpeechResult(const WsResult* r); static void SpeechBugInfo(wchar_t* o, int cap); static void TtsNextQueued(); static bool gTtsQuiet = false; static void SpCmdList(); static void BlOutsText();
+// Settings > Stream (1.60.0): the avatar and captions' settings (the code is further down: "Stream tools")
+#define AV_PICS 5                               // Quiet, Talking, Blink, Talk + blink, Loud
+static wchar_t gAvFile[AV_PICS][MAX_PATH];
+static int gAvTalkDb = -40, gAvLoudDb = -12, gAvBg = 0, gAvBounce = 1;   // (bg: 0-4 green / blue / magenta / black / white, 5 yours)
+static COLORREF gAvBgCustom = RGB(0, 255, 0);
+static bool gAvOpen = true, gAvTop = false; static RECT gAvRc = {};
+static bool gCapOn = true, gCapMask = true, gCapFile = false, gCapOpen = true, gCapTop = false;
+static int gCapLines = 2, gCapSize = 44, gCapClearS = 6, gCapBg = 0;
+static COLORREF gCapBgCustom = RGB(0, 255, 0); static RECT gCapRc = {};
+static char gCbReply[400] = "";                 // the command builder's Test: the reply (WsQueue to id -2)
+static void StreamSave(); static void StreamLoad(); static void StreamStartup(); static void CapClear(); static void CapTick(); static void AvShow(bool on);
+static void SpeechApply(); static void AvDecoded();
+struct WsResult; static void SpeechResult(const WsResult* r); static void CapResult(const WsResult* r); static void SpeechBugInfo(wchar_t* o, int cap); static void TtsNextQueued(); static bool gTtsQuiet = false; static void SpCmdList(); static void BlOutsText();
 // Mic > Speech (1.57.0): its settings and the recognizer (the code is with the window's, further down)
 // ---- settings ----
 #define VC_MAX 32
@@ -6649,7 +6670,7 @@ static void LoadSettings()
     gUiScale      = Iclamp(INI_INT(L"ui_scale", 100), 80, 250);
     gCompact      = INI_INT(L"compact", 0) != 0;
     gCmdLine      = INI_INT(L"command_line_control", 0) != 0;
-    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 3);
+    gSetSub       = Iclamp(INI_INT(L"settings_subtab", 0), 0, 4);
     for (int i = 0; i < USERCOL_N; i++) { wchar_t k[32]; wsprintfW(k, L"color_custom_%d", i); gUserCol[i] = (COLORREF)INI_INT(k, (int)CLR_NONE); }
     GetPrivateProfileStringW(L"settings", L"background_picture", L"", gPicPath, MAX_PATH, gIni);
     gPicFit       = Iclamp(INI_INT(L"background_fit", 0), 0, 4);
@@ -6776,6 +6797,7 @@ static void LoadSettings()
     gPadChoke     = INI_INT(L"pads_one_at_a_time", 0) != 0;
     gPadDuck      = INI_INT(L"pads_duck_voice", 0) != 0;
     SpeechLoad();                               // Mic > Speech (1.57.0)
+    StreamLoad();                               // Settings > Stream (1.60.0)
     gLpVolPct     = Iclamp(INI_INT(L"looper_volume", 100), 0, 200);   // Soundboard > Looper / Beatbox (1.56.0)
     gLpVoiceOnly  = INI_INT(L"looper_voice_only", 0) != 0;
     gLpSync       = INI_INT(L"looper_line_up", 1) != 0;
@@ -7255,6 +7277,7 @@ static void PicWant(PicImg& m, int tw, int th, unsigned bake = 0)
 #define STK_MAX 8
 struct Sticker { wchar_t path[MAX_PATH]; int x, y, size, opacity; PicImg img; bool stale; };
 static Sticker  gStk[STK_MAX];  static int gStkN = 0, gStkSel = 0;
+static PicImg   gAvImg[AV_PICS];                // the avatar's pictures (1.60.0, Settings > Stream)
 static PicImg   gBase;                          // the background picture
 static int      gCW = 0, gCH = 0;               // composite size (the window's client area)
 static DWORD*   gBaseBuf = nullptr;             // theme colour + background picture + fade
@@ -7499,6 +7522,8 @@ static void OnPicDecoded(PicJob* j)
     PicImg* m = gBase.uid == j->uid && gBase.job == j ? &gBase : nullptr;
     int stk = -1;
     for (int i = 0; i < gStkN && !m; i++) if (gStk[i].img.uid == j->uid && gStk[i].img.job == j) { m = &gStk[i].img; stk = i; }
+    int av = -1;
+    for (int i = 0; i < AV_PICS && !m; i++) if (gAvImg[i].uid == j->uid && gAvImg[i].job == j) { m = &gAvImg[i]; av = i; }
     if (!m) { PicJobFree(j, true); return; }
     m->job = nullptr;
     if (j->n > 0 && j->px) {                    // swap in the new frames
@@ -7509,6 +7534,7 @@ static void OnPicDecoded(PicJob* j)
     }
     PicJobFree(j, false);
     if (m->want) { m->want = false; PicWant(*m, m->wantW, m->wantH, m->wantBake); }
+    if (av >= 0) { AvDecoded(); return; }
     if (stk >= 0 && gCompBmp) { StkRefresh(nullptr); PicAnimTimer(); }
     else { PictureRebuild(); PicRedraw(nullptr); }
 }
@@ -7696,6 +7722,7 @@ static void SaveSettings()
     SaveInt(L"sound_subtab", gSbSub);
     LoopBbSave();
     SpeechSave();
+    StreamSave();
     SaveInt(L"fx_dist_style", gDistStyle);
     SaveInt(L"fx_chorus_style", gChoStyle);
     SaveInt(L"fx_muffle_style", gMufStyle);
@@ -14090,7 +14117,7 @@ static bool EdIsSubTab(HWND h)
 {
     int id = GetDlgCtrlID(h);
     return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || MicSubOf(id) >= 0 ||
-           (id >= IDC_SETSUB0 && id <= IDC_SETSUB3);
+           SetSubOf(id) >= 0;
 }
 static bool CondOn(int c) { return c == 0 || (c == 2) == (gVocStyle == VOC_PLUGIN); }
 static bool SectionShown(const Section& s)
@@ -14802,7 +14829,35 @@ static void AddTips()
     TipId(IDC_SETSUB0, L"Profiles, latency, updates, screen share, shortcuts and the window.");
     TipId(IDC_SETSUB1, L"Look: theme, colours, size, font, text size, opacity, and moving things around.");
     TipId(IDC_SETSUB2, L"A background picture or GIF, and pictures / GIFs on top that you place yourself.");
-    TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard and clips. And remote control (Streamer.bot).");
+    TipId(IDC_SETSUB3, L"Turn on only what you use: the lag effect, Voice FX, the soundboard, clips, plugins, speech, the avatar and captions.");
+    TipId(IDC_SETSUB4, L"For streaming: remote control (Streamer.bot) and its command builder, your PNGtuber avatar, live captions.");
+    TipId(IDC_CBACT,   L"Command builder: what the Streamer.bot action should make Lag Effect do.");
+    TipId(IDC_CBTGT,   L"Which one (channel, output, scene, character, profile, pad...).");
+    TipId(IDC_CBOPT,   L"How: on / off, mute, volume, fade...");
+    TipId(IDC_CBVAL,   L"The number (or text) it needs, if any: dB, %, seconds, milliseconds, what to say.");
+    TipId(IDC_CBLINE,  L"The command. Streamer.bot sends it with CPH.WebsocketSend(\"...\", 0); Copy C# gives you the whole code.");
+    TipId(IDC_CBCOPY,  L"Copies the whole C# for Streamer.bot's \"Execute C# Code\" with this command in it: paste, Compile, Save.");
+    TipId(IDC_CBTEST,  L"Does it now, here, as if Streamer.bot had sent it (the remote control doesn't need to be on).");
+    TipId(IDC_AVPIC0,  L"Your picture while you're not talking (needed). A PNG with a see-through background works best; GIFs move. Right-click to remove it.");
+    TipId(IDC_AVPIC1,  L"Your picture while you're talking (mouth open). Right-click to remove it.");
+    TipId(IDC_AVPIC2,  L"Optional: eyes shut, shown for a moment every few seconds while you're quiet. Right-click to remove it.");
+    TipId(IDC_AVPIC3,  L"Optional: eyes shut while talking. Right-click to remove it.");
+    TipId(IDC_AVPIC4,  L"Optional: shown while you're loud (shouting). Right-click to remove it.");
+    TipId(IDC_AVTALK,  L"Your mic (after cleanup) louder than this = talking. Watch the bar: green while it thinks you're talking.");
+    TipId(IDC_AVLOUD,  L"Louder than this = loud: the Loud picture (if you have one) and a bigger hop.");
+    TipId(IDC_AVMETER, L"Your mic level now, with the Talking and Loud lines: grey quiet, green talking, red loud.");
+    TipId(IDC_AVBG,    L"The window's background: in OBS add a Window Capture of it, then a Chroma Key filter with this colour.");
+    TipId(IDC_AVBOUNCE, L"A little hop when you start talking (bigger when loud), and a bob while you talk.");
+    TipId(IDC_AVOPEN,  L"The avatar's own window (capture it in OBS). Right-click it for its settings.");
+    TipId(IDC_CAPON,   L"Live captions of what you say (Whisper, the Speech model, on this PC). Uses some CPU while you talk.");
+    TipId(IDC_CAPMASK, L"Words from your bleep list (Mic > Speech) show as ****.");
+    TipId(IDC_CAPOPEN, L"The captions' own window (capture it in OBS, Chroma Key its background). Right-click it for its settings.");
+    TipId(IDC_CAPLINES, L"How many lines the captions window shows (the newest words at the bottom).");
+    TipId(IDC_CAPSIZE, L"The captions' text size in the window.");
+    TipId(IDC_CAPCLEAR, L"After this many seconds without speech, the captions clear.");
+    TipId(IDC_CAPFILE, L"Also writes the captions to Documents\\Lag Effect\\captions.txt: in OBS add a Text source with \"Read from file\" and pick it.");
+    TipId(IDC_CAPFOLDER, L"Shows captions.txt in its folder.");
+    TipId(IDC_CAPBG,   L"The captions window's background, for OBS's Chroma Key.");
     TipId(IDC_WSON,    L"Off: nothing can connect (no port is open). On: apps on this PC, like Streamer.bot, can send Lag Effect commands. Never websites.");
     TipId(IDC_WSPORT,  L"The port it listens on (ws://127.0.0.1:port). Change it only if another app already uses this one.");
     TipId(IDC_WSPASS,  L"Optional. If set, an app has to send {\"do\":\"auth\",\"password\":\"...\"} before anything else.");
@@ -15136,13 +15191,13 @@ static void DrawSwatch(DRAWITEMSTRUCT* d)       // a colour box + its name; "the
 
 // Voice FX sub-tab: a pill, filled when selected, with how many of its effects are on.
 static const wchar_t* MIC_SUB_NAMES[5] = { L"Cleanup", L"Tone", L"Plugins", L"Volume", L"Speech" };
-static const wchar_t* SET_SUB_NAMES[4] = { L"General", L"Look", L"Pictures", L"Features" };
+static const wchar_t* SET_SUB_NAMES[5] = { L"General", L"Look", L"Pictures", L"Features", L"Stream" };
 static void DrawFxSub(DRAWITEMSTRUCT* d)        // Voice FX, Mic, Settings and Soundboard sub-tabs
 {
     const bool sbs = (int)d->CtlID >= IDC_SBSUB0 && (int)d->CtlID <= IDC_SBSUB2;
-    const bool set = !sbs && (int)d->CtlID >= IDC_SETSUB0 && (int)d->CtlID <= IDC_SETSUB3;
+    const bool set = !sbs && SetSubOf((int)d->CtlID) >= 0;
     const bool mic = !set && !sbs && MicSubOf((int)d->CtlID) >= 0;
-    int t = sbs ? (int)d->CtlID - IDC_SBSUB0 : mic ? MicSubOf((int)d->CtlID) : (int)d->CtlID - (set ? IDC_SETSUB0 : IDC_FXSUB0);
+    int t = sbs ? (int)d->CtlID - IDC_SBSUB0 : mic ? MicSubOf((int)d->CtlID) : set ? SetSubOf((int)d->CtlID) : (int)d->CtlID - IDC_FXSUB0;
     HDC dc = d->hDC;
     RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
@@ -18819,6 +18874,11 @@ static void ShowHelp()
         L"hold the bleep key to bleep anything (it reaches back a little). Sound: a beep (pitch, volume), silence, static, muffled, "
         L"the word backwards, or your own sound files (one, or a random one each time); Hear it plays a sample. TTS voice: what you say is spoken by a text-to-speech voice "
         L"and your own is muted.\n\n"
+        L"STREAM (Settings > Stream)\n"
+        L"Remote control for Streamer.bot, with a command builder. Avatar (PNGtuber): pick your Quiet and Talking pictures (Blink, "
+        L"Talk + blink and Loud are optional); its window shows them as you talk, hops and blinks: capture it in OBS (Window Capture, "
+        L"then a Chroma Key filter). Live captions: what you say, from the Speech model, in a window for OBS or a text file "
+        L"(OBS Text source: Read from file). Right-click either window for its settings.\n\n"
         L"BEATBOX TO DRUMS (Soundboard tab)\n"
         L"Tick Drums on and beatbox: kick (\"b\"), snare (\"pf\", \"k\") and hi-hat (\"ts\") sounds play a drum kit, about 8 ms after you. "
         L"Drums only mutes your voice while it's on. If a sound plays the wrong drum, Teach it your sounds.\n\n"
@@ -19002,7 +19062,7 @@ static void PollKeyCapture()
 }
 
 // ======================= remote control (Streamer.bot & co.) =======================
-// A small WebSocket server on 127.0.0.1, only while Settings > Features > Remote control is on. Commands are JSON,
+// A small WebSocket server on 127.0.0.1, only while Settings > Stream > Remote control is on (Features before 1.60.0). Commands are JSON,
 // e.g. {"do":"lag","ms":2000}; every command gets a reply, and changes (mute, lag, profile...) are sent as events.
 // ---- remote control: the protocol bits (no Windows calls, so they're tested on their own) ----
 static void Sha1(const unsigned char* data, size_t len, unsigned char out[20])   // for the WebSocket handshake
@@ -19166,6 +19226,7 @@ static int       gWsState = 0;                  // 0 off, 1 listening, 2 the por
 
 static void WsQueue(int id, const char* utf8)   // (any thread) send to one connection, or -1: all of them
 {
+    if (id == -2) { lstrcpynA(gCbReply, utf8, sizeof(gCbReply)); return; }   // (the command builder's Test, Settings > Stream)
     if (!gWsLockInit || !gWsThread) return;
     const int n = (int)strlen(utf8);
     char* c = (char*)HeapAlloc(GetProcessHeap(), 0, n + 1);
@@ -19309,7 +19370,7 @@ static void WsStart()                           // (only when it's switched on i
 // ---- remote control: running a command (the window's thread) ----
 static bool WsAuthed(int id)
 {
-    if (!gWsPass[0]) return true;
+    if (!gWsPass[0] || id == -2) return true;   // (-2: the command builder's Test, here)
     for (int i = 0; i < gWsAuthedN; i++) if (gWsAuthed[i] == id) return true;
     return false;
 }
@@ -19413,7 +19474,10 @@ static bool WsPlain(const char* m, char* out, int cap)   // false: no command in
     else if (!strcmp(cmd, "chatmix")) { if (n > 1 && WsIsNum(tk[1])) addRaw("value", tk[1].t); }
     else if (!strcmp(cmd, "levels")) { for (int i = 1; i < n; i++) { if (WsIsNum(tk[i])) addRaw("rate", tk[i].t); else if (WsIsOnOff(tk[i])) onOff("on", tk[i]); } }
     else if (!strcmp(cmd, "talkback")) { for (int i = 1; i < n; i++) { if (WsIsNum(tk[i])) addRaw("n", tk[i].t); else if (WsIsOnOff(tk[i])) onOff("on", tk[i]); } }
-    else if (!strcmp(cmd, "mute") || !strcmp(cmd, "fx")) { if (n > 1 && WsIsOnOff(tk[1])) onOff("on", tk[1]); }
+    else if (!strcmp(cmd, "mute") || !strcmp(cmd, "fx") || !strcmp(cmd, "avatar") || !strcmp(cmd, "captions")) {
+        if (n > 1 && WsIsOnOff(tk[1])) onOff("on", tk[1]);
+        else if (n > 1 && !_stricmp(tk[1].t, "clear")) addRaw("clear", "true");
+    }
     else if (isCh || isOut) {                   // which one (its number, or its name: in quotes if it has spaces), then what to change
         if (n > 1) { if (WsIsNum(tk[1])) addRaw("n", tk[1].t); else addStr("name", tk[1].t); }
         for (int i = 2; i < n; i++) {
@@ -19536,6 +19600,17 @@ static void WsExec(int id, const char* m)
         if (i == gWsLvN) { if (gWsLvN >= 32) { WsReply(id, what, "Too many connections want levels."); return; } gWsLvId[gWsLvN++] = id; }
         gWsLvMs[i] = 1000 / rate; gWsLvT[i] = 0;
         WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "captions")) {            // (1.60.0) {"do":"captions","on":"toggle"} / {"clear":true}
+        if (!gFeatCaptions) { WsReply(id, what, "Live captions are off (Settings > Features)."); return; }
+        if (JsonOnOff(m, "clear") == 1) { CapClear(); WsReply(id, what, nullptr); return; }
+        WsBool(m, "on", gCapOn, &b); gCapOn = b; CheckDlgButton(gWnd, IDC_CAPON, b ? BST_CHECKED : BST_UNCHECKED);
+        if (!b) CapClear();
+        SpeechApply(); WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "avatar")) {              // (1.60.0) {"do":"avatar","on":true}: its window
+        if (!gFeatAvatar) { WsReply(id, what, "The avatar is off (Settings > Features)."); return; }
+        WsBool(m, "on", gAvOpen, &b); AvShow(b); WsReply(id, what, nullptr); return;
     }
     if (!strcmp(what, "talkback")) {            // {"do":"talkback","on":true,"n":2}: only output 2 gets your mic (until "on":false)
         if (JsonNum(m, "n", &v)) gTalkbackOut = Iclamp((int)v - 1, 0, MAX_OUT - 1);
@@ -19743,6 +19818,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"5. Run the action (right-click > Test Trigger). Lag Effect does it.\n\n"
         L"COMMANDS\n"
         L"A command is plain words. In the C# it goes between the quotes:   CPH.WebsocketSend(\"mute toggle\", 0);\n"
+        L"Settings > Stream has a command builder: pick from lists, and Copy C# gives the whole code with the command in it.\n"
         L"Where it says on, you can write on, off or toggle. Names with spaces go in 'single quotes'.\n\n"
         L"Mic and voice\n"
         L"    mute on   \x2014   mute your mic (off, toggle)\n"
@@ -19765,6 +19841,9 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    scene Gaming   \x2014   switch to a scene\n"
         L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
         L"    talkback on 2   \x2014   only output 2 hears your mic;  talkback off\n\n"
+        L"Stream (Settings > Stream)\n"
+        L"    captions on   \x2014   live captions (off, toggle);  captions clear  empties them\n"
+        L"    avatar on   \x2014   the avatar's window (off, toggle)\n\n"
         L"Other\n"
         L"    start,  stop,  status,  ping\n\n"
         L"Several changes fit in one command:   channel Spotify -12 unmute pan 0\n\n"
@@ -19773,7 +19852,8 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"Replies: every command gets one: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}.\n\n"
         L"Events: Lag Effect tells Streamer.bot when things change. Use the trigger Core > Websocket > Client >\n"
         L"Websocket Client Message; the text is in %%message%%. They look like {\"event\":\"mute\",\"on\":true}. The events:\n"
-        L"mute, lag, fx, running, profile, scene, channel, output, talking (you started / stopped talking), talkback.\n\n"
+        L"mute, lag, fx, running, profile, scene, channel, output, talking (you started / stopped talking), talkback,\n"
+        L"caption (live captions: {\"event\":\"caption\",\"text\":\"...\",\"final\":true}).\n\n"
         L"Levels for overlays:  levels on 10  sends every channel's and output's level 10 times a second;  levels off.\n\n"
         L"JSON: the older form still works, e.g. {\"do\":\"lag\",\"ms\":2000}, and is the only way to pick a tts accent:\n"
         L"{\"do\":\"tts\",\"text\":\"hello\",\"accent\":\"Scottish\"}. In C#, JSON needs a \\ before every \".\n\n"
@@ -19911,7 +19991,7 @@ static const wchar_t* SubName(int page, int sub)
     if (sub < 0) return nullptr;
     if (page == PAGE_MIC && sub < 5) return MIC_SUB_NAMES[sub];
     if (page == PAGE_FX && sub < FX_SUBS) return FX_SUB_NAMES[sub];
-    if (page == PAGE_SETTINGS && sub < 4) return SET_SUB_NAMES[sub];
+    if (page == PAGE_SETTINGS && sub < 5) return SET_SUB_NAMES[sub];
     if (page == PAGE_SOUND && sub < 3) return SB_SUB_NAMES[sub];
     if (page == PAGE_MIXER && sub == 1) return L"Hotkeys";
     return nullptr;
@@ -20113,6 +20193,7 @@ static void GoTo(int page, int sub, HWND target, const wchar_t* title = nullptr,
         int id = 0;
         if (page == PAGE_MIC) id = sub == 0 ? IDC_MICSUB0 : sub == 1 ? IDC_MICSUB1 : sub == 2 ? IDC_MICSUB2 : sub == 4 ? IDC_MICSUB4 : IDC_MICSUB3;
         if (page == PAGE_SETTINGS && sub <= 3) id = IDC_SETSUB0 + sub;
+        if (page == PAGE_SETTINGS && sub == 4) id = IDC_SETSUB4;
         if (page == PAGE_SOUND && sub <= 2) id = IDC_SBSUB0 + sub;
         if (page == PAGE_MIXER && sub != gMixSub) id = IDC_MIXKEYSBTN;
         if (page == PAGE_FX && sub < FX_SUBS) SetFxSub(sub);
@@ -20528,6 +20609,12 @@ static void BugInfoBuild(wchar_t* o, int cap)
         SpeechBugInfo(o, cap);
         if (gSpErr[0]) BugAdd(o, cap, L"Speech problem: %ls", gSpErr);
     }
+    if (gFeatAvatar || gFeatCaptions) {         // Settings > Stream (1.60.0)
+        int np = 0; for (int i = 0; i < AV_PICS; i++) if (gAvFile[i][0]) np++;
+        BugAdd(o, cap, L"Stream: avatar %ls (%d pictures, window %ls, talk %d dB, loud %d dB, bg %d, bounce %d); captions %ls (%ls, window %ls, file %ls, %d lines, %d px)",
+               gFeatAvatar ? L"on" : L"off", np, gAvOpen ? L"open" : L"closed", gAvTalkDb, gAvLoudDb, gAvBg, gAvBounce,
+               gFeatCaptions ? L"on" : L"off", gCapOn ? L"running" : L"paused", gCapOpen ? L"open" : L"closed", gCapFile ? L"on" : L"off", gCapLines, gCapSize);
+    }
     BugAdd(o, cap, L"Silence alarm: %ls%ls%ls (outputs 0x%x)", gSilMain ? L"audio stopped " : L"", gSilMic ? L"mic silent " : L"",
         !gSilMain && !gSilMic && !gSilOut ? L"nothing" : L"", gSilOut);
 }
@@ -20698,6 +20785,8 @@ static int ChipsBuild(Chip* c)
         if (gBlOn.load() && gBlOuts.load()) { wchar_t t[32]; swprintf(t, 32, L"Bleep %.1f s", gBlDelayMs / 1000.0); add(t, 0, PAGE_MIC, 4); }
         if (gSpCmdOn && gVcN > 0) add(L"Voice commands", 0, PAGE_MIC, 4);
     }
+    if (gFeatCaptions && gCapOn && gFeatSpeech) add(L"Captions", 0, PAGE_SETTINGS, 4);   // (1.60.0)
+    if (gFeatAvatar && gAvOpen) add(L"Avatar", 0, PAGE_SETTINGS, 4);
     return n;
 }
 static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
@@ -20837,7 +20926,7 @@ static void SrchBuild()                         // (again each time the box gets
     for (int s = 0; s < 5; s++) SrchAdd(MIC_SUB_NAMES[s], nullptr, PAGE_MIC, s, -1, s == 2 ? FEAT_VST : s == 4 ? FEAT_SPEECH : 0, SK_SUB);
     for (int s = 0; s < 3; s++) SrchAdd(SB_SUB_NAMES[s], nullptr, PAGE_SOUND, s, -1, FEAT_SOUND, SK_SUB);
     for (int s = 0; s < FX_SUBS; s++) SrchAdd(FX_SUB_NAMES[s], nullptr, PAGE_FX, s, -1, 0, SK_SUB);
-    for (int s = 0; s < 4; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
+    for (int s = 0; s < 5; s++) SrchAdd(SET_SUB_NAMES[s], nullptr, PAGE_SETTINGS, s, -1, 0, SK_SUB);
     SrchAdd(L"Mixer hotkeys", nullptr, PAGE_MIXER, 1, -1, 0, SK_SUB);
     for (int k = 0; k < gSectionN; k++)
         if (gSections[k].title && gSections[k].page >= 0) SrchAdd(gSections[k].title, nullptr, gSections[k].page, gSections[k].sub, k, gSections[k].feat, SK_SEC);
@@ -21712,7 +21801,7 @@ static void WsDownload(int m)
 
 static bool SpeechWanted()
 {
-    return gFeatSpeech && ((gSpCmdOn && gVcN > 0) || (gBlOn.load() && gBlWords[0]) || gSpTts);
+    return gFeatSpeech && ((gSpCmdOn && gVcN > 0) || (gBlOn.load() && gBlWords[0]) || gSpTts || (gFeatCaptions && gCapOn));
 }
 static void WsPrompt()                          // words it should expect: your command phrases (helps it hear them)
 {
@@ -21726,7 +21815,7 @@ static void WsPrompt()                          // words it should expect: your 
     while (gWs.pm.test_and_set(std::memory_order_acquire)) {}
     memcpy(gWs.prompt, p, sizeof(p));
     gWs.pm.clear(std::memory_order_release);
-    gWs.partials = gBlOn.load() && gBlWords[0] != 0;   // (quick guesses cost CPU: only bleeping needs them)
+    gWs.partials = (gBlOn.load() && gBlWords[0] != 0) || (gFeatCaptions && gCapOn);   // (quick guesses cost CPU: only bleeping and captions need them)
 }
 static void WsCallbackPost(const WsResult* r, void*)   // (the engine's thread) a copy goes to the window
 {
@@ -21775,6 +21864,7 @@ static void SpeechTick()                        // every 50 ms (PadTick): keep i
         SpeechStatus();
     }
     BlRetireTick();
+    CapTick();
     static DWORD lastShown = 0;                 // the page's status line (and the lists, which name channels and outputs)
     if (gPage == PAGE_MIC && gMicSub == 4 && !gCompact && GetTickCount() - lastShown > 500) { lastShown = GetTickCount(); SpeechStatus(); BlOutsText(); }
 }
@@ -21848,6 +21938,7 @@ static void SpeechResult(const WsResult* r)     // WM_APP + 21: what Whisper hea
         gWsBroken = true; SpeechStatus();
         return;
     }
+    CapResult(r);                               // live captions (1.60.0): quick guesses and final text
     if (gBlOn.load() && gBlWords[0]) {          // bleep words (quick guesses too, so they're caught while you're still talking)
         for (int i = 0; i < r->n; i++) {
             wchar_t w[48]; MultiByteToWideChar(CP_UTF8, 0, r->w[i].text, -1, w, 48);
@@ -22384,6 +22475,694 @@ static void SetFeatSpeech(bool on)
     gFeatSpeech = on;
     if (!on) { if (gMicSub == 4) gMicSub = 0; if (gSpTts) SpTtsSet(false, false); }
     SpeechApply();
+}
+
+// ======================= 1.60.0: Stream tools (Settings > Stream) =======================
+// Avatar (N1): a PNGtuber picture of you, in its own window for OBS (Window Capture + a Chroma Key filter): it shows
+// your "talking" picture while your mic is over a level, hops when you start, blinks now and then, a "loud" picture
+// when you shout. Pictures are decoded like the background picture (GDI+: PNG, GIF (animated too), JPG, BMP).
+// Captions (N5): what Whisper (Mic > Speech's model) hears, in a window for OBS, a text file (OBS Text: Read from file)
+// and a Streamer.bot event. Command builder: Streamer.bot commands from lists, copied as C# or tested here.
+static const wchar_t* AV_PIC_NAMES[AV_PICS] = { L"Quiet", L"Talking", L"Blink", L"Talk + blink", L"Loud" };
+static const COLORREF STREAM_BGS[5] = { RGB(0, 255, 0), RGB(0, 0, 255), RGB(255, 0, 255), RGB(0, 0, 0), RGB(255, 255, 255) };
+static const wchar_t* STREAM_BG_NAMES[6] = { L"Green", L"Blue", L"Magenta", L"Black", L"White", L"Your colour..." };
+static COLORREF StreamBg(int i, COLORREF custom) { return i >= 0 && i < 5 ? STREAM_BGS[i] : custom; }
+static bool StreamPickColour(HWND owner, COLORREF* c)
+{
+    static COLORREF custom[16] = {};
+    CHOOSECOLORW cc = {}; cc.lStructSize = sizeof(cc); cc.hwndOwner = owner; cc.rgbResult = *c; cc.lpCustColors = custom; cc.Flags = CC_FULLOPEN | CC_RGBINIT;
+    if (!ChooseColorW(&cc)) return false;
+    *c = cc.rgbResult; return true;
+}
+static void StreamPlace(HWND w, RECT& rc, int dw, int dh, int dx)   // where a stream window opens: as last time, or beside the app
+{
+    RECT m; GetWindowRect(gWnd, &m);
+    int x = rc.right > rc.left ? rc.left : m.right + 8 + dx, y = rc.right > rc.left ? rc.top : m.top + dx;
+    int cw = rc.right > rc.left ? rc.right - rc.left : dw, ch = rc.bottom > rc.top ? rc.bottom - rc.top : dh;
+    RECT test = { x, y, x + cw, y + ch };
+    if (!MonitorFromRect(&test, MONITOR_DEFAULTTONULL)) { x = m.left + 40; y = m.top + 40; }   // (its screen is gone)
+    SetWindowPos(w, nullptr, x, y, cw, ch, SWP_NOZORDER | SWP_NOACTIVATE);
+}
+static void SetFeatAvatar(bool on); static void SetFeatCaptions(bool on);
+
+// ---- avatar ----
+static HWND gAvWnd = nullptr;
+static struct AvState {
+    float env = -120; bool talk = false, loud = false, blink = false;
+    ULONGLONG holdTo = 0, loudTo = 0, hopAt = 0, blinkAt = 0, blinkTo = 0; float hopAmp = 1, bob = 0;
+    int shown = -2, y = 0;
+} gAv;
+static bool AvHas(int i) { return gAvImg[i].gp != nullptr; }
+static int AvPick()                             // which picture now
+{
+    int i;
+    if (gAv.talk) i = gAv.loud && AvHas(4) ? 4 : gAv.blink && AvHas(3) ? 3 : AvHas(1) ? 1 : gAv.blink && AvHas(2) ? 2 : 0;
+    else i = gAv.blink && AvHas(2) ? 2 : 0;
+    if (!AvHas(i)) { i = -1; for (int k = 0; k < AV_PICS && i < 0; k++) if (AvHas(k)) i = k; }
+    return i;
+}
+static void AvFit(int i, int cw, int ch, int* w, int* h)   // its size in the window: as big as fits, room above for the hop
+{
+    const PicImg& m = gAvImg[i];
+    const double aw = cw * 0.96, ah = ch * 0.86;
+    const double k = m.w0 && m.h0 ? fmin(aw / m.w0, ah / m.h0) : 1.0;
+    *w = Imax(1, (int)(m.w0 * k)); *h = Imax(1, (int)(m.h0 * k));
+}
+static void AvWantAll()                         // (re)decode every picture at the window's size
+{
+    if (!gAvWnd) return;
+    RECT rc; GetClientRect(gAvWnd, &rc);
+    if (rc.right < 8 || rc.bottom < 8) return;
+    for (int i = 0; i < AV_PICS; i++) if (AvHas(i)) { int w, h; AvFit(i, rc.right, rc.bottom, &w, &h); PicWant(gAvImg[i], w, h); }
+}
+static int gAvGen = 0;                          // (a picture changed or was decoded again: compose afresh)
+static void AvDecoded() { gAv.shown = -2; gAvGen++; if (gAvWnd) InvalidateRect(gAvWnd, nullptr, FALSE); }
+static void AvUiRefresh()                       // Settings > Stream: the picture buttons, the open button
+{
+    if (!gWnd) return;
+    for (int i = 0; i < AV_PICS; i++) {
+        wchar_t t[48]; swprintf(t, 48, gAvFile[i][0] ? L"%ls \x2713" : L"%ls...", AV_PIC_NAMES[i]);
+        SetTextIfChanged(gWnd, IDC_AVPIC0 + i, t);
+    }
+    SetTextIfChanged(gWnd, IDC_AVOPEN, gAvWnd && IsWindowVisible(gAvWnd) ? L"Close the window" : L"Open the window");
+}
+static void AvSetPic(int i, const wchar_t* path)   // nullptr / "" = none
+{
+    PicClose(gAvImg[i]);
+    gAvFile[i][0] = 0;
+    if (path && path[0]) {
+        if (!PicOpen(gAvImg[i], path)) {
+            MessageBoxW(gWnd, L"That picture couldn't be opened. PNG (with a see-through background), GIF, JPG and BMP work.", L"Lag Effect - Avatar", MB_ICONWARNING);
+        } else lstrcpynW(gAvFile[i], path, MAX_PATH);
+    }
+    AvWantAll(); AvDecoded(); AvUiRefresh();
+}
+static void AvPickFile(int i)
+{
+    wchar_t path[MAX_PATH] = L"";
+    OPENFILENAMEW o = {};
+    o.lStructSize = sizeof(o); o.hwndOwner = gAvWnd && GetForegroundWindow() == gAvWnd ? gAvWnd : gWnd;
+    o.lpstrFilter = L"Pictures (PNG, GIF, JPG, BMP)\0*.png;*.gif;*.jpg;*.jpeg;*.bmp\0All files\0*.*\0";
+    o.lpstrFile = path; o.nMaxFile = MAX_PATH;
+    wchar_t title[80]; swprintf(title, 80, L"Avatar: your \"%ls\" picture", AV_PIC_NAMES[i]); o.lpstrTitle = title;
+    o.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY;
+    if (!GetOpenFileNameW(&o)) return;
+    AvSetPic(i, path); SaveSettings();
+}
+static float AvLevelDb()                        // the mic as others hear it (after cleanup): its loudest since last time
+{
+    const float pk = gAvPk; gAvPk = 0;
+    return pk > 1e-6f ? 20.0f * log10f(pk) : -120.0f;
+}
+static void AvFollow(float db, ULONGLONG now)   // the talking / loud / blink / hop state, from the level
+{
+    gAv.env = db > gAv.env ? db : gAv.env - 1.2f;   // (falls ~75 dB a second)
+    const bool talkNow = gAv.env > gAvTalkDb;
+    if (talkNow) gAv.holdTo = now + 200;        // (between words: stays talking)
+    const bool talk = talkNow || now < gAv.holdTo;
+    if (talk && !gAv.talk) { gAv.hopAt = now; gAv.hopAmp = 1.0f; }
+    if (gAv.env > gAvLoudDb) { if (now >= gAv.loudTo) { gAv.hopAt = now; gAv.hopAmp = 1.7f; } gAv.loudTo = now + 350; }
+    gAv.talk = talk; gAv.loud = talk && now < gAv.loudTo;
+    if (!gAv.blinkAt) gAv.blinkAt = now + 2000 + (ULONGLONG)(rand() % 4000);
+    if (now >= gAv.blinkAt) { gAv.blinkTo = now + 140; gAv.blinkAt = now + 2500 + (ULONGLONG)(rand() % 4500); }
+    gAv.blink = now < gAv.blinkTo;
+}
+static void AvTick()                            // (its timer, 60 a second, while it's showing)
+{
+    const ULONGLONG now = PicNow();
+    AvFollow(AvLevelDb(), now);
+    RECT rc; GetClientRect(gAvWnd, &rc);
+    const float A = gAvBounce == 2 ? 0.09f : 0.045f;
+    float hop = 0.0f;
+    if (gAvBounce && now - gAv.hopAt < 240) hop = A * gAv.hopAmp * sinf(3.14159265f * (float)(now - gAv.hopAt) / 240.0f);
+    const float bobT = gAv.talk && gAvBounce ? A * 0.35f * fminf(1.0f, fmaxf(0.0f, (gAv.env - gAvTalkDb) / 25.0f)) : 0.0f;
+    gAv.bob += (bobT - gAv.bob) * 0.3f;
+    const int y = (int)lroundf((hop + gAv.bob) * rc.bottom);
+    const int idx = AvPick();
+    const bool frame = idx >= 0 && PicAdvance(gAvImg[idx], now);
+    if (idx != gAv.shown || y != gAv.y || frame) { gAv.shown = idx; gAv.y = y; InvalidateRect(gAvWnd, nullptr, FALSE); }
+    if (gPage == PAGE_SETTINGS && gSetSub == 4) InvalidateRect(GetDlgItem(gWnd, IDC_AVMETER), nullptr, FALSE);
+}
+static void AvPaint(HWND h)
+{
+    // The picture over the colour is composed only when the picture, its frame, the size or the colour changes; the
+    // hop / bob is then just a shifted copy (talking moves it every frame: no blending 60 times a second).
+    PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+    RECT rc; GetClientRect(h, &rc);
+    const int cw = rc.right, ch = rc.bottom;
+    static HBITMAP bmp = nullptr; static DWORD* bits = nullptr; static int bw = 0, bh = 0;
+    static const DWORD* lastF = nullptr; static int lastIdx = -3, lastGen = -1; static COLORREF lastC = 0xFFFFFFFF;
+    bool fresh = false;
+    if (cw > 0 && ch > 0 && (cw != bw || ch != bh || !bmp)) {
+        if (bmp) DeleteObject(bmp);
+        BITMAPINFO bi = {}; bi.bmiHeader.biSize = sizeof(bi.bmiHeader); bi.bmiHeader.biWidth = cw; bi.bmiHeader.biHeight = -ch;
+        bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+        bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void**)&bits, nullptr, 0); bw = cw; bh = ch; fresh = true;
+    }
+    if (bmp && bits) {
+        const COLORREF c = StreamBg(gAvBg, gAvBgCustom);
+        const int idx = AvPick();
+        const DWORD* f = idx >= 0 ? PicCurFrame(gAvImg[idx]) : nullptr;
+        HDC md = CreateCompatibleDC(dc); HGDIOBJ ob = SelectObject(md, bmp);
+        if (fresh || f != lastF || idx != lastIdx || c != lastC || gAvGen != lastGen || !f) {
+            lastF = f; lastIdx = idx; lastC = c; lastGen = gAvGen;
+            const DWORD bg = ((DWORD)GetRValue(c) << 16) | ((DWORD)GetGValue(c) << 8) | GetBValue(c);
+            for (size_t i = 0, n = (size_t)cw * ch; i < n; i++) bits[i] = bg;
+            if (f) {                            // premultiplied BGRA over the colour, bottom-centred
+                const int iw = gAvImg[idx].w, ih = gAvImg[idx].h;
+                const int x0 = (cw - iw) / 2, y0 = ch - ih - ch / 50;
+                for (int y = 0; y < ih; y++) {
+                    const int dy = y0 + y; if (dy < 0 || dy >= ch) continue;
+                    const DWORD* s = f + (size_t)y * iw; DWORD* d = bits + (size_t)dy * cw;
+                    for (int x = 0; x < iw; x++) {
+                        const int dx = x0 + x; if (dx < 0 || dx >= cw) continue;
+                        const DWORD p = s[x], a = p >> 24;
+                        if (a == 255) d[dx] = p & 0xFFFFFF;
+                        else if (a) {
+                            const DWORD q = d[dx], k = 255 - a;
+                            const DWORD r = ((p >> 16) & 255) + (((q >> 16) & 255) * k + 127) / 255;
+                            const DWORD g = ((p >> 8) & 255) + (((q >> 8) & 255) * k + 127) / 255;
+                            const DWORD b = (p & 255) + ((q & 255) * k + 127) / 255;
+                            d[dx] = (Imin((int)r, 255) << 16) | (Imin((int)g, 255) << 8) | Imin((int)b, 255);
+                        }
+                    }
+                }
+            } else {                            // no pictures yet
+                GdiFlush();
+                SetBkMode(md, TRANSPARENT);
+                SetTextColor(md, GetRValue(c) + GetGValue(c) + GetBValue(c) > 380 ? RGB(0, 0, 0) : RGB(255, 255, 255));
+                HGDIOBJ of = SelectObject(md, gFont);
+                RECT t = { 16, 16, cw - 16, ch - 16 };
+                DrawTextW(md, AvHas(0) || AvHas(1) ? L"Loading..." : L"Right-click here (or Settings > Stream) to pick your pictures:\n"
+                          L"Quiet and Talking (PNGs with a see-through background).\n\nIn OBS: Window Capture of this window, then a Chroma Key filter.",
+                          -1, &t, DT_CENTER | DT_WORDBREAK);
+                SelectObject(md, of);
+            }
+        }
+        const int y = f ? Iclamp(gAv.y, 0, ch) : 0; // (the hop: everything moves up; the strip it leaves at the bottom is the colour)
+        BitBlt(dc, 0, 0, cw, ch - y, md, 0, y, SRCCOPY);
+        if (y > 0) { RECT st = { 0, ch - y, cw, ch }; HBRUSH b = CreateSolidBrush(c); FillRect(dc, &st, b); DeleteObject(b); }
+        SelectObject(md, ob); DeleteDC(md);
+    }
+    EndPaint(h, &ps);
+}
+static void AvShow(bool on);
+static void AvMenu(HWND h)
+{
+    HMENU m = CreatePopupMenu(), mp = CreatePopupMenu(), mb = CreatePopupMenu(), mo = CreatePopupMenu();
+    for (int i = 0; i < AV_PICS; i++) {
+        wchar_t t[80]; swprintf(t, 80, L"%ls...%ls", AV_PIC_NAMES[i], i == 0 ? L"   (not talking)" : i == 1 ? L"   (talking)" : i == 4 ? L"   (shouting, optional)" : L"   (optional)");
+        AppendMenuW(mp, MF_STRING | (gAvFile[i][0] ? MF_CHECKED : 0), 10 + i, t);
+    }
+    AppendMenuW(mp, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(mp, MF_STRING, 19, L"Remove them all");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mp, L"Pictures");
+    for (int i = 0; i < 6; i++) AppendMenuW(mb, MF_STRING | (gAvBg == i ? MF_CHECKED : 0), 20 + i, STREAM_BG_NAMES[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mb, L"Background (for OBS's Chroma Key)");
+    static const wchar_t* BN[3] = { L"Off", L"Small", L"Big" };
+    for (int i = 0; i < 3; i++) AppendMenuW(mo, MF_STRING | (gAvBounce == i ? MF_CHECKED : 0), 30 + i, BN[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mo, L"Bounce");
+    AppendMenuW(m, MF_STRING | (gAvTop ? MF_CHECKED : 0), 40, L"Always on top");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 41, L"Settings...");
+    AppendMenuW(m, MF_STRING, 42, L"Close");
+    POINT p; GetCursorPos(&p);
+    const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, p.x, p.y, 0, h, nullptr);
+    DestroyMenu(m);
+    if (c >= 10 && c < 10 + AV_PICS) { AvPickFile(c - 10); return; }
+    if (c == 19) { for (int i = 0; i < AV_PICS; i++) AvSetPic(i, nullptr); }
+    else if (c >= 20 && c < 26) {
+        if (c == 25 && !StreamPickColour(h, &gAvBgCustom)) return;
+        gAvBg = c - 20; InvalidateRect(h, nullptr, FALSE);
+        SendDlgItemMessageW(gWnd, IDC_AVBG, CB_SETCURSEL, gAvBg, 0);
+    }
+    else if (c >= 30 && c < 33) { gAvBounce = c - 30; SendDlgItemMessageW(gWnd, IDC_AVBOUNCE, CB_SETCURSEL, gAvBounce, 0); }
+    else if (c == 40) { gAvTop = !gAvTop; SetWindowPos(h, gAvTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); }
+    else if (c == 41) { ShowWindow(gWnd, SW_SHOWNORMAL); SetForegroundWindow(gWnd); GoTo(PAGE_SETTINGS, 4, GetDlgItem(gWnd, IDC_AVOPEN)); return; }
+    else if (c == 42) { AvShow(false); }
+    else return;
+    SaveSettings();
+}
+static LRESULT CALLBACK AvProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: AvPaint(h); return 0;
+    case WM_TIMER: if (wp == 1) AvTick(); return 0;
+    case WM_SIZE: AvWantAll(); InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_EXITSIZEMOVE: GetWindowRect(h, &gAvRc); SaveSettings(); return 0;
+    case WM_RBUTTONUP: AvMenu(h); return 0;
+    case WM_CLOSE: AvShow(false); SaveSettings(); return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void AvShow(bool on)
+{
+    if (on && !gFeatAvatar) return;
+    if (on && !gAvWnd) {
+        static bool reg = false;
+        if (!reg) {
+            WNDCLASSW wc = {}; wc.lpfnWndProc = AvProc; wc.hInstance = gInst; wc.lpszClassName = L"LagAvatar";
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hIcon = LoadIconW(gInst, MAKEINTRESOURCEW(1));
+            RegisterClassW(&wc); reg = true;
+        }
+        gAvWnd = CreateWindowExW(0, L"LagAvatar", L"Lag Effect - Avatar", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 420, 460,
+                                 nullptr, nullptr, gInst, nullptr);   // (its own window, not the app's: OBS captures it even while the app is in the tray)
+        if (!gAvWnd) return;
+        ThemeTitleBar(gAvWnd);
+        StreamPlace(gAvWnd, gAvRc, 420, 460, 0);
+    }
+    if (!gAvWnd) { gAvOpen = false; AvUiRefresh(); return; }
+    if (on) {
+        SetWindowPos(gAvWnd, gAvTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        ShowWindow(gAvWnd, SW_SHOWNOACTIVATE);
+        AvWantAll(); gAv.shown = -2;
+        SetTimer(gAvWnd, 1, 16, nullptr);
+    } else {
+        KillTimer(gAvWnd, 1);
+        GetWindowRect(gAvWnd, &gAvRc);
+        ShowWindow(gAvWnd, SW_HIDE);
+    }
+    gAvOpen = on;
+    AvUiRefresh();
+}
+static void AvDrawMeter(DRAWITEMSTRUCT* d)      // Settings > Stream: your level, and where talking / loud start
+{
+    HDC dc = d->hDC; RECT r = d->rcItem;
+    FillRect(dc, &r, BgBrush());
+    const int w = r.right - r.left - 2;
+    auto xOf = [&](float db) { return r.left + 1 + (int)(w * fminf(1.0f, fmaxf(0.0f, (db + 70.0f) / 70.0f))); };
+    HBRUSH tr = CreateSolidBrush(gDark ? DK_CTL : LT_BORDER); RECT t = r; InflateRect(&t, 0, -3); FillRect(dc, &t, tr); DeleteObject(tr);
+    if (!gAvWnd || !IsWindowVisible(gAvWnd)) AvFollow(AvLevelDb(), PicNow());   // (the window isn't running it)
+    RECT l = t; l.right = xOf(gAv.env);
+    HBRUSH lb = CreateSolidBrush(gAv.loud ? RGB(230, 80, 60) : gAv.talk ? RGB(60, 190, 90) : RGB(130, 130, 130)); FillRect(dc, &l, lb); DeleteObject(lb);
+    HPEN p = CreatePen(PS_SOLID, 2, TXT_C); HGDIOBJ op = SelectObject(dc, p);
+    MoveToEx(dc, xOf((float)gAvTalkDb), r.top, nullptr); LineTo(dc, xOf((float)gAvTalkDb), r.bottom);
+    MoveToEx(dc, xOf((float)gAvLoudDb), r.top, nullptr); LineTo(dc, xOf((float)gAvLoudDb), r.bottom);
+    SelectObject(dc, op); DeleteObject(p);
+}
+static void SetFeatAvatar(bool on)
+{
+    gFeatAvatar = on;
+    if (on) { for (int i = 0; i < AV_PICS; i++) if (gAvFile[i][0] && !AvHas(i)) PicOpen(gAvImg[i], gAvFile[i]); AvShow(true); }
+    else { AvShow(false); for (int i = 0; i < AV_PICS; i++) PicClose(gAvImg[i]); }
+    AvUiRefresh();
+}
+
+// ---- captions ----
+static HWND gCapsWnd = nullptr;
+static wchar_t gCapDone[1400] = L"", gCapPart[1100] = L"", gCapShown[1400] = L"";
+static ULONGLONG gCapAt = 0;
+static void CapPath(wchar_t* out)               // Documents\Lag Effect\captions.txt
+{
+    wchar_t docs[MAX_PATH] = L"";
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, 0, docs)) || !docs[0]) GetTempPathW(MAX_PATH, docs);
+    swprintf(out, MAX_PATH, L"%ls\\Lag Effect", docs); CreateDirectoryW(out, nullptr);
+    lstrcatW(out, L"\\captions.txt");
+}
+static void CapWriteFile()
+{
+    if (!gCapFile) return;
+    wchar_t p[MAX_PATH]; CapPath(p);
+    static char u8[4200]; const int n = WideCharToMultiByte(CP_UTF8, 0, gCapShown, -1, u8, sizeof(u8), nullptr, nullptr);
+    HANDLE f = CreateFileW(p, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD w; if (n > 1) WriteFile(f, u8, (DWORD)(n - 1), &w, nullptr);
+    CloseHandle(f);
+}
+static void CapClean(const wchar_t* in, wchar_t* out, int cap)   // no [BLANK_AUDIO] / (music) notes; bleep-list words as ****
+{
+    int o = 0; const wchar_t* p = in;
+    while (*p && o < cap - 1) {
+        while (*p == L' ' || *p == L'\t' || *p == L'\n' || *p == L'\r') p++;
+        if (!*p) break;
+        const wchar_t* s = p; while (*p && *p != L' ' && *p != L'\t' && *p != L'\n' && *p != L'\r') p++;
+        const int len = (int)(p - s);
+        if (len >= 2 && ((s[0] == L'[' && s[len - 1] == L']') || (s[0] == L'(' && s[len - 1] == L')') || (s[0] == L'*' && s[len - 1] == L'*'))) continue;
+        if (len && (s[0] == L'[' || s[0] == L'(')) { const wchar_t* e = s; while (*e && *e != L']' && *e != L')') e++; if (*e) { p = e + 1; continue; } }
+        wchar_t word[64]; lstrcpynW(word, s, Imin(len + 1, 64));
+        const bool hide = gCapMask && gBlWords[0] && BlWordMatch(word);
+        if (o && o < cap - 1) out[o++] = L' ';
+        for (int i = 0; i < len && o < cap - 1; i++) out[o++] = hide && IsCharAlphaNumericW(s[i]) ? L'*' : s[i];
+    }
+    out[o] = 0;
+}
+static void CapUpdate(bool final)               // what shows now: the end of what you said (about the lines' worth)
+{
+    static wchar_t all[2600]; swprintf(all, 2600, L"%ls %ls", gCapDone, gCapPart);
+    static wchar_t clean[2600]; CapClean(all, clean, 2600);
+    const int keep = gCapLines * 64;            // (the window trims to its lines by what fits; the file gets this much)
+    const wchar_t* s = clean; const int len = lstrlenW(clean);
+    if (len > keep) { s = clean + len - keep; while (*s && *s != L' ') s++; while (*s == L' ') s++; }
+    if (!lstrcmpW(s, gCapShown)) return;
+    lstrcpynW(gCapShown, s, 1400);
+    if (gCapsWnd) InvalidateRect(gCapsWnd, nullptr, FALSE);
+    CapWriteFile();
+    if (gWsOn && gWsThread && gWsCount) {       // Streamer.bot: {"event":"caption","text":"...","final":true}
+        static char u8[4200], e[8400];
+        WideCharToMultiByte(CP_UTF8, 0, gCapShown, -1, u8, sizeof(u8), nullptr, nullptr); JsonEsc(u8, e, sizeof(e));
+        static char r[8600]; snprintf(r, sizeof(r), "{\"event\":\"caption\",\"text\":\"%s\",\"final\":%s}", e, final ? "true" : "false");
+        WsQueue(-1, r);
+    }
+}
+static void CapResult(const WsResult* r)        // (SpeechResult) a quick guess replaces the line being said; a final one is added
+{
+    if (!gFeatCaptions || !gCapOn) return;
+    wchar_t t[1024]; MultiByteToWideChar(CP_UTF8, 0, r->text, -1, t, 1024);
+    if (r->kind == 1) {
+        const int have = lstrlenW(gCapDone), add = lstrlenW(t);
+        if (have + add + 2 >= 1400) {           // (keep the end)
+            const wchar_t* s = gCapDone + Imin(have, have + add + 2 - 1400 + 200); while (*s && *s != L' ') s++;
+            memmove(gCapDone, s, (lstrlenW(s) + 1) * sizeof(wchar_t));
+        }
+        if (gCapDone[0] && t[0] != L' ') lstrcatW(gCapDone, L" ");
+        lstrcatW(gCapDone, t);
+        gCapPart[0] = 0;
+    } else lstrcpynW(gCapPart, t, 1100);
+    gCapAt = GetTickCount64();
+    CapUpdate(r->kind == 1);
+}
+static void CapClear() { gCapDone[0] = gCapPart[0] = 0; CapUpdate(true); }
+static void CapTick()                           // (SpeechTick, 50 ms) a pause: the captions clear
+{
+    if (gCapShown[0] && GetTickCount64() - gCapAt > (ULONGLONG)gCapClearS * 1000) CapClear();
+    if (gFeatAvatar && gPage == PAGE_SETTINGS && gSetSub == 4 && !(gAvWnd && IsWindowVisible(gAvWnd)))   // (the avatar's level bar, while its
+        InvalidateRect(GetDlgItem(gWnd, IDC_AVMETER), nullptr, FALSE);                                     //  window isn't open to drive it)
+}
+static void CapPaint(HWND h)
+{
+    PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
+    RECT rc; GetClientRect(h, &rc);
+    HDC md = CreateCompatibleDC(dc); HBITMAP bm = CreateCompatibleBitmap(dc, Imax(1, rc.right), Imax(1, rc.bottom)); HGDIOBJ ob = SelectObject(md, bm);
+    HBRUSH b = CreateSolidBrush(StreamBg(gCapBg, gCapBgCustom)); FillRect(md, &rc, b); DeleteObject(b);
+    HFONT f = CreateFontW(-gCapSize, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+    HGDIOBJ of = SelectObject(md, f);
+    SetBkMode(md, TRANSPARENT);
+    const wchar_t* s = gCapShown[0] ? gCapShown : gFeatSpeech ? L"" : L"Captions need Speech (Settings > Features).";
+    TEXTMETRICW tm; GetTextMetricsW(md, &tm);
+    const int lineH = tm.tmHeight, pad = Imax(6, gCapSize / 4);
+    RECT box = { pad, 0, rc.right - pad, 0 };
+    while (*s) {                                // drop words from the front until it fits its lines
+        RECT c = box; DrawTextW(md, s, -1, &c, DT_CALCRECT | DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+        if (c.bottom - c.top <= lineH * gCapLines + 2) { box.top = rc.bottom - pad - (c.bottom - c.top); box.bottom = rc.bottom - pad; break; }
+        const wchar_t* sp = wcschr(s, L' '); if (!sp) { box.top = rc.bottom - pad - lineH * gCapLines; box.bottom = rc.bottom - pad; break; }
+        s = sp + 1;
+    }
+    const int o = Imax(2, gCapSize / 16);       // a black outline, then the white text
+    SetTextColor(md, RGB(0, 0, 0));
+    for (int dy = -o; dy <= o; dy += o) for (int dx = -o; dx <= o; dx += o) {
+        if (!dx && !dy) continue;
+        RECT t = box; OffsetRect(&t, dx, dy); DrawTextW(md, s, -1, &t, DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+    }
+    SetTextColor(md, RGB(255, 255, 255));
+    DrawTextW(md, s, -1, &box, DT_WORDBREAK | DT_CENTER | DT_NOPREFIX);
+    BitBlt(dc, 0, 0, rc.right, rc.bottom, md, 0, 0, SRCCOPY);
+    SelectObject(md, of); DeleteObject(f); SelectObject(md, ob); DeleteObject(bm); DeleteDC(md);
+    EndPaint(h, &ps);
+}
+static void CapShow(bool on);
+static void CapUiRefresh()
+{
+    if (!gWnd) return;
+    SetTextIfChanged(gWnd, IDC_CAPOPEN, gCapsWnd && IsWindowVisible(gCapsWnd) ? L"Close the window" : L"Open the window");
+}
+static void CapMenu(HWND h)
+{
+    HMENU m = CreatePopupMenu(), ml = CreatePopupMenu(), ms = CreatePopupMenu(), mb = CreatePopupMenu();
+    for (int i = 1; i <= 3; i++) { wchar_t t[16]; swprintf(t, 16, L"%d", i); AppendMenuW(ml, MF_STRING | (gCapLines == i ? MF_CHECKED : 0), 10 + i, t); }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)ml, L"Lines");
+    static const int SZ[6] = { 28, 36, 44, 56, 72, 96 };
+    for (int i = 0; i < 6; i++) { wchar_t t[16]; swprintf(t, 16, L"%d", SZ[i]); AppendMenuW(ms, MF_STRING | (gCapSize == SZ[i] ? MF_CHECKED : 0), 20 + i, t); }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)ms, L"Text size");
+    for (int i = 0; i < 6; i++) AppendMenuW(mb, MF_STRING | (gCapBg == i ? MF_CHECKED : 0), 30 + i, STREAM_BG_NAMES[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)mb, L"Background (for OBS's Chroma Key)");
+    AppendMenuW(m, MF_STRING | (gCapTop ? MF_CHECKED : 0), 40, L"Always on top");
+    AppendMenuW(m, MF_STRING, 43, L"Clear now");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 41, L"Settings...");
+    AppendMenuW(m, MF_STRING, 42, L"Close");
+    POINT p; GetCursorPos(&p);
+    const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, p.x, p.y, 0, h, nullptr);
+    DestroyMenu(m);
+    if (c >= 11 && c <= 13) { gCapLines = c - 10; SendDlgItemMessageW(gWnd, SPIN_UD(IDC_CAPLINES), UDM_SETPOS32, 0, gCapLines); }
+    else if (c >= 20 && c < 26) { gCapSize = SZ[c - 20]; SendDlgItemMessageW(gWnd, SPIN_UD(IDC_CAPSIZE), UDM_SETPOS32, 0, gCapSize); }
+    else if (c >= 30 && c < 36) { if (c == 35 && !StreamPickColour(h, &gCapBgCustom)) return; gCapBg = c - 30; SendDlgItemMessageW(gWnd, IDC_CAPBG, CB_SETCURSEL, gCapBg, 0); }
+    else if (c == 40) { gCapTop = !gCapTop; SetWindowPos(h, gCapTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE); }
+    else if (c == 43) { CapClear(); return; }
+    else if (c == 41) { ShowWindow(gWnd, SW_SHOWNORMAL); SetForegroundWindow(gWnd); GoTo(PAGE_SETTINGS, 4, GetDlgItem(gWnd, IDC_CAPOPEN)); return; }
+    else if (c == 42) { CapShow(false); }
+    else return;
+    CapUpdate(true); InvalidateRect(h, nullptr, FALSE); SaveSettings();
+}
+static LRESULT CALLBACK CapProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: CapPaint(h); return 0;
+    case WM_SIZE: InvalidateRect(h, nullptr, FALSE); return 0;
+    case WM_EXITSIZEMOVE: GetWindowRect(h, &gCapRc); SaveSettings(); return 0;
+    case WM_RBUTTONUP: CapMenu(h); return 0;
+    case WM_CLOSE: CapShow(false); SaveSettings(); return 0;
+    }
+    return DefWindowProcW(h, msg, wp, lp);
+}
+static void CapShow(bool on)
+{
+    if (on && !gFeatCaptions) return;
+    if (on && !gCapsWnd) {
+        static bool reg = false;
+        if (!reg) {
+            WNDCLASSW wc = {}; wc.lpfnWndProc = CapProc; wc.hInstance = gInst; wc.lpszClassName = L"LagCaptions";
+            wc.hCursor = LoadCursor(nullptr, IDC_ARROW); wc.hIcon = LoadIconW(gInst, MAKEINTRESOURCEW(1));
+            RegisterClassW(&wc); reg = true;
+        }
+        gCapsWnd = CreateWindowExW(0, L"LagCaptions", L"Lag Effect - Captions", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 820, 200,
+                                  nullptr, nullptr, gInst, nullptr);
+        if (!gCapsWnd) return;
+        ThemeTitleBar(gCapsWnd);
+        StreamPlace(gCapsWnd, gCapRc, 820, 200, 480);
+    }
+    if (!gCapsWnd) { gCapOpen = false; CapUiRefresh(); return; }
+    if (on) {
+        SetWindowPos(gCapsWnd, gCapTop ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        ShowWindow(gCapsWnd, SW_SHOWNOACTIVATE); InvalidateRect(gCapsWnd, nullptr, FALSE);
+    } else { GetWindowRect(gCapsWnd, &gCapRc); ShowWindow(gCapsWnd, SW_HIDE); }
+    gCapOpen = on;
+    CapUiRefresh();
+}
+static void SetFeatCaptions(bool on)
+{
+    gFeatCaptions = on;
+    if (on && !gFeatSpeech) { SetFeatSpeech(true); CheckDlgButton(gWnd, IDC_FEATSPEECH, BST_CHECKED); }   // (Whisper is Speech's)
+    if (on) CapShow(true); else { CapShow(false); CapClear(); }
+    SpeechApply();
+}
+
+// ---- Streamer.bot command builder ----
+// Pick what it should do (and which channel / output / scene...), it writes the command; Copy C# puts the whole
+// "Execute C# Code" text on the clipboard with it, Test runs it here (WsExec with id -2: its reply comes back to us).
+enum { CBT_NONE, CBT_CHAN, CBT_OUT, CBT_CHAR, CBT_PROF, CBT_SCENE, CBT_PAD, CBT_CLIP };
+enum { CBO_NONE, CBO_ONOFF, CBO_CHAN, CBO_OUT, CBO_TALKBACK, CBO_CAPS };
+enum { CBV_NONE, CBV_NUM, CBV_TEXT };
+struct CbAct { const wchar_t* name; const char* cmd; int tgt, opt, val; int def; };
+static const CbAct CB_ACTS[] = {
+    { L"Mute your mic", "mute", CBT_NONE, CBO_ONOFF, CBV_NONE, 0 },
+    { L"Voice FX on / off", "fx", CBT_NONE, CBO_ONOFF, CBV_NONE, 0 },
+    { L"Stutter for (ms)", "lag", CBT_NONE, CBO_NONE, CBV_NUM, 2000 },
+    { L"Stop the stutter", "lag off", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Rewind", "rewind", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Repeat word", "repeat", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Voice FX character", "character", CBT_CHAR, CBO_NONE, CBV_NONE, 0 },
+    { L"Profile", "profile", CBT_PROF, CBO_NONE, CBV_NONE, 0 },
+    { L"Next profile", "nextprofile", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Play a soundboard pad", "pad", CBT_PAD, CBO_NONE, CBV_NONE, 0 },
+    { L"Stop all sounds", "stopsounds", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Say something (TTS)", "tts", CBT_NONE, CBO_NONE, CBV_TEXT, 0 },
+    { L"Save a clip", "clip", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Play a clip", "playclip", CBT_CLIP, CBO_NONE, CBV_NONE, 0 },
+    { L"Mixer channel", "channel", CBT_CHAN, CBO_CHAN, CBV_NUM, -12 },
+    { L"Output", "output", CBT_OUT, CBO_OUT, CBV_NUM, 80 },
+    { L"Mixer scene", "scene", CBT_SCENE, CBO_NONE, CBV_NONE, 0 },
+    { L"ChatMix (-100 game .. 100 chat)", "chatmix", CBT_NONE, CBO_NONE, CBV_NUM, 0 },
+    { L"Talkback", "talkback", CBT_OUT, CBO_TALKBACK, CBV_NONE, 0 },
+    { L"Captions", "captions", CBT_NONE, CBO_CAPS, CBV_NONE, 0 },
+    { L"Avatar window", "avatar", CBT_NONE, CBO_ONOFF, CBV_NONE, 0 },
+    { L"Start the audio", "start", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+    { L"Stop the audio", "stop", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
+};
+#define CB_ACT_N ((int)(sizeof(CB_ACTS) / sizeof(CB_ACTS[0])))
+static const wchar_t* CB_CHAN_HOW[] = { L"Volume (dB)", L"Mute", L"Unmute", L"Mute on / off", L"Solo on / off", L"Duck on / off",
+                                        L"Fade out (s)", L"Fade in (s)", L"Fade out / in (s)", L"Pan (-100..100)" };
+static const char* CB_CHAN_W[] = { "", "mute", "unmute", "mute toggle", "solo toggle", "duck toggle", "fade out", "fade in", "fade toggle", "pan" };
+static const bool CB_CHAN_NUM[] = { true, false, false, false, false, false, true, true, true, true };
+static const wchar_t* CB_OUT_HOW[] = { L"Volume (%)", L"Mute", L"Unmute", L"Mute on / off" };
+static const char* CB_OUT_W[] = { "", "mute", "unmute", "mute toggle" };
+static const bool CB_OUT_NUM[] = { true, false, false, false };
+static int CbSel(int id) { return (int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0); }
+static void CbQuote(const wchar_t* name, char* out, int cap)   // a name: in 'single quotes' if it has a space
+{
+    char u[200]; WideCharToMultiByte(CP_UTF8, 0, name, -1, u, 200, nullptr, nullptr);
+    for (char* q = u; *q; q++) if (*q == '\'') *q = '`';
+    if (strchr(u, ' ')) snprintf(out, cap, "'%s'", u); else lstrcpynA(out, u, cap);
+}
+static void CbFillTargets()                     // the "which" list for this action
+{
+    HWND t = GetDlgItem(gWnd, IDC_CBTGT), o = GetDlgItem(gWnd, IDC_CBOPT);
+    const CbAct& a = CB_ACTS[Iclamp(CbSel(IDC_CBACT), 0, CB_ACT_N - 1)];
+    SendMessageW(t, CB_RESETCONTENT, 0, 0); SendMessageW(o, CB_RESETCONTENT, 0, 0);
+    wchar_t s[120];
+    switch (a.tgt) {
+    case CBT_CHAN: for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) { ChanLabel(c, s, 120); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s); SendMessageW(t, CB_SETITEMDATA, SendMessageW(t, CB_GETCOUNT, 0, 0) - 1, c); } break;
+    case CBT_OUT: for (int k = 0; k < gRows && k < MAX_OUT; k++) { wchar_t nm[60]; OutName(k, nm, 60); swprintf(s, 120, L"%d: %ls", k + 1, nm); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s); SendMessageW(t, CB_SETITEMDATA, k, k); } break;
+    case CBT_CHAR: for (int i = 1; i < CHAR_N; i++) SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)CHARACTERS[i]); for (int i = 0; i < gMyCharN; i++) SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)gMyChars[i]); break;
+    case CBT_PROF: for (int i = 0; i < gProfCount; i++) SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)gProfNames[i]); break;
+    case CBT_SCENE: for (int i = 0; i < gSceneN; i++) SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)gSceneName[i]); break;
+    case CBT_PAD: for (int i = 0; i < PADS; i++) {
+            const wchar_t* f = gPadFile[i][0] ? wcsrchr(gPadFile[i], L'\\') : nullptr;
+            swprintf(s, 120, L"Pad %d%ls%ls", i + 1, f ? L": " : L"", f ? f + 1 : L""); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s);
+        } break;
+    case CBT_CLIP: for (int i = 0; i < CLIP_N; i++) { swprintf(s, 120, L"Clip %d%ls", i + 1, gClips[i].base ? L"" : L" (empty)"); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s); } break;
+    }
+    switch (a.opt) {
+    case CBO_ONOFF: case CBO_TALKBACK: { const wchar_t* oo[] = { L"On / off", L"On", L"Off" }; for (int i = a.opt == CBO_TALKBACK ? 1 : 0; i < 3; i++) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)oo[i]); } break;
+    case CBO_CHAN: for (const wchar_t* w : CB_CHAN_HOW) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)w); break;
+    case CBO_OUT: for (const wchar_t* w : CB_OUT_HOW) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)w); break;
+    case CBO_CAPS: { const wchar_t* oo[] = { L"On / off", L"On", L"Off", L"Clear" }; for (const wchar_t* w : oo) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)w); } break;
+    }
+    SendMessageW(t, CB_SETCURSEL, 0, 0); SendMessageW(o, CB_SETCURSEL, 0, 0);
+    EnableWindow(t, a.tgt != CBT_NONE && SendMessageW(t, CB_GETCOUNT, 0, 0) > 0);
+    EnableWindow(o, a.opt != CBO_NONE);
+    wchar_t v[16] = L""; if (a.val == CBV_NUM) swprintf(v, 16, L"%d", a.def);
+    SetDlgItemTextW(gWnd, IDC_CBVAL, a.val == CBV_TEXT ? L"hello chat" : v);
+}
+static void CbBuild(char* out, int cap)         // the command, from the lists
+{
+    const CbAct& a = CB_ACTS[Iclamp(CbSel(IDC_CBACT), 0, CB_ACT_N - 1)];
+    const int ti = CbSel(IDC_CBTGT), oi = Imax(0, CbSel(IDC_CBOPT));
+    wchar_t vw[400] = L""; GetDlgItemTextW(gWnd, IDC_CBVAL, vw, 400);
+    char v[1200]; WideCharToMultiByte(CP_UTF8, 0, vw, -1, v, sizeof(v), nullptr, nullptr);
+    char num[32]; { double d = atof(v); snprintf(num, sizeof(num), "%g", d); }
+    char tg[240] = "";
+    wchar_t s[120];
+    switch (a.tgt) {
+    case CBT_CHAN: if (ti >= 0) { const int c = (int)SendDlgItemMessageW(gWnd, IDC_CBTGT, CB_GETITEMDATA, ti, 0); ChanLabel(c, s, 120); CbQuote(s, tg, 240); } break;
+    case CBT_OUT: if (ti >= 0) snprintf(tg, sizeof(tg), "%d", ti + 1); break;
+    case CBT_CHAR: if (ti >= 0) { SendDlgItemMessageW(gWnd, IDC_CBTGT, CB_GETLBTEXT, ti, (LPARAM)s); CbQuote(s, tg, 240); } break;
+    case CBT_PROF: if (ti >= 0 && ti < gProfCount) CbQuote(gProfNames[ti], tg, 240); break;
+    case CBT_SCENE: if (ti >= 0 && ti < gSceneN) CbQuote(gSceneName[ti], tg, 240); break;
+    case CBT_PAD: case CBT_CLIP: if (ti >= 0) snprintf(tg, sizeof(tg), "%d", ti + 1); break;
+    }
+    if (a.tgt != CBT_NONE && !tg[0]) { lstrcpynA(out, "(nothing to pick yet)", cap); return; }
+    static const char* ONOFF[] = { "toggle", "on", "off" };
+    switch (a.opt) {
+    case CBO_ONOFF: snprintf(out, cap, "%s %s", a.cmd, ONOFF[Imin(oi, 2)]); return;
+    case CBO_CAPS: snprintf(out, cap, "%s %s", a.cmd, oi == 3 ? "clear" : ONOFF[Imin(oi, 2)]); return;
+    case CBO_TALKBACK: if (oi == 0) snprintf(out, cap, "talkback on %s", tg); else lstrcpynA(out, "talkback off", cap); return;
+    case CBO_CHAN: { const int k = Iclamp(oi, 0, 9);
+        if (k == 0) snprintf(out, cap, "channel %s %s", tg, num);
+        else if (CB_CHAN_NUM[k]) snprintf(out, cap, "channel %s %s %s", tg, CB_CHAN_W[k], num);
+        else snprintf(out, cap, "channel %s %s", tg, CB_CHAN_W[k]);
+        return; }
+    case CBO_OUT: { const int k = Iclamp(oi, 0, 3);
+        if (k == 0) snprintf(out, cap, "output %s %s", tg, num); else snprintf(out, cap, "output %s %s", tg, CB_OUT_W[k]);
+        return; }
+    }
+    if (a.val == CBV_NUM) snprintf(out, cap, "%s %s", a.cmd, num);
+    else if (a.val == CBV_TEXT) snprintf(out, cap, "%s %s", a.cmd, v);
+    else if (tg[0]) snprintf(out, cap, "%s %s", a.cmd, tg);
+    else lstrcpynA(out, a.cmd, cap);
+}
+static void CbRefresh()                         // the command line, and which boxes matter
+{
+    if (!gWnd || !GetDlgItem(gWnd, IDC_CBACT)) return;
+    const CbAct& a = CB_ACTS[Iclamp(CbSel(IDC_CBACT), 0, CB_ACT_N - 1)];
+    bool needVal = a.val != CBV_NONE;
+    if (a.opt == CBO_CHAN) needVal = CB_CHAN_NUM[Iclamp(Imax(0, CbSel(IDC_CBOPT)), 0, 9)];
+    if (a.opt == CBO_OUT) needVal = CB_OUT_NUM[Iclamp(Imax(0, CbSel(IDC_CBOPT)), 0, 3)];
+    EnableWindow(GetDlgItem(gWnd, IDC_CBVAL), needVal);
+    char c[1300]; CbBuild(c, sizeof(c));
+    wchar_t w[1300]; MultiByteToWideChar(CP_UTF8, 0, c, -1, w, 1300);
+    SetTextIfChanged(gWnd, IDC_CBLINE, w);
+}
+static void CbCopyCs()                          // the whole "Execute C# Code" text, with this command in it
+{
+    char c[1300]; CbBuild(c, sizeof(c));
+    char esc[2700]; int e = 0;                  // (C# string: \" and \\)
+    for (const char* q = c; *q && e < 2690; q++) { if (*q == '"' || *q == '\\') esc[e++] = '\\'; esc[e++] = *q; }
+    esc[e] = 0;
+    wchar_t cmd[1400]; MultiByteToWideChar(CP_UTF8, 0, esc, -1, cmd, 1400);
+    static wchar_t code[3000];
+    swprintf(code, 3000,
+        L"// Lag Effect: %ls\r\n"
+        L"// (Streamer.bot: Servers/Clients > Websocket Clients > Add, Endpoint ws://127.0.0.1:%d, Auto Connect)\r\n"
+        L"using System;\r\n"
+        L"public class CPHInline\r\n{\r\n    public bool Execute()\r\n    {\r\n"
+        L"%ls"
+        L"        CPH.WebsocketSend(\"%ls\", 0);   // (0 = the first connection in Websocket Clients)\r\n"
+        L"        return true;\r\n    }\r\n}\r\n",
+        CB_ACTS[Iclamp(CbSel(IDC_CBACT), 0, CB_ACT_N - 1)].name, Iclamp(gWsPort, 1024, 65535),
+        gWsPass[0] ? L"        CPH.WebsocketSend(\"auth YOUR PASSWORD\", 0);   // (once per connection)\r\n" : L"", cmd);
+    if (OpenClipboard(gWnd)) {
+        EmptyClipboard();
+        const size_t n = (wcslen(code) + 1) * sizeof(wchar_t);
+        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
+        if (g) { memcpy(GlobalLock(g), code, n); GlobalUnlock(g); if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g); }
+        CloseClipboard();
+    }
+    SetDlgItemTextW(gWnd, IDC_CBSTAT, L"Copied. In Streamer.bot: an action > Sub-Actions > Core > C# > Execute C# Code: paste, Compile, Save.");
+}
+static void CbTest()                            // run it here, as if Streamer.bot sent it
+{
+    char c[1300]; CbBuild(c, sizeof(c));
+    gCbReply[0] = 0;
+    WsExec(-2, c);
+    wchar_t w[500];
+    if (strstr(gCbReply, "\"ok\":true")) lstrcpyW(w, L"Done: that's what it will do from Streamer.bot.");
+    else {
+        char e[300] = ""; const char* p = gCbReply; JsonString(gCbReply, "error", &p, e, 300);
+        wchar_t we[300]; MultiByteToWideChar(CP_UTF8, 0, e[0] ? e : "it didn't work", -1, we, 300);
+        swprintf(w, 500, L"Didn't work: %ls", we);
+    }
+    SetDlgItemTextW(gWnd, IDC_CBSTAT, w);
+}
+
+// ---- start, save, load ----
+static void StreamStartup()                     // (after the window is made) last time's windows
+{
+    if (gFeatAvatar) { for (int i = 0; i < AV_PICS; i++) if (gAvFile[i][0]) PicOpen(gAvImg[i], gAvFile[i]); if (gAvOpen) AvShow(true); }
+    if (gFeatCaptions && gCapOpen) CapShow(true);
+    AvUiRefresh(); CapUiRefresh();
+    SendDlgItemMessageW(gWnd, IDC_CBACT, CB_SETCURSEL, 0, 0); CbFillTargets(); CbRefresh();
+}
+static void StreamSave()
+{
+    SaveInt(L"feat_avatar", gFeatAvatar); SaveInt(L"feat_captions", gFeatCaptions);
+    for (int i = 0; i < AV_PICS; i++) { wchar_t k[24]; swprintf(k, 24, L"avatar_pic%d", i + 1); IniSet(k, gAvFile[i][0] ? gAvFile[i] : nullptr); }
+    SaveInt(L"avatar_talk_db", gAvTalkDb); SaveInt(L"avatar_loud_db", gAvLoudDb); SaveInt(L"avatar_bg", gAvBg); SaveInt(L"avatar_bg_rgb", (int)gAvBgCustom);
+    SaveInt(L"avatar_bounce", gAvBounce); SaveInt(L"avatar_open", gAvOpen); SaveInt(L"avatar_top", gAvTop);
+    if (gAvWnd && IsWindowVisible(gAvWnd) && !IsIconic(gAvWnd)) GetWindowRect(gAvWnd, &gAvRc);
+    SaveInt(L"avatar_x", gAvRc.left); SaveInt(L"avatar_y", gAvRc.top); SaveInt(L"avatar_w", gAvRc.right - gAvRc.left); SaveInt(L"avatar_h", gAvRc.bottom - gAvRc.top);
+    SaveInt(L"captions_on", gCapOn); SaveInt(L"captions_mask", gCapMask); SaveInt(L"captions_file", gCapFile); SaveInt(L"captions_open", gCapOpen);
+    SaveInt(L"captions_lines", gCapLines); SaveInt(L"captions_size", gCapSize); SaveInt(L"captions_clear_s", gCapClearS);
+    SaveInt(L"captions_bg", gCapBg); SaveInt(L"captions_bg_rgb", (int)gCapBgCustom); SaveInt(L"captions_top", gCapTop);
+    if (gCapsWnd && IsWindowVisible(gCapsWnd) && !IsIconic(gCapsWnd)) GetWindowRect(gCapsWnd, &gCapRc);
+    SaveInt(L"captions_x", gCapRc.left); SaveInt(L"captions_y", gCapRc.top); SaveInt(L"captions_w", gCapRc.right - gCapRc.left); SaveInt(L"captions_h", gCapRc.bottom - gCapRc.top);
+}
+static void StreamLoad()
+{
+    auto I = [](const wchar_t* k, int d) { return (int)GetPrivateProfileIntW(L"settings", k, d, gIni); };
+    gFeatAvatar = I(L"feat_avatar", 0) != 0; gFeatCaptions = I(L"feat_captions", 0) != 0;
+    for (int i = 0; i < AV_PICS; i++) { wchar_t k[24]; swprintf(k, 24, L"avatar_pic%d", i + 1); GetPrivateProfileStringW(L"settings", k, L"", gAvFile[i], MAX_PATH, gIni); }
+    gAvTalkDb = Iclamp(I(L"avatar_talk_db", -40), -70, -5); gAvLoudDb = Iclamp(I(L"avatar_loud_db", -12), -60, -1);
+    gAvBg = Iclamp(I(L"avatar_bg", 0), 0, 5); gAvBgCustom = (COLORREF)I(L"avatar_bg_rgb", (int)RGB(0, 255, 0));
+    gAvBounce = Iclamp(I(L"avatar_bounce", 1), 0, 2); gAvOpen = I(L"avatar_open", 1) != 0; gAvTop = I(L"avatar_top", 0) != 0;
+    { const int x = I(L"avatar_x", 0), y = I(L"avatar_y", 0), w = I(L"avatar_w", 0), h = I(L"avatar_h", 0);
+      gAvRc = w >= 80 && h >= 80 ? RECT{ x, y, x + w, y + h } : RECT{ 0, 0, 0, 0 }; }
+    gCapOn = I(L"captions_on", 1) != 0; gCapMask = I(L"captions_mask", 1) != 0; gCapFile = I(L"captions_file", 0) != 0; gCapOpen = I(L"captions_open", 1) != 0;
+    gCapLines = Iclamp(I(L"captions_lines", 2), 1, 3); gCapSize = Iclamp(I(L"captions_size", 44), 16, 120); gCapClearS = Iclamp(I(L"captions_clear_s", 6), 1, 60);
+    gCapBg = Iclamp(I(L"captions_bg", 0), 0, 5); gCapBgCustom = (COLORREF)I(L"captions_bg_rgb", (int)RGB(0, 255, 0)); gCapTop = I(L"captions_top", 0) != 0;
+    { const int x = I(L"captions_x", 0), y = I(L"captions_y", 0), w = I(L"captions_w", 0), h = I(L"captions_h", 0);
+      gCapRc = w >= 120 && h >= 60 ? RECT{ x, y, x + w, y + h } : RECT{ 0, 0, 0, 0 }; }
 }
 
 // ======================= Recorder (1.52.0): the window, start / stop, MP3 copies =======================
@@ -23478,6 +24257,7 @@ static void CreateUI()
     Ctl(L"BUTTON", L"Look", BS_OWNERDRAW | WS_TABSTOP, 108, 52, 90, 26, IDC_SETSUB1);
     Ctl(L"BUTTON", L"Pictures", BS_OWNERDRAW | WS_TABSTOP, 202, 52, 90, 26, IDC_SETSUB2);
     Ctl(L"BUTTON", L"Features", BS_OWNERDRAW | WS_TABSTOP, 296, 52, 90, 26, IDC_SETSUB3);
+    Ctl(L"BUTTON", L"Stream", BS_OWNERDRAW | WS_TABSTOP, 390, 52, 90, 26, IDC_SETSUB4);
     gBuildSub = 0;
     AddSection(14, 88, 532, 108, L"Profiles");
     Ctl(L"STATIC", L"Profile:", 0, 30, 110, 56, 20, -1);
@@ -23556,7 +24336,7 @@ static void CreateUI()
 
     // ---- Features ----
     gBuildSub = 3;
-    AddSection(14, 88, 532, 300, L"Features");
+    AddSection(14, 88, 532, 316, L"Features");
     Ctl(L"STATIC", L"Turn on only what you use. A feature that's off is hidden and doesn't run at all, so it costs nothing.",
         0, 30, 110, 500, 36, IDC_HDR);
     {
@@ -23567,25 +24347,89 @@ static void CreateUI()
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
             { IDC_FEATVST,   L"Plugins (VST3, CLAP)", L"VST3 and CLAP effect plugins on your mic (Mic > Plugins), Mixer channels and outputs.", gFeatVst },
             { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice (Mic > Speech). Downloads a speech model once.", gFeatSpeech },
+            { IDC_FEATAVATAR, L"Avatar (PNGtuber)", L"Your pictures that talk when you talk, in a window for OBS (Settings > Stream).", gFeatAvatar },
+            { IDC_FEATCAPS,  L"Live captions", L"What you say as text, in a window or a text file for OBS (Settings > Stream). Uses Speech.", gFeatCaptions },
         };
-        for (int i = 0; i < 6; i++) {
-            const int y = 150 + i * 38;
-            Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 160, 20, f[i].id);
+        for (int i = 0; i < 8; i++) {
+            const int y = 148 + i * 31;
+            Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 180, 20, f[i].id);
             CheckDlgButton(gWnd, f[i].id, f[i].on ? BST_CHECKED : BST_UNCHECKED);
-            Ctl(L"STATIC", f[i].what, 0, 50, y + 22, 480, 18, IDC_HDR);
+            Ctl(L"STATIC", f[i].what, 0, 50, y + 19, 480, 16, IDC_HDR);
         }
     }
-    AddSection(14, 402, 532, 132, L"Remote control (Streamer.bot)");
-    Ctl(L"BUTTON", L"Let apps on this PC control Lag Effect (like Streamer.bot)", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 424, 420, 20, IDC_WSON);
+
+    // ---- Stream (1.60.0): remote control (Streamer.bot) + its command builder, the avatar, captions ----
+    gBuildSub = 4;
+    AddSection(14, 88, 532, 228, L"Remote control (Streamer.bot)");
+    Ctl(L"BUTTON", L"Let apps on this PC control Lag Effect (like Streamer.bot)", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 110, 420, 20, IDC_WSON);
     CheckDlgButton(gWnd, IDC_WSON, gWsOn ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Port:", 0, 30, 456, 40, 20, -1);
-    Spin(IDC_WSPORT, 72, 453, 86, 1024, 65535, gWsPort);
-    Ctl(L"STATIC", L"Password (optional):", 0, 176, 456, 130, 20, -1);
-    Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 308, 453, 120, 23, IDC_WSPASS);
+    Ctl(L"STATIC", L"Port:", 0, 30, 142, 40, 20, -1);
+    Spin(IDC_WSPORT, 72, 139, 86, 1024, 65535, gWsPort);
+    Ctl(L"STATIC", L"Password (optional):", 0, 176, 142, 130, 20, -1);
+    Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 308, 139, 120, 23, IDC_WSPASS);
     SendDlgItemMessageW(gWnd, IDC_WSPASS, EM_LIMITTEXT, 60, 0);
-    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 492, 250, 20, IDC_WSSTATUS);
-    Ctl(L"BUTTON", L"How to use...", WS_TABSTOP, 288, 486, 118, 28, IDC_WSGUIDE);
-    Ctl(L"BUTTON", L"Copy C# code", WS_TABSTOP, 412, 486, 118, 28, IDC_WSHELP);
+    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 176, 250, 20, IDC_WSSTATUS);
+    Ctl(L"BUTTON", L"How to use...", WS_TABSTOP, 288, 170, 118, 28, IDC_WSGUIDE);
+    Ctl(L"BUTTON", L"Copy C# code", WS_TABSTOP, 412, 170, 118, 28, IDC_WSHELP);
+    Ctl(L"STATIC", L"Command builder: pick what it should do, then Copy C# and paste it into a Streamer.bot action.", 0, 30, 210, 500, 18, IDC_HDR);
+    {
+        HWND ca = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 30, 232, 196, 500, IDC_CBACT);
+        for (int i = 0; i < CB_ACT_N; i++) SendMessageW(ca, CB_ADDSTRING, 0, (LPARAM)CB_ACTS[i].name);
+        SendMessageW(ca, CB_SETCURSEL, 0, 0);
+        Ctl(L"COMBOBOX", L"", COMBO, 232, 232, 154, 400, IDC_CBTGT);
+        Ctl(L"COMBOBOX", L"", COMBO, 392, 232, 138, 400, IDC_CBOPT);
+        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 30, 266, 96, 23, IDC_CBVAL);
+        SendDlgItemMessageW(gWnd, IDC_CBVAL, EM_LIMITTEXT, 300, 0);
+        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP, 132, 266, 254, 23, IDC_CBLINE);
+        Ctl(L"BUTTON", L"Copy C#", WS_TABSTOP, 392, 264, 66, 27, IDC_CBCOPY);
+        Ctl(L"BUTTON", L"Test", WS_TABSTOP, 464, 264, 66, 27, IDC_CBTEST);
+        Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 296, 500, 16, IDC_CBSTAT);
+    }
+    gBuildFeat = FEAT_AVATAR;
+    AddSection(14, 326, 532, 124, L"Avatar (PNGtuber)");
+    for (int i = 0; i < AV_PICS; i++) Ctl(L"BUTTON", AV_PIC_NAMES[i], WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + i * 101, 346, 96, 26, IDC_AVPIC0 + i);
+    Ctl(L"STATIC", L"Talking above  \x2212", 0, 30, 383, 96, 18, -1);
+    Spin(IDC_AVTALK, 128, 380, 52, 5, 70, -gAvTalkDb);
+    Ctl(L"STATIC", L"dB", 0, 184, 383, 22, 18, -1);
+    Ctl(L"STATIC", L"Loud above  \x2212", 0, 214, 383, 80, 18, -1);
+    Spin(IDC_AVLOUD, 296, 380, 52, 1, 60, -gAvLoudDb);
+    Ctl(L"STATIC", L"dB", 0, 352, 383, 22, 18, -1);
+    Ctl(L"STATIC", L"", SS_OWNERDRAW, 380, 383, 150, 16, IDC_AVMETER);
+    Ctl(L"STATIC", L"Background", 0, 30, 418, 74, 18, -1);
+    {
+        HWND b = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 106, 414, 110, 300, IDC_AVBG);
+        for (const wchar_t* n : STREAM_BG_NAMES) SendMessageW(b, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(b, CB_SETCURSEL, gAvBg, 0);
+        Ctl(L"STATIC", L"Bounce", 0, 226, 418, 50, 18, -1);
+        HWND o = Ctl(L"COMBOBOX", L"", COMBO, 278, 414, 90, 300, IDC_AVBOUNCE);
+        for (const wchar_t* n : { L"Off", L"Small", L"Big" }) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(o, CB_SETCURSEL, gAvBounce, 0);
+    }
+    Ctl(L"BUTTON", L"Open the window", WS_TABSTOP, 380, 412, 150, 28, IDC_AVOPEN);
+    gBuildFeat = FEAT_CAPTIONS;
+    AddSection(14, 460, 532, 126, L"Live captions");
+    Ctl(L"BUTTON", L"Captions on", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 482, 120, 20, IDC_CAPON);
+    CheckDlgButton(gWnd, IDC_CAPON, gCapOn ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Hide bleep-list words (****)", BS_AUTOCHECKBOX | WS_TABSTOP, 156, 482, 214, 20, IDC_CAPMASK);
+    CheckDlgButton(gWnd, IDC_CAPMASK, gCapMask ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Open the window", WS_TABSTOP, 380, 478, 150, 28, IDC_CAPOPEN);
+    Ctl(L"STATIC", L"Lines", 0, 30, 517, 40, 18, -1);
+    Spin(IDC_CAPLINES, 72, 514, 46, 1, 3, gCapLines);
+    Ctl(L"STATIC", L"Text size", 0, 132, 517, 62, 18, -1);
+    Spin(IDC_CAPSIZE, 196, 514, 56, 16, 120, gCapSize);
+    Ctl(L"STATIC", L"Clear after", 0, 266, 517, 74, 18, -1);
+    Spin(IDC_CAPCLEAR, 342, 514, 50, 1, 60, gCapClearS);
+    Ctl(L"STATIC", L"s", 0, 396, 517, 12, 18, -1);
+    Ctl(L"BUTTON", L"Text file for OBS", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 550, 150, 20, IDC_CAPFILE);
+    CheckDlgButton(gWnd, IDC_CAPFILE, gCapFile ? BST_CHECKED : BST_UNCHECKED);
+    Ctl(L"BUTTON", L"Show the file", WS_TABSTOP, 184, 546, 106, 26, IDC_CAPFOLDER);
+    Ctl(L"STATIC", L"Background", 0, 300, 551, 74, 18, -1);
+    {
+        HWND b = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 376, 547, 154, 300, IDC_CAPBG);
+        for (const wchar_t* n : STREAM_BG_NAMES) SendMessageW(b, CB_ADDSTRING, 0, (LPARAM)n);
+        SendMessageW(b, CB_SETCURSEL, gCapBg, 0);
+    }
+    gBuildFeat = 0;
 
     // ---- Look ----
     gBuildSub = 1;
@@ -24127,6 +24971,48 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_WSHELP)  { if (code == BN_CLICKED) WsHelp(); return; }
+    // ---- Settings > Stream (1.60.0) ----
+    if (id >= IDC_AVPIC0 && id <= IDC_AVPIC4) { if (code == BN_CLICKED) AvPickFile(id - IDC_AVPIC0); return; }
+    if (id == IDC_AVOPEN)  { if (code == BN_CLICKED) { AvShow(!(gAvWnd && IsWindowVisible(gAvWnd))); SaveSettings(); } return; }
+    if (id == IDC_CAPOPEN) { if (code == BN_CLICKED) { CapShow(!(gCapsWnd && IsWindowVisible(gCapsWnd))); SaveSettings(); } return; }
+    if (id == IDC_AVTALK || id == IDC_AVLOUD || id == IDC_CAPLINES || id == IDC_CAPSIZE || id == IDC_CAPCLEAR) {
+        if (!gUiReady) return;
+        BOOL ok = FALSE; const int v = (int)GetDlgItemInt(gWnd, id, &ok, FALSE);
+        int* var = id == IDC_AVTALK ? &gAvTalkDb : id == IDC_AVLOUD ? &gAvLoudDb : id == IDC_CAPLINES ? &gCapLines : id == IDC_CAPSIZE ? &gCapSize : &gCapClearS;
+        const int lo = id == IDC_AVTALK ? 5 : id == IDC_AVLOUD ? 1 : id == IDC_CAPLINES ? 1 : id == IDC_CAPSIZE ? 16 : 1;
+        const int hi = id == IDC_AVTALK ? 70 : id == IDC_AVLOUD ? 60 : id == IDC_CAPLINES ? 3 : id == IDC_CAPSIZE ? 120 : 60;
+        const bool neg = id == IDC_AVTALK || id == IDC_AVLOUD;   // (shown without their minus)
+        if (code == EN_CHANGE && ok && v >= lo && v <= hi) { *var = neg ? -v : v; if (gCapsWnd) InvalidateRect(gCapsWnd, nullptr, FALSE); InvalidateRect(GetDlgItem(gWnd, IDC_AVMETER), nullptr, FALSE); }
+        else if (code == EN_KILLFOCUS) SetDlgItemInt(gWnd, id, (UINT)(neg ? -*var : *var), FALSE);
+        return;
+    }
+    if (id == IDC_AVBG || id == IDC_CAPBG) {
+        if (code != CBN_SELCHANGE) return;
+        int& v = id == IDC_AVBG ? gAvBg : gCapBg; COLORREF& c = id == IDC_AVBG ? gAvBgCustom : gCapBgCustom;
+        const int i = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 5);
+        if (i == 5 && !StreamPickColour(gWnd, &c)) { SendDlgItemMessageW(gWnd, id, CB_SETCURSEL, v, 0); return; }
+        v = i;
+        if (gAvWnd) InvalidateRect(gAvWnd, nullptr, FALSE);
+        if (gCapsWnd) InvalidateRect(gCapsWnd, nullptr, FALSE);
+        SaveSettings(); return;
+    }
+    if (id == IDC_AVBOUNCE) { if (code == CBN_SELCHANGE) { gAvBounce = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 2); SaveSettings(); } return; }
+    if (id == IDC_CAPON)   { if (code == BN_CLICKED) { gCapOn = Checked(id); if (!gCapOn) CapClear(); SpeechApply(); SaveSettings(); } return; }
+    if (id == IDC_CAPMASK) { if (code == BN_CLICKED) { gCapMask = Checked(id); CapUpdate(true); SaveSettings(); } return; }
+    if (id == IDC_CAPFILE) { if (code == BN_CLICKED) { gCapFile = Checked(id); CapWriteFile(); SaveSettings(); } return; }
+    if (id == IDC_CAPFOLDER) {
+        if (code != BN_CLICKED) return;
+        wchar_t pth[MAX_PATH]; CapPath(pth);
+        if (GetFileAttributesW(pth) == INVALID_FILE_ATTRIBUTES) { HANDLE f = CreateFileW(pth, GENERIC_WRITE, 0, nullptr, CREATE_NEW, 0, nullptr); if (f != INVALID_HANDLE_VALUE) CloseHandle(f); }
+        wchar_t a[MAX_PATH + 20]; swprintf(a, MAX_PATH + 20, L"/select,\"%ls\"", pth);
+        ShellExecuteW(gWnd, nullptr, L"explorer.exe", a, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    if (id == IDC_CBACT) { if (code == CBN_SELCHANGE) { CbFillTargets(); CbRefresh(); } return; }
+    if (id == IDC_CBTGT || id == IDC_CBOPT) { if (code == CBN_SELCHANGE) CbRefresh(); return; }
+    if (id == IDC_CBVAL)  { if (code == EN_CHANGE) CbRefresh(); return; }
+    if (id == IDC_CBCOPY) { if (code == BN_CLICKED) CbCopyCs(); return; }
+    if (id == IDC_CBTEST) { if (code == BN_CLICKED) CbTest(); return; }
     if (id == IDC_WSGUIDE) { if (code == BN_CLICKED) WsGuide(); return; }
     if (id >= IDC_VSTON0 && id < IDC_VSTON0 + VST_MIC) {       // Mic > Plugins: a slot's On switch
         if (code != BN_CLICKED) return;
@@ -24155,10 +25041,12 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_VSTLIC) { if (code == BN_CLICKED) MessageBoxW(gWnd, VST_LICENCE, L"Lag Effect - Plugins", MB_ICONINFORMATION); return; }
-    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST || id == IDC_FEATSPEECH) {   // Settings > Features
+    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST || id == IDC_FEATSPEECH || id == IDC_FEATAVATAR || id == IDC_FEATCAPS) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
-        if (id == IDC_FEATSPEECH) SetFeatSpeech(on);
+        if (id == IDC_FEATSPEECH) { SetFeatSpeech(on); if (!on && gFeatCaptions) { SetFeatCaptions(false); CheckDlgButton(gWnd, IDC_FEATCAPS, BST_UNCHECKED); } }
+        if (id == IDC_FEATAVATAR) SetFeatAvatar(on);
+        if (id == IDC_FEATCAPS) SetFeatCaptions(on);
         if (id == IDC_FEATVST) SetFeatVst(on);  // off: every plugin is saved and unloaded, and nothing of this runs
         if (id == IDC_FEATLAG)   gFeatLag = on;
         if (id == IDC_FEATFX)    { gFeatFx = on; if (!on && gFxOn) SetFxOn(false); }   // (off: the effects stop too)
@@ -24346,10 +25234,12 @@ static void OnCommand(int id, int code)
         }
         return;
     }
-    if (id >= IDC_SETSUB0 && id <= IDC_SETSUB3) {
-        if (code == BN_CLICKED && gSetSub != id - IDC_SETSUB0) {
-            gSetSub = id - IDC_SETSUB0; Layout();
+    if (SetSubOf(id) >= 0) {
+        if (code == BN_CLICKED && gSetSub != SetSubOf(id)) {
+            gSetSub = SetSubOf(id); Layout();
             for (int k = IDC_SETSUB0; k <= IDC_SETSUB3; k++) InvalidateRect(GetDlgItem(gWnd, k), nullptr, FALSE);
+            InvalidateRect(GetDlgItem(gWnd, IDC_SETSUB4), nullptr, FALSE);
+            if (gSetSub == 4) { CbFillTargets(); CbRefresh(); }   // (channels, scenes... may have changed)
         }
         return;
     }
@@ -24977,12 +25867,13 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     }
     if ((d)->hwndItem == gStatus) { DrawStatus(d); return true; }
     if (w == IDC_ONSTRIP) { DrawOnStrip(d); return true; }
+    if (w == IDC_AVMETER) { AvDrawMeter(d); return true; }
     if (w == IDC_VOICEPROG) { DrawVoiceProgress(d); return true; }
     if (w >= IDC_TAB0 && w < IDC_TAB0 + TAB_COUNT) { DrawTab(d); return true; }
     if (w == IDC_FXON) { DrawFxSwitch(d); return true; }
     if (w == IDC_SONGBTN) { DrawSongButton(d); return true; }
     if (w == IDC_SONGMETER) { DrawVMeter2(d, gSongMeter, -1.0f, SongModeOn() && gRunning, 0, 0, gSongMeter >= 0.99f); return true; }
-    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || MicSubOf((int)w) >= 0 || (w >= IDC_SETSUB0 && w <= IDC_SETSUB3) ||
+    if ((w >= IDC_FXSUB0 && w < IDC_FXSUB0 + FX_SUBS) || MicSubOf((int)w) >= 0 || SetSubOf((int)w) >= 0 ||
         (w >= IDC_SBSUB0 && w <= IDC_SBSUB2)) {
         DrawFxSub(d); return true;
     }
@@ -25062,6 +25953,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         ExecCommandLine(GetCommandLineW());     // switches given on the first start (only if allowed)
         if (!gSafe) PictureLoad(gPicPath);      // (safe start: no picture either)
         StkLoadAll();
+        StreamStartup();                        // (1.60.0) the avatar / captions windows, if they were open
         if (PicActive()) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
         PictureInfo();
         ApplyOpacity();
@@ -25362,6 +26254,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_BLKEY)       { ClearFxKey(SLOT_BLEEP); return 0; }
         if (id == IDC_SPTTSKEY)    { ClearFxKey(SLOT_SPTTS); return 0; }
         if (id == IDC_BLLIVEKEY)   { ClearFxKey(SLOT_BLLIVE); return 0; }
+        if (id >= IDC_AVPIC0 && id <= IDC_AVPIC4 && gAvFile[id - IDC_AVPIC0][0]) { AvSetPic(id - IDC_AVPIC0, nullptr); SaveSettings(); return 0; }
         if (id >= IDC_MIXKEY0 && id < IDC_MIXKEY0 + (MIX_SLOT_END - SLOT_MIX0)) { ClearFxKey(SLOT_MIX0 + id - IDC_MIXKEY0); return 0; }
         if (id >= IDC_VSTKEY0 && id < IDC_VSTKEY0 + VST_MIC) { ClearFxKey(SLOT_VST0 + id - IDC_VSTKEY0); return 0; }
         if (id >= IDC_COLSW0 && id < IDC_COLSW0 + USERCOL_N) { gUserCol[id - IDC_COLSW0] = CLR_NONE; ApplyTheme(); return 0; }
