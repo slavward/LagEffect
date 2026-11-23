@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.66.0"
+#define APP_VERSION L"1.66.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -5510,6 +5510,7 @@ enum {
     IDC_AVPIC0, IDC_AVPIC1, IDC_AVPIC2, IDC_AVPIC3, IDC_AVPIC4, IDC_AVTALK, IDC_AVLOUD, IDC_AVMETER, IDC_AVBG, IDC_AVBOUNCE, IDC_AVOPEN,
     IDC_CAPON, IDC_CAPMASK, IDC_CAPOPEN, IDC_CAPLINES, IDC_CAPSIZE, IDC_CAPCLEAR, IDC_CAPFILE, IDC_CAPFOLDER, IDC_CAPBG,
     IDC_CBACT, IDC_CBTGT, IDC_CBOPT, IDC_CBVAL, IDC_CBLINE, IDC_CBCOPY, IDC_CBTEST, IDC_CBSTAT,
+    IDC_CBLBLACT, IDC_CBLBLTGT, IDC_CBLBLOPT, IDC_CBLBLVAL,   // (1.66.1: the builder's labels)
     IDC_SBSUB3, IDC_MUSVIEW, IDC_MUSPREV, IDC_MUSPLAY, IDC_MUSNEXT, IDC_MUSSTOP, IDC_MUSSHUF, IDC_MUSREP, IDC_MUSOUTS, IDC_MUSVOL,   // (1.61.0: Mic > Music)
     IDC_MUSLIST, IDC_MUSADD, IDC_MUSFOLDER, IDC_MUSDEL, IDC_MUSCLEAR, IDC_MUSKEYPLAY, IDC_MUSKEYNEXT,
     IDC_VOLSTYLE,                               // (1.63.0: Settings > Look > Volume controls)
@@ -6113,6 +6114,7 @@ static bool     gGifPauseBg = false;             // pause GIFs while another win
 static HBRUSH   gBrPicture = nullptr;            // the picture, sized to the window and dimmed (a pattern brush)
 static wchar_t  gFontName[40] = L"Segoe UI";
 static int      gOpacity = 100;
+static int      gCbShow = 7;                    // (1.66.1) the command builder's lists that matter now: 1 "Which one", 2 "How", 4 the value
 static int      gHdrMeter = 1;                  // (1.65.0) a thin mic level bar under the tabs, on every tab (Settings > Look)
 static int      gVolStyle = 0;                  // volume boxes (pads, clips, music, TTS): 0 a number you drag, 1 a small knob (1.63.0)
 static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
@@ -12983,7 +12985,7 @@ static void DrawToggleC(DRAWITEMSTRUCT* d, bool on, COLORREF fillOn, COLORREF te
     HGDIOBJ ob = SelectObject(dc, b), op = SelectObject(dc, p);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, SC(5), SC(5));
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(b); DeleteObject(p);
-    wchar_t t[16]; GetWindowTextW(d->hwndItem, t, 16);
+    wchar_t t[64]; GetWindowTextW(d->hwndItem, t, 64);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, on ? textOn : (IsWindowEnabled(d->hwndItem) ? TXT_C : (gDark ? DK_DIM : gLtDim)));
     HGDIOBJ of = SelectObject(dc, gFontBold);
@@ -15427,11 +15429,15 @@ static void AddTips()
     TipId(IDC_MUSKEYNEXT, L"A hotkey for the next song. Right-click to clear it.");
     TipId(IDC_SETSUB4, L"For streaming: remote control (Streamer.bot) and its command builder, your PNGtuber avatar, live captions.");
     TipId(IDC_CBACT,   L"Command builder: what the Streamer.bot action should make Lag Effect do.");
+    TipId(IDC_CBLBLACT, L"Command builder: what the Streamer.bot action should make Lag Effect do.");   // (1.66.1: the labels share their list's tip)
+    TipId(IDC_CBLBLTGT, L"Which one (channel, output, scene, character, profile, pad...).");
+    TipId(IDC_CBLBLOPT, L"How: on / off, mute, volume, fade...");
+    TipId(IDC_CBLBLVAL, L"The number (or text) it needs, if any: dB, %, seconds, milliseconds, what to say.");
     TipId(IDC_CBTGT,   L"Which one (channel, output, scene, character, profile, pad...).");
     TipId(IDC_CBOPT,   L"How: on / off, mute, volume, fade...");
     TipId(IDC_CBVAL,   L"The number (or text) it needs, if any: dB, %, seconds, milliseconds, what to say.");
-    TipId(IDC_CBLINE,  L"The command. Streamer.bot sends it with CPH.WebsocketSend(\"...\", 0); Copy C# gives you the whole code.");
-    TipId(IDC_CBCOPY,  L"Copies the whole C# for Streamer.bot's \"Execute C# Code\" with this command in it: paste, Compile, Save.");
+    TipId(IDC_CBLINE,  L"The command it sends. You can also type this into anything that sends WebSocket text; \"Copy C# for Streamer.bot\" gives you the whole code.");
+    TipId(IDC_CBCOPY,  L"Copies the whole C# for Streamer.bot with this command in it. In Streamer.bot: an action > Sub-Actions > Core > C# > Execute C# Code: paste, Compile, Save.");
     TipId(IDC_CBTEST,  L"Does it now, here, as if Streamer.bot had sent it (the remote control doesn't need to be on).");
     TipId(IDC_AVPIC0,  L"Your picture while you're not talking (needed). A PNG with a see-through background works best; GIFs move. Right-click to remove it.");
     TipId(IDC_AVPIC1,  L"Your picture while you're talking (mouth open). Right-click to remove it.");
@@ -15457,7 +15463,6 @@ static void AddTips()
     TipId(IDC_WSPORT,  L"The port it listens on (ws://127.0.0.1:port). Change it only if another app already uses this one.");
     TipId(IDC_WSPASS,  L"Optional. If set, an app has to send {\"do\":\"auth\",\"password\":\"...\"} before anything else.");
     TipId(IDC_WSGUIDE, L"Step by step: setting up Streamer.bot, and every command you can send.");
-    TipId(IDC_WSHELP,  L"Copies C# code to paste into a Streamer.bot action (Execute C# Code).");
     TipId(IDC_FONT,    L"The font for the whole window.");
     TipId(IDC_VOLSTYLE, L"How the % volume controls look (pads, clips, music, text to speech, outputs, looper, drums): a number you drag left / right (click it to type), or a small knob you drag up / down. Other number boxes are always numbers.");
     TipId(IDC_OPACITY, L"See-through window: 100% = solid. Lower lets what's behind show through.");
@@ -17260,6 +17265,9 @@ static void Layout()
             for (int base : chIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanShown(cid - base);
             static const int fullIds[] = { IDC_CHSOLO0, IDC_CHDUCK0, IDC_CHPAN0 };   // (not on a compact strip)
             for (int base : fullIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanFull(cid - base);
+            if (cid == IDC_CBTGT || cid == IDC_CBLBLTGT) vis = vis && (gCbShow & 1);   // (1.66.1) the builder: only the lists this action uses
+            if (cid == IDC_CBOPT || cid == IDC_CBLBLOPT) vis = vis && (gCbShow & 2);
+            if (cid == IDC_CBVAL || cid == IDC_CBLBLVAL) vis = vis && (gCbShow & 4);
             if (cid == IDC_MIXHIDDEN) {         // "2 hidden": only when some are
                 const int nh = HiddenChans(); vis = vis && nh > 0;
                 if (nh) { wchar_t t[32], o[32]; wsprintfW(t, L"%d hidden", nh); GetWindowTextW(gPaged[i].h, o, 32); if (lstrcmpW(t, o)) SetWindowTextW(gPaged[i].h, t); }
@@ -20438,31 +20446,6 @@ static void WsStatusText()                      // Settings: what it's doing
     else lstrcpynW(t, L"Starting...", 200);
     SetDlgItemTextW(gWnd, IDC_WSSTATUS, t);
 }
-static void WsHelp()                            // Settings: how to set up Streamer.bot (and copy the C# to paste)
-{
-    wchar_t code[1200];
-    swprintf(code, 1200,
-        L"// Lag Effect remote control. In Streamer.bot: Servers/Clients > Websocket Clients > Add,\r\n"
-        L"// Endpoint ws://127.0.0.1:%d, then use this in an action's C# (\"Execute C# Code\"):\r\n"
-        L"using System;\r\n"
-        L"public class CPHInline\r\n{\r\n    public bool Execute()\r\n    {\r\n"
-        L"        // the 0 is the connection's number in Websocket Clients (the first one is 0)\r\n"
-        L"%ls"
-        L"        CPH.WebsocketSend(\"lag 2000\", 0);   // <- the command: see \"How to use...\" in Lag Effect for the list\r\n"
-        L"        return true;\r\n    }\r\n}\r\n",
-        Iclamp(gWsPort, 1024, 65535),
-        gWsPass[0] ? L"        CPH.WebsocketSend(\"auth YOUR PASSWORD\", 0);   // (once per connection)\r\n" : L"");
-    if (OpenClipboard(gWnd)) {
-        EmptyClipboard();
-        const size_t n = (wcslen(code) + 1) * sizeof(wchar_t);
-        HGLOBAL g = GlobalAlloc(GMEM_MOVEABLE, n);
-        if (g) { memcpy(GlobalLock(g), code, n); GlobalUnlock(g); if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g); }
-        CloseClipboard();
-    }
-    MessageBoxW(gWnd, L"Copied. In Streamer.bot, paste it into an action's \"Execute C# Code\" sub-action, change the message "
-                      L"between the quotes to the command you want, then Compile and Save.\n\n\"How to use...\" has every step and command.",
-                L"Lag Effect - remote control", MB_OK | MB_ICONINFORMATION);
-}
 static void WsGuide()                           // Settings: the walkthrough, and how messages are written
 {
     static wchar_t t[8000];
@@ -20474,13 +20457,13 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    OK, then right-click it > Connect. Here it now says \"1 connected\".\n\n"
         L"3. Actions tab > right-click > Add an action (e.g. \"Lag chat\"), and give it a trigger,\n"
         L"    like a channel point reward or a chat command.\n\n"
-        L"4. In the action: right-click Sub-Actions > Core > C# > Execute C# Code. Here press \"Copy C# code\"\n"
-        L"    and paste it in. Change  lag 2000  to the command you want (below), then Compile and Save.\n"
+        L"4. Here, in the Command builder (under Remote control): pick what it should do, press \"Copy C# for Streamer.bot\".\n"
+        L"    In the action: right-click Sub-Actions > Core > C# > Execute C# Code, paste it in, then Compile and Save.\n"
         L"    The 0 in WebsocketSend is the connection's number in Websocket Clients (the first is 0).\n\n"
         L"5. Run the action (right-click > Test Trigger). Lag Effect does it.\n\n"
         L"COMMANDS\n"
         L"A command is plain words. In the C# it goes between the quotes:   CPH.WebsocketSend(\"mute toggle\", 0);\n"
-        L"Settings > Stream has a command builder: pick from lists, and Copy C# gives the whole code with the command in it.\n"
+        L"The Command builder (Settings > Stream) writes any of these for you, and its Copy button gives the whole code with it in.\n"
         L"Where it says on, you can write on, off or toggle. Names with spaces go in 'single quotes'.\n\n"
         L"Mic and voice\n"
         L"    mute on   \x2014   mute your mic (off, toggle)\n"
@@ -20514,7 +20497,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    start,  stop,  status,  ping\n\n"
         L"Several changes fit in one command:   channel Spotify -12 unmute pan 0\n\n"
         L"\x2500\x2500\x2500\x2500\x2500  ADVANCED  \x2500\x2500\x2500\x2500\x2500\n\n"
-        L"Password: if you set one, send  auth YOUR PASSWORD  first after connecting (\"Copy C# code\" includes it).\n\n"
+        L"Password: if you set one, send  auth YOUR PASSWORD  first after connecting (the builder's Copy button includes it).\n\n"
         L"Replies: every command gets one: {\"ok\":true,...} or {\"ok\":false,\"error\":\"why\"}.\n\n"
         L"Events: Lag Effect tells Streamer.bot when things change. Use the trigger Core > Websocket > Client >\n"
         L"Websocket Client Message; the text is in %%message%%. They look like {\"event\":\"mute\",\"on\":true}. The events:\n"
@@ -21110,7 +21093,10 @@ static const SecIntro SEC_INTROS[] = {
     { L"Outputs",     L"Each output's volume, limit and mute, as the Mixer sends them. The buttons at the bottom of each channel pick which outputs it goes to." },
     { L"Mixer hotkeys", L"Keys for each channel (volume, mute, solo, duck, hold, fade) and each output, working from any app." },
     { L"Features",    L"Turn whole parts of Lag Effect on or off. Off means hidden and not using any time on the audio." },
-    { L"Remote control (Streamer.bot)", L"Lets Streamer.bot, a Stream Deck or a script control Lag Effect over a local WebSocket. Off until you turn it on." },
+    { L"Remote control (Streamer.bot)", L"Lets Streamer.bot, a Stream Deck or a script control Lag Effect over a local WebSocket. Off until you turn it on. "
+                                        L"\"How to use...\" walks you through connecting Streamer.bot." },
+    { L"Command builder (Streamer.bot)", L"Pick what it should do (and which channel, output, scene... and how). Then press \"Copy C# for Streamer.bot\" and, in Streamer.bot, "
+                                         L"paste it into an action: Sub-Actions > Core > C# > Execute C# Code, then Compile and Save. Test does it here right away." },
     { L"Latency",     L"How much delay the audio has. Lower is snappier but can crackle on a busy PC." },
     { L"Layout",      L"Move any control or box, saved per profile." },
 };
@@ -24482,6 +24468,8 @@ static void CbRefresh()                         // the command line, and which b
     if (a.opt == CBO_CHAN) needVal = CB_CHAN_NUM[Iclamp(Imax(0, CbSel(IDC_CBOPT)), 0, 9)];
     if (a.opt == CBO_OUT) needVal = CB_OUT_NUM[Iclamp(Imax(0, CbSel(IDC_CBOPT)), 0, 3)];
     EnableWindow(GetDlgItem(gWnd, IDC_CBVAL), needVal);
+    const int show = (a.tgt != CBT_NONE ? 1 : 0) | (a.opt != CBO_NONE ? 2 : 0) | (needVal ? 4 : 0);   // (1.66.1) hide the rest
+    if (show != gCbShow) { gCbShow = show; Layout(); }
     char c[1300]; CbBuild(c, sizeof(c));
     wchar_t w[1300]; MultiByteToWideChar(CP_UTF8, 0, c, -1, w, 1300);
     SetTextIfChanged(gWnd, IDC_CBLINE, w);
@@ -24511,7 +24499,8 @@ static void CbCopyCs()                          // the whole "Execute C# Code" t
         if (g) { memcpy(GlobalLock(g), code, n); GlobalUnlock(g); if (!SetClipboardData(CF_UNICODETEXT, g)) GlobalFree(g); }
         CloseClipboard();
     }
-    SetDlgItemTextW(gWnd, IDC_CBSTAT, L"Copied. In Streamer.bot: an action > Sub-Actions > Core > C# > Execute C# Code: paste, Compile, Save.");
+    SetDlgItemTextW(gWnd, IDC_CBSTAT, gWsOn ? L"Copied: paste it into Execute C# Code in Streamer.bot, then Compile."
+                                            : L"Copied. Remote control is off: tick it above so Streamer.bot can connect.");
 }
 static void CbTest()                            // run it here, as if Streamer.bot sent it
 {
@@ -25762,7 +25751,7 @@ static void CreateUI()
 
     // ---- Features ----
     gBuildSub = 3;
-    AddSection(14, 88, 532, 316, L"Features");
+    AddSection(14, 88, 532, 390, L"Features");
     Ctl(L"STATIC", L"Turn on only what you use. A feature that's off is hidden and doesn't run at all, so it costs nothing.",
         0, 30, 110, 500, 36, IDC_HDR);
     {
@@ -25776,82 +25765,87 @@ static void CreateUI()
             { IDC_FEATAVATAR, L"Avatar (PNGtuber)", L"Your pictures that talk when you talk, in a window for OBS (Settings > Stream).", gFeatAvatar },
             { IDC_FEATCAPS,  L"Live captions", L"What you say as text, in a window or a text file for OBS (Settings > Stream). Uses Speech.", gFeatCaptions },
         };
-        for (int i = 0; i < 8; i++) {
-            const int y = 148 + i * 31;
-            Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 180, 20, f[i].id);
+        for (int i = 0; i < 8; i++) {           // (1.66.1: 40 apart, so the line under each isn't covered by the next box)
+            const int y = 148 + i * 40;
+            Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 220, 20, f[i].id);
             CheckDlgButton(gWnd, f[i].id, f[i].on ? BST_CHECKED : BST_UNCHECKED);
-            Ctl(L"STATIC", f[i].what, 0, 50, y + 19, 480, 16, IDC_HDR);
+            Ctl(L"STATIC", f[i].what, SS_NOPREFIX | SS_ENDELLIPSIS, 50, y + 20, 480, 18, IDC_HDR);
         }
     }
 
     // ---- Stream (1.60.0): remote control (Streamer.bot) + its command builder, the avatar, captions ----
     gBuildSub = 4;
-    AddSection(14, 88, 532, 228, L"Remote control (Streamer.bot)");
-    Ctl(L"BUTTON", L"Let apps on this PC control Lag Effect (like Streamer.bot)", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 110, 420, 20, IDC_WSON);
+    AddSection(14, 88, 532, 104, L"Remote control (Streamer.bot)");
+    Ctl(L"BUTTON", L"Let apps on this PC control Lag Effect (like Streamer.bot)", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 108, 420, 20, IDC_WSON);
     CheckDlgButton(gWnd, IDC_WSON, gWsOn ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"STATIC", L"Port:", 0, 30, 142, 40, 20, -1);
-    Spin(IDC_WSPORT, 72, 139, 86, 1024, 65535, gWsPort);
-    Ctl(L"STATIC", L"Password (optional):", 0, 176, 142, 130, 20, -1);
-    Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 308, 139, 120, 23, IDC_WSPASS);
+    Ctl(L"STATIC", L"Port:", 0, 30, 136, 40, 20, -1);
+    Spin(IDC_WSPORT, 72, 133, 86, 1024, 65535, gWsPort);
+    Ctl(L"STATIC", L"Password (optional):", 0, 172, 136, 130, 20, -1);
+    Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 304, 133, 106, 23, IDC_WSPASS);
     SendDlgItemMessageW(gWnd, IDC_WSPASS, EM_LIMITTEXT, 60, 0);
-    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 176, 250, 20, IDC_WSSTATUS);
-    Ctl(L"BUTTON", L"How to use...", WS_TABSTOP, 288, 170, 118, 28, IDC_WSGUIDE);
-    Ctl(L"BUTTON", L"Copy C# code", WS_TABSTOP, 412, 170, 118, 28, IDC_WSHELP);
-    Ctl(L"STATIC", L"Command builder: pick what it should do, then Copy C# and paste it into a Streamer.bot action.", 0, 30, 210, 500, 18, IDC_HDR);
+    Ctl(L"BUTTON", L"How to use...", WS_TABSTOP, 416, 131, 114, 27, IDC_WSGUIDE);
+    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 164, 500, 18, IDC_WSSTATUS);
+    // (1.66.1) the command builder: its own box, labelled lists, the command in a box, one clear Copy button
+    AddSection(14, 202, 532, 130, L"Command builder (Streamer.bot)");
+    Ctl(L"STATIC", L"Do this", 0, 30, 218, 196, 16, IDC_CBLBLACT);
+    Ctl(L"STATIC", L"Which one", 0, 232, 218, 154, 16, IDC_CBLBLTGT);
+    Ctl(L"STATIC", L"How", 0, 392, 218, 138, 16, IDC_CBLBLOPT);
     {
-        HWND ca = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 30, 232, 196, 500, IDC_CBACT);
+        HWND ca = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 30, 234, 196, 500, IDC_CBACT);
         for (int i = 0; i < CB_ACT_N; i++) SendMessageW(ca, CB_ADDSTRING, 0, (LPARAM)CB_ACTS[i].name);
         SendMessageW(ca, CB_SETCURSEL, 0, 0);
-        Ctl(L"COMBOBOX", L"", COMBO, 232, 232, 154, 400, IDC_CBTGT);
-        Ctl(L"COMBOBOX", L"", COMBO, 392, 232, 138, 400, IDC_CBOPT);
-        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 30, 266, 96, 23, IDC_CBVAL);
+        Ctl(L"COMBOBOX", L"", COMBO, 232, 234, 154, 400, IDC_CBTGT);
+        Ctl(L"COMBOBOX", L"", COMBO, 392, 234, 138, 400, IDC_CBOPT);
+        Ctl(L"STATIC", L"Value", 0, 30, 269, 40, 18, IDC_CBLBLVAL);
+        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 72, 266, 86, 23, IDC_CBVAL);
         SendDlgItemMessageW(gWnd, IDC_CBVAL, EM_LIMITTEXT, 300, 0);
-        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP, 132, 266, 254, 23, IDC_CBLINE);
-        Ctl(L"BUTTON", L"Copy C#", WS_TABSTOP, 392, 264, 66, 27, IDC_CBCOPY);
-        Ctl(L"BUTTON", L"Test", WS_TABSTOP, 464, 264, 66, 27, IDC_CBTEST);
-        Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 296, 500, 16, IDC_CBSTAT);
+        Ctl(L"STATIC", L"Command", 0, 166, 269, 62, 18, -1);
+        Ctl(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP, 230, 266, 300, 23, IDC_CBLINE);
+        Ctl(L"STATIC", L"Pick above, then copy it into a Streamer.bot action.", SS_NOPREFIX, 30, 298, 260, 30, IDC_CBSTAT);
+        Ctl(L"BUTTON", L"Test", WS_TABSTOP, 296, 298, 60, 28, IDC_CBTEST);
+        Ctl(L"BUTTON", L"Copy C# for Streamer.bot", BS_OWNERDRAW | WS_TABSTOP, 362, 298, 168, 28, IDC_CBCOPY);
     }
     gBuildFeat = FEAT_AVATAR;
-    AddSection(14, 326, 532, 124, L"Avatar (PNGtuber)");
-    for (int i = 0; i < AV_PICS; i++) Ctl(L"BUTTON", AV_PIC_NAMES[i], WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + i * 101, 346, 96, 26, IDC_AVPIC0 + i);
-    Ctl(L"STATIC", L"Talking above  \x2212", 0, 30, 383, 96, 18, -1);
-    Spin(IDC_AVTALK, 128, 380, 52, 5, 70, -gAvTalkDb);
-    Ctl(L"STATIC", L"dB", 0, 184, 383, 22, 18, -1);
-    Ctl(L"STATIC", L"Loud above  \x2212", 0, 214, 383, 80, 18, -1);
-    Spin(IDC_AVLOUD, 296, 380, 52, 1, 60, -gAvLoudDb);
-    Ctl(L"STATIC", L"dB", 0, 352, 383, 22, 18, -1);
-    Ctl(L"STATIC", L"", SS_OWNERDRAW, 380, 383, 150, 16, IDC_AVMETER);
-    Ctl(L"STATIC", L"Background", 0, 30, 418, 74, 18, -1);
+    AddSection(14, 342, 532, 120, L"Avatar (PNGtuber)");
+    for (int i = 0; i < AV_PICS; i++) Ctl(L"BUTTON", AV_PIC_NAMES[i], WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30 + i * 101, 362, 96, 26, IDC_AVPIC0 + i);
+    Ctl(L"STATIC", L"Talking above  \x2212", 0, 30, 399, 96, 18, -1);
+    Spin(IDC_AVTALK, 128, 396, 52, 5, 70, -gAvTalkDb);
+    Ctl(L"STATIC", L"dB", 0, 184, 399, 22, 18, -1);
+    Ctl(L"STATIC", L"Loud above  \x2212", 0, 214, 399, 80, 18, -1);
+    Spin(IDC_AVLOUD, 296, 396, 52, 1, 60, -gAvLoudDb);
+    Ctl(L"STATIC", L"dB", 0, 352, 399, 22, 18, -1);
+    Ctl(L"STATIC", L"", SS_OWNERDRAW, 380, 399, 150, 16, IDC_AVMETER);
+    Ctl(L"STATIC", L"Background", 0, 30, 430, 74, 18, -1);
     {
-        HWND b = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 106, 414, 110, 300, IDC_AVBG);
+        HWND b = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 106, 426, 110, 300, IDC_AVBG);
         for (const wchar_t* n : STREAM_BG_NAMES) SendMessageW(b, CB_ADDSTRING, 0, (LPARAM)n);
         SendMessageW(b, CB_SETCURSEL, gAvBg, 0);
-        Ctl(L"STATIC", L"Bounce", 0, 226, 418, 50, 18, -1);
-        HWND o = Ctl(L"COMBOBOX", L"", COMBO, 278, 414, 90, 300, IDC_AVBOUNCE);
+        Ctl(L"STATIC", L"Bounce", 0, 226, 430, 50, 18, -1);
+        HWND o = Ctl(L"COMBOBOX", L"", COMBO, 278, 426, 90, 300, IDC_AVBOUNCE);
         for (const wchar_t* n : { L"Off", L"Small", L"Big" }) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)n);
         SendMessageW(o, CB_SETCURSEL, gAvBounce, 0);
     }
-    Ctl(L"BUTTON", L"Open the window", WS_TABSTOP, 380, 412, 150, 28, IDC_AVOPEN);
+    Ctl(L"BUTTON", L"Open the window", WS_TABSTOP, 380, 424, 150, 28, IDC_AVOPEN);
     gBuildFeat = FEAT_CAPTIONS;
-    AddSection(14, 460, 532, 126, L"Live captions");
-    Ctl(L"BUTTON", L"Captions on", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 482, 120, 20, IDC_CAPON);
+    AddSection(14, 470, 532, 116, L"Live captions");
+    Ctl(L"BUTTON", L"Captions on", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 492, 120, 20, IDC_CAPON);
     CheckDlgButton(gWnd, IDC_CAPON, gCapOn ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Hide bleep-list words (****)", BS_AUTOCHECKBOX | WS_TABSTOP, 156, 482, 214, 20, IDC_CAPMASK);
+    Ctl(L"BUTTON", L"Hide bleep-list words (****)", BS_AUTOCHECKBOX | WS_TABSTOP, 156, 492, 214, 20, IDC_CAPMASK);
     CheckDlgButton(gWnd, IDC_CAPMASK, gCapMask ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Open the window", WS_TABSTOP, 380, 478, 150, 28, IDC_CAPOPEN);
-    Ctl(L"STATIC", L"Lines", 0, 30, 517, 40, 18, -1);
-    Spin(IDC_CAPLINES, 72, 514, 46, 1, 3, gCapLines);
-    Ctl(L"STATIC", L"Text size", 0, 132, 517, 62, 18, -1);
-    Spin(IDC_CAPSIZE, 196, 514, 56, 16, 120, gCapSize);
-    Ctl(L"STATIC", L"Clear after", 0, 266, 517, 74, 18, -1);
-    Spin(IDC_CAPCLEAR, 342, 514, 50, 1, 60, gCapClearS);
-    Ctl(L"STATIC", L"s", 0, 396, 517, 12, 18, -1);
-    Ctl(L"BUTTON", L"Text file for OBS", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 550, 150, 20, IDC_CAPFILE);
+    Ctl(L"BUTTON", L"Open the window", WS_TABSTOP, 380, 488, 150, 28, IDC_CAPOPEN);
+    Ctl(L"STATIC", L"Lines", 0, 30, 527, 40, 18, -1);
+    Spin(IDC_CAPLINES, 72, 524, 46, 1, 3, gCapLines);
+    Ctl(L"STATIC", L"Text size", 0, 132, 527, 62, 18, -1);
+    Spin(IDC_CAPSIZE, 196, 524, 56, 16, 120, gCapSize);
+    Ctl(L"STATIC", L"Clear after", 0, 266, 527, 74, 18, -1);
+    Spin(IDC_CAPCLEAR, 342, 524, 50, 1, 60, gCapClearS);
+    Ctl(L"STATIC", L"s", 0, 396, 527, 12, 18, -1);
+    Ctl(L"BUTTON", L"Text file for OBS", BS_AUTOCHECKBOX | WS_TABSTOP, 30, 554, 150, 20, IDC_CAPFILE);
     CheckDlgButton(gWnd, IDC_CAPFILE, gCapFile ? BST_CHECKED : BST_UNCHECKED);
-    Ctl(L"BUTTON", L"Show the file", WS_TABSTOP, 184, 546, 106, 26, IDC_CAPFOLDER);
-    Ctl(L"STATIC", L"Background", 0, 300, 551, 74, 18, -1);
+    Ctl(L"BUTTON", L"Show the file", WS_TABSTOP, 184, 550, 106, 26, IDC_CAPFOLDER);
+    Ctl(L"STATIC", L"Background", 0, 300, 555, 74, 18, -1);
     {
-        HWND b = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 376, 547, 154, 300, IDC_CAPBG);
+        HWND b = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 376, 551, 154, 300, IDC_CAPBG);
         for (const wchar_t* n : STREAM_BG_NAMES) SendMessageW(b, CB_ADDSTRING, 0, (LPARAM)n);
         SendMessageW(b, CB_SETCURSEL, gCapBg, 0);
     }
@@ -26115,6 +26109,11 @@ static LRESULT CtlColor(HWND h, UINT m, WPARAM w, LPARAM l)
     bool header = h == gWnd ? (cid == IDC_HDR || cid == IDC_RADIODESC || cid == IDC_SONGSTATUS || cid == IDC_SONGHINT || cid == IDC_SONGNOTE || cid == IDC_SYNNAME || cid == IDC_SYNNOTE || cid == IDC_LPHINT || cid == IDC_BBHINT || cid == IDC_RECSTATUS || cid == IDC_FXORDER)
                             : cid == IDT_HINT;  // dim helper text
     bool field  = m == WM_CTLCOLOREDIT || m == WM_CTLCOLORLISTBOX;
+    if (h == gWnd && cid == IDC_CBLINE) {       // (1.66.1) the builder's command: a box, in the accent colour
+        SetTextColor(dc, ACCENT);
+        SetBkColor(dc, gDark ? DK_CTL : RGB(255, 255, 255));
+        return (LRESULT)(gDark ? gBrDarkCtl : (HBRUSH)GetStockObject(WHITE_BRUSH));
+    }
     if (gBrPicture && !field && h == gWnd) {    // background picture: text sits on the picture, lined up with it
         POINT pt = { 0, 0 }; MapWindowPoints((HWND)l, gWnd, &pt, 1);
         SetBrushOrgEx(dc, -pt.x, -pt.y, nullptr);
@@ -26436,7 +26435,6 @@ static void OnCommand(int id, int code)
         if (code == EN_KILLFOCUS) SaveSettings();
         return;
     }
-    if (id == IDC_WSHELP)  { if (code == BN_CLICKED) WsHelp(); return; }
     // ---- Settings > Stream (1.60.0) ----
     if (id >= IDC_AVPIC0 && id <= IDC_AVPIC4) { if (code == BN_CLICKED) AvPickFile(id - IDC_AVPIC0); return; }
     if (id == IDC_AVOPEN)  { if (code == BN_CLICKED) { AvShow(!(gAvWnd && IsWindowVisible(gAvWnd))); SaveSettings(); } return; }
@@ -27358,6 +27356,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if ((d)->hwndItem == gStatus) { DrawStatus(d); return true; }
     if (w == IDC_ONSTRIP) { DrawOnStrip(d); return true; }
     if (w == IDC_HDRMETER) { DrawHdrMeter(d); return true; }
+    if (w == IDC_CBCOPY)   { DrawToggleC(d, true, ACCENT, RGB(255, 255, 255)); return true; }   // (1.66.1) the builder's main button
     if (w == IDC_AVMETER) { AvDrawMeter(d); return true; }
     if (w == IDC_MUSVIEW) { DrawMusView(d); return true; }
     if (w == IDC_MUSLIST) { DrawMusItem(d); return true; }
