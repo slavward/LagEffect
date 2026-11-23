@@ -216,6 +216,22 @@ int main()
             printf("  as a Mixer channel on output 1: %.3f; its fader at -6 dB: %.3f\n", viaCh, down6);
             check("the Mixer's Music channel plays it (100%)", viaCh > 0.25 * 0.33 && viaCh < 0.25 * 0.37);
             check("its fader works on it", down6 > viaCh * 0.45 && down6 < viaCh * 0.55);
+            // (1.65.0) its own duck amount: while you talk it goes down by that, not by the Mixer's "Duck by"
+            gCh[1].db10 = 0; gCh[1].duck = true; gDuckDb = 12; gMicMuted = false;
+            const double sHz = gHz; const float sAmp = gAmp; gHz = 5000; gAmp = 0.2f;   // (you talk: a high tone, far from the music's 660 Hz)
+            auto ducked = [&](int own) {
+                gCh[1].duckDb = own; gMusR = 0; gMusW = MUS_RING - 1;   // (the song from the top: the ring holds 2.7 s)
+                run(40, tone); rec.clear(); run(50, tone);
+                return goertzel(rec, 2400, 19200, 660);
+            };
+            const double d12 = ducked(0), d24 = ducked(24), d6 = ducked(6);
+            gHz = sHz; gAmp = sAmp; gMicMuted = true;
+            printf("  ducked while you talk: shared 12 dB %.4f (%.1f dB), its own 24 dB %.4f (%.1f dB), its own 6 dB %.4f (%.1f dB)\n",
+                   d12, 20 * log10(d12 / viaCh), d24, 20 * log10(d24 / viaCh), d6, 20 * log10(d6 / viaCh));
+            check("Duck by 12 dB takes it down 12 dB", fabs(20 * log10(d12 / viaCh) + 12) < 1.0);
+            check("a channel's own duck amount (24 dB) is used", fabs(20 * log10(d24 / viaCh) + 24) < 1.5);
+            check("a smaller one (6 dB) too", fabs(20 * log10(d6 / viaCh) + 6) < 1.0);
+            gCh[1].duck = false; gCh[1].duckDb = 0; run(60, silence);
             gCh[1].type = CH_NONE; gChA[1].live = false; gCh[1].db10 = 0; gMusOuts = 1;
         }
         gMusPlay = false; run(10, silence); gMusR = 0; gMusW = 0; gMicMuted = false;
