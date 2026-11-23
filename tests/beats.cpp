@@ -232,6 +232,28 @@ int main()
             check("a channel's own duck amount (24 dB) is used", fabs(20 * log10(d24 / viaCh) + 24) < 1.5);
             check("a smaller one (6 dB) too", fabs(20 * log10(d6 / viaCh) + 6) < 1.0);
             gCh[1].duck = false; gCh[1].duckDb = 0; run(60, silence);
+            // (1.66.0) a bus: the music channel goes through it; the bus's fader, mute and outputs decide, not the channel's own routes
+            auto measure = [&]() { gMusR = 0; gMusW = MUS_RING - 1; run(40, silence); rec.clear(); run(50, silence); return goertzel(rec, 2400, 19200, 660); };
+            gCh[2].type = CH_BUS; gCh[2].src[0] = L'1'; gCh[2].src[1] = 0; gCh[2].db10 = 0; gCh[2].routes = 1; gCh[2].mute = false;
+            gChA[2].w = gChA[2].r = 0; gChA[2].live = true;
+            gCh[1].busId = 1; gCh[1].routes = 2;    // (its own routes: output 2 only; they don't count while it's in the bus)
+            const double viaBus = measure();
+            gCh[2].db10 = -60; const double busDown = measure();
+            gCh[2].db10 = 0; gCh[1].db10 = -60; const double memberDown = measure();
+            gCh[1].db10 = 0; gCh[2].routes = 2; const double busElsewhere = measure();
+            gCh[2].routes = 1; gCh[2].mute = true; const double busMuted = measure();
+            gCh[2].mute = false; gCh[1].busId = 0; gCh[1].routes = 1; const double outAgain = measure();
+            gCh[1].busId = 1; gCh[2].type = CH_NONE; gChA[2].live = false; const double busGone = measure();
+            printf("  through a bus: %.3f; bus -6 dB %.3f; member -6 dB %.3f; bus to output 2 %.4f; bus muted %.4f; out of the bus %.3f; bus removed %.3f\n",
+                   viaBus, busDown, memberDown, busElsewhere, busMuted, outAgain, busGone);
+            check("a bus plays its member (0 dB: the same level)", fabs(viaBus / viaCh - 1) < 0.03);
+            check("the bus's fader works on it", busDown > viaCh * 0.45 && busDown < viaCh * 0.55);
+            check("the member's own fader still works", memberDown > viaCh * 0.45 && memberDown < viaCh * 0.55);
+            check("the bus's outputs decide (not the member's own)", busElsewhere < viaCh * 0.01);
+            check("muting the bus mutes it", busMuted < viaCh * 0.01);
+            check("taken out of the bus: straight to its outputs again", fabs(outAgain / viaCh - 1) < 0.03);
+            check("bus removed: its member plays on its own routes", busGone < viaCh * 0.01 || fabs(busGone / viaCh - 1) < 0.03);
+            gCh[1].busId = 0; gCh[2].src[0] = 0;
             gCh[1].type = CH_NONE; gChA[1].live = false; gCh[1].db10 = 0; gMusOuts = 1;
         }
         gMusPlay = false; run(10, silence); gMusR = 0; gMusW = 0; gMicMuted = false;

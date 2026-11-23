@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.65.0"
+#define APP_VERSION L"1.66.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1700,7 +1700,8 @@ static inline void LimitStereo(int k, float& l, float& r)
 // callback takes them out, applies the channel's volume / mute and adds them to the outputs it's sent to.
 #define CH_MAX   8
 #define CH_RING  16384                          // frames (stereo, interleaved), power of two
-enum { CH_NONE = 0, CH_APP = 1, CH_DEV = 2, CH_OUT = 3, CH_MUS = 4 };   // app / input device / what an output device plays / Mic > Music (1.64.0)
+enum { CH_NONE = 0, CH_APP = 1, CH_DEV = 2, CH_OUT = 3, CH_MUS = 4, CH_BUS = 5 };   // app / input device / what an output device plays / Mic > Music (1.64.0) / a bus (1.66.0)
+#define MAX_BUS 4                               // (1.66.0) buses (sub-mixes): a channel whose sound is other channels'; src = its number "1".."4"
 struct ChanAudio {
     float buf[CH_RING * 2];
     volatile unsigned w, r;                     // frames written (capture thread) / read (audio callback)
@@ -1730,6 +1731,7 @@ struct ChanSet {
     volatile int gateHold, gateRange;           // ...stays open this long after (ms, 50..2000); turns down by (dB, 10..80; 80 = silent)
     volatile int duckDb;                        // (1.65.0) how far Duck takes it down: 0 = the Mixer's "Duck by", else 3..40 dB of its own
     int view;                                   // (1.65.0) its strip: 0 = full, 1 = compact (fader and mute), 2 = hidden (it still plays)
+    volatile int busId;                         // (1.66.0) 0 = straight to its outputs; 1..MAX_BUS = through that bus (its routes then don't count)
 };
 #define CH_GATE_HOLD 250                        // (a new channel's gate: holds 250 ms, silent when shut)
 #define CH_GATE_RANGE 80
@@ -4554,34 +4556,61 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     // plays only the soloed channels; every other output carries on as normal.
     unsigned soloMask = 0;
     for (int c = 0; c < CH_MAX; c++) if (gCh[c].solo && gCh[c].type != CH_NONE) soloMask |= 1u << c;
+    // Buses (1.66.0): a bus is a channel whose sound is what its members send it (after their faders), in the same sample.
+    // A member's own routes are faded out; its sound reaches the outputs only through the bus's fader, EQ, routes...
+    int busCh[MAX_BUS + 1]; for (int b = 0; b <= MAX_BUS; b++) busCh[b] = -1;
+    bool anyBus = false;
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_BUS && gChA[c].live) {
+        const int b = gCh[c].src[0] - L'0'; if (b >= 1 && b <= MAX_BUS && !gCh[c].src[1] && busCh[b] < 0) { busCh[b] = c; anyBus = true; }
+    }
+    static float chBusCur[CH_MAX]; static int chBusTo[CH_MAX]; static bool chBusInit = false;   // (a member's level into its bus, gliding; which bus)
+    if (!chBusInit) { for (int c = 0; c < CH_MAX; c++) chBusTo[c] = -1; chBusInit = true; }
+    float chBusTgt[CH_MAX] = {}; int chToBus[CH_MAX];   // (this block: where it's heading; the bus channel it adds to, -1 = none)
+    for (int c = 0; c < CH_MAX; c++) {
+        const int b = gCh[c].busId;
+        const int to = anyBus && gCh[c].type != CH_BUS && gCh[c].type != CH_NONE && b >= 1 && b <= MAX_BUS ? busCh[b] : -1;
+        if (to >= 0) chBusTo[c] = to;
+        else if (chBusTo[c] >= 0 && (!anyBus || gCh[chBusTo[c]].type != CH_BUS || !gChA[chBusTo[c]].live)) { chBusTo[c] = -1; chBusCur[c] = 0; }
+        chToBus[c] = chBusTo[c] >= 0 && (to >= 0 || chBusCur[c] > 0.00001f) ? chBusTo[c] : -1;   // (in it, or still fading out of it)
+        if (chToBus[c] < 0) chBusCur[c] = 0;
+    }
     const int soloOut = gHearOut >= 1 && gHearOut <= MAX_OUT ? gHearOut - 1 : 0;
     for (int c = 0; c < CH_MAX; c++) {
         ChanAudio& a = gChA[c];
         chAv[c] = 0; chRd[c] = a.r;
         for (int k = 0; k < MAX_OUT; k++) chTgt[c][k] = chCur[c][k];   // (not playing this block: stays where it is)
         if (!a.live) { a.primed = false; gChAudible[c] = false; continue; }
-        const unsigned wr = a.w; MemoryBarrier();
-        unsigned rd = a.r, av = wr - rd;
+        const bool isBus = gCh[c].type == CH_BUS; // (a bus has no buffer: its members fill it sample by sample)
+        const unsigned wr = isBus ? a.r : a.w; MemoryBarrier();
+        unsigned rd = a.r, av = isBus ? frames : wr - rd;
         const unsigned target = frames + 1024;  // ~20 ms + a block of cushion against the capture's bursts
-        if (av > target + 4096) { rd = wr - target; av = target; }   // fallen behind (clock drift / a hiccup): catch up
-        if (!a.primed) { if (av < target) { chRd[c] = rd; continue; } a.primed = true; }
-        if (av < frames) a.primed = false;      // about to run dry: wait for a cushion again after this block
+        if (!isBus) {
+            if (av > target + 4096) { rd = wr - target; av = target; }   // fallen behind (clock drift / a hiccup): catch up
+            if (!a.primed) { if (av < target) { chRd[c] = rd; continue; } a.primed = true; }
+            if (av < frames) a.primed = false;  // about to run dry: wait for a cushion again after this block
+        }
         unsigned rt = gCh[c].routes;
         if (soloMask) { rt &= ~(1u << soloOut); if (soloMask & (1u << c)) rt |= 1u << soloOut; }
         const float g = gCh[c].mute || gCh[c].held ? 0.0f : DbGain10(gCh[c].db10) * ChatGain(gCh[c].chatRole);
         chG[c] = g;
         bool need = false;
+        if (chToBus[c] >= 0) {                  // in a bus: its fader into the bus; straight to an output only when it's soloed there
+            const bool in = chBusTo[c] == chToBus[c] && gCh[c].busId >= 1 && busCh[Iclamp(gCh[c].busId, 0, MAX_BUS)] == chToBus[c];
+            chBusTgt[c] = in ? g : 0.0f;
+            rt = soloMask & (1u << c) ? 1u << soloOut : 0u;
+            if (chBusTgt[c] > 0.0f || chBusCur[c] > 0.00001f) need = true;
+        }
         for (int k = 0; k < MAX_OUT; k++) {
-            chTgt[c][k] = rt & (1u << k) ? g * DbGain10(Iclamp(gCh[c].send[k], -400, 60)) : 0.0f;   // (and its level there)
+            chTgt[c][k] = rt & (1u << k) ? g * (chToBus[c] >= 0 ? 1.0f : DbGain10(Iclamp(gCh[c].send[k], -400, 60))) : 0.0f;   // (and its level there)
             if (chTgt[c][k] > 0.0f || chCur[c][k] > 0.0001f) need = true;
         }
         if (c == songCh) need = true;           // (Vocode to song listens to it, even when it plays nowhere)
         if (c == gLpSrcCh.load(std::memory_order_relaxed) && gFeatSound && gLpMem.load(std::memory_order_relaxed)) need = true;   // (the looper records it, muted or not)
         gChAudible[c] = need;
-        if (!need) { for (int k = 0; k < MAX_OUT; k++) chCur[c][k] = 0; chRd[c] = wr; continue; }   // silent: keep its buffer empty
+        if (!need) { for (int k = 0; k < MAX_OUT; k++) chCur[c][k] = 0; chBusCur[c] = 0; chRd[c] = wr; continue; }   // silent: keep its buffer empty
         chRd[c] = rd; chAv[c] = av;
         // Its clock and ours never match exactly: drop / repeat one sample now and then to keep the cushion steady.
-        chAdj[c] = av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
+        chAdj[c] = isBus ? 0 : av > target + 480 ? 1 : (av < target - 480 && av > frames + 64) ? -1 : 0;
         chDk[c] = gCh[c].duck;
         chMono[c] = gCh[c].mono; chDucker[c] = gCh[c].ducker;
         {                                       // EQ and compressor: refiltered only when changed (keeps the state: no clicks)
@@ -4621,6 +4650,12 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         }
         act[nAct++] = c;                        // (the per-sample loop only visits these)
         anyCh = true;
+    }
+    if (anyBus) {                               // buses last: in each sample their members have added to them by then
+        int o[CH_MAX], n = 0;
+        for (int i = 0; i < nAct; i++) if (gCh[act[i]].type != CH_BUS) o[n++] = act[i];
+        for (int i = 0; i < nAct; i++) if (gCh[act[i]].type == CH_BUS) o[n++] = act[i];
+        for (int i = 0; i < nAct; i++) act[i] = o[i];
     }
 
     int      mode[MAX_OUT];
@@ -4936,7 +4971,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     if (vstAny) {
         for (int ci = 0; ci < nAct; ci++) {
             const int c = act[ci], rk = gVstChMap[c].load() - 1;
-            if (rk < 0 || rk >= VST_RACKS || !chAv[c] || !VstRangeOn(VST_CH0 + rk * VST_PER, VST_PER)) continue;
+            if (rk < 0 || rk >= VST_RACKS || !chAv[c] || gCh[c].type == CH_BUS || !VstRangeOn(VST_CH0 + rk * VST_PER, VST_PER)) continue;   // (no plugins on a bus)
             float* L = gVstChL[c]; float* R = gVstChR[c];
             unsigned rd = chRd[c], av = chAv[c];
             for (ma_uint32 f = 0; f < frames; f++) {    // exactly the samples the loop below takes (its clock nudge included)
@@ -5144,15 +5179,19 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         };
         // mixer channels: this frame of each, summed per output (stereo)
         float cL[MAX_OUT] = {}, cR[MAX_OUT] = {};
+        float bL[CH_MAX], bR[CH_MAX];           // (1.66.0) each bus's sound this sample (indexed by its channel)
+        if (anyBus) for (int c = 0; c < CH_MAX; c++) bL[c] = bR[c] = 0.0f;
         if (anyCh)
             for (int ci = 0; ci < nAct; ci++) {
                 const int c = act[ci];
                 if (!chAv[c]) continue;
+                const bool isBus = anyBus && gCh[c].type == CH_BUS;
                 const unsigned i = (chRd[c] & (CH_RING - 1)) * 2;
                 // a ducker isn't ducked by itself (only by your mic)
                 float dk = chDk[c] ? (chDucker[c] ? chDuck : chDuckAll) : 1.0f;
                 if (chDkK[c] != 1.0f && dk < 1.0f) dk = Max(0.0f, 1.0f - (1.0f - dk) * chDkK[c]);   // (its own amount: same glide, scaled)
-                float L = gChA[c].buf[i], R = gChA[c].buf[i + 1];
+                float L, R;
+                if (isBus) { L = bL[c]; R = bR[c]; } else { L = gChA[c].buf[i]; R = gChA[c].buf[i + 1]; }
                 if (c == songCh) {               // (before its fader: muting it here doesn't stop the vocoder hearing it)
                     songRing[songWr & (SONG_RING - 1)] = (L + R) * 0.5f; songWr++;
                     const float a = Max(fabsf(L), fabsf(R)); if (a > gSongPeak) gSongPeak = a;
@@ -5199,9 +5238,15 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
                     rcdChG[c] += (chG[c] - rcdChG[c]) * fc;
                     float* b = rcdBuf[rcdCh[c]] + f * 2; b[0] = L * rcdChG[c]; b[1] = R * rcdChG[c];
                 }
-                if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
+                if (isBus) { /* (no buffer to move along) */ }
+                else if (f == frames / 2 && chAdj[c] < 0) { /* hold this sample one frame longer */ }
                 else { chRd[c]++; chAv[c]--; }
                 if (f == frames / 2 && chAdj[c] > 0 && chAv[c] > 1) { chRd[c]++; chAv[c]--; }   // skip one
+                if (anyBus && chToBus[c] >= 0) {  // into its bus (after its fader, duck and pan; before the bus's own)
+                    float& g = chBusCur[c];
+                    if (g != chBusTgt[c]) g += (chBusTgt[c] - g) * fc;
+                    if (g > 0.00001f) { bL[chToBus[c]] += L * g; bR[chToBus[c]] += R * g; }
+                }
                 for (unsigned go = chGo[c]; go; go &= go - 1) {   // only the outputs it reaches (or is fading out of)
                     const int k = BitIndex(go);
                     float& g = chCur[c][k];
@@ -5296,6 +5341,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     for (int c = 0; c < CH_MAX; c++) {
         if (gChA[c].live) gChA[c].r = chRd[c];
         for (int k = 0; k < MAX_OUT; k++) if (fabsf(chCur[c][k] - chTgt[c][k]) < 0.0001f) chCur[c][k] = chTgt[c][k];   // (arrived)
+        if (chToBus[c] >= 0 && fabsf(chBusCur[c] - chBusTgt[c]) < 0.0001f) chBusCur[c] = chBusTgt[c];
     }
     MemoryBarrier();
     for (int k = 1; k < MAX_OUT; k++) if (on[k]) ringW[k] = w[k];
@@ -6789,7 +6835,7 @@ static void LoadSettings()
     gTtsAccent = INI_INT(L"tts_accent", 0);
     for (int c = 0; c < CH_MAX; c++) {           // mixer channels
         wchar_t k[32];
-        wsprintfW(k, L"ch_%d_type", c);   gCh[c].type = Iclamp(INI_INT(k, CH_NONE), CH_NONE, CH_MUS);
+        wsprintfW(k, L"ch_%d_type", c);   gCh[c].type = Iclamp(INI_INT(k, CH_NONE), CH_NONE, CH_BUS);
         wsprintfW(k, L"ch_%d_src", c);    GetPrivateProfileStringW(L"settings", k, L"", gCh[c].src, 128, gIni);
         {                                       // volume in dB (older settings kept it in %)
             wsprintfW(k, L"ch_%d_db", c);
@@ -6827,6 +6873,7 @@ static void LoadSettings()
         wsprintfW(k, L"ch_%d_gaterange", c); gCh[c].gateRange = Iclamp(INI_INT(k, CH_GATE_RANGE), 10, 80);
         wsprintfW(k, L"ch_%d_duckdb", c); gCh[c].duckDb = Iclamp(INI_INT(k, 0), 0, 40); if (gCh[c].duckDb && gCh[c].duckDb < 3) gCh[c].duckDb = 3;
         wsprintfW(k, L"ch_%d_view", c);   gCh[c].view = Iclamp(INI_INT(k, 0), 0, 2);
+        wsprintfW(k, L"ch_%d_bus", c);    gCh[c].busId = Iclamp(INI_INT(k, 0), 0, MAX_BUS);
         for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); gCh[c].send[o] = Iclamp(INI_INT(k, 0), -400, 60); }
     }
     ScenesLoad();
@@ -7775,6 +7822,7 @@ static void SaveSettings()
         wsprintfW(k, L"ch_%d_gaterange", c); SaveInt(k, gCh[c].gateRange);
         wsprintfW(k, L"ch_%d_duckdb", c); SaveInt(k, gCh[c].duckDb);
         wsprintfW(k, L"ch_%d_view", c);   SaveInt(k, gCh[c].view);
+        wsprintfW(k, L"ch_%d_bus", c);    SaveInt(k, gCh[c].busId);
         for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); SaveInt(k, gCh[c].send[o]); }
     }
     for (int c = 0; c < CH_MAX; c++) MixMemStore(c);   // (remember each app's settings for next time)
@@ -9026,7 +9074,7 @@ static bool ChanStartPid(int c, DWORD pid)
         if (ma_device_init(&gCtx, &cfg, &gChDev[c]) != MA_SUCCESS) { gChA[c].live = false; return false; }
         if (ma_device_start(&gChDev[c]) != MA_SUCCESS) { ma_device_uninit(&gChDev[c]); gChA[c].live = false; return false; }
         gChOnPL[c] = false;
-    } else if (cs.type == CH_MUS) {             // the music player (Mic > Music): the audio callback writes it in
+    } else if (cs.type == CH_MUS || cs.type == CH_BUS) {   // the music player (Mic > Music) / a bus (1.66.0): the audio callback fills it
         gChA[c].w = gChA[c].r = 0; gChA[c].primed = false;
         gChOnPL[c] = false; gChVirt[c] = true;
         gChA[c].live = true;
@@ -11535,6 +11583,7 @@ static void ChanLabel(int c, wchar_t* out, int cap)   // what its strip calls it
     else if (gCh[c].type == CH_APP) AppDisplayName(gCh[c].src, out, cap);
     else if (gCh[c].type == CH_DEV || gCh[c].type == CH_OUT) ShortDevName(gCh[c].src, out, cap);   // ("CABLE Output", not "... (VB-Audio Virtual Cable)")
     else if (gCh[c].type == CH_MUS) lstrcpynW(out, L"Music", cap);
+    else if (gCh[c].type == CH_BUS) { _snwprintf(out, cap - 1, L"Bus %s", gCh[c].src); out[cap - 1] = 0; }   // (1.66.0)
     else lstrcpynW(out, L"", cap);
 }
 static void ChanIconFromPath(int c, const wchar_t* path)
@@ -11602,7 +11651,7 @@ static int  FxKeyButtonId(int slot);
 static void FaderLabel(int id);
 static void MixMemKey(int c, wchar_t* key)
 {
-    wsprintfW(key, L"%s|%s", gCh[c].type == CH_APP ? L"app" : gCh[c].type == CH_DEV ? L"in" : gCh[c].type == CH_MUS ? L"mus" : L"out", gCh[c].src);
+    wsprintfW(key, L"%s|%s", gCh[c].type == CH_APP ? L"app" : gCh[c].type == CH_DEV ? L"in" : gCh[c].type == CH_MUS ? L"mus" : gCh[c].type == CH_BUS ? L"bus" : L"out", gCh[c].src);
     CharLowerBuffW(key, lstrlenW(key));
     for (wchar_t* q = key; *q; q++) if (*q == L'=' || *q == L'[' || *q == L']') *q = L'_';
 }
@@ -11617,6 +11666,7 @@ static void MixMemStore(int c)
     for (int k = 0; k < MAX_OUT; k++) n += wsprintfW(v + n, L",%d", (int)gCh[c].send[k]);
     n += wsprintfW(v + n, L",%d,%d,%d", (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange);   // (added in 1.54)
     n += wsprintfW(v + n, L",%d,%d", (int)gCh[c].duckDb, gCh[c].view);   // (added in 1.65)
+    n += wsprintfW(v + n, L",%d", (int)gCh[c].busId);   // (added in 1.66)
     wsprintfW(v + n, L"|%s", gCh[c].name);
     WritePrivateProfileStringW(L"mixer_memory", key, v, gIni);
 }
@@ -11648,6 +11698,7 @@ static bool MixMemLoad(int c)
         const bool has4 = nf >= b + 18;         // (added in 1.65)
         gCh[c].duckDb = has4 ? Iclamp(f[b + 16], 0, 40) : 0; if (gCh[c].duckDb && gCh[c].duckDb < 3) gCh[c].duckDb = 3;
         gCh[c].view = has4 ? Iclamp(f[b + 17], 0, 2) : 0;
+        gCh[c].busId = nf >= b + 19 ? Iclamp(f[b + 18], 0, MAX_BUS) : 0;   // (added in 1.66)
     }
     const wchar_t* nm = wcschr(v, L'|');
     lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
@@ -11677,7 +11728,7 @@ static void ChanSetSource(int c, int type, const wchar_t* src)
         gCh[c].link = 0; gCh[c].pan = 0; gCh[c].mono = false; gCh[c].ducker = false;
         gCh[c].eqLo = gCh[c].eqMid = gCh[c].eqHi = 0; gCh[c].comp = 0; for (int k = 0; k < MAX_OUT; k++) gCh[c].send[k] = 0;
         gCh[c].gate = 0; gCh[c].gateHold = CH_GATE_HOLD; gCh[c].gateRange = CH_GATE_RANGE;
-        gCh[c].duckDb = 0; gCh[c].view = 0;
+        gCh[c].duckDb = 0; gCh[c].view = 0; gCh[c].busId = 0;
         if (gCfxCh == c && gCfxWnd) DestroyWindow(gCfxWnd);
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = 0;
         if (type != CH_NONE && (wasEmpty || !gCh[c].routes)) gCh[c].routes = (1u << gRows) - 1;   // to every output
@@ -11831,12 +11882,12 @@ static void SceneWrite(int i)                   // the mixer as it is now -> sce
     for (int c = 0; c < CH_MAX; c++) {
         wchar_t k[16], v[520]; wsprintfW(k, L"ch%d", c + 1);
         if (gCh[c].type == CH_NONE) lstrcpyW(v, L"0");
-        else _snwprintf(v, 519, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
+        else _snwprintf(v, 519, L"%d|%s|%d,%d,%d,%d,%u,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d|%s", gCh[c].type, gCh[c].src, (int)gCh[c].db10, gCh[c].mute ? 1 : 0,
                         gCh[c].solo ? 1 : 0, gCh[c].duck ? 1 : 0, (unsigned)gCh[c].routes, gCh[c].color, gChW[c], gCh[c].holdTalk,
                         (int)gCh[c].chatRole, gCh[c].link, (int)gCh[c].pan, gCh[c].mono ? 1 : 0, gCh[c].ducker ? 1 : 0,
                         (int)gCh[c].eqLo, (int)gCh[c].eqMid, (int)gCh[c].eqHi, (int)gCh[c].comp,
                         (int)gCh[c].send[0], (int)gCh[c].send[1], (int)gCh[c].send[2], (int)gCh[c].send[3], (int)gCh[c].send[4],
-                        (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange, (int)gCh[c].duckDb, gCh[c].view, gCh[c].name);
+                        (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange, (int)gCh[c].duckDb, gCh[c].view, (int)gCh[c].busId, gCh[c].name);
         v[519] = 0;
         WritePrivateProfileStringW(sec, k, v, gIni);
     }
@@ -11866,13 +11917,13 @@ static void SceneApply(int i)                   // switch to scene i: volumes gl
         GetPrivateProfileStringW(sec, k, L"0", v, 520, gIni);
         const int type = _wtoi(v);
         const wchar_t* p1 = wcschr(v, L'|');
-        if (type < CH_APP || type > CH_MUS || !p1) { if (gCh[c].type != CH_NONE) ChanSetSource(c, CH_NONE, L""); continue; }
+        if (type < CH_APP || type > CH_BUS || !p1) { if (gCh[c].type != CH_NONE) ChanSetSource(c, CH_NONE, L""); continue; }
         wchar_t src[128] = L""; const wchar_t* p2 = wcschr(p1 + 1, L'|');
         if (!p2) continue;
         lstrcpynW(src, p1 + 1, (int)Imin(128, (int)(p2 - p1)));
         if (gCh[c].type != type || lstrcmpiW(gCh[c].src, src)) ChanSetSource(c, type, src);
-        int f[27] = {}; int nf = 0; const wchar_t* q = p2 + 1;
-        while (*q && *q != L'|' && nf < 27) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
+        int f[28] = {}; int nf = 0; const wchar_t* q = p2 + 1;
+        while (*q && *q != L'|' && nf < 28) { f[nf++] = _wtoi(q); while (*q && *q != L',' && *q != L'|') q++; if (*q == L',') q++; }
         if (nf >= 8) {
             gCh[c].db10 = Iclamp(f[0], -600, 60); gCh[c].mute = f[1] != 0; gCh[c].solo = f[2] != 0; gCh[c].duck = f[3] != 0;
             gCh[c].routes = (unsigned)f[4] & ((1u << MAX_OUT) - 1); gCh[c].color = Iclamp(f[5], 0, 7);
@@ -11886,6 +11937,7 @@ static void SceneApply(int i)                   // switch to scene i: volumes gl
             else gCh[c].gate = 0;               // (a scene from before 1.54: no gate)
             if (nf >= 27) { gCh[c].duckDb = Iclamp(f[25], 0, 40); if (gCh[c].duckDb && gCh[c].duckDb < 3) gCh[c].duckDb = 3; gCh[c].view = Iclamp(f[26], 0, 2); }
             else { gCh[c].duckDb = 0; gCh[c].view = 0; }   // (from before 1.65)
+            gCh[c].busId = nf >= 28 ? Iclamp(f[27], 0, MAX_BUS) : 0;   // (1.66)
         }
         const wchar_t* nm = wcschr(p2 + 1, L'|');
         lstrcpynW(gCh[c].name, nm ? nm + 1 : L"", 32);
@@ -12504,6 +12556,37 @@ static LRESULT CALLBACK RouteBtnProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PT
 }
 static void RackOpen(int t);                    // (plugins: defined with them)
 static bool VstTargetOn(int t);
+// ---- (1.66.0) buses: a channel (type CH_BUS, src "1".."4") whose sound is its members' (after their faders)
+static int BusNum(int c) { return gCh[c].type == CH_BUS && gCh[c].src[0] >= L'1' && gCh[c].src[0] <= L'0' + MAX_BUS && !gCh[c].src[1] ? gCh[c].src[0] - L'0' : 0; }
+static int BusChan(int b) { if (b < 1 || b > MAX_BUS) return -1; for (int c = 0; c < CH_MAX; c++) if (BusNum(c) == b) return c; return -1; }
+static int ChanInBus(int c) { return gCh[c].type != CH_BUS && gCh[c].type != CH_NONE && gCh[c].busId ? BusChan(gCh[c].busId) : -1; }   // its bus's channel, or -1
+static int BusFreeNum() { for (int b = 1; b <= MAX_BUS; b++) if (BusChan(b) < 0) return b; return 0; }
+static int ChanFirstEmpty() { for (int c = 0; c < CH_MAX; c++) if (gCh[c].type == CH_NONE) return c; return -1; }
+static void BusMembersText(int bc, wchar_t* t, int cap)   // "In it: Spotify, Game" / "(nothing in it yet...)"
+{
+    const int b = BusNum(bc); int n = 0; bool first = true;
+    n = _snwprintf(t, cap - 1, L"In it: ");
+    for (int j = 0; j < CH_MAX; j++) if (j != bc && ChanInBus(j) == bc && n < cap - 40) {
+        wchar_t nm[40]; ChanLabel(j, nm, 32); n += _snwprintf(t + n, cap - 1 - n, L"%s%s", first ? L"" : L", ", nm); first = false;
+    }
+    if (first || !b) lstrcpynW(t, L"Nothing in it yet: pick it in another channel's menu > Bus", cap);
+    t[cap - 1] = 0;
+}
+static void ChanSetSource(int c, int type, const wchar_t* src);
+static void BusMake(int at, int member)          // a new bus in channel `at`; `member` (if any) goes through it, and it plays where that did
+{
+    const int b = BusFreeNum();
+    if (at < 0 || !b) { ShowOsd(at < 0 ? L"No free channel for a bus: clear one first" : L"All 4 buses are in use", true); return; }
+    wchar_t src[4] = { (wchar_t)(L'0' + b), 0 };
+    const unsigned rt = member >= 0 ? gCh[member].routes : 0;
+    ChanSetSource(at, CH_BUS, src);
+    if (member >= 0) { if (rt) gCh[at].routes = rt; gCh[member].busId = b; }
+    MixerRedraw(); SaveSettings();
+    wchar_t t[160];
+    if (member >= 0) { wchar_t who[40]; ChanLabel(member, who, 32); _snwprintf(t, 159, L"Bus %d made: %s goes through it. Put more channels in it from their menus > Bus.", b, who); }
+    else _snwprintf(t, 159, L"Bus %d made. Put channels in it from their menus > Bus (sub-mix).", b);
+    t[159] = 0; ShowOsd(t, true);
+}
 // ---- (1.65.0) a channel's own duck amount, copy / paste of its settings, its strip size
 static void ChanDuckText(int c)                 // its Duck button: "Duck", or "Duck 20" with an amount of its own
 {
@@ -12526,6 +12609,7 @@ static void ChanPasteSettings(int c)            // its sound, not who it is: not
     g.eqLo = o.eqLo; g.eqMid = o.eqMid; g.eqHi = o.eqHi; g.comp = o.comp;
     g.gate = o.gate; g.gateHold = o.gateHold; g.gateRange = o.gateRange;
     g.pan = o.pan; g.mono = o.mono; g.duck = o.duck; g.duckDb = o.duckDb; g.ducker = o.ducker; g.chatRole = o.chatRole;
+    if (g.type != CH_BUS) g.busId = o.type == CH_BUS ? 0 : o.busId;   // (the same bus too; a bus isn't put in one)
     g.routes = o.routes & ((1u << MAX_OUT) - 1); for (int k = 0; k < MAX_OUT; k++) g.send[k] = o.send[k];
     ChanDuckText(c); ChanFxBadge(c);
     if (gCfxCh == c && gCfxWnd) { DestroyWindow(gCfxWnd); ChanFxOpen(c); }   // (its window shows the new values)
@@ -12593,7 +12677,24 @@ static void ChanMenu(int c, HWND from)
         AppendMenuW(m, MF_STRING | (gCh[c].mono ? MF_CHECKED : 0), 40, L"Mono (left and right mixed)");
         AppendMenuW(m, MF_STRING | (gCh[c].ducker ? MF_CHECKED : 0), 41, L"Duck the others while this plays (e.g. Discord)");
         AppendMenuW(m, MF_STRING | (ChanFxUsed(c) ? MF_CHECKED : 0), 42, L"EQ, compressor, level on each output...");
-        if (gFeatVst) AppendMenuW(m, MF_STRING | (VstTargetOn(c) ? MF_CHECKED : 0), 43, L"Plugins (VST3 / CLAP)...");
+        if (gFeatVst && gCh[c].type != CH_BUS) AppendMenuW(m, MF_STRING | (VstTargetOn(c) ? MF_CHECKED : 0), 43, L"Plugins (VST3 / CLAP)...");
+        if (gCh[c].type == CH_BUS) {            // (1.66.0) a bus: who's in it
+            wchar_t t[200]; BusMembersText(c, t, 200);
+            AppendMenuW(m, MF_STRING | MF_GRAYED, 0, t);
+        } else {                                // (1.66.0) through a bus, or straight to its outputs
+            HMENU bm = CreatePopupMenu(); const int in = gCh[c].busId;
+            AppendMenuW(bm, MF_STRING | (!in || BusChan(in) < 0 ? MF_CHECKED : 0), 70, L"None (straight to its outputs)");
+            bool any = false;
+            for (int b = 1; b <= MAX_BUS; b++) {
+                const int bc = BusChan(b); if (bc < 0) continue;
+                wchar_t nm[40], t[80]; ChanLabel(bc, nm, 32);
+                if (lstrcmpW(nm, gCh[bc].src) && _wcsnicmp(nm, L"Bus ", 4)) _snwprintf(t, 79, L"Bus %d  (%s)", b, nm); else lstrcpynW(t, nm, 80);
+                t[79] = 0; AppendMenuW(bm, MF_STRING | (in == b ? MF_CHECKED : 0), 70 + b, t); any = true;
+            }
+            AppendMenuW(bm, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(bm, MF_STRING | (BusFreeNum() && ChanFirstEmpty() >= 0 ? 0 : MF_GRAYED), 79, any ? L"A new bus..." : L"A new bus (a sub-mix)...");
+            AppendMenuW(m, MF_POPUP, (UINT_PTR)bm, L"Bus (sub-mix)");
+        }
         {                                       // (1.65.0) how far Duck takes it down
             HMENU dm = CreatePopupMenu(); wchar_t t[80];
             _snwprintf(t, 79, L"Same as \"Duck by\" (%d dB)", (int)gDuckDb); t[79] = 0;
@@ -12657,12 +12758,28 @@ static void ChanMenu(int c, HWND from)
     AppendMenuW(m, MF_POPUP, (UINT_PTR)ins,  L"Input (a mic, line-in...)");
     AppendMenuW(m, MF_POPUP, (UINT_PTR)outs, L"Output (what a device plays)");
     if (musOpt >= 0) AppendMenuW(m, musFl, 100 + musOpt, L"Music player (Mic > Music)");   // (1.64.0)
+    if (gCh[c].type == CH_BUS) { wchar_t t[40]; wsprintfW(t, L"Bus %s (a sub-mix)", gCh[c].src); AppendMenuW(m, MF_STRING | MF_CHECKED, 5, t); }
+    else AppendMenuW(m, MF_STRING | (BusFreeNum() ? 0 : MF_GRAYED), 5, BusFreeNum() ? L"A bus (a sub-mix of other channels)" : L"A bus (all 4 are in use)");   // (1.66.0)
     if (used) { AppendMenuW(m, MF_SEPARATOR, 0, nullptr); AppendMenuW(m, MF_STRING, 2, L"Clear this channel"); }
     RECT r; GetWindowRect(from, &r);
     int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
     DestroyMenu(m);
     if (cmd == 1) ChanRename(c);
-    else if (cmd == 2) ChanSetSource(c, CH_NONE, L"");
+    else if (cmd == 2) {
+        if (gCh[c].type == CH_BUS) {            // (a bus going: who was in it goes straight to its outputs again)
+            const int b = BusNum(c);
+            for (int j = 0; j < CH_MAX; j++) if (j != c && gCh[j].busId == b) gCh[j].busId = 0;
+        }
+        ChanSetSource(c, CH_NONE, L"");
+    }
+    else if (cmd == 5) { if (gCh[c].type != CH_BUS) BusMake(c, -1); }
+    else if (cmd == 70) { gCh[c].busId = 0; MixerRedraw(); SaveSettings(); }
+    else if (cmd > 70 && cmd <= 70 + MAX_BUS) {
+        gCh[c].busId = cmd - 70; MixerRedraw(); SaveSettings();
+        wchar_t who[40], bn[40], t[140]; ChanLabel(c, who, 32); ChanLabel(BusChan(cmd - 70), bn, 32);
+        _snwprintf(t, 139, L"%s now goes through %s (its fader, EQ and outputs)", who, bn); t[139] = 0; ShowOsd(t, true);
+    }
+    else if (cmd == 79) BusMake(ChanFirstEmpty(), c);
     else if (cmd == 3 || cmd == 4) ChanPickExe(c, cmd == 4);
     else if (cmd >= 10 && cmd < 18) { gCh[c].color = cmd - 10; MixerRedraw(); }
     else if (cmd >= 20 && cmd <= 22) gCh[c].chatRole = cmd - 20;
@@ -12888,7 +13005,10 @@ static void DrawChanSrc(DRAWITEMSTRUCT* d, int c)   // icon, name, and a little 
     else {                                      // no icon: a microphone for inputs, a window for apps
         HPEN p = CreatePen(PS_SOLID, Imax(1, SC(2) - 1), col);
         HGDIOBJ op = SelectObject(dc, p), ob = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        if (gCh[c].type == CH_MUS) {            // a note (the music player)
+        if (gCh[c].type == CH_BUS) {            // (1.66.0) a bus: three lines into one
+            for (int i = 0; i < 3; i++) { MoveToEx(dc, x + SC(1), y + SC(3 + 5 * i), nullptr); LineTo(dc, x + SC(9), y + SC(8)); }
+            LineTo(dc, x + SC(15), y + SC(8));
+        } else if (gCh[c].type == CH_MUS) {     // a note (the music player)
             HBRUSH nb = CreateSolidBrush(col); HGDIOBJ obb = SelectObject(dc, nb);
             Ellipse(dc, x + SC(2), y + SC(10), x + SC(8), y + SC(15));
             SelectObject(dc, obb); DeleteObject(nb);
@@ -12932,6 +13052,17 @@ static void DrawChanSrc(DRAWITEMSTRUCT* d, int c)   // icon, name, and a little 
         SetTextColor(dc, ACCENT); HGDIOBJ of3 = SelectObject(dc, FitFont(2));
         DrawTextW(dc, L"fx", 2, &fr, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
         SelectObject(dc, of3);
+    }
+    if (ChanInBus(c) >= 0) {                    // (1.66.0) through a bus: "B1", top right (left of the arrow)
+        wchar_t g[4] = { L'B', (wchar_t)(L'0' + gCh[c].busId), 0 };
+        RECT br = { rc.right - SC(32), y, rc.right - SC(14), y + SC(13) };
+        HBRUSH bb = CreateSolidBrush(CH_COLORS[Iclamp(gCh[ChanInBus(c)].color, 0, 7)]);
+        HGDIOBJ o1 = SelectObject(dc, bb), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, br.left, br.top, br.right + 1, br.bottom + 1, SC(4), SC(4));
+        SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(bb);
+        SetTextColor(dc, RGB(255, 255, 255)); HGDIOBJ of4 = SelectObject(dc, FitFont(2));
+        DrawTextW(dc, g, 2, &br, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
+        SelectObject(dc, of4);
     }
     if (gDragCh >= 0 && (c == gDropCh || c == gDragCh)) {   // dragging: where it would go (and which one moves)
         HPEN pp = CreatePen(c == gDragCh ? PS_DOT : PS_SOLID, Imax(1, SC(2)), ACCENT);
@@ -15158,7 +15289,7 @@ static void AddTips()
         TipId(IDC_OLBL0 + k,  L"Click to rename this output (e.g. \"Stream\" or \"Headphones\"). The name shows on the Main tab too.");
     }
     for (int c = 0; c < CH_MAX; c++) {
-        TipId(IDC_CHSRC0 + c,  L"Click: pick what this channel plays (an app, an input like a second mic, or what an output device plays), rename it, change its colour, link it to other channels, make it mono or have it duck the others, set how far Duck takes it down, copy / paste its settings, make its strip compact or hide it, or resync it. Drag it sideways to move the channel. Drag the strip's right edge to make it wider.");
+        TipId(IDC_CHSRC0 + c,  L"Click: pick what this channel plays (an app, an input like a second mic, what an output device plays, the music player, or a bus: a sub-mix of other channels), rename it, change its colour, link it to other channels, make it mono or have it duck the others, set how far Duck takes it down, copy / paste its settings, make its strip compact or hide it, resync it, or send it through a bus. Drag it sideways to move the channel. Drag the strip's right edge to make it wider.");
         TipId(IDC_CHADD0 + c,  L"Add a channel: an app (Spotify, a game, a browser...), another input, or what an output device plays.");
         TipId(IDC_CHMUTE0 + c, L"Mute: silence this channel.");
         TipId(IDC_CHSOLO0 + c, L"Solo: hear only this channel on your listening output (the \"Always hear sounds on\" one on the Main tab, else output 1). The other outputs carry on as normal.");
@@ -15874,7 +16005,7 @@ struct MixSnapCh {
     int type; wchar_t src[128], name[32];
     int db10, mute, solo, duck, routes, color, holdTalk, chatRole, link, pan, mono, ducker, width;
     int eqLo, eqMid, eqHi, comp, send[MAX_OUT];
-    int gate, gateHold, gateRange, duckDb, view;
+    int gate, gateHold, gateRange, duckDb, view, busId;
     int keys[MIXA_N][MAX_KEYS];
     int fadeKeys[MAX_KEYS];
 };
@@ -15897,7 +16028,7 @@ static void MixSnapTake(MixSnap& m)
         o.db10 = g.db10; o.mute = g.mute; o.solo = g.solo; o.duck = g.duck; o.routes = (int)g.routes; o.color = g.color;
         o.holdTalk = g.holdTalk; o.chatRole = g.chatRole; o.link = g.link; o.pan = g.pan; o.mono = g.mono; o.ducker = g.ducker; o.width = gChW[c];
         o.eqLo = g.eqLo; o.eqMid = g.eqMid; o.eqHi = g.eqHi; o.comp = g.comp; for (int k = 0; k < MAX_OUT; k++) o.send[k] = g.send[k];
-        o.gate = g.gate; o.gateHold = g.gateHold; o.gateRange = g.gateRange; o.duckDb = g.duckDb; o.view = g.view;
+        o.gate = g.gate; o.gateHold = g.gateHold; o.gateRange = g.gateRange; o.duckDb = g.duckDb; o.view = g.view; o.busId = g.busId;
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) o.keys[a][i] = gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i];
         for (int i = 0; i < MAX_KEYS; i++) o.fadeKeys[i] = gFxKeys[SLOT_FADE0 + c][i];
     }
@@ -15929,7 +16060,7 @@ static void MixSnapApply(const MixSnap& m)
         g.db10 = o.db10; g.mute = o.mute != 0; g.solo = o.solo != 0; g.duck = o.duck != 0; g.routes = (unsigned)o.routes; g.color = o.color;
         g.holdTalk = o.holdTalk; g.chatRole = o.chatRole; g.link = o.link; g.pan = o.pan; g.mono = o.mono != 0; g.ducker = o.ducker != 0; gChW[c] = o.width;
         g.eqLo = o.eqLo; g.eqMid = o.eqMid; g.eqHi = o.eqHi; g.comp = o.comp; for (int k = 0; k < MAX_OUT; k++) g.send[k] = o.send[k];
-        g.gate = o.gate; g.gateHold = o.gateHold; g.gateRange = o.gateRange; g.duckDb = o.duckDb; g.view = o.view;
+        g.gate = o.gate; g.gateHold = o.gateHold; g.gateRange = o.gateRange; g.duckDb = o.duckDb; g.view = o.view; g.busId = o.busId;
         for (int a = 0; a < MIXA_N; a++) for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MIX0 + c * MIXA_N + a][i] = o.keys[a][i];
         for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_FADE0 + c][i] = o.fadeKeys[i];
         MixKeysShow(c); FaderLabel(IDC_CHVOL0 + c);
@@ -15962,7 +16093,7 @@ static void MixSnapWhat(const MixSnap& a, const MixSnap& b, wchar_t* t)   // wha
                              : x.chatRole != y.chatRole ? L"ChatMix" : x.width != y.width ? L"width"
                              : x.eqLo != y.eqLo || x.eqMid != y.eqMid || x.eqHi != y.eqHi ? L"EQ" : x.comp != y.comp ? L"compressor"
                              : x.gate != y.gate || x.gateHold != y.gateHold || x.gateRange != y.gateRange ? L"gate"
-                             : x.duckDb != y.duckDb ? L"duck amount" : x.view != y.view ? L"strip size"
+                             : x.duckDb != y.duckDb ? L"duck amount" : x.view != y.view ? L"strip size" : x.busId != y.busId ? L"bus"
                              : memcmp(x.send, y.send, sizeof(x.send)) ? L"output levels" : L"hotkeys";
             _snwprintf(t, 63, L"%s %s", who, f); t[63] = 0; return;
         }
@@ -20170,6 +20301,7 @@ static void WsExec(int id, const char* m)
         else if (JsonOnOff(m, "gate") == 0) gCh[c].gate = 0;
         if (JsonNum(m, "gatehold", &v))   gCh[c].gateHold  = Iclamp((int)lround(v), 50, 2000);
         if (JsonNum(m, "gaterange", &v))  gCh[c].gateRange = Iclamp((int)lround(fabs(v)), 10, 80);
+        if (JsonNum(m, "bus", &v) && gCh[c].type != CH_BUS) { gCh[c].busId = Iclamp((int)lround(v), 0, MAX_BUS); MixerRedraw(); }   // (1.66.0) 0 = straight to its outputs
         if (JsonNum(m, "duckby", &v))     { const int d = (int)lround(fabs(v)); gCh[c].duckDb = d <= 0 ? 0 : Iclamp(d, 3, 40); ChanDuckText(c); }   // (1.65.0) 0 = the Mixer's
         for (int o = 0; o < MAX_OUT; o++) {     // "out1db": its level on output 1 (on top of the fader)
             char key[12]; wsprintfA(key, "out%ddb", o + 1);
@@ -20368,6 +20500,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    channel Spotify pan -50   \x2014   also: bass 3, middle -2, treble 4, compressor 40, out2db -10\n"
         L"    channel Discord gate -45   \x2014   gate: opens above -45 dB (gate 0 = off); also gatehold 300 (ms), gaterange 80 (dB, 80 = silent)\n"
         L"    channel Spotify duckby 20   \x2014   how far Duck takes it down while you talk (0 = the Mixer's Duck by)\n"
+        L"    channel Spotify bus 1   \x2014   send it through bus 1 (0 = straight to its outputs); the bus is a channel: channel 'Bus 1' -6\n"
         L"    output 2 mute   \x2014   an output: mute, unmute, or its volume:  output 2 80\n"
         L"    scene Gaming   \x2014   switch to a scene\n"
         L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
@@ -20971,7 +21104,9 @@ static const SecIntro SEC_INTROS[] = {
     { L"Looper",      L"Records a loop and plays it back under your voice; layer more on top." },
     { L"Instant replay", L"Keeps the last few seconds of sound so you can save a clip after something happens." },
     { L"Channels",    L"Each strip is an app, an input or what an output plays. Click a strip's name for its menu: what it plays, colour, duck amount, "
-                      L"copy / paste its settings, a compact or hidden strip, resync. Drag a name to reorder; drag a strip's right edge to resize it." },
+                      L"copy / paste its settings, a compact or hidden strip, resync, a bus. "
+                      L"A bus (pick \"A bus\" as a channel's source) is a sub-mix: channels you put in it (their menu > Bus) go through its fader, EQ, compressor, mute and outputs, "
+                      L"so one fader turns them all down together. Their own output buttons show the bus's, greyed. Drag a name to reorder; drag a strip's right edge to resize it." },
     { L"Outputs",     L"Each output's volume, limit and mute, as the Mixer sends them. The buttons at the bottom of each channel pick which outputs it goes to." },
     { L"Mixer hotkeys", L"Keys for each channel (volume, mute, solo, duck, hold, fade) and each output, working from any app." },
     { L"Features",    L"Turn whole parts of Lag Effect on or off. Off means hidden and not using any time on the audio." },
@@ -21264,13 +21399,14 @@ static void BugInfoBuild(wchar_t* o, int cap)
         gGateThump ? L" + ignore thumps" : L"", (int)gLevelerPct, gAgcMaxDb > 0 ? L"on" : L"off", (int)gLoudDb, gWhineOn ? L"on" : L"off");
     for (int c = 0; c < CH_MAX; c++) {
         if (gCh[c].type == CH_NONE) continue;
-        static const wchar_t* types[] = { L"", L"app", L"input", L"output's sound", L"music player" };
+        static const wchar_t* types[] = { L"", L"app", L"input", L"output's sound", L"music player", L"bus" };
         wchar_t gt[64] = L"";
         if (gCh[c].gate) swprintf(gt, 64, L", gate -%d dB (%d ms, %d dB)", 70 - (int)gCh[c].gate, (int)gCh[c].gateHold, (int)gCh[c].gateRange);
         wchar_t dk[48] = L"";
         if (gCh[c].duck) { if (gCh[c].duckDb) swprintf(dk, 48, L", ducks %d dB", (int)gCh[c].duckDb); else lstrcpyW(dk, L", ducks"); }
         if (gCh[c].view) lstrcatW(dk, gCh[c].view == 1 ? L", compact" : L", hidden");
-        BugAdd(o, cap, L"Mixer channel %d: %ls %ls, %.1f dB%ls, routes 0x%x%ls%ls%ls", c + 1, types[Iclamp(gCh[c].type, 0, 4)], gCh[c].src,
+        if (gCh[c].busId && gCh[c].type != CH_BUS) { wchar_t b[24]; wsprintfW(b, L", in bus %d", (int)gCh[c].busId); lstrcatW(dk, b); }
+        BugAdd(o, cap, L"Mixer channel %d: %ls %ls, %.1f dB%ls, routes 0x%x%ls%ls%ls", c + 1, types[Iclamp(gCh[c].type, 0, 5)], gCh[c].src,
             gCh[c].db10 / 10.0, gCh[c].mute ? L", muted" : L"", gCh[c].routes, gChA[c].live ? L"" : L", not capturing", gt, dk);
     }
     if (gFeatVst || gSafe) {
@@ -26868,8 +27004,15 @@ static void OnCommand(int id, int code)
     if (id >= IDC_CHRT0 && id < IDC_CHRT0 + CH_MAX * MAX_OUT) {
         if (code == BN_CLICKED) {
             int c = (id - IDC_CHRT0) / MAX_OUT, k = (id - IDC_CHRT0) % MAX_OUT;
+            const int bc = ChanInBus(c);
+            if (bc >= 0) {                      // (1.66.0) its bus decides where it goes
+                wchar_t who[40], bn[40], t[200]; ChanLabel(c, who, 32); ChanLabel(bc, bn, 32);
+                _snwprintf(t, 199, L"%s goes through %s: change the outputs on %s's strip, or take it out (its menu > Bus)", who, bn, bn); t[199] = 0;
+                ShowOsd(t, true); return;
+            }
             gCh[c].routes ^= 1u << k;
             InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
+            if (gCh[c].type == CH_BUS) MixerRedraw();   // (its members' greyed buttons show it)
         }
         return;
     }
@@ -27184,6 +27327,11 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     }
     if (w >= IDC_CHRT0 && w < IDC_CHRT0 + CH_MAX * MAX_OUT) {
         int c = (int)(w - IDC_CHRT0) / MAX_OUT, k = (int)(w - IDC_CHRT0) % MAX_OUT;
+        const int bc = ChanInBus(c);
+        if (bc >= 0) {                          // (1.66.0) through a bus: shows where the bus goes, greyed (its own routes don't count)
+            DrawToggleC(d, (gCh[bc].routes >> k) & 1, gDark ? RGB(88, 88, 92) : RGB(170, 170, 176), gDark ? RGB(200, 200, 200) : RGB(255, 255, 255));
+            return true;
+        }
         DrawToggle(d, (gCh[c].routes >> k) & 1, false);
         if (gCh[c].send[k]) {                   // its own level there: a little dot, top right
             const int ds = Imax(3, SC(4)); RECT rc = d->rcItem;
