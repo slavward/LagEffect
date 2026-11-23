@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.66.1"
+#define APP_VERSION L"1.67.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -556,6 +556,14 @@ static const clap_event_header_t* CLAP_ABI ClapEvGet(const clap_input_events_t*,
 static bool CLAP_ABI ClapEvPush(const clap_output_events_t*, const clap_event_header_t*) { return true; }
 static const clap_input_events_t  gClapNoIn = { nullptr, ClapEvSize, ClapEvGet };
 static const clap_output_events_t gClapDrop = { nullptr, ClapEvPush };
+// (1.67.0) settings changed from outside (plugin ... set): the block's param changes, as CLAP events
+struct ClapPev { clap_event_param_value_t e[32]; uint32_t n; };
+static uint32_t CLAP_ABI ClapPevSize(const clap_input_events_t* l) { return ((const ClapPev*)l->ctx)->n; }
+static const clap_event_header_t* CLAP_ABI ClapPevGet(const clap_input_events_t* l, uint32_t i)
+{
+    const ClapPev* p = (const ClapPev*)l->ctx;
+    return i < p->n ? &p->e[i].header : nullptr;
+}
 // its settings, read from / written to a block of memory
 struct ClapMem { unsigned char* d; SB::int64 size, cap, pos; };
 static int64_t CLAP_ABI ClapWrite(const clap_ostream_t* st, const void* buf, uint64_t n)
@@ -911,6 +919,19 @@ static bool ClapProcess(VstSlot& s, int n, const clap_input_events_t* evIn = &gC
     tr.tempo = tempo; tr.tsig_num = 4; tr.tsig_denom = 4;
     tr.bar_number = (int32_t)(beats / 4.0);
     tr.bar_start = (clap_beattime)((double)tr.bar_number * 4.0 * (double)CLAP_BEATTIME_FACTOR);
+    ClapPev pv; clap_input_events_t pin;
+    if (evIn == &gClapNoIn && s.inCh.n > 0) {   // (only when it has no notes coming: the synth's list is its own)
+        pv.n = 0;
+        for (int i = 0; i < s.inCh.n && pv.n < 32; i++) {
+            const VstQueue& q = s.inCh.q[i];
+            if (!q.n) continue;
+            clap_event_param_value_t& e = pv.e[pv.n++];
+            memset(&e, 0, sizeof(e));
+            e.header.size = sizeof(e); e.header.space_id = CLAP_CORE_EVENT_SPACE_ID; e.header.type = CLAP_EVENT_PARAM_VALUE;
+            e.param_id = q.id; e.note_id = -1; e.port_index = -1; e.channel = -1; e.key = -1; e.value = q.val[q.n - 1];
+        }
+        pin.ctx = &pv; pin.size = ClapPevSize; pin.get = ClapPevGet; evIn = &pin;
+    }
     clap_process_t pr;
     memset(&pr, 0, sizeof(pr));
     pr.steady_time = s.pos; pr.frames_count = (uint32_t)n; pr.transport = &tr;
@@ -5515,7 +5536,8 @@ enum {
     IDC_MUSLIST, IDC_MUSADD, IDC_MUSFOLDER, IDC_MUSDEL, IDC_MUSCLEAR, IDC_MUSKEYPLAY, IDC_MUSKEYNEXT,
     IDC_VOLSTYLE,                               // (1.63.0: Settings > Look > Volume controls)
     IDC_MICSUB5,                                // (1.63.0: Mic > Music, moved from the Soundboard)
-    IDC_MIXHIDDEN, IDC_HDRMETER, IDC_HDRMETERON,   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
+    IDC_MIXHIDDEN, IDC_HDRMETER, IDC_HDRMETERON,
+    IDC_MACROBTN,                               // (1.67.0) the bottom bar's Macros button   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5907,7 +5929,14 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_MUSPLAY (SLOT_RECORD + 9)           // Mic > Music (1.61.0): play / pause
 #define SLOT_MUSNEXT (SLOT_RECORD + 10)          //   the next song
 #define SLOT_NEW0    SLOT_LPREC                  // (slots after the plugins' and the recorder's)
-#define KEY_SLOTS    (SLOT_MUSNEXT + 1)
+#define MACRO_MAX    16                          // (1.67.0) macros: one key each
+#define SLOT_MACRO0  (SLOT_MUSNEXT + 1)
+#define KEY_SLOTS    (SLOT_MACRO0 + MACRO_MAX)
+static void MacroLabel(int i, wchar_t* out, int cap);   // (1.67.0: defined with the macros)
+static const char* MacroRemote(int k, int on); static int MacroFind(const wchar_t* name);
+static void BugMacros(wchar_t* o, int cap);
+static void MacroShow(); static void MacrosLoad(); static void MacrosSave(); static int gMacroSel = -1, gMacroN = 0;
+static inline bool IsMacroSlot(int slot) { return slot >= SLOT_MACRO0 && slot < SLOT_MACRO0 + MACRO_MAX; }
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
 static bool gFxKeyWasDown[KEY_SLOTS];
 static bool gFxHold[1 + FX_GROUPS];             // hold-to-activate: [0] = the Voice effects switch, [1+g] = effect g
@@ -6575,6 +6604,12 @@ static const wchar_t* FxKeyIniName(int slot)
     if (slot == SLOT_BLLIVE)  return L"bleep_live_hotkey";
     if (slot == SLOT_MUSPLAY) return L"music_play_hotkey";
     if (slot == SLOT_MUSNEXT) return L"music_next_hotkey";
+    if (IsMacroSlot(slot)) {                    // "macro3_hotkey" (1.67.0)
+        static wchar_t mn[MACRO_MAX][20];
+        wchar_t* n = mn[slot - SLOT_MACRO0];
+        if (!n[0]) wsprintfW(n, L"macro%d_hotkey", slot - SLOT_MACRO0 + 1);
+        return n;
+    }
     if (slot >= SLOT_VST0) {                    // "plugin3_key"
         static wchar_t vn[VST_SLOTS][20];
         wchar_t* n = vn[slot - SLOT_VST0];
@@ -6879,6 +6914,7 @@ static void LoadSettings()
         for (int o = 0; o < MAX_OUT; o++) { wsprintfW(k, L"ch_%d_send%d", c, o); gCh[c].send[o] = Iclamp(INI_INT(k, 0), -400, 60); }
     }
     ScenesLoad();
+    MacrosLoad();
     for (int c = 0; c < CH_MAX; c++)  { wchar_t key[24]; wsprintfW(key, L"ch_%d_width", c);  int v = INI_INT(key, 0); gChW[c] = v ? Iclamp(v, 52, 240) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); int v = INI_INT(key, 0); gOutW[k] = v ? Iclamp(v, 84, 320) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
@@ -7714,6 +7750,7 @@ static void SaveSettings()
 {
     IniBatchBegin();                            // everything below is written to the file in one go (IniBatchEnd)
     for (Range& r : gRanges) SaveInt(r.key, *r.var);
+    MacrosSave();
     SaveInt(L"hotkey", gHotkeys[0]); SaveInt(L"hotkey2", gHotkeys[1]); SaveInt(L"hotkey3", gHotkeys[2]);
     SaveInt(L"toggle", gToggleMode);
     SaveInt(L"gate", gGateMode != GATE_OFF); SaveInt(L"talkover", gTalkOver);
@@ -11174,6 +11211,7 @@ static void SlotName(int slot, wchar_t* out, int cap)
     if (slot == SLOT_BLLIVE)  { lstrcpynW(out, L"Live bleep (while held, no delay)", cap); return; }
     if (slot == SLOT_MUSPLAY) { lstrcpynW(out, L"Music: play / pause", cap); return; }
     if (slot == SLOT_MUSNEXT) { lstrcpynW(out, L"Music: next song", cap); return; }
+    if (IsMacroSlot(slot)) { MacroLabel(slot - SLOT_MACRO0, out, cap); return; }
     if (slot >= SLOT_VST0) { lstrcpynW(out, L"switching a plugin on / off", cap); return; }
     if (slot == 0) lstrcpynW(out, L"Voice effects", cap);
     else if (slot < FX_KEY_SLOTS) wsprintfW(out, L"%s (Voice FX)", gFxGroups[slot - 1].title);
@@ -15433,7 +15471,7 @@ static void AddTips()
     TipId(IDC_CBLBLTGT, L"Which one (channel, output, scene, character, profile, pad...).");
     TipId(IDC_CBLBLOPT, L"How: on / off, mute, volume, fade...");
     TipId(IDC_CBLBLVAL, L"The number (or text) it needs, if any: dB, %, seconds, milliseconds, what to say.");
-    TipId(IDC_CBTGT,   L"Which one (channel, output, scene, character, profile, pad...).");
+    TipId(IDC_CBTGT,   L"Which one (channel, output, scene, character, profile, pad, macro, plugin...).");
     TipId(IDC_CBOPT,   L"How: on / off, mute, volume, fade...");
     TipId(IDC_CBVAL,   L"The number (or text) it needs, if any: dB, %, seconds, milliseconds, what to say.");
     TipId(IDC_CBLINE,  L"The command it sends. You can also type this into anything that sends WebSocket text; \"Copy C# for Streamer.bot\" gives you the whole code.");
@@ -15607,6 +15645,8 @@ static void AddTips()
     TipId(IDC_ONSTRIP,  L"What's on right now. Click one to go to its settings.");
     TipId(IDC_HDRMETER, L"Your mic's level, on every tab (dim while the gate is shut, red when it's close to too loud). Click: the Mic tab. Turn it off in Settings > Look.");
     TipId(IDC_HDRMETERON, L"A thin bar under the tabs showing your mic's level, so you can see it from any tab.");
+    TipId(IDC_MACROBTN, L"Macros: one key (or voice command, or Streamer.bot) that does several things in a row, with waits between. "
+                        L"\"While held\" ones undo themselves when you let go.");
     TipId(IDC_RCDBTN,   L"Record what an output plays, or each part on its own track (your voice, sounds, each Mixer channel), "
                         L"to WAV files of any length. It has its own start / stop key.");
     TipId(IDC_MUTEKEY, L"A hotkey that mutes / unmutes your mic from anywhere, even in a game. Right-click to clear it.");
@@ -16279,7 +16319,10 @@ static void BlKey(bool down); static void SpTtsSet(bool on, bool fromKey); stati
 static void MusToggle(); static void MusNext(); static void MusPrev(); static void MusStop(); static void MusUi();   // (Mic > Music, 1.61.0)
 static bool MusActive();
 static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a hotkey: seen down for one tick, then let go
+static unsigned char gMacroDown[KEY_SLOTS];     // (1.67.0) a "while held" macro holds these keys down until it's let go
+static bool gTapTog[KEY_SLOTS];                 // (1.67.0) a tap (voice / macro / remote) on a hold-type key: it toggles instead
 static bool gSpTts = false;
+static void MacroPress(int i, bool tapped); static void MacroRelease(int i); static void MacroTick();   // (1.67.0)
 static void PollFxKeys()
 {
     SoloCheck();
@@ -16294,12 +16337,20 @@ static void PollFxKeys()
                          ((slot == SLOT_BLEEP || slot == SLOT_SPTTS) && !gFeatSpeech);
         if (off) { gVoiceTap[slot] = 0; gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
+        if (gMacroDown[slot]) down = true;      // (held by a macro)
+        const bool tapped = gVoiceTap[slot] == 2;   // (pressed by a voice command, a macro or a remote: let go next tick)
         if (gVoiceTap[slot]) { if (gVoiceTap[slot] == 2) down = true; gVoiceTap[slot]--; }   // a voice command (Mic > Speech)
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
-        if (slot < FX_KEY_SLOTS && gFxHold[slot]) {   // hold-to-activate effect hotkeys
-            if (pressed) HoldPress(slot); else if (released) HoldRelease(slot);
+        if (IsMacroSlot(slot)) {                // (1.67.0) a macro's key
+            if (pressed) { gTapTog[slot] = tapped; MacroPress(slot - SLOT_MACRO0, tapped); }
+            else if (released) { if (gTapTog[slot]) gTapTog[slot] = false; else MacroRelease(slot - SLOT_MACRO0); }
             continue;
+        }
+        if (slot < FX_KEY_SLOTS && gFxHold[slot]) {   // hold-to-activate effect hotkeys
+            if (pressed && tapped) gTapTog[slot] = true;   // (a tap can't be held: it switches the effect on / off instead)
+            if (gTapTog[slot]) { if (released) gTapTog[slot] = false; if (!pressed) continue; }
+            else { if (pressed) HoldPress(slot); else if (released) HoldRelease(slot); continue; }
         }
         if (slot == SLOT_RECORD) { if (pressed) RcdToggle(); continue; }   // the recorder
         if (slot >= SLOT_LPREC && slot <= SLOT_LPCLEAR) { if (pressed) LoopKey(slot); continue; }   // the looper
@@ -16353,6 +16404,7 @@ static void PollFxKeys()
         UpdateStatus(true);
     }
     MixHoldTick();
+    MacroTick();                                // (1.67.0) running macros take their next steps (seen next poll)
 }
 
 // ---------- Mic tab ----------
@@ -19421,7 +19473,9 @@ static void ShowHelp()
         L"Along the bottom: search any setting (Ctrl+F), see every hotkey in one list (Hotkeys...), and what's on right now "
         L"(click one to go to it). Right-click any knob to type an exact value.\n"
         L"Recorder... records an output, or separate tracks (your voice, sounds, each Mixer channel), to WAV files; "
-        L"a red REC chip shows while it runs.\n\n"
+        L"a red REC chip shows while it runs.\n"
+        L"Macros... makes one key do several things in a row (with waits between): \"Run once\", or \"While held\" to undo "
+        L"them all when you let go. Voice commands and Streamer.bot (macro NAME) can run them too.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -19558,6 +19612,7 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     wsprintfW(buf, L"%s%s", pre, k);
 }
 
+static int MacroKeyButton(int i);
 static int FxKeyButtonId(int slot)
 {
     if (slot == SLOT_RECORD) return 4545;       // (IDC_RCD_KEY, in the Recorder window)
@@ -19568,6 +19623,7 @@ static int FxKeyButtonId(int slot)
     if (slot == SLOT_BLLIVE)  return IDC_BLLIVEKEY;
     if (slot == SLOT_MUSPLAY) return IDC_MUSKEYPLAY;
     if (slot == SLOT_MUSNEXT) return IDC_MUSKEYNEXT;
+    if (IsMacroSlot(slot)) return MacroKeyButton(slot - SLOT_MACRO0);   // (1.67.0: in the Macros window, while that macro shows)
     if (slot >= SLOT_VST0) {                    // a plugin slot: on the Mic tab, or in the open channel / output plugins window
         const int k = slot - SLOT_VST0;
         if (k < VST_MIC) return IDC_VSTKEY0 + k;
@@ -20068,6 +20124,168 @@ static int WsFindOutput(const char* m)          // "n": 1-5, or "name": its name
     for (int k = 0; k < gRows; k++) { wchar_t l[32]; OutName(k, l, 32); if (!lstrcmpiW(l, w)) return k; }
     return -1;
 }
+// ---- (1.67.0) a plugin's settings from outside (Streamer.bot / the phone): by name, as its window shows them ----
+static double Fclampd(double v, double lo, double hi) { return v < lo ? lo : v > hi ? hi : v; }
+static void CbQuote(const wchar_t* name, char* out, int cap);
+static void VstPushEdit(VstSlot& s, SB::uint32 id, double v)   // (the window's thread) into the ring the audio thread reads
+{
+    const unsigned w = s.taW.load();
+    if (w - s.taR.load() < VST_RING) { s.toAudio[w % VST_RING] = { id, v }; s.taW.store(w + 1); }
+}
+static int VstNameMatch(const wchar_t* have, const wchar_t* want)   // 3 the same, 2 starts with it, 1 has it in it, 0 no (any case)
+{
+    if (!want[0]) return 0;
+    if (!lstrcmpiW(have, want)) return 3;
+    const int hl = lstrlenW(have), wl = lstrlenW(want);
+    for (int i = 0; i + wl <= hl; i++) {
+        int j = 0; while (j < wl && towlower(have[i + j]) == towlower(want[j])) j++;
+        if (j == wl) return i == 0 ? 2 : 1;
+    }
+    return 0;
+}
+// One of its settings (pct: value is 0..100% of its range, else in its own units). nullptr: done; else what went wrong.
+// (Plugins that let a host set their knobs all do it this way: the window sees the move too.)
+static const char* VstParamSet(int k, const wchar_t* pname, double val, bool pct, wchar_t* got, int gotCap)
+{
+    VstUi& u = gVstUi[k]; VstSlot& s = gVst[k];
+    if (u.dead) return "That plugin crashed (reload it in Lag Effect).";
+    if (!u.loaded) return "That plugin isn't loaded: switch it on first.";
+    got[0] = 0;
+    if (s.cp) {                                 // CLAP
+        if (!s.cpParams) return "That plugin has no settings it lets a host change.";
+        const uint32_t n = s.cpParams->count(s.cp);
+        int bestQ = 0; clap_param_info_t best; memset(&best, 0, sizeof(best));
+        for (uint32_t i = 0; i < n && bestQ < 3; i++) {
+            clap_param_info_t inf; memset(&inf, 0, sizeof(inf));
+            if (!s.cpParams->get_info(s.cp, i, &inf)) continue;
+            wchar_t w[CLAP_NAME_SIZE]; MultiByteToWideChar(CP_UTF8, 0, inf.name, -1, w, CLAP_NAME_SIZE);
+            const int q = VstNameMatch(w, pname);
+            if (q > bestQ) { bestQ = q; best = inf; lstrcpynW(got, w, gotCap); }
+        }
+        if (!bestQ) return "That plugin has no setting by that name (ask for its list: plugin N params).";
+        if (best.flags & CLAP_PARAM_IS_READONLY) return "That setting can't be changed from outside.";
+        double v = pct ? best.min_value + Fclampd(val / 100.0, 0.0, 1.0) * (best.max_value - best.min_value)
+                       : Fclampd(val, best.min_value, best.max_value);
+        if (best.flags & CLAP_PARAM_IS_STEPPED) v = floor(v + 0.5);
+        VstPushEdit(s, (SB::uint32)best.id, v);
+        return nullptr;
+    }
+    if (!s.ctrl) return "That plugin has no settings it lets a host change.";
+    const SB::int32 n = s.ctrl->getParameterCount();
+    int bestQ = 0; SV::ParameterInfo best; memset(&best, 0, sizeof(best));
+    for (SB::int32 i = 0; i < n && bestQ < 3; i++) {
+        SV::ParameterInfo pi; memset(&pi, 0, sizeof(pi));
+        if (s.ctrl->getParameterInfo(i, pi) != SB::kResultOk) continue;
+        wchar_t t[129], st[129];
+        for (int c = 0; c < 128; c++) { t[c] = (wchar_t)pi.title[c]; st[c] = (wchar_t)pi.shortTitle[c]; }
+        t[128] = st[128] = 0;
+        const int q = Imax(VstNameMatch(t, pname), VstNameMatch(st, pname));
+        if (q > bestQ) { bestQ = q; best = pi; lstrcpynW(got, t, gotCap); }
+    }
+    if (!bestQ) return "That plugin has no setting by that name (ask for its list: plugin N params).";
+    if (best.flags & SV::ParameterInfo::kIsReadOnly) return "That setting can't be changed from outside.";
+    double norm = pct ? val / 100.0 : s.ctrl->plainParamToNormalized(best.id, val);
+    norm = Fclampd(norm, 0.0, 1.0);
+    if (best.stepCount > 0) norm = floor(norm * best.stepCount + 0.5) / best.stepCount;
+    s.ctrl->setParamNormalized(best.id, norm);  // (its window)
+    VstPushEdit(s, best.id, norm);              // (the sound)
+    return nullptr;
+}
+static int VstParamList(int k, char* out, int cap)   // ,"params":[{"name":..,"value":..,"min":..,"max":..},...] (what fits)
+{
+    VstUi& u = gVstUi[k]; VstSlot& s = gVst[k];
+    int o = snprintf(out, cap, ",\"params\":[");
+    auto one = [&](const wchar_t* w, double v, double lo, double hi) {
+        char n8[300], e[400]; WideCharToMultiByte(CP_UTF8, 0, w, -1, n8, 300, nullptr, nullptr); JsonEsc(n8, e, 400);
+        if (o > cap - 520) return false;
+        o += snprintf(out + o, cap - o, "%s{\"name\":\"%s\",\"value\":%g,\"min\":%g,\"max\":%g}", out[o - 1] == '[' ? "" : ",", e, v, lo, hi);
+        return true;
+    };
+    if (u.loaded && !u.dead && s.cp && s.cpParams) {
+        const uint32_t n = s.cpParams->count(s.cp);
+        for (uint32_t i = 0; i < n; i++) {
+            clap_param_info_t inf; memset(&inf, 0, sizeof(inf));
+            if (!s.cpParams->get_info(s.cp, i, &inf) || (inf.flags & (CLAP_PARAM_IS_READONLY | CLAP_PARAM_IS_HIDDEN))) continue;
+            double v = inf.default_value; s.cpParams->get_value(s.cp, inf.id, &v);
+            wchar_t w[CLAP_NAME_SIZE]; MultiByteToWideChar(CP_UTF8, 0, inf.name, -1, w, CLAP_NAME_SIZE);
+            if (!one(w, v, inf.min_value, inf.max_value)) break;
+        }
+    } else if (u.loaded && !u.dead && s.ctrl) {
+        const SB::int32 n = s.ctrl->getParameterCount();
+        for (SB::int32 i = 0; i < n; i++) {
+            SV::ParameterInfo pi; memset(&pi, 0, sizeof(pi));
+            if (s.ctrl->getParameterInfo(i, pi) != SB::kResultOk || (pi.flags & (SV::ParameterInfo::kIsReadOnly | SV::ParameterInfo::kIsHidden))) continue;
+            wchar_t t[129]; for (int c = 0; c < 128; c++) t[c] = (wchar_t)pi.title[c]; t[128] = 0;
+            const double v = s.ctrl->normalizedParamToPlain(pi.id, s.ctrl->getParamNormalized(pi.id));
+            if (!one(t, v, s.ctrl->normalizedParamToPlain(pi.id, 0.0), s.ctrl->normalizedParamToPlain(pi.id, 1.0))) break;
+        }
+    }
+    if (o < cap - 2) { out[o++] = ']'; out[o] = 0; }
+    return o;
+}
+static int VstChanOfRack(int k)                 // a Mixer rack slot: the channel it's on now (-1: none)
+{
+    if (k < VST_CH0 || k >= VST_OUT0) return -1;
+    const int r = (k - VST_CH0) / VST_PER;
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE && gVstChMap[c].load() == r + 1) return c;
+    return -1;
+}
+static void VstAddr(int k, char* out, int cap)  // how a command names slot k: "2", "channel Discord 1", "output 3 2"
+{
+    if (k < VST_MIC) { snprintf(out, cap, "%d", k + 1); return; }
+    if (k >= VST_OUT0 && k < VST_SYNTH) { snprintf(out, cap, "output %d %d", (k - VST_OUT0) / VST_PER + 1, (k - VST_OUT0) % VST_PER + 1); return; }
+    const int c = VstChanOfRack(k);
+    if (c < 0) { out[0] = 0; return; }
+    wchar_t l[64]; ChanLabel(c, l, 64);
+    char q[200]; CbQuote(l, q, 200);
+    snprintf(out, cap, "channel %s %d", q, (k - VST_CH0) % VST_PER + 1);
+}
+static int WsChanByText(const char* nm)         // a channel by its number or its name
+{
+    char* e = nullptr; const long n = strtol(nm, &e, 10);
+    if (e && e != nm && !*e) return n >= 1 && n <= CH_MAX && gCh[n - 1].type != CH_NONE ? (int)n - 1 : -1;
+    wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200);
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        wchar_t l[64]; ChanLabel(c, l, 64);
+        if (!lstrcmpiW(l, w) || !lstrcmpiW(gCh[c].src, w)) return c;
+    }
+    return -1;
+}
+static int WsFindPlugin(const char* m, const char** err)   // "n" (its row), "name" (the plugin's), "channel" / "output" (whose; else the mic's)
+{
+    double v; int t = -1;                       // -1 the mic, 0..7 a channel, 100 + k an output
+    char nm[200]; const char* p = m;
+    if (JsonNum(m, "output", &v)) {
+        const int o = (int)v - 1;
+        if (o < 0 || o >= gRows) { *err = "No output with that number."; return -1; }
+        t = 100 + o;
+    } else if (JsonString(m, "channel", &p, nm, 200) || (JsonNum(m, "channel", &v) && snprintf(nm, 200, "%d", (int)v) > 0)) {
+        t = WsChanByText(nm);
+        if (t < 0) { *err = "No Mixer channel with that name or number."; return -1; }
+    }
+    auto slotOf = [&](int j) { return t < 0 ? (j < VST_MIC ? j : -1) : j < VST_PER ? VstTargetSlot(t, j, false) : -1; };
+    const int rows = t < 0 ? VST_MIC : VST_PER;
+    int k = -1;
+    p = m;
+    if (JsonNum(m, "n", &v)) {
+        k = slotOf((int)v - 1);
+        if (k < 0 || !gVstUi[k].path[0]) { *err = "No plugin in that slot."; return -1; }
+        return k;
+    }
+    if (JsonString(m, "name", &p, nm, 200)) {   // by the plugin's name: on that channel / output, or anywhere
+        wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200);
+        int bestQ = 0;
+        auto look = [&](int s) { if (s < 0 || s == VST_SYNTH || !gVstUi[s].path[0]) return; const int q = VstNameMatch(gVstUi[s].name, w); if (q > bestQ) { bestQ = q; k = s; } };
+        if (t != -1 || JsonNum(m, "mic", &v)) for (int j = 0; j < rows; j++) look(slotOf(j));
+        else for (int s = 0; s < VST_SYNTH; s++) look(s);
+        if (k < 0) *err = "No plugin with that name.";
+        return k;
+    }
+    for (int j = 0; j < rows; j++) { const int s = slotOf(j); if (s >= 0 && gVstUi[s].path[0]) return s; }   // (just "which": its first)
+    *err = t < 0 ? "No plugin on your mic. Give its slot \"n\" or its \"name\"." : "No plugin there.";
+    return -1;
+}
 // ---- plain-word commands ----
 // "mute toggle", "lag 2000", "channel Spotify -12 mute", "scene Gaming": the same commands without the JSON, so a
 // Streamer.bot line needs no backslashes. Turned into the JSON form here; everything after that is shared.
@@ -20114,6 +20332,39 @@ static bool WsPlain(const char* m, char* out, int cap)   // false: no command in
         if (!strcmp(cmd, "scene") && n == 2 && WsIsNum(tk[1])) addRaw("n", tk[1].t); else if (rest[0]) addStr("name", rest);
     }
     else if (!strcmp(cmd, "tts") || !strcmp(cmd, "say")) { restText(rest, sizeof(rest)); if (rest[0]) addStr("text", rest); }
+    else if (!strcmp(cmd, "macro")) {           // (1.67.0) macro NAME [on | off | toggle]: the name is the rest of the line
+        restText(rest, sizeof(rest));
+        int l = (int)strlen(rest);
+        if (n > 2 && WsIsOnOff(tk[n - 1])) {    // (a last word on / off: what to do with a "while held" one)
+            const int wl = (int)strlen(tk[n - 1].t);
+            if (l > wl) { l -= wl; rest[l] = 0; while (l && (rest[l - 1] == ' ' || rest[l - 1] == '\t')) rest[--l] = 0;
+                          if (l >= 2 && (rest[0] == '"' || rest[0] == '\'') && rest[l - 1] == rest[0]) { rest[l - 1] = 0; memmove(rest, rest + 1, (size_t)l - 1); } }
+            onOff("on", tk[n - 1]);
+        }
+        if (n == 2 && WsIsNum(tk[1])) addRaw("n", tk[1].t); else if (rest[0]) addStr("name", rest);
+    }
+    else if (!strcmp(cmd, "plugin")) {         // (1.67.0) plugin [channel X | output N] (slot | name) [on|off|toggle] [mix 50] [set 'Name' value] [params]
+        int i = 1;
+        if (i < n && !tk[i].quoted && (!_stricmp(tk[i].t, "channel") || !_stricmp(tk[i].t, "output")) && i + 1 < n) {
+            if (!_stricmp(tk[i].t, "output")) addRaw("output", WsIsNum(tk[i + 1]) ? tk[i + 1].t : "0"); else addStr("channel", tk[i + 1].t);
+            i += 2;
+        } else if (i < n && !tk[i].quoted && !_stricmp(tk[i].t, "mic")) { addRaw("mic", "1"); i++; }
+        auto word = [&](int j, const char* w) { return j < n && !tk[j].quoted && !_stricmp(tk[j].t, w); };
+        if (i < n && !WsIsOnOff(tk[i]) && !word(i, "mix") && !word(i, "set") && !word(i, "params") && !word(i, "list")) {
+            if (WsIsNum(tk[i])) addRaw("n", tk[i].t); else addStr("name", tk[i].t);
+            i++;
+        }
+        for (; i < n; i++) {
+            if (WsIsOnOff(tk[i])) onOff("on", tk[i]);
+            else if (word(i, "mix") && i + 1 < n && WsIsNum(tk[i + 1])) { addRaw("mix", tk[i + 1].t); i++; }
+            else if (word(i, "params") || word(i, "list")) addRaw("list", "true");
+            else if (word(i, "set") && i + 2 < n) {
+                addStr("param", tk[i + 1].t);
+                if (WsIsNum(tk[i + 2])) addRaw("value", tk[i + 2].t); else addStr("value", tk[i + 2].t);   // ("50%": of its range)
+                i += 2;
+            }
+        }
+    }
     else if (!strcmp(cmd, "auth")) { restText(rest, sizeof(rest)); addStr("password", rest); }
     else if (!strcmp(cmd, "lag")) { if (n > 1) { if (WsIsNum(tk[1])) addRaw("ms", tk[1].t); else if (WsIsOnOff(tk[1])) onOff("on", tk[1]); } }
     else if (!strcmp(cmd, "pad") || !strcmp(cmd, "sound") || !strcmp(cmd, "playclip")) { if (n > 1 && WsIsNum(tk[1])) addRaw("n", tk[1].t); }
@@ -20343,7 +20594,49 @@ static void WsExec(int id, const char* m)
         if (JsonOnOff(m, "mute") >= 0) { WsBool(m, "mute", gOutMute[k], &b); gOutMute[k] = b; }
         MixerRedraw(); WsReply(id, what, nullptr); return;
     }
-    WsReply(id, what, "Unknown command. Try ping, status, mute, lag, fx, character, profile, tts, pad, clip, channel, output, scene or chatmix.");
+    if (!strcmp(what, "macro")) {               // (1.67.0) {"do":"macro","name":"Intro"} / "n": 2; "on": a "while held" one: on / off
+        int k = -1;
+        if (JsonNum(m, "n", &v)) k = (int)v - 1;
+        else { char nm[200]; const char* np = m; if (JsonString(m, "name", &np, nm, 200)) { wchar_t w[200]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 200); k = MacroFind(w); } }
+        WsReply(id, what, MacroRemote(k, JsonOnOff(m, "on"))); return;
+    }
+    if (!strcmp(what, "plugin")) {              // (1.67.0) {"do":"plugin","n":1,"on":true,"mix":50,"param":"Threshold","value":-20,"list":true}
+        if (!gFeatVst) { WsReply(id, what, "Plugins are off (Settings > Features)."); return; }
+        const char* err = nullptr;
+        const int k = WsFindPlugin(m, &err);
+        if (k < 0) { WsReply(id, what, err ? err : "No plugin there."); return; }
+        bool did = false;
+        if (JsonOnOff(m, "list") == 1) {
+            static char r[16384];
+            char n8[200], e[300]; WideCharToMultiByte(CP_UTF8, 0, gVstUi[k].name, -1, n8, 200, nullptr, nullptr); JsonEsc(n8, e, 300);
+            int o = snprintf(r, sizeof(r), "{\"ok\":true,\"do\":\"plugin\",\"name\":\"%s\",\"on\":%s,\"mix\":%d", e,
+                             gVstUi[k].want ? "true" : "false", (1000 - gVst[k].dryPm.load() + 5) / 10);
+            if (!gVstUi[k].loaded) o += snprintf(r + o, sizeof(r) - o, ",\"note\":\"not loaded: switch it on to see its settings\"");
+            o += VstParamList(k, r + o, (int)sizeof(r) - o - 2);
+            r[o++] = '}'; r[o] = 0;
+            WsQueue(id, r); return;
+        }
+        if (JsonOnOff(m, "on") >= 0) {
+            WsBool(m, "on", gVstUi[k].want, &b);
+            VstSetOn(k, b, true);
+            if (b && !gVstUi[k].want) { WsReply(id, what, "That plugin wouldn't load."); return; }
+            did = true;
+        }
+        if (JsonNum(m, "mix", &v)) { gVst[k].dryPm = 1000 - 10 * Iclamp((int)lround(v), 0, 100); VstRefreshUi(); did = true; }
+        char pn[200]; const char* pp = m;
+        if (JsonString(m, "param", &pp, pn, 200)) {
+            char vs[64] = ""; const char* vp = m; double val = 0; bool pct = false;
+            if (JsonString(m, "value", &vp, vs, 64)) { val = atof(vs); pct = strchr(vs, '%') != nullptr; }
+            else if (!JsonNum(m, "value", &val)) { WsReply(id, what, "Give the setting's \"value\" (a number, or like \"50%\")."); return; }
+            wchar_t w[200], got[130]; MultiByteToWideChar(CP_UTF8, 0, pn, -1, w, 200);
+            const char* pe = VstParamSet(k, w, val, pct, got, 130);
+            if (pe) { WsReply(id, what, pe); return; }
+            did = true;
+        }
+        if (!did) VstSetOn(k, !gVstUi[k].want, true);   // (just which one: on / off)
+        WsReply(id, what, nullptr); return;
+    }
+    WsReply(id, what, "Unknown command. Try ping, status, mute, lag, fx, character, profile, tts, pad, clip, channel, output, scene, chatmix, macro or plugin.");
 }
 static void WsEvents()                          // (50 ms, while anything is connected) tell them what changed
 {
@@ -20488,6 +20781,14 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    scene Gaming   \x2014   switch to a scene\n"
         L"    chatmix -50   \x2014   -100 only game .. 100 only chat\n"
         L"    talkback on 2   \x2014   only output 2 hears your mic;  talkback off\n\n"
+        L"Macros (bottom bar > Macros)\n"
+        L"    macro Intro   \x2014   run a macro;  a \"while held\" one: macro Intro on  /  off  (or toggle)\n\n"
+        L"Plugins (Mic > Plugins, or a Mixer channel's / output's FX)\n"
+        L"    plugin 1 on   \x2014   your mic's plugin 1 (off, toggle);  by name anywhere:  plugin OTT off\n"
+        L"    plugin channel Discord 1 off   \x2014   a channel's plugin;  an output's:  plugin output 2 1 toggle\n"
+        L"    plugin 1 mix 50   \x2014   its Mix knob (%%)\n"
+        L"    plugin 1 set 'Threshold' -20   \x2014   one of its settings, in its own units (or '50%%' of its range)\n"
+        L"    plugin 1 params   \x2014   replies with its settings' names and values\n\n"
         L"Music (Mic > Music)\n"
         L"    music toggle   \x2014   play / pause (also: play, pause, next, prev, stop);  music volume 60\n\n"
         L"Stream (Settings > Stream)\n"
@@ -21405,6 +21706,7 @@ static void BugInfoBuild(wchar_t* o, int cap)
         }
     }
     BugAdd(o, cap, L"Recorder: %ls", gRcd ? L"recording" : L"idle");
+    BugMacros(o, cap);
     {
         static const wchar_t* LS[5] = { L"empty", L"recording", L"playing", L"adding a layer", L"stopped" };
         BugAdd(o, cap, L"Looper: %ls, %d layer(s), %d ms; beatbox %ls (mode %d, kit %d, sensitivity %d, volume %d, taught %u)",
@@ -21930,6 +22232,7 @@ static void KeyRowsBuild()
         const int di = DesignOf(r.btn);
         if (di >= 0 && gDesign[di].page >= 0) { r.page = gDesign[di].page; r.sub = gDesign[di].sub; LocText(r.page, r.sub, gDesign[di].sec, r.where, 110); }
         else if (slot == SLOT_RECORD) { r.page = -2; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"The Recorder window (bottom bar)", 110); }
+        else if (IsMacroSlot(slot)) { r.page = -6; r.sub = slot - SLOT_MACRO0; r.btn = nullptr; lstrcpynW(r.where, L"The Macros window (bottom bar)", 110); }
         else if (slot == SLOT_VST0 + VST_SYNTH) { r.page = PAGE_FX; r.sub = 1; r.btn = nullptr; lstrcpynW(r.where, L"Voice FX > Tune > Synth plugin", 110); }
         else if (slot >= SLOT_VST0) { r.page = PAGE_MIXER; r.sub = 0; r.btn = nullptr; lstrcpynW(r.where, L"Mixer > a channel's or output's plugins (FX)", 110); }
         else { r.page = -1; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"", 110); }
@@ -22073,6 +22376,7 @@ static void KeysListShow()
     if (gKeysGo >= 0 && gKeysGo < gKeyRowN) {
         const KeyRow r = gKeyRows[gKeysGo];
         if (r.page == -2) RcdShow();
+        else if (r.page == -6) { gMacroSel = r.sub; MacroShow(); }
         else if (r.page >= 0) {
             wchar_t b[96]; swprintf(b, 96, L"Hotkey: %ls", r.key);
             GoTo(r.page, r.sub, r.btn, r.what, b);
@@ -22083,16 +22387,17 @@ static void KeysListShow()
 // ---- placing the bar ----
 static void PlaceStrip()                        // at the bottom of the window, the whole width; not in the compact window
 {
-    HWND e = GetDlgItem(gWnd, IDC_SEARCH), b = GetDlgItem(gWnd, IDC_KEYSLIST), s = GetDlgItem(gWnd, IDC_ONSTRIP), rb = GetDlgItem(gWnd, IDC_RCDBTN);
-    if (!e || !b || !s || !rb) return;
-    if (gCompact) { ShowWindow(e, SW_HIDE); ShowWindow(b, SW_HIDE); ShowWindow(s, SW_HIDE); ShowWindow(rb, SW_HIDE); SearchHide(); return; }
+    HWND e = GetDlgItem(gWnd, IDC_SEARCH), b = GetDlgItem(gWnd, IDC_KEYSLIST), s = GetDlgItem(gWnd, IDC_ONSTRIP), rb = GetDlgItem(gWnd, IDC_RCDBTN), mb = GetDlgItem(gWnd, IDC_MACROBTN);
+    if (!e || !b || !s || !rb || !mb) return;
+    if (gCompact) { ShowWindow(e, SW_HIDE); ShowWindow(b, SW_HIDE); ShowWindow(s, SW_HIDE); ShowWindow(rb, SW_HIDE); ShowWindow(mb, SW_HIDE); SearchHide(); return; }
     RECT c; GetClientRect(gWnd, &c);
     const int y = c.bottom - SC(STRIP_H) + SC(2), x0 = SC(14);
     PlaceFree(e, x0, y, SC(166), SC(24));
     PlaceFree(b, x0 + SC(172), y, SC(80), SC(24));
     PlaceFree(rb, x0 + SC(256), y, SC(84), SC(24));
-    PlaceFree(s, x0 + SC(348), y, Imax(SC(60), (int)c.right - SC(14) - (x0 + SC(348))), SC(24));
-    ShowWindow(e, SW_SHOWNA); ShowWindow(b, SW_SHOWNA); ShowWindow(s, SW_SHOWNA); ShowWindow(rb, SW_SHOWNA);
+    PlaceFree(mb, x0 + SC(344), y, SC(76), SC(24));
+    PlaceFree(s, x0 + SC(428), y, Imax(SC(60), (int)c.right - SC(14) - (x0 + SC(428))), SC(24));
+    ShowWindow(e, SW_SHOWNA); ShowWindow(b, SW_SHOWNA); ShowWindow(s, SW_SHOWNA); ShowWindow(rb, SW_SHOWNA); ShowWindow(mb, SW_SHOWNA);
 }
 
 // ---- text that doesn't fit, after all the fitting: a list (right-click the version number) ----
@@ -22891,6 +23196,7 @@ static void VcActionName(int slot, wchar_t* out, int cap)
     if (slot == SLOT_BLLIVE) { lstrcpynW(out, L"Live bleep (while held)", cap); return; }
     if (slot == SLOT_MUSPLAY) { lstrcpynW(out, L"Music: play / pause", cap); return; }
     if (slot == SLOT_MUSNEXT) { lstrcpynW(out, L"Music: next song", cap); return; }
+    if (IsMacroSlot(slot)) { MacroLabel(slot - SLOT_MACRO0, out, cap); return; }
     if (slot == SLOT_RECORD) { lstrcpynW(out, L"Recorder: start / stop", cap); return; }
     if (slot == SLOT_MUTE) { lstrcpynW(out, L"Mute / unmute mic", cap); return; }
     if (slot > 0 && slot < FX_KEY_SLOTS) { swprintf(out, cap, L"%ls on / off (Voice FX)", gFxGroups[slot - 1].title); return; }
@@ -22915,6 +23221,7 @@ static int VcActions(int* out, int cap)          // the actions a command can pi
     if (gFeatVst) for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0]) add(SLOT_VST0 + k);
     add(SLOT_RECORD); add(SLOT_SPTTS);
     add(SLOT_MUSPLAY); add(SLOT_MUSNEXT);       // (Mic > Music: no feature switch since 1.63.0)
+    for (int i = 0; i < gMacroN; i++) add(SLOT_MACRO0 + i);   // (1.67.0)
     return n;
 }
 static void VoiceCmdRun(int i)
@@ -22927,6 +23234,480 @@ static void VoiceCmdRun(int i)
     lstrcpynW(gSpHeard, t, 200);
     wchar_t o[64]; swprintf(o, 64, L"Voice: %ls", a); ShowOsd(o, true);
     SpeechStatus();
+}
+
+// ======================= macros (1.67.0) =======================
+// A macro is a list of steps: any action a hotkey can do (pressed for it, as a voice command does), a wait, or a profile.
+// "Run once" does them top to bottom. "While held" does them, holds down the ones that only work while held (push-to-talk,
+// bleep, an effect in Hold mode...), and when you let go it lets those go and undoes the rest: switches go back to how they
+// were, volume steps go the other way, a scene goes back to the one before. From a voice command, Streamer.bot or a tap on
+// the phone (nothing to hold) a "while held" macro is on / off instead: the first time does it, the next undoes it.
+#define MACRO_STEPS 24
+struct MacroStep { short slot; int ms; wchar_t prof[64]; };   // slot >= 0: an action; -1: wait ms; -2: load the profile named prof
+struct Macro { wchar_t name[48]; int mode; int n; MacroStep st[MACRO_STEPS]; };   // mode 0 run once, 1 while held
+static Macro gMacro[MACRO_MAX];
+struct MacroDone { short slot; signed char kind; signed char before; short prevScene; };   // kind: 0 switch, 1 the other way, 2 scene, 3 held, 4 nothing
+struct MacroRun { bool on, undoing; int step, nd, ui; DWORD waitUntil, stuck; MacroDone d[MACRO_STEPS]; };
+static MacroRun gMRun[MACRO_MAX];
+static HWND gMacroWnd = nullptr;
+static void MacroWndSync();
+
+static void MacroLabel(int i, wchar_t* out, int cap)
+{
+    if (i >= 0 && i < gMacroN && gMacro[i].name[0]) _snwprintf(out, cap - 1, L"Macro \"%s\"", gMacro[i].name);
+    else _snwprintf(out, cap - 1, L"Macro %d", i + 1);
+    out[cap - 1] = 0;
+}
+static int MacroFind(const wchar_t* name)       // by name (any case), or its number
+{
+    for (int i = 0; i < gMacroN; i++) if (!lstrcmpiW(gMacro[i].name, name)) return i;
+    const int n = _wtoi(name); return n >= 1 && n <= gMacroN ? n - 1 : -1;
+}
+static bool MacroHoldSlot(int s)                // only does something while it's held down
+{
+    if (s == SLOT_PTT || s == SLOT_DIVE || s == SLOT_BLEEP || s == SLOT_BLLIVE || s == SLOT_TALKBACK) return true;
+    if (s < FX_KEY_SLOTS) return gFxHold[s];
+    if (s >= SLOT_MIX0 && s < SLOT_MIXOUT0) return (s - SLOT_MIX0) % MIXA_N == MIXA_HOLD;
+    if (s >= SLOT_VST0 && s < SLOT_VST_END) return gVstUi[s - SLOT_VST0].keyMode != 0;
+    return false;
+}
+static int MacroState(int s)                    // a switch: 1 on, 0 off, -1 can't tell
+{
+    if (s == SLOT_MUTE) return gMicMuted ? 1 : 0;
+    if (s == 0) return gFxOn ? 1 : 0;
+    if (s > 0 && s < FX_KEY_SLOTS) return *gFxGroups[s - 1].on && gFxOn ? 1 : 0;
+    if (s >= SLOT_MIX0 && s < SLOT_MIXOUT0) {
+        const int c = (s - SLOT_MIX0) / MIXA_N, a = (s - SLOT_MIX0) % MIXA_N;
+        return a == MIXA_MUTE ? gCh[c].mute : a == MIXA_SOLO ? gCh[c].solo : a == MIXA_DUCK ? gCh[c].duck : -1;
+    }
+    if (s >= SLOT_MIXOUT0 && s < SLOT_CHATG) { const int k = (s - SLOT_MIXOUT0) / MIXO_N; return (s - SLOT_MIXOUT0) % MIXO_N == MIXO_MUTE ? gOutMute[k] : -1; }
+    if (s >= SLOT_VST0 && s < SLOT_VST_END) return gVstUi[s - SLOT_VST0].want ? 1 : 0;
+    if (s == SLOT_RECORD) return gRcd ? 1 : 0;
+    if (s == SLOT_BEATBOX) return gBbOn.load() ? 1 : 0;
+    if (s == SLOT_SPTTS) return gSpTts ? 1 : 0;
+    if (s == SLOT_MUSPLAY) return gMusPlay.load() ? 1 : 0;
+    return -1;
+}
+static int MacroUndoKind(int s, int* other)     // how a step is undone; *other: the key that goes the other way
+{
+    *other = -1;
+    if (s == SLOT_MUTE || s < FX_KEY_SLOTS || (s >= SLOT_FADE0 && s < SLOT_FADE0 + CH_MAX) || (s >= SLOT_VST0 && s < SLOT_VST_END) ||
+        s == SLOT_RECORD || s == SLOT_BEATBOX || s == SLOT_SPTTS || s == SLOT_MUSPLAY) return 0;
+    if (s >= SLOT_MIX0 && s < SLOT_MIXOUT0) {
+        const int a = (s - SLOT_MIX0) % MIXA_N;
+        if (a == MIXA_UP || a == MIXA_DOWN) { *other = s + (a == MIXA_UP ? 1 : -1); return 1; }
+        return a == MIXA_MUTE || a == MIXA_SOLO || a == MIXA_DUCK ? 0 : 4;
+    }
+    if (s >= SLOT_MIXOUT0 && s < SLOT_CHATG) {
+        const int a = (s - SLOT_MIXOUT0) % MIXO_N;
+        if (a == MIXO_UP || a == MIXO_DOWN) { *other = s + (a == MIXO_UP ? 1 : -1); return 1; }
+        return 0;
+    }
+    if (s == SLOT_CHATG || s == SLOT_CHATC) { *other = s == SLOT_CHATG ? SLOT_CHATC : SLOT_CHATG; return 1; }
+    if (s >= SLOT_SCENE0 && s < SLOT_SCENE0 + SCENE_MAX) return 2;
+    return 4;
+}
+static bool MacroKeyFree(int s) { return s >= 0 && s < KEY_SLOTS && !gVoiceTap[s] && !gFxKeyWasDown[s]; }
+static void MacroUndoStart(int i)
+{
+    MacroRun& r = gMRun[i];
+    r.undoing = true; r.ui = r.nd - 1; r.waitUntil = 0;
+}
+static void MacroPress(int i, bool tapped)
+{
+    if (i < 0 || i >= gMacroN || !gMacro[i].n) return;
+    MacroRun& r = gMRun[i];
+    if (r.on) {                                 // already going
+        if (gMacro[i].mode == 1 && tapped && !r.undoing) MacroUndoStart(i);   // (a tap on a "while held" one: off again)
+        return;
+    }
+    r = MacroRun(); r.on = true;
+    wchar_t t[80]; MacroLabel(i, t, 80); ShowOsd(t, true);
+}
+static void MacroRelease(int i)
+{
+    if (i < 0 || i >= MACRO_MAX) return;
+    MacroRun& r = gMRun[i];
+    if (r.on && !r.undoing && i < gMacroN && gMacro[i].mode == 1) MacroUndoStart(i);
+}
+static const char* MacroRemote(int k, int on)   // from Streamer.bot / the phone: on 1 / 0, else (-1, 2) toggle; nullptr: done
+{
+    if (k < 0 || k >= gMacroN) return "No macro with that \"name\" or \"n\".";
+    if (!gMacro[k].n) return "That macro has no steps yet.";
+    if (gMacro[k].mode == 1 && on == 0) { if (gMRun[k].on && !gMRun[k].undoing) MacroUndoStart(k); }
+    else if (gMacro[k].mode == 1 && on == 1) { if (!gMRun[k].on) MacroPress(k, true); }
+    else MacroPress(k, true);                   // (run once; or a "while held" one: on, or off again)
+    return nullptr;
+}
+static void BugMacros(wchar_t* o, int cap)      // (bug info)
+{
+    int run = 0; for (int i = 0; i < gMacroN; i++) run += gMRun[i].on;
+    BugAdd(o, cap, L"Macros: %d (%d running)", gMacroN, run);
+    for (int i = 0; i < gMacroN; i++) BugAdd(o, cap, L"  macro %d: %d step(s), %ls, %ls", i + 1, gMacro[i].n, gMacro[i].mode ? L"while held" : L"run once",
+                                             gFxKeys[SLOT_MACRO0 + i][0] ? L"has a key" : L"no key");
+}
+static void MacroStopAll()                      // (the list changed under them)
+{
+    for (int i = 0; i < MACRO_MAX; i++) {
+        MacroRun& r = gMRun[i];
+        for (int j = 0; j < r.nd; j++) if (r.d[j].kind == 3 && gMacroDown[r.d[j].slot]) gMacroDown[r.d[j].slot]--;
+        r = MacroRun();
+    }
+}
+static void MacroTick()                         // every key poll (20 ms): each running macro does what it can now
+{
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < MACRO_MAX; i++) {
+        MacroRun& r = gMRun[i];
+        if (!r.on) continue;
+        if (i >= gMacroN) { r = MacroRun(); continue; }
+        const Macro& m = gMacro[i];
+        if (r.undoing) {                        // last step first
+            while (r.ui >= 0) {
+                MacroDone& d = r.d[r.ui];
+                if (d.kind == 3) { if (gMacroDown[d.slot]) gMacroDown[d.slot]--; }
+                else if (d.kind == 0) {
+                    const int st = MacroState(d.slot);
+                    if (st < 0 || st != d.before) { if (!MacroKeyFree(d.slot)) break; gVoiceTap[d.slot] = 2; }
+                }
+                else if (d.kind == 1) { int o; MacroUndoKind(d.slot, &o); if (o >= 0) { if (!MacroKeyFree(o)) break; gVoiceTap[o] = 2; } }
+                else if (d.kind == 2) { if (!MacroKeyFree(d.slot)) break; if (d.prevScene >= 0 && d.prevScene < gSceneN) SceneApply(d.prevScene); }
+                r.ui--;
+            }
+            if (r.ui < 0) r = MacroRun();
+            continue;
+        }
+        while (r.step < m.n) {
+            const MacroStep& s = m.st[r.step];
+            if (s.slot == -1) {                 // a wait
+                if (!r.waitUntil) r.waitUntil = now + (DWORD)Iclamp(s.ms, 0, 600000);
+                if ((int)(now - r.waitUntil) < 0) break;
+                r.waitUntil = 0; r.step++; continue;
+            }
+            if (s.slot == -2) {                 // a profile, by name
+                for (int k = 0; k < gProfCount; k++) if (!lstrcmpiW(gProfNames[k], s.prof)) { ProfileLoad(k, true); break; }
+                r.step++; continue;
+            }
+            const int k = s.slot;
+            if (k < 0 || k >= KEY_SLOTS || IsMacroSlot(k)) { r.step++; continue; }
+            MacroDone d = { (short)k, 4, -1, -1 };
+            const bool hold = m.mode == 1 && MacroHoldSlot(k);
+            if (!hold && (gMacroDown[k] || (!MacroKeyFree(k) && r.stuck && now - r.stuck > 2000))) { r.stuck = 0; r.step++; continue; }   // (held by a macro, or its key held down for 2 s: skip it)
+            if (!hold && !MacroKeyFree(k)) { if (!r.stuck) r.stuck = now | 1; break; }   // (pressed a moment ago: next poll)
+            r.stuck = 0;
+            if (hold) { gMacroDown[k]++; d.kind = 3; }
+            else {
+                int o; d.kind = (signed char)MacroUndoKind(k, &o);
+                if (d.kind == 0) d.before = (signed char)MacroState(k);
+                if (d.kind == 2) d.prevScene = (short)gSceneCur;
+                gVoiceTap[k] = 2;
+            }
+            if (r.nd < MACRO_STEPS) r.d[r.nd++] = d;
+            r.step++;
+        }
+        if (r.step >= m.n && m.mode == 0) r = MacroRun();   // (run once: done; "while held" waits for the let-go)
+    }
+}
+
+// ---- saved in [settings]: macro_count, macroN_name / _mode / _steps ("mute_hotkey|wait:500|profile:Gaming|...") ----
+static int SlotByIniName(const wchar_t* n)
+{
+    for (int s = 0; s < KEY_SLOTS; s++) { const wchar_t* k = FxKeyIniName(s); if (k && !lstrcmpiW(k, n)) return s; }
+    return -1;
+}
+static void MacrosLoad()
+{
+    gMacroN = Iclamp(GetPrivateProfileIntW(L"settings", L"macro_count", 0, gIni), 0, MACRO_MAX);
+    for (int i = 0; i < gMacroN; i++) {
+        Macro& m = gMacro[i]; m = Macro();
+        wchar_t k[40]; static wchar_t v[4000];
+        wsprintfW(k, L"macro%d_name", i + 1); GetPrivateProfileStringW(L"settings", k, L"", m.name, 48, gIni);
+        if (!m.name[0]) wsprintfW(m.name, L"Macro %d", i + 1);
+        wsprintfW(k, L"macro%d_mode", i + 1); m.mode = Iclamp(GetPrivateProfileIntW(L"settings", k, 0, gIni), 0, 1);
+        wsprintfW(k, L"macro%d_steps", i + 1); GetPrivateProfileStringW(L"settings", k, L"", v, 4000, gIni);
+        for (wchar_t* p = v; *p && m.n < MACRO_STEPS; ) {
+            wchar_t* e = wcschr(p, L'|'); if (e) *e = 0;
+            MacroStep& st = m.st[m.n];
+            if (!wcsncmp(p, L"wait:", 5)) { st.slot = -1; st.ms = Iclamp(_wtoi(p + 5), 0, 600000); m.n++; }
+            else if (!wcsncmp(p, L"profile:", 8)) { st.slot = -2; lstrcpynW(st.prof, p + 8, 64); m.n++; }
+            else { const int s = SlotByIniName(p); if (s >= 0 && !IsMacroSlot(s)) { st.slot = (short)s; m.n++; } }
+            if (!e) break;
+            p = e + 1;
+        }
+    }
+}
+static void MacrosSave()
+{
+    SaveInt(L"macro_count", gMacroN);
+    for (int i = 0; i < MACRO_MAX; i++) {
+        wchar_t k[40]; static wchar_t v[4000];
+        wsprintfW(k, L"macro%d_name", i + 1);  IniSet(k, i < gMacroN ? gMacro[i].name : nullptr);
+        wsprintfW(k, L"macro%d_mode", i + 1);  IniSet(k, i < gMacroN ? (gMacro[i].mode ? L"1" : L"0") : nullptr);
+        wsprintfW(k, L"macro%d_steps", i + 1);
+        if (i >= gMacroN) { IniSet(k, nullptr); continue; }
+        int n = 0; v[0] = 0;
+        for (int j = 0; j < gMacro[i].n && n < 3800; j++) {
+            const MacroStep& st = gMacro[i].st[j];
+            if (n) v[n++] = L'|';
+            if (st.slot == -1) n += wsprintfW(v + n, L"wait:%d", st.ms);
+            else if (st.slot == -2) { wchar_t pn[64]; lstrcpynW(pn, st.prof, 64); for (wchar_t* q = pn; *q; q++) if (*q == L'|') *q = L'/'; n += wsprintfW(v + n, L"profile:%s", pn); }
+            else { const wchar_t* kn = FxKeyIniName(st.slot); n += wsprintfW(v + n, L"%s", kn ? kn : L"?"); }
+            v[n] = 0;
+        }
+        IniSet(k, v);
+    }
+}
+
+// ---- the Macros window (bottom bar > Macros...) ----
+enum { IDC_MC_LIST = 4900, IDC_MC_NEW, IDC_MC_DEL, IDC_MC_NAME, IDC_MC_MODE, IDC_MC_KEY, IDC_MC_STEPS, IDC_MC_ADD, IDC_MC_WAIT,
+       IDC_MC_UP, IDC_MC_DOWN, IDC_MC_REM, IDC_MC_TEST, IDC_MC_STAT, IDC_MC_DUP };
+static int MacroKeyButton(int i) { return gMacroWnd && i == gMacroSel ? IDC_MC_KEY : 0; }
+static void MacroStepText(const Macro& m, int j, wchar_t* out, int cap)
+{
+    const MacroStep& st = m.st[j];
+    wchar_t a[120];
+    if (st.slot == -1) { if (st.ms % 1000 == 0) swprintf(a, 120, L"Wait %d s", st.ms / 1000); else swprintf(a, 120, L"Wait %.1f s", st.ms / 1000.0); }
+    else if (st.slot == -2) swprintf(a, 120, L"Profile \"%ls\"", st.prof);
+    else { VcActionName(st.slot, a, 120); if (m.mode == 1 && MacroHoldSlot(st.slot)) lstrcatW(a, L"  (held)"); }
+    swprintf(out, cap, L"%d.  %ls", j + 1, a);
+}
+static void MacroWndSync()                      // the window shows gMacroSel
+{
+    if (!gMacroWnd) return;
+    HWND l = GetDlgItem(gMacroWnd, IDC_MC_LIST);
+    SendMessageW(l, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gMacroN; i++) SendMessageW(l, LB_ADDSTRING, 0, (LPARAM)gMacro[i].name);
+    if (gMacroSel >= gMacroN) gMacroSel = gMacroN - 1;
+    SendMessageW(l, LB_SETCURSEL, gMacroSel, 0);
+    const bool has = gMacroSel >= 0;
+    for (int id : { IDC_MC_DEL, IDC_MC_DUP, IDC_MC_NAME, IDC_MC_MODE, IDC_MC_KEY, IDC_MC_STEPS, IDC_MC_ADD, IDC_MC_WAIT, IDC_MC_UP, IDC_MC_DOWN, IDC_MC_REM, IDC_MC_TEST })
+        EnableWindow(GetDlgItem(gMacroWnd, id), has);
+    HWND sl = GetDlgItem(gMacroWnd, IDC_MC_STEPS);
+    const int keep = (int)SendMessageW(sl, LB_GETCURSEL, 0, 0);
+    SendMessageW(sl, LB_RESETCONTENT, 0, 0);
+    if (!has) { SetDlgItemTextW(gMacroWnd, IDC_MC_NAME, L""); SetDlgItemTextW(gMacroWnd, IDC_MC_KEY, L"Set hotkey"); return; }
+    const Macro& m = gMacro[gMacroSel];
+    wchar_t cur[48]; GetDlgItemTextW(gMacroWnd, IDC_MC_NAME, cur, 48);
+    if (lstrcmpW(cur, m.name)) SetDlgItemTextW(gMacroWnd, IDC_MC_NAME, m.name);
+    SendDlgItemMessageW(gMacroWnd, IDC_MC_MODE, CB_SETCURSEL, m.mode, 0);
+    for (int j = 0; j < m.n; j++) { wchar_t t[160]; MacroStepText(m, j, t, 160); SendMessageW(sl, LB_ADDSTRING, 0, (LPARAM)t); }
+    if (keep >= 0 && keep < m.n) SendMessageW(sl, LB_SETCURSEL, keep, 0);
+    wchar_t k[100]; FxKeyButtonText(SLOT_MACRO0 + gMacroSel, k, 100); SetDlgItemTextW(gMacroWnd, IDC_MC_KEY, k);
+}
+static void MacroActionMenu(HMENU m)            // every action, grouped: item id 10000 + its key slot, profiles 20000 + index
+{
+    auto item = [&](HMENU h, int s) { wchar_t t[120]; VcActionName(s, t, 120); AppendMenuW(h, MF_STRING, 10000 + s, t); };
+    auto sub = [&](const wchar_t* name) { HMENU h = CreatePopupMenu(); AppendMenuW(m, MF_POPUP, (UINT_PTR)h, name); return h; };
+    HMENU mic = sub(L"Mic");
+    item(mic, SLOT_MUTE); item(mic, SLOT_PTT); item(mic, SLOT_BLLIVE);
+    if (gFeatSpeech) { item(mic, SLOT_BLEEP); item(mic, SLOT_SPTTS); }
+    if (gFeatFx) {
+        HMENU fx = sub(L"Voice FX");
+        item(fx, 0); for (int g = 0; g < FX_GROUPS; g++) item(fx, 1 + g);
+        item(fx, SLOT_TAPESTOP); item(fx, SLOT_DIVE);
+    }
+    if (gFeatLag) { HMENU lg = sub(L"Lag effect"); item(lg, SLOT_REWIND); item(lg, SLOT_REPEAT); }
+    if (gFeatSound) {
+        HMENU sb = sub(L"Soundboard");
+        for (int i = 0; i < PADS; i++) item(sb, SLOT_PAD0 + i);
+        item(sb, SLOT_PADBANK); for (int s = SLOT_LPREC; s <= SLOT_BEATBOX; s++) item(sb, s);
+    }
+    if (gFeatClips) { HMENU cl = sub(L"Clips"); item(cl, SLOT_CLIPNOW); for (int i = 0; i < CLIPS; i++) item(cl, SLOT_CLIP0 + i); }
+    HMENU mx = sub(L"Mixer");
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) {
+        wchar_t nm[48]; ChanLabel(c, nm, 48);
+        HMENU ch = CreatePopupMenu(); AppendMenuW(mx, MF_POPUP, (UINT_PTR)ch, nm);
+        for (int a = 0; a < MIXA_N; a++) item(ch, SLOT_MIX0 + c * MIXA_N + a);
+        item(ch, SLOT_FADE0 + c);
+    }
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) {
+        wchar_t nm[48], t[60]; OutName(k, nm, 48); swprintf(t, 60, L"Output %ls", nm);
+        HMENU oh = CreatePopupMenu(); AppendMenuW(mx, MF_POPUP, (UINT_PTR)oh, t);
+        for (int a = 0; a < MIXO_N; a++) item(oh, SLOT_MIXOUT0 + k * MIXO_N + a);
+    }
+    item(mx, SLOT_CHATG); item(mx, SLOT_CHATC); item(mx, SLOT_TALKBACK);
+    if (gSceneN) { HMENU sc = CreatePopupMenu(); AppendMenuW(mx, MF_POPUP, (UINT_PTR)sc, L"Scenes"); for (int i = 0; i < gSceneN; i++) item(sc, SLOT_SCENE0 + i); }
+    if (gFeatVst) {
+        HMENU pl = sub(L"Plugins"); bool any = false;
+        for (int k = 0; k < VST_SLOTS; k++) if (gVstUi[k].path[0] && k != VST_SYNTH) {
+            wchar_t t[140]; swprintf(t, 140, L"%ls on / off", gVstUi[k].name); AppendMenuW(pl, MF_STRING, 10000 + SLOT_VST0 + k, t); any = true;
+        }
+        if (!any) AppendMenuW(pl, MF_STRING | MF_GRAYED, 0, L"(no plugins loaded)");
+    }
+    HMENU mu = sub(L"Music and recorder"); item(mu, SLOT_MUSPLAY); item(mu, SLOT_MUSNEXT); item(mu, SLOT_RECORD);
+    HMENU pr = sub(L"Profiles");
+    item(pr, SLOT_PROFNEXT);
+    for (int i = 0; i < gProfCount; i++) { wchar_t t[90]; swprintf(t, 90, L"Load \"%ls\"", gProfNames[i]); AppendMenuW(pr, MF_STRING, 20000 + i, t); }
+}
+static void MacroChanged() { MacroWndSync(); SaveSettings(); }   // (one write: SaveSettings saves the macros with the rest)
+static LRESULT CALLBACK MacroProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        Macro* m = gMacroSel >= 0 && gMacroSel < gMacroN ? &gMacro[gMacroSel] : nullptr;
+        HWND sl = GetDlgItem(h, IDC_MC_STEPS);
+        const int sel = (int)SendMessageW(sl, LB_GETCURSEL, 0, 0);
+        if (id == IDC_MC_LIST && code == LBN_SELCHANGE) {
+            if (gCapturingKey && gCapWnd == h) EndKeyCapture();
+            gMacroSel = (int)SendDlgItemMessageW(h, id, LB_GETCURSEL, 0, 0); SendMessageW(sl, LB_SETCURSEL, (WPARAM)-1, 0); MacroWndSync();
+        }
+        if ((id == IDC_MC_NEW || id == IDC_MC_DUP) && code == BN_CLICKED) {
+            if (gMacroN >= MACRO_MAX) { SetDlgItemTextW(h, IDC_MC_STAT, L"That's all 16. Delete one to make another."); return 0; }
+            MacroStopAll();
+            Macro& n = gMacro[gMacroN];
+            if (id == IDC_MC_DUP && m) { n = *m; swprintf(n.name, 48, L"%.40ls copy", m->name); }
+            else { n = Macro(); swprintf(n.name, 48, L"Macro %d", gMacroN + 1); }
+            for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MACRO0 + gMacroN][i] = 0;
+            gMacroSel = gMacroN++; MacroChanged();
+            SetFocus(GetDlgItem(h, IDC_MC_NAME)); SendDlgItemMessageW(h, IDC_MC_NAME, EM_SETSEL, 0, -1);
+        }
+        if (id == IDC_MC_DEL && code == BN_CLICKED && m) {
+            wchar_t q[120]; swprintf(q, 120, L"Delete \"%ls\"?", m->name);
+            if (MessageBoxW(h, q, L"Lag Effect - Macros", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+            if (gCapturingKey && gCapWnd == h) EndKeyCapture();
+            MacroStopAll();
+            for (int i = gMacroSel; i < gMacroN - 1; i++) {   // the ones after it move up, their keys with them
+                gMacro[i] = gMacro[i + 1];
+                for (int j = 0; j < MAX_KEYS; j++) gFxKeys[SLOT_MACRO0 + i][j] = gFxKeys[SLOT_MACRO0 + i + 1][j];
+            }
+            gMacroN--; for (int j = 0; j < MAX_KEYS; j++) gFxKeys[SLOT_MACRO0 + gMacroN][j] = 0;
+            for (int v = 0; v < gVcN; ) {      // voice commands for it go; ones for the macros after it follow them
+                const int ds = SLOT_MACRO0 + gMacroSel;
+                if (gVc[v].slot == ds) { for (int w = v; w < gVcN - 1; w++) gVc[w] = gVc[w + 1]; gVcN--; continue; }
+                if (IsMacroSlot(gVc[v].slot) && gVc[v].slot > ds) gVc[v].slot--;
+                v++;
+            }
+            SpCmdList(); SpeechApply();
+            if (gMacroSel >= gMacroN) gMacroSel = gMacroN - 1;
+            MacroChanged();
+        }
+        if (id == IDC_MC_NAME && code == EN_CHANGE && m) {
+            wchar_t t[48]; GetDlgItemTextW(h, IDC_MC_NAME, t, 48);
+            if (t[0] && lstrcmpW(t, m->name)) {
+                lstrcpynW(m->name, t, 48);
+                HWND l2 = GetDlgItem(h, IDC_MC_LIST);
+                SendMessageW(l2, LB_DELETESTRING, gMacroSel, 0); SendMessageW(l2, LB_INSERTSTRING, gMacroSel, (LPARAM)t); SendMessageW(l2, LB_SETCURSEL, gMacroSel, 0);
+            }
+        }
+        if (id == IDC_MC_NAME && code == EN_KILLFOCUS) SaveSettings();
+        if (id == IDC_MC_MODE && code == CBN_SELCHANGE && m) {
+            MacroStopAll(); m->mode = (int)SendDlgItemMessageW(h, id, CB_GETCURSEL, 0, 0) == 1; MacroChanged();
+        }
+        if (id == IDC_MC_KEY && code == BN_CLICKED && m) BeginKeyCapture(gFxKeys[SLOT_MACRO0 + gMacroSel], IDC_MC_KEY, h);
+        if (id == IDC_MC_ADD && code == BN_CLICKED && m) {
+            if (m->n >= MACRO_STEPS) { SetDlgItemTextW(h, IDC_MC_STAT, L"A macro can have 24 steps."); return 0; }
+            HMENU pm = CreatePopupMenu(); MacroActionMenu(pm);
+            RECT r; GetWindowRect(GetDlgItem(h, id), &r);
+            const int cmd = (int)TrackPopupMenu(pm, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, h, nullptr);
+            DestroyMenu(pm);
+            if (cmd <= 0) return 0;
+            MacroStopAll();
+            const int at = sel >= 0 && sel < m->n ? sel + 1 : m->n;   // (after the step picked, else at the end)
+            for (int j = m->n; j > at; j--) m->st[j] = m->st[j - 1];
+            MacroStep& st = m->st[at]; st = MacroStep();
+            if (cmd >= 20000) { st.slot = -2; lstrcpynW(st.prof, gProfNames[Iclamp(cmd - 20000, 0, PROF_MAX - 1)], 64); }
+            else st.slot = (short)(cmd - 10000);
+            m->n++; MacroChanged(); SendMessageW(sl, LB_SETCURSEL, at, 0);
+        }
+        if (id == IDC_MC_WAIT && code == BN_CLICKED && m) {
+            if (m->n >= MACRO_STEPS) { SetDlgItemTextW(h, IDC_MC_STAT, L"A macro can have 24 steps."); return 0; }
+            wchar_t b[32] = L"1";
+            if (!InputBox(L"Wait", L"How long to wait, in seconds (like 0.5 or 3):", b, 32)) return 0;
+            const double secs = _wtof(b);
+            if (secs <= 0 || secs > 600) { SetDlgItemTextW(h, IDC_MC_STAT, L"A wait is from 0.1 to 600 seconds."); return 0; }
+            MacroStopAll();
+            const int at = sel >= 0 && sel < m->n ? sel + 1 : m->n;
+            for (int j = m->n; j > at; j--) m->st[j] = m->st[j - 1];
+            m->st[at] = MacroStep(); m->st[at].slot = -1; m->st[at].ms = (int)lround(secs * 1000);
+            m->n++; MacroChanged(); SendMessageW(sl, LB_SETCURSEL, at, 0);
+        }
+        if ((id == IDC_MC_UP || id == IDC_MC_DOWN) && code == BN_CLICKED && m && sel >= 0) {
+            const int to = sel + (id == IDC_MC_UP ? -1 : 1);
+            if (to < 0 || to >= m->n) return 0;
+            MacroStopAll();
+            const MacroStep t = m->st[sel]; m->st[sel] = m->st[to]; m->st[to] = t;
+            MacroChanged(); SendMessageW(sl, LB_SETCURSEL, to, 0);
+        }
+        if (id == IDC_MC_REM && code == BN_CLICKED && m && sel >= 0 && sel < m->n) {
+            MacroStopAll();
+            for (int j = sel; j < m->n - 1; j++) m->st[j] = m->st[j + 1];
+            m->n--; MacroChanged(); SendMessageW(sl, LB_SETCURSEL, Imin(sel, m->n - 1), 0);
+        }
+        if (id == IDC_MC_TEST && code == BN_CLICKED && m) {
+            if (!m->n) { SetDlgItemTextW(h, IDC_MC_STAT, L"Add a step first."); return 0; }
+            MacroPress(gMacroSel, true);
+            SetDlgItemTextW(h, IDC_MC_STAT, m->mode ? L"Running. Press Test again to undo it (as letting go of its key would)." : L"Running it now.");
+        }
+        return 0;
+    }
+    case WM_CONTEXTMENU:                        // right-click the key button: clear it
+        if ((HWND)w == GetDlgItem(h, IDC_MC_KEY) && gMacroSel >= 0) {
+            if (gCapturingKey) EndKeyCapture();
+            for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_MACRO0 + gMacroSel][i] = 0;
+            MacroWndSync(); SaveSettings();
+            return 0;
+        }
+        break;
+    case WM_VKEYTOITEM:                         // Delete in the steps list removes the step
+        if (LOWORD(w) == VK_DELETE && (HWND)l == GetDlgItem(h, IDC_MC_STEPS)) { SendMessageW(h, WM_COMMAND, MAKEWPARAM(IDC_MC_REM, BN_CLICKED), 0); return -2; }
+        return -1;
+    case WM_CLOSE: if (gCapturingKey && gCapWnd == h) EndKeyCapture(); SaveSettings(); DestroyWindow(h); return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, msg, w, l);
+    case WM_DESTROY: if (gMacroWnd == h) gMacroWnd = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+static void MacroShow()
+{
+    if (gMacroWnd) { MacroWndSync(); ShowWindow(gMacroWnd, SW_SHOW); SetForegroundWindow(gMacroWnd); return; }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = MacroProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagMacros"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    const int cw = SC(620), ch = SC(430);
+    RECT r = { 0, 0, cw, ch }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND w = CreateWindowExW(0, L"LagMacros", L"Lag Effect - Macros", style,
+                             (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    gMacroWnd = w;
+    if (gMacroSel < 0 && gMacroN) gMacroSel = 0;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x), SC(y), SC(w2), SC(h2), w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"STATIC", L"Your macros", 0, 16, 14, 180, 18, -1);
+    mk(L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER, 16, 36, 180, 300, IDC_MC_LIST);
+    mk(L"BUTTON", L"New", WS_TABSTOP, 16, 342, 56, 28, IDC_MC_NEW);
+    mk(L"BUTTON", L"Copy", WS_TABSTOP, 78, 342, 56, 28, IDC_MC_DUP);
+    mk(L"BUTTON", L"Delete", WS_TABSTOP, 140, 342, 56, 28, IDC_MC_DEL);
+    mk(L"STATIC", L"Name", 0, 212, 19, 60, 18, -1);
+    mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 276, 16, 328, 23, IDC_MC_NAME, WS_EX_CLIENTEDGE);
+    SendDlgItemMessageW(w, IDC_MC_NAME, EM_LIMITTEXT, 46, 0);
+    mk(L"STATIC", L"Does", 0, 212, 51, 60, 18, -1);
+    HWND md = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 276, 48, 328, 200, IDC_MC_MODE);
+    SendMessageW(md, CB_ADDSTRING, 0, (LPARAM)L"Run once: the steps, top to bottom");
+    SendMessageW(md, CB_ADDSTRING, 0, (LPARAM)L"While held: the steps, undone when you let go");
+    mk(L"STATIC", L"Hotkey", 0, 212, 85, 60, 18, -1);
+    mk(L"BUTTON", L"", WS_TABSTOP, 276, 80, 200, 28, IDC_MC_KEY);
+    mk(L"STATIC", L"(right-click to clear)", 0, 484, 85, 120, 18, IDC_HDR);
+    mk(L"STATIC", L"Steps", 0, 212, 118, 100, 18, -1);
+    mk(L"LISTBOX", L"", LBS_NOTIFY | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP | WS_BORDER, 212, 138, 296, 232, IDC_MC_STEPS);
+    mk(L"BUTTON", L"Add action...", WS_TABSTOP, 516, 138, 88, 28, IDC_MC_ADD);
+    mk(L"BUTTON", L"Add wait...", WS_TABSTOP, 516, 172, 88, 28, IDC_MC_WAIT);
+    mk(L"BUTTON", L"Up", WS_TABSTOP, 516, 214, 88, 28, IDC_MC_UP);
+    mk(L"BUTTON", L"Down", WS_TABSTOP, 516, 248, 88, 28, IDC_MC_DOWN);
+    mk(L"BUTTON", L"Remove", WS_TABSTOP, 516, 290, 88, 28, IDC_MC_REM);
+    mk(L"BUTTON", L"Test", WS_TABSTOP, 516, 342, 88, 28, IDC_MC_TEST);
+    mk(L"STATIC", L"A voice command (Mic > Speech) or Streamer.bot (macro NAME) can run a macro too. New steps go after the one picked.",
+       SS_NOPREFIX, 16, 382, 588, 36, IDC_MC_STAT);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    MacroWndSync();
+    ShowWindow(w, SW_SHOW);
 }
 static void TtsSay(const wchar_t* t)            // the TTS voice: one after another
 {
@@ -24345,8 +25126,8 @@ static void SetFeatCaptions(bool on)
 // ---- Streamer.bot command builder ----
 // Pick what it should do (and which channel / output / scene...), it writes the command; Copy C# puts the whole
 // "Execute C# Code" text on the clipboard with it, Test runs it here (WsExec with id -2: its reply comes back to us).
-enum { CBT_NONE, CBT_CHAN, CBT_OUT, CBT_CHAR, CBT_PROF, CBT_SCENE, CBT_PAD, CBT_CLIP };
-enum { CBO_NONE, CBO_ONOFF, CBO_CHAN, CBO_OUT, CBO_TALKBACK, CBO_CAPS, CBO_MUSIC };
+enum { CBT_NONE, CBT_CHAN, CBT_OUT, CBT_CHAR, CBT_PROF, CBT_SCENE, CBT_PAD, CBT_CLIP, CBT_MACRO, CBT_PLUG };
+enum { CBO_NONE, CBO_ONOFF, CBO_CHAN, CBO_OUT, CBO_TALKBACK, CBO_CAPS, CBO_MUSIC, CBO_PLUGMIX, CBO_PLUGSET };
 enum { CBV_NONE, CBV_NUM, CBV_TEXT };
 struct CbAct { const wchar_t* name; const char* cmd; int tgt, opt, val; int def; };
 static const CbAct CB_ACTS[] = {
@@ -24367,6 +25148,10 @@ static const CbAct CB_ACTS[] = {
     { L"Mixer channel", "channel", CBT_CHAN, CBO_CHAN, CBV_NUM, -12 },
     { L"Output", "output", CBT_OUT, CBO_OUT, CBV_NUM, 80 },
     { L"Mixer scene", "scene", CBT_SCENE, CBO_NONE, CBV_NONE, 0 },
+    { L"Run a macro", "macro", CBT_MACRO, CBO_NONE, CBV_NONE, 0 },
+    { L"Plugin on / off", "plugin", CBT_PLUG, CBO_ONOFF, CBV_NONE, 0 },
+    { L"Plugin Mix (%)", "plugin", CBT_PLUG, CBO_PLUGMIX, CBV_NUM, 100 },
+    { L"Plugin setting (name, value)", "plugin", CBT_PLUG, CBO_PLUGSET, CBV_TEXT, 0 },
     { L"ChatMix (-100 game .. 100 chat)", "chatmix", CBT_NONE, CBO_NONE, CBV_NUM, 0 },
     { L"Talkback", "talkback", CBT_OUT, CBO_TALKBACK, CBV_NONE, 0 },
     { L"Captions", "captions", CBT_NONE, CBO_CAPS, CBV_NONE, 0 },
@@ -24408,6 +25193,17 @@ static void CbFillTargets()                     // the "which" list for this act
             swprintf(s, 120, L"Pad %d%ls%ls", i + 1, f ? L": " : L"", f ? f + 1 : L""); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s);
         } break;
     case CBT_CLIP: for (int i = 0; i < CLIP_N; i++) { swprintf(s, 120, L"Clip %d%ls", i + 1, gClips[i].base ? L"" : L" (empty)"); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s); } break;
+    case CBT_MACRO: for (int i = 0; i < gMacroN; i++) { MacroLabel(i, s, 120); SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s); } break;
+    case CBT_PLUG: for (int k = 0; k < VST_SYNTH; k++) {   // (each loaded plugin, with where it is)
+            if (!gVstUi[k].path[0]) continue;
+            char ad[240]; VstAddr(k, ad, 240); if (!ad[0]) continue;
+            wchar_t where[80];
+            if (k < VST_MIC) swprintf(where, 80, L"Mic %d", k + 1);
+            else if (k >= VST_OUT0) { wchar_t on[48]; OutName((k - VST_OUT0) / VST_PER, on, 48); swprintf(where, 80, L"Output %ls", on); }
+            else { wchar_t cl[48]; ChanLabel(VstChanOfRack(k), cl, 48); swprintf(where, 80, L"%ls", cl); }
+            swprintf(s, 120, L"%ls: %ls", where, gVstUi[k].name[0] ? gVstUi[k].name : L"(plugin)");
+            const int at = (int)SendMessageW(t, CB_ADDSTRING, 0, (LPARAM)s); SendMessageW(t, CB_SETITEMDATA, at, k);
+        } break;
     }
     switch (a.opt) {
     case CBO_ONOFF: case CBO_TALKBACK: { const wchar_t* oo[] = { L"On / off", L"On", L"Off" }; for (int i = a.opt == CBO_TALKBACK ? 1 : 0; i < 3; i++) SendMessageW(o, CB_ADDSTRING, 0, (LPARAM)oo[i]); } break;
@@ -24418,9 +25214,9 @@ static void CbFillTargets()                     // the "which" list for this act
     }
     SendMessageW(t, CB_SETCURSEL, 0, 0); SendMessageW(o, CB_SETCURSEL, 0, 0);
     EnableWindow(t, a.tgt != CBT_NONE && SendMessageW(t, CB_GETCOUNT, 0, 0) > 0);
-    EnableWindow(o, a.opt != CBO_NONE);
+    EnableWindow(o, a.opt != CBO_NONE && a.opt < CBO_PLUGMIX);   // (the plugin Mix / setting ones: only the value box)
     wchar_t v[16] = L""; if (a.val == CBV_NUM) swprintf(v, 16, L"%d", a.def);
-    SetDlgItemTextW(gWnd, IDC_CBVAL, a.val == CBV_TEXT ? L"hello chat" : v);
+    SetDlgItemTextW(gWnd, IDC_CBVAL, a.opt == CBO_PLUGSET ? L"'Threshold' -20" : a.val == CBV_TEXT ? L"hello chat" : v);
 }
 static void CbBuild(char* out, int cap)         // the command, from the lists
 {
@@ -24438,11 +25234,15 @@ static void CbBuild(char* out, int cap)         // the command, from the lists
     case CBT_PROF: if (ti >= 0 && ti < gProfCount) CbQuote(gProfNames[ti], tg, 240); break;
     case CBT_SCENE: if (ti >= 0 && ti < gSceneN) CbQuote(gSceneName[ti], tg, 240); break;
     case CBT_PAD: case CBT_CLIP: if (ti >= 0) snprintf(tg, sizeof(tg), "%d", ti + 1); break;
+    case CBT_MACRO: if (ti >= 0 && ti < gMacroN) CbQuote(gMacro[ti].name, tg, 240); break;
+    case CBT_PLUG: if (ti >= 0) VstAddr((int)SendDlgItemMessageW(gWnd, IDC_CBTGT, CB_GETITEMDATA, ti, 0), tg, 240); break;
     }
     if (a.tgt != CBT_NONE && !tg[0]) { lstrcpynA(out, "(nothing to pick yet)", cap); return; }
     static const char* ONOFF[] = { "toggle", "on", "off" };
     switch (a.opt) {
-    case CBO_ONOFF: snprintf(out, cap, "%s %s", a.cmd, ONOFF[Imin(oi, 2)]); return;
+    case CBO_ONOFF: if (tg[0]) snprintf(out, cap, "%s %s %s", a.cmd, tg, ONOFF[Imin(oi, 2)]); else snprintf(out, cap, "%s %s", a.cmd, ONOFF[Imin(oi, 2)]); return;
+    case CBO_PLUGMIX: snprintf(out, cap, "plugin %s mix %d", tg, Iclamp(atoi(v), 0, 100)); return;
+    case CBO_PLUGSET: snprintf(out, cap, "plugin %s set %s", tg, v); return;
     case CBO_CAPS: snprintf(out, cap, "%s %s", a.cmd, oi == 3 ? "clear" : ONOFF[Imin(oi, 2)]); return;
     case CBO_MUSIC: { static const char* MA[6] = { "toggle", "play", "pause", "next", "prev", "stop" }; snprintf(out, cap, "music %s", MA[Iclamp(oi, 0, 5)]); return; }
     case CBO_TALKBACK: if (oi == 0) snprintf(out, cap, "talkback on %s", tg); else lstrcpynA(out, "talkback off", cap); return;
@@ -24468,7 +25268,7 @@ static void CbRefresh()                         // the command line, and which b
     if (a.opt == CBO_CHAN) needVal = CB_CHAN_NUM[Iclamp(Imax(0, CbSel(IDC_CBOPT)), 0, 9)];
     if (a.opt == CBO_OUT) needVal = CB_OUT_NUM[Iclamp(Imax(0, CbSel(IDC_CBOPT)), 0, 3)];
     EnableWindow(GetDlgItem(gWnd, IDC_CBVAL), needVal);
-    const int show = (a.tgt != CBT_NONE ? 1 : 0) | (a.opt != CBO_NONE ? 2 : 0) | (needVal ? 4 : 0);   // (1.66.1) hide the rest
+    const int show = (a.tgt != CBT_NONE ? 1 : 0) | (a.opt != CBO_NONE && a.opt < CBO_PLUGMIX ? 2 : 0) | (needVal ? 4 : 0);   // (1.66.1) hide the rest
     if (show != gCbShow) { gCbShow = show; Layout(); }
     char c[1300]; CbBuild(c, sizeof(c));
     wchar_t w[1300]; MultiByteToWideChar(CP_UTF8, 0, c, -1, w, 1300);
@@ -24933,6 +25733,8 @@ static void CreateUI()
         Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP, 210, BASE_H - 28, 84, 24, IDC_KEYSLIST);
         gDesign[gDesignN - 1].free = true;
         Ctl(L"BUTTON", L"Recorder...", WS_TABSTOP, 298, BASE_H - 28, 84, 24, IDC_RCDBTN);
+        gDesign[gDesignN - 1].free = true;
+        Ctl(L"BUTTON", L"Macros...", WS_TABSTOP, 386, BASE_H - 28, 76, 24, IDC_MACROBTN);
         gDesign[gDesignN - 1].free = true;
         Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 302, BASE_H - 28, 244, 24, IDC_ONSTRIP);
         gDesign[gDesignN - 1].free = true;
@@ -26574,6 +27376,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_SEARCH)      { if (code == EN_CHANGE) SearchUpdate(); return; }
     if (id == IDC_KEYSLIST)    { if (code == BN_CLICKED) KeysListShow(); return; }
     if (id == IDC_RCDBTN)      { if (code == BN_CLICKED) RcdShow(); return; }
+    if (id == IDC_MACROBTN)    { if (code == BN_CLICKED) MacroShow(); return; }
     if (id == IDC_ONSTRIP)     { if (code == STN_CLICKED) ChipsClick(); return; }
     if (id == IDC_HDRMETER)    { if (code == STN_CLICKED && PageOn(PAGE_MIC)) SetPage(PAGE_MIC); return; }
     if (id == IDC_HDRMETERON)  {

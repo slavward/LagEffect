@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lag Effect's tests, on Linux (GitHub runs them on every push: .github/workflows/tests.yml).
-#   tests/run.sh [base.cpp]     (tests: gate, synth, beats, speech, [whisper], outputs, names, recorder; "same sound": mic, a Mixer channel, the vocoder)
+#   tests/run.sh [base.cpp]     (tests: gate, synth, beats, speech, [whisper], outputs, names, plain commands, recorder; "same sound": mic, a Mixer channel, the vocoder)
 # Cuts the audio code out of LagEffect.cpp and runs it with stubs for Windows / miniaudio. With a base file (main's
 # LagEffect.cpp), also checks that default settings sound bit-for-bit the same as there.
 # Skip that one check for a commit meant to change the sound: put [audio-change] in its message (AUDIO_CHANGE=1 here).
@@ -41,6 +41,8 @@ cut_from_to LagEffect.cpp '^static float    gExtFill' > "$B/ext.inc"
 awk '/^static void ShortDevName\(const wchar_t\* full, wchar_t\* out, int cap\)$/{p=1} /^static void DevTipUpdate/{p=0} p' LagEffect.cpp > "$B/names.inc"
 awk '/^\/\/ =+ Recorder \(1\.52\.0\): the core/{p=1} p{print} p && /^    for \(int i = 0; i < s->n; i\+\+\) free\(s->t\[i\]\.ring\);/{getline; print; exit}' LagEffect.cpp > "$B/rcd.inc"
 awk '/^\/\/ =+ Whisper speech engine \(1\.58\.0\): the core/{p=1} p{print} /^\/\/ =+ Whisper speech engine: end of the core/{exit}' LagEffect.cpp > "$B/ws.inc"
+{ cut_from_to LagEffect.cpp '^static void JsonEsc'; cut_from_to LagEffect.cpp '^static int VstNameMatch'
+  awk '/^struct WsTok /{p=1} p{print} p && /^static bool WsPlain/{q=1} q && /^}/{exit}' LagEffect.cpp; } > "$B/plain.inc"   # (1.67.0)
 
 fail=0
 run() { echo; echo "== $1"; shift; if ! "$@"; then fail=1; fi; }
@@ -52,6 +54,7 @@ run() { echo; echo "== $1"; shift; if ! "$@"; then fail=1; fi; }
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/noise" "$T/noise.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -DEXT="\"$B/ext.inc\"" -o "$B/outputs" "$T/outputs.cpp" "$B/rn.a"
 "$CXX" -O2 -std=c++17 -w -DNAMES="\"$B/names.inc\"" -o "$B/names" "$T/names.cpp"
+"$CXX" -O2 -std=c++17 -w -DPLAIN="\"$B/plain.inc\"" -o "$B/plain" "$T/plain.cpp"
 "$CXX" -O2 -std=c++17 -w -pthread -DRCD="\"$B/rcd.inc\"" -o "$B/recorder" "$T/recorder.cpp"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/same_new" "$T/audio_same.cpp" "$B/rn.a"
 
@@ -71,6 +74,7 @@ else
 fi
 run "extra outputs don't run dry" "$B/outputs"
 run "short device names" "$B/names"
+run "Streamer.bot plain commands: macro, plugin (1.67.0)" "$B/plain"
 mkdir -p "$B/rec"; run "recorder" "$B/recorder" "$B/rec"
 
 echo; echo "== same sound as main with default settings"
