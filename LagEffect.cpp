@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.67.0"
+#define APP_VERSION L"1.68.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -50,6 +50,14 @@
 #include <sapi.h>                               // text to speech (Windows' own voices)
 #include <wctype.h>
 #include <shlobj.h>                             // folder picker (Load a folder of sounds)
+#include <shldisp.h>                            // (unzipping VB-CABLE's package when Windows has no tar)
+#include <wintrust.h>                           // VB-CABLE's installer: checking its signature before running it
+#include <softpub.h>
+#include <iphlpapi.h>                           // (1.68.0) the phone remote: this PC's address on the Wi-Fi
+#include <bcrypt.h>                             // ...and random PINs / keys for it
+extern "C" {
+#include "qrcodegen.h"                          // ...and its QR code (Nayuki's QR Code generator, MIT licence)
+}
 #include <mfapi.h>                              // MP3 export (Windows' own encoder, loaded at run time)
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -102,6 +110,11 @@ static inline int FocusRectIfKeys(HDC dc, const RECT* r) { return gKbdNav ? Draw
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "oleaut32.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
@@ -1287,7 +1300,7 @@ static volatile bool gFeatLag = false, gFeatFx = false, gFeatSound = false, gFea
 static volatile bool gFeatSpeech = false;          // Mic > Speech (1.57.0): voice commands, bleep, the TTS voice
 static volatile bool gFeatAvatar = false, gFeatCaptions = false;   // Settings > Stream (1.60.0): the PNGtuber avatar, live captions
 static bool gSafe = false;                      // safe start (Shift held while starting): plugins, Voice FX, remote control off for this run
-static bool gSafeVst = false, gSafeFx = false, gSafeWs = false;   // (what they were: saved back unless you switch them on)
+static bool gSafeVst = false, gSafeFx = false, gSafeWs = false, gSafePhone = false;   // (what they were: saved back unless you switch them on)
 static unsigned long long gStartTick = 0;       // when Lag Effect started (bug report info: uptime)
 static bool gNoThrottle = false;                // Windows was told not to slow Lag Effect down to save power
 #ifdef _WIN32
@@ -1313,6 +1326,14 @@ static void CalloutHide(); static void SafeExplain();
 static bool    gWsOn = false;
 static int     gWsPort = 7600;
 static wchar_t gWsPass[64] = L"";
+// (1.68.0) Phone remote: a page for a phone on the same Wi-Fi, from the same server thread but its own port, open to the
+// network (not just this PC). Off unless you switch it on. A phone pairs once with a PIN shown on the PC, then keeps a token.
+static bool    gPhoneOn = false;
+static int     gPhonePort = 8790;
+static int     gPhoneState = 0;                 // 0 off, 1 listening, 2 the port is in use
+static int     gPhoneCount = 0;                 // phones connected now
+static volatile int gWsRunLocal = 0, gWsRunPhone = 0;   // what the server thread listens on this run (0 = not)
+static const char* gPhonePage = nullptr; static int gPhonePageN = 0;   // the page (resource RCDATA 3, phone.html)
 static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutter until then
 enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16, FEAT_SPEECH = 32, FEAT_AVATAR = 64, FEAT_CAPTIONS = 128 };
 static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst) || (mask & FEAT_SPEECH && gFeatSpeech)
@@ -5537,7 +5558,8 @@ enum {
     IDC_VOLSTYLE,                               // (1.63.0: Settings > Look > Volume controls)
     IDC_MICSUB5,                                // (1.63.0: Mic > Music, moved from the Soundboard)
     IDC_MIXHIDDEN, IDC_HDRMETER, IDC_HDRMETERON,
-    IDC_MACROBTN,                               // (1.67.0) the bottom bar's Macros button   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
+    IDC_MACROBTN,                               // (1.67.0) the bottom bar's Macros button
+    IDC_PHONEBTN,                               // (1.68.0) Settings > Stream: Phone remote...   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5934,7 +5956,8 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define KEY_SLOTS    (SLOT_MACRO0 + MACRO_MAX)
 static void MacroLabel(int i, wchar_t* out, int cap);   // (1.67.0: defined with the macros)
 static const char* MacroRemote(int k, int on); static int MacroFind(const wchar_t* name);
-static void BugMacros(wchar_t* o, int cap);
+static void BugMacros(wchar_t* o, int cap); static void BugVbCable(wchar_t* o, int cap); static void BugPhone(wchar_t* o, int cap);
+static void PhonesLoad(); static void PhonesSave(); static void PhoneShow(); static void PhoneTick(); static void PhoneStatusText();
 static void MacroShow(); static void MacrosLoad(); static void MacrosSave(); static int gMacroSel = -1, gMacroN = 0;
 static inline bool IsMacroSlot(int slot) { return slot >= SLOT_MACRO0 && slot < SLOT_MACRO0 + MACRO_MAX; }
 static int  gFxKeys[KEY_SLOTS][MAX_KEYS];
@@ -6865,6 +6888,9 @@ static void LoadSettings()
     for (int r = 0; r < VST_RACKS; r++) { wchar_t key[32]; wsprintfW(key, L"plugin_rack%d", r + 1); GetPrivateProfileStringW(L"settings", key, L"", gVstRackKey[r], 140, gIni); }
     gWsOn   = INI_INT(L"remote_on", 0) != 0;     // (off unless you switch it on)
     gWsPort = Iclamp(INI_INT(L"remote_port", 7600), 1024, 65535);
+    gPhoneOn = INI_INT(L"phone_on", 0) != 0;     // (1.68.0, off unless you switch it on)
+    gPhonePort = Iclamp(INI_INT(L"phone_port", 8790), 1024, 65535);
+    PhonesLoad();
     GetPrivateProfileStringW(L"settings", L"remote_password", L"", gWsPass, 64, gIni);
     gRandLagSec   = Iclamp(INI_INT(L"random_lag_every_s", 8), 2, 120);
     gRepeatN      = Iclamp(INI_INT(L"repeat_word_times", 3), 1, 6);
@@ -7803,6 +7829,8 @@ static void SaveSettings()
     SaveInt(L"clip_auto_trim", gClipAutoTrim);
     SaveInt(L"random_lag", gRandLagOn);
     SaveInt(L"remote_on", gSafe && !gWsOn ? gSafeWs : gWsOn); SaveInt(L"remote_port", gWsPort); IniSet(L"remote_password", gWsPass);
+    SaveInt(L"phone_on", gSafe && !gPhoneOn ? gSafePhone : gPhoneOn); SaveInt(L"phone_port", gPhonePort);
+    PhonesSave();
     SaveInt(L"feat_lag", gFeatLag); SaveInt(L"feat_voicefx", gFeatFx); SaveInt(L"feat_soundboard", gFeatSound); SaveInt(L"feat_clips", gFeatClips);
     SaveInt(L"feat_plugins", gSafe && !gFeatVst ? gSafeVst : gFeatVst);   // (safe start switched it off for this run only)
     SaveInt(L"feat_speech", gFeatSpeech);
@@ -15621,7 +15649,8 @@ static void AddTips()
                         L"Off or Stutter only, or the sounds go through your voice effects.");
     TipId(IDC_HEARLBL,  L"Pick your headphones' output to always hear the soundboard, clips and text to speech there, even if it's set to "
                         L"Off or Stutter only, or the sounds go through your voice effects.");
-    TipId(IDC_VBCABLE, L"Set up VB-Cable automatically: output 1 goes to VB-Cable, output 2 to your headphones.");
+    TipId(IDC_VBCABLE, L"Set up VB-Cable automatically: output 1 goes to VB-Cable, output 2 to your headphones. "
+                       L"Not installed yet? It offers to install it (VB-Audio's free VB-CABLE, donationware, vb-cable.com).");
     TipId(IDC_LOOP,    L"How much of your last words gets repeated when you press the hotkey, in milliseconds.");
     TipId(IDC_SPEED,   L"How fast the loop plays through. 100% = normal; lower = slower and longer.");
     TipId(IDC_PITCH,   L"How high or low the loop sounds. 100% = normal; 200% = one octave up, 50% = one octave down.");
@@ -15645,6 +15674,8 @@ static void AddTips()
     TipId(IDC_ONSTRIP,  L"What's on right now. Click one to go to its settings.");
     TipId(IDC_HDRMETER, L"Your mic's level, on every tab (dim while the gate is shut, red when it's close to too loud). Click: the Mic tab. Turn it off in Settings > Look.");
     TipId(IDC_HDRMETERON, L"A thin bar under the tabs showing your mic's level, so you can see it from any tab.");
+    TipId(IDC_PHONEBTN, L"Control Lag Effect from your phone's browser, on the same Wi-Fi: pads, voice effects, the Mixer, scenes, "
+                        L"macros and your own buttons. Pair it once by scanning a QR code and typing a PIN. Off unless you switch it on.");
     TipId(IDC_MACROBTN, L"Macros: one key (or voice command, or Streamer.bot) that does several things in a row, with waits between. "
                         L"\"While held\" ones undo themselves when you let go.");
     TipId(IDC_RCDBTN,   L"Record what an output plays, or each part on its own track (your voice, sounds, each Mixer channel), "
@@ -16320,6 +16351,7 @@ static void MusToggle(); static void MusNext(); static void MusPrev(); static vo
 static bool MusActive();
 static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a hotkey: seen down for one tick, then let go
 static unsigned char gMacroDown[KEY_SLOTS];     // (1.67.0) a "while held" macro holds these keys down until it's let go
+static unsigned char gRemoteDown[KEY_SLOTS];    // (1.68.0) ...and the phone remote's hold buttons (key ... down / up)
 static bool gTapTog[KEY_SLOTS];                 // (1.67.0) a tap (voice / macro / remote) on a hold-type key: it toggles instead
 static bool gSpTts = false;
 static void MacroPress(int i, bool tapped); static void MacroRelease(int i); static void MacroTick();   // (1.67.0)
@@ -16337,7 +16369,7 @@ static void PollFxKeys()
                          ((slot == SLOT_BLEEP || slot == SLOT_SPTTS) && !gFeatSpeech);
         if (off) { gVoiceTap[slot] = 0; gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
-        if (gMacroDown[slot]) down = true;      // (held by a macro)
+        if (gMacroDown[slot] || gRemoteDown[slot]) down = true;      // (held by a macro)
         const bool tapped = gVoiceTap[slot] == 2;   // (pressed by a voice command, a macro or a remote: let go next tick)
         if (gVoiceTap[slot]) { if (gVoiceTap[slot] == 2) down = true; gVoiceTap[slot]--; }   // a voice command (Mic > Speech)
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
@@ -17935,16 +17967,219 @@ static void CleanupOldExe()
 
 
 // ======================= VB-Cable + help =======================
-static void SetupVbCable()
+static DWORD gVbLastCode = 0xFFFFFFFE;          // (bug info: the last VB-CABLE setup's exit code; FFFFFFFE = not run)
+// ---- (VB-CABLE install) VB-Audio's own VB-CABLE package travels inside the exe (resource RCDATA 2, put there by the
+// build, unchanged: VB-Audio allows that for the standard VB-CABLE, which is donationware, vb-cable.com). "Use VB-Cable"
+// with no cable installed offers to run its setup: unpacked to a temp folder, its signature checked, then run as admin.
+static bool gVbInstalling = false;
+static bool VbSignedByVbAudio(const wchar_t* path)   // a valid Authenticode signature, and VB-Audio's (Vincent Burel)
 {
+    WINTRUST_FILE_INFO fi = {}; fi.cbStruct = sizeof(fi); fi.pcwszFilePath = path;
+    WINTRUST_DATA wd = {}; wd.cbStruct = sizeof(wd); wd.dwUIChoice = WTD_UI_NONE; wd.fdwRevocationChecks = WTD_REVOKE_NONE;
+    wd.dwUnionChoice = WTD_CHOICE_FILE; wd.pFile = &fi; wd.dwStateAction = WTD_STATEACTION_VERIFY;
+    GUID act = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    const LONG r = WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &act, &wd);
+    bool ok = false;
+    if (r == ERROR_SUCCESS) {
+        CRYPT_PROVIDER_DATA* pd = WTHelperProvDataFromStateData(wd.hWVTStateData);
+        CRYPT_PROVIDER_SGNR* sg = pd ? WTHelperGetProvSignerFromChain(pd, 0, FALSE, 0) : nullptr;
+        if (sg && sg->csCertChain && sg->pasCertChain && sg->pasCertChain[0].pCert) {
+            wchar_t subj[512] = L"";
+            CertNameToStrW(X509_ASN_ENCODING, &sg->pasCertChain[0].pCert->pCertInfo->Subject, CERT_X500_NAME_STR, subj, 512);
+            ok = ContainsNoCase(subj, L"Burel") || ContainsNoCase(subj, L"VB-Audio");
+        }
+    }
+    wd.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust((HWND)INVALID_HANDLE_VALUE, &act, &wd);
+    return ok;
+}
+static bool VbFindSetup(const wchar_t* dir, const wchar_t* name, wchar_t* out, int depth)   // (in the folder or one below)
+{
+    wchar_t pat[MAX_PATH]; swprintf(pat, MAX_PATH, L"%ls\\*", dir);
+    WIN32_FIND_DATAW fd; HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool found = false;
+    do {
+        if (fd.cFileName[0] == L'.') continue;
+        wchar_t p[MAX_PATH]; swprintf(p, MAX_PATH, L"%ls\\%ls", dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) { if (depth > 0 && VbFindSetup(p, name, out, depth - 1)) found = true; }
+        else if (!lstrcmpiW(fd.cFileName, name)) { lstrcpynW(out, p, MAX_PATH); found = true; }
+    } while (!found && FindNextFileW(h, &fd));
+    FindClose(h);
+    return found;
+}
+static bool VbUnzip(const wchar_t* zip, const wchar_t* dir)   // Windows' own tar (10 and 11), else Explorer's zip folder
+{
+    wchar_t tar[MAX_PATH]; GetSystemDirectoryW(tar, MAX_PATH); lstrcatW(tar, L"\\tar.exe");
+    if (GetFileAttributesW(tar) != INVALID_FILE_ATTRIBUTES) {
+        wchar_t cmd[3 * MAX_PATH + 40]; swprintf(cmd, 3 * MAX_PATH + 40, L"\"%ls\" -xf \"%ls\" -C \"%ls\"", tar, zip, dir);
+        STARTUPINFOW si = {}; si.cb = sizeof(si); PROCESS_INFORMATION pi = {};
+        if (CreateProcessW(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+            WaitForSingleObject(pi.hProcess, 60000);
+            DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code);
+            CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+            if (code == 0) return true;
+        }
+    }
+    bool ok = false;                            // (fallback: Shell.Application's CopyHere out of the zip)
+    IShellDispatch* sh = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_Shell, nullptr, CLSCTX_INPROC_SERVER, IID_IShellDispatch, (void**)&sh)) && sh) {
+        VARIANT vz, vd; VariantInit(&vz); VariantInit(&vd);
+        vz.vt = VT_BSTR; vz.bstrVal = SysAllocString(zip); vd.vt = VT_BSTR; vd.bstrVal = SysAllocString(dir);
+        Folder* fz = nullptr; Folder* fdst = nullptr;
+        if (SUCCEEDED(sh->NameSpace(vz, &fz)) && fz && SUCCEEDED(sh->NameSpace(vd, &fdst)) && fdst) {
+            FolderItems* items = nullptr;
+            if (SUCCEEDED(fz->Items(&items)) && items) {
+                VARIANT vi, vo; VariantInit(&vi); VariantInit(&vo);
+                vi.vt = VT_DISPATCH; vi.pdispVal = items; vo.vt = VT_I4; vo.lVal = 4 | 16 | 512 | 1024;   // no UI, yes to all
+                ok = SUCCEEDED(fdst->CopyHere(vi, vo));
+                items->Release();
+            }
+        }
+        if (fdst) fdst->Release();
+        if (fz) fz->Release();
+        VariantClear(&vz); VariantClear(&vd);
+        sh->Release();
+    }
+    return ok;
+}
+struct VbWait { HANDLE proc; };
+static DWORD WINAPI VbWaitThread(LPVOID p)       // the setup's end, told to the window (WM_APP + 70)
+{
+    HANDLE h = (HANDLE)p;
+    const DWORD w = WaitForSingleObject(h, 10 * 60 * 1000);
+    DWORD code = 0; if (w == WAIT_OBJECT_0) GetExitCodeProcess(h, &code); else code = 0xFFFFFFFF;
+    CloseHandle(h);
+    PostMessageW(gWnd, WM_APP + 70, (WPARAM)code, 0);
+    return 0;
+}
+static wchar_t gVbDir[MAX_PATH];
+static void VbCleanup()
+{
+    if (!gVbDir[0]) return;
+    wchar_t from[MAX_PATH + 2] = {}; lstrcpynW(from, gVbDir, MAX_PATH);   // (double-nul ended, as SHFileOperation wants)
+    SHFILEOPSTRUCTW op = {}; op.wFunc = FO_DELETE; op.pFrom = from; op.fFlags = FOF_NO_UI;
+    SHFileOperationW(&op);
+    gVbDir[0] = 0;
+}
+static bool VbInstall()                          // false: no package in this exe (a home-made build): use the website
+{
+    HRSRC rs = FindResourceW(nullptr, MAKEINTRESOURCEW(2), (LPCWSTR)RT_RCDATA);
+    HGLOBAL rg = rs ? LoadResource(nullptr, rs) : nullptr;
+    const void* data = rg ? LockResource(rg) : nullptr;
+    const DWORD size = rs ? SizeofResource(nullptr, rs) : 0;
+    if (!data || size < 1000) return false;
+    if (gVbInstalling) return true;
+    if (MessageBoxW(gWnd,
+            L"VB-Cable isn't installed.\n\n"
+            L"It's a free virtual audio cable that lets Discord, OBS and games hear Lag Effect. Lag Effect has VB-Audio's "
+            L"installer with it and can install it now:\n\n"
+            L"  \x2022 Windows asks if the installer may make changes (it needs admin rights)\n"
+            L"  \x2022 then whether to install VB-Audio's device software: say Install\n"
+            L"  \x2022 you may need to restart your PC before the cable shows up\n\n"
+            L"VB-CABLE is made by VB-Audio (vb-cable.com) and is donationware: free to use, and you can support them "
+            L"with a donation on their site.\n\nInstall VB-Cable now?",
+            L"Lag Effect - VB-Cable", MB_YESNO | MB_ICONQUESTION) != IDYES) return true;
+    wchar_t tmp[MAX_PATH]; GetTempPathW(MAX_PATH, tmp);
+    swprintf(gVbDir, MAX_PATH, L"%lsLag Effect VB-CABLE %u", tmp, (unsigned)GetTickCount());
+    wchar_t zip[MAX_PATH]; swprintf(zip, MAX_PATH, L"%ls\\VBCABLE_Driver_Pack45.zip", gVbDir);
+    const wchar_t* fail = nullptr;
+    if (!CreateDirectoryW(gVbDir, nullptr)) fail = L"Couldn't make a folder for it in your temp folder.";
+    if (!fail) {
+        HANDLE f = CreateFileW(zip, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        DWORD wr = 0;
+        if (f == INVALID_HANDLE_VALUE || !WriteFile(f, data, size, &wr, nullptr) || wr != size) fail = L"Couldn't write the installer to your temp folder.";
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+    }
+    wchar_t dir[MAX_PATH]; swprintf(dir, MAX_PATH, L"%ls\\files", gVbDir);
+    if (!fail && (!CreateDirectoryW(dir, nullptr) || !VbUnzip(zip, dir))) fail = L"Couldn't unpack the installer.";
+    wchar_t setup[MAX_PATH] = L"";
+    if (!fail) {
+        USHORT pm = 0, nm = 0;                  // (an ARM PC: its own setup, if the package has one)
+        typedef BOOL (WINAPI *IW2)(HANDLE, USHORT*, USHORT*);
+        IW2 iw2 = (IW2)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "IsWow64Process2");
+        if (iw2) iw2(GetCurrentProcess(), &pm, &nm);
+        bool got = nm == 0xAA64 && VbFindSetup(dir, L"VBCABLE_Setup_ARM64.exe", setup, 1);
+        if (!got) got = VbFindSetup(dir, L"VBCABLE_Setup_x64.exe", setup, 1);
+        if (!got) fail = L"The installer isn't in the package.";
+        else if (!VbSignedByVbAudio(setup)) fail = L"The installer's signature isn't VB-Audio's, so Lag Effect won't run it.";
+    }
+    if (!fail) {
+        wchar_t sdir[MAX_PATH]; lstrcpynW(sdir, setup, MAX_PATH); wchar_t* bs = wcsrchr(sdir, L'\\'); if (bs) *bs = 0;
+        SHELLEXECUTEINFOW se = {}; se.cbSize = sizeof(se); se.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+        se.hwnd = gWnd; se.lpVerb = L"runas"; se.lpFile = setup; se.lpParameters = L"-i -h"; se.lpDirectory = sdir; se.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&se) || !se.hProcess) {
+            const DWORD err = GetLastError();
+            VbCleanup();
+            if (err == ERROR_CANCELLED) return true;   // (you said no to Windows' question)
+            fail = L"Windows wouldn't start the installer.";
+        } else {
+            gVbInstalling = true;
+            SetDlgItemTextW(gWnd, IDC_VBCABLE, L"Installing...");
+            EnableWindow(GetDlgItem(gWnd, IDC_VBCABLE), FALSE);
+            HANDLE t = CreateThread(nullptr, 0, VbWaitThread, se.hProcess, 0, nullptr);
+            if (t) CloseHandle(t); else { CloseHandle(se.hProcess); PostMessageW(gWnd, WM_APP + 70, 0, 0); }
+            return true;
+        }
+    }
+    VbCleanup();
+    wchar_t m[600];
+    swprintf(m, 600, L"%ls\n\nYou can install it yourself from VB-Audio's site instead. Open vb-audio.com/Cable now?", fail);
+    if (MessageBoxW(gWnd, m, L"Lag Effect - VB-Cable", MB_YESNO | MB_ICONWARNING) == IDYES)
+        ShellExecuteW(nullptr, L"open", L"https://vb-audio.com/Cable/", nullptr, nullptr, SW_SHOWNORMAL);
+    return true;
+}
+static bool VbCableFound(int* idx);
+static void SetupVbCable();
+static void VbInstallDone(DWORD code)            // (WM_APP + 70) the setup closed
+{
+    gVbInstalling = false;
+    gVbLastCode = code;
+    SetDlgItemTextW(gWnd, IDC_VBCABLE, L"Use VB-Cable");
+    EnableWindow(GetDlgItem(gWnd, IDC_VBCABLE), TRUE);
+    VbCleanup();
     RefreshDevices();
-    int cable = -1;
+    int i;
+    if (VbCableFound(&i)) {                     // there already: set it up as the button does
+        SetupVbCable();
+        if (MessageBoxW(gWnd, L"VB-Cable is installed.\n\nVB-CABLE is donationware by VB-Audio. Open vb-cable.com to "
+                              L"see their other apps or to donate?", L"Lag Effect - VB-Cable", MB_YESNO | MB_ICONINFORMATION) == IDYES)
+            ShellExecuteW(nullptr, L"open", L"https://vb-audio.com/Cable/", nullptr, nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    MessageBoxW(gWnd,
+        L"The VB-Cable installer has finished.\n\nWindows usually needs a restart before the cable shows up: restart your "
+        L"PC, then click \"Use VB-Cable\" again and Lag Effect sets it up.\n\n"
+        L"(If the installer said it failed, or you said no to installing the device software, click the button again "
+        L"to retry.)",
+        L"Lag Effect - VB-Cable", MB_ICONINFORMATION);
+}
+static void BugAdd(wchar_t* o, int cap, const wchar_t* fmt, ...);
+static void BugVbCable(wchar_t* o, int cap)
+{
+    int i = -1; const bool have = VbCableFound(&i);
+    const bool pkg = FindResourceW(nullptr, MAKEINTRESOURCEW(2), (LPCWSTR)RT_RCDATA) != nullptr;
+    if (gVbLastCode == 0xFFFFFFFE) BugAdd(o, cap, L"VB-Cable: %ls; installer in the exe: %ls", have ? L"found" : L"not found", pkg ? L"yes" : L"no");
+    else BugAdd(o, cap, L"VB-Cable: %ls; installer in the exe: %ls; last install exit code 0x%X", have ? L"found" : L"not found", pkg ? L"yes" : L"no", gVbLastCode);
+}
+static bool VbCableFound(int* idx)
+{
     wchar_t n[512];
     for (ma_uint32 i = 0; i < gPlayCount; i++) {
         Widen(gPlayDevs[i].name, n, 512);
-        if (ContainsNoCase(n, L"CABLE Input")) { cable = (int)i; break; }
+        if (ContainsNoCase(n, L"CABLE Input")) { *idx = (int)i; return true; }
     }
+    return false;
+}
+
+static void SetupVbCable()
+{
+    if (gVbInstalling) return;
+    RefreshDevices();
+    int cable = -1;
+    VbCableFound(&cable);
     if (cable < 0) {
+        if (VbInstall()) return;                // (the installer is in this exe: it offers to run it)
         if (MessageBoxW(gWnd,
                 L"VB-Cable isn't installed.\n\nIt's a free virtual audio cable that lets Discord, OBS and games hear "
                 L"Lag Effect. After installing it, restart your PC and click this button again.\n\nOpen the download page now?",
@@ -19475,7 +19710,10 @@ static void ShowHelp()
         L"Recorder... records an output, or separate tracks (your voice, sounds, each Mixer channel), to WAV files; "
         L"a red REC chip shows while it runs.\n"
         L"Macros... makes one key do several things in a row (with waits between): \"Run once\", or \"While held\" to undo "
-        L"them all when you let go. Voice commands and Streamer.bot (macro NAME) can run them too.\n\n"
+        L"them all when you let go. Voice commands and Streamer.bot (macro NAME) can run them too.\n"
+        L"Phone remote (Settings > Stream > Phone remote...): your phone's browser becomes a control pad, on the same Wi-Fi. "
+        L"Scan the QR code, type the PIN once, and it shows your pads, voice effects, the Mixer, scenes, macros and your own buttons. "
+        L"Hold buttons (push-to-talk, the stutter...) work while you hold them.\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -19513,7 +19751,8 @@ static void ShowHelp()
         L"  Everything - your voice plus the stutter (what others should hear)\n"
         L"  Any effect - silent while you talk normally; your voice with its effects while a voice effect or the stutter is on\n\n"
         L"DISCORD / GAMES\n"
-        L"1. Install VB-Cable (free) and click \"Use VB-Cable\".\n"
+        L"1. Click \"Use VB-Cable\" (if you don't have VB-Cable yet, it offers to install it. VB-CABLE is made by VB-Audio, "
+        L"vb-cable.com, and is donationware: free to use, donations welcome).\n"
         L"2. In Discord, set Input Device to \"CABLE Output\".\n"
         L"3. Set Noise Suppression to None or Standard (Krisp erases the effect), and turn off Echo "
         L"Cancellation and Automatic Gain Control.\n"
@@ -19828,6 +20067,13 @@ static bool WsHeader(const char* req, const char* name, char* out, int cap)   //
 }
 // The handshake reply for a request (the whole header, ending "\r\n\r\n"). Returns false: refuse it.
 // Web pages are refused (a browser always says which site it's from), so a website can't control the app.
+static void WsAcceptReply(const char* key, char* reply, int cap)   // the 101 answer to a WebSocket handshake
+{
+    char cat[200]; snprintf(cat, sizeof(cat), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
+    unsigned char dg[20]; Sha1((const unsigned char*)cat, strlen(cat), dg);
+    char acc[40]; Base64(dg, 20, acc);
+    snprintf(reply, cap, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+}
 static bool WsAccept(const char* req, char* reply, int cap)
 {
     char key[128], origin[256], up[64];
@@ -19835,11 +20081,31 @@ static bool WsAccept(const char* req, char* reply, int cap)
     if (!WsHeader(req, "Sec-WebSocket-Key", key, 100)) return false;
     if (WsHeader(req, "Origin", origin, 256) &&
         (_strnicmp(origin, "http", 4) == 0 || _strnicmp(origin, "null", 4) == 0 || _strnicmp(origin, "file", 4) == 0)) return false;
-    char cat[200]; snprintf(cat, sizeof(cat), "%s258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key);
-    unsigned char dg[20]; Sha1((const unsigned char*)cat, strlen(cat), dg);
-    char acc[40]; Base64(dg, 20, acc);
-    snprintf(reply, cap, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", acc);
+    WsAcceptReply(key, reply, cap);
     return true;
+}
+// (1.68.0) The phone port's HTTP. 1: the page (GET / or /index.html), 2: the page's WebSocket (GET /ws: reply filled in),
+// 3: the icon (nothing), 0: anything else. A browser's WebSocket must come from the page itself (its Origin = this
+// server); something that isn't a browser sends no Origin. Either way nothing works until the phone has paired.
+static int PhoneHttp(const char* req, char* reply, int cap)
+{
+    char m[8] = "", path[200] = "";
+    if (sscanf(req, "%7s %199s", m, path) != 2 || strcmp(m, "GET") != 0) return 0;
+    char* q = strchr(path, '?'); if (q) *q = 0;
+    if (!strcmp(path, "/ws")) {
+        char up[64], host[200], key[128], origin[260];
+        if (!WsHeader(req, "Upgrade", up, 64) || _stricmp(up, "websocket") != 0) return 0;
+        if (!WsHeader(req, "Host", host, 200) || !WsHeader(req, "Sec-WebSocket-Key", key, 100)) return 0;
+        if (WsHeader(req, "Origin", origin, 260)) {
+            char want[220]; snprintf(want, sizeof(want), "http://%s", host);
+            if (_stricmp(origin, want) != 0) return 0;
+        }
+        WsAcceptReply(key, reply, cap);
+        return 2;
+    }
+    if (!strcmp(path, "/") || !strcmp(path, "/index.html")) return 1;
+    if (!strcmp(path, "/favicon.ico")) return 3;
+    return 0;
 }
 // One frame from a client: returns the bytes it used (0: not all here yet, -1: broken / too big).
 // Clients must mask their frames; the payload is unmasked into out (cap bytes at most).
@@ -19913,7 +20179,7 @@ static void JsonEsc(const char* in, char* out, int cap)   // a string's inside, 
 // ---- remote control: the server (a background thread, only while it's switched on) ----
 // Off: no thread, no port open, networking not even started. On: listens on 127.0.0.1 (this PC only).
 #define WS_MAX 8
-struct WsConn { SOCKET s; int id; bool ws; int inN; unsigned char in[70000]; char msg[65536]; int msgN; };
+struct WsConn { SOCKET s; int id; bool ws, phone; int inN; unsigned char in[70000]; char msg[65536]; int msgN; };   // (phone: came in on the phone port)
 static WsConn*   gWsConn[WS_MAX];
 static HANDLE    gWsThread = nullptr;
 static volatile LONG gWsStopNow = 0;
@@ -19946,40 +20212,53 @@ static void WsClose(int i)
 {
     if (!gWsConn[i]) return;
     closesocket(gWsConn[i]->s);
-    if (gWsConn[i]->ws) PostMessageW(gWnd, WM_WS_CONN, (WPARAM)gWsConn[i]->id, 0);   // (only ones that had connected)
+    if (gWsConn[i]->ws) PostMessageW(gWnd, WM_WS_CONN, (WPARAM)gWsConn[i]->id, gWsConn[i]->phone ? 3 : 0);   // (only ones that had connected; 3: a phone)
     HeapFree(GetProcessHeap(), 0, gWsConn[i]);
     gWsConn[i] = nullptr;
 }
-static DWORD WINAPI WsThread(LPVOID arg)
+static int PhoneHttp(const char* req, char* reply, int cap);   // (the phone port's HTTP: further down)
+static SOCKET WsListen(int port, bool lan)       // a listening socket: this PC only, or (lan) every network
 {
-    const int port = (int)(INT_PTR)arg;
-    SOCKET ls = INVALID_SOCKET;
+    SOCKET ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) return ls;
+    BOOL ex = TRUE; setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&ex, sizeof(ex));
+    sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = htonl(lan ? INADDR_ANY : INADDR_LOOPBACK);
+    if (bind(ls, (sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 4) != 0) { closesocket(ls); ls = INVALID_SOCKET; }
+    return ls;
+}
+static DWORD WINAPI WsThread(LPVOID)
+{
+    const int port = gWsRunLocal, pport = gWsRunPhone;   // (0: not that one)
+    SOCKET ls = INVALID_SOCKET, lp = INVALID_SOCKET;
     int nextId = 1;
-    DWORD lastTry = 0;
+    DWORD lastTry = 0, lastTryP = 0;
     while (!gWsStopNow) {
-        if (ls == INVALID_SOCKET && GetTickCount() - lastTry > 3000) {   // (the port may be in use: tried again now and then)
+        if (port && ls == INVALID_SOCKET && GetTickCount() - lastTry > 3000) {   // (the port may be in use: tried again now and then)
             lastTry = GetTickCount();
-            ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-            if (ls != INVALID_SOCKET) {
-                BOOL ex = TRUE; setsockopt(ls, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&ex, sizeof(ex));
-                sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((u_short)port); a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-                if (bind(ls, (sockaddr*)&a, sizeof(a)) != 0 || listen(ls, 4) != 0) { closesocket(ls); ls = INVALID_SOCKET; }
-            }
+            ls = WsListen(port, false);
             PostMessageW(gWnd, WM_WS_STATE, ls != INVALID_SOCKET ? 1 : 2, 0);
+        }
+        if (pport && lp == INVALID_SOCKET && GetTickCount() - lastTryP > 3000) {
+            lastTryP = GetTickCount();
+            lp = WsListen(pport, true);
+            PostMessageW(gWnd, WM_WS_STATE, lp != INVALID_SOCKET ? 1 : 2, 1);
         }
         fd_set rd; FD_ZERO(&rd);
         if (ls != INVALID_SOCKET) FD_SET(ls, &rd);
+        if (lp != INVALID_SOCKET) FD_SET(lp, &rd);
         for (int i = 0; i < WS_MAX; i++) if (gWsConn[i]) FD_SET(gWsConn[i]->s, &rd);
         timeval tv = { 0, 20000 };              // 20 ms: replies go out quickly
         if (rd.fd_count) select(0, &rd, nullptr, nullptr, &tv); else Sleep(20);
-        if (ls != INVALID_SOCKET && FD_ISSET(ls, &rd)) {
-            SOCKET c = accept(ls, nullptr, nullptr);
-            if (c != INVALID_SOCKET) {
-                int slot = -1; for (int i = 0; i < WS_MAX; i++) if (!gWsConn[i]) { slot = i; break; }
-                WsConn* w = slot >= 0 ? (WsConn*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WsConn)) : nullptr;
-                if (!w) closesocket(c);
-                else { BOOL nd = TRUE; setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd)); w->s = c; w->id = nextId++; gWsConn[slot] = w; }
-            }
+        for (int which = 0; which < 2; which++) {
+            const SOCKET l = which ? lp : ls;
+            if (l == INVALID_SOCKET || !FD_ISSET(l, &rd)) continue;
+            SOCKET c = accept(l, nullptr, nullptr);
+            if (c == INVALID_SOCKET) continue;
+            int slot = -1; for (int i = 0; i < WS_MAX; i++) if (!gWsConn[i]) { slot = i; break; }
+            WsConn* w = slot >= 0 ? (WsConn*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(WsConn)) : nullptr;
+            if (!w) { closesocket(c); continue; }
+            BOOL nd = TRUE; setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
+            w->s = c; w->id = nextId++; w->phone = which == 1; gWsConn[slot] = w;
         }
         for (int i = 0; i < WS_MAX; i++) {
             WsConn* w = gWsConn[i];
@@ -19989,15 +20268,32 @@ static DWORD WINAPI WsThread(LPVOID arg)
             w->inN += k; w->in[w->inN] = 0;
             if (!w->ws) {                       // the handshake first
                 if (!strstr((char*)w->in, "\r\n\r\n")) { if (w->inN > 8000) WsClose(i); continue; }
-                char reply[400];
-                if (!WsAccept((char*)w->in, reply, 400)) {
+                char reply[600];
+                if (w->phone) {                 // (the phone port: the page, or the page's WebSocket)
+                    const int r = PhoneHttp((char*)w->in, reply, 600);
+                    if (r == 1 && gPhonePage) {
+                        char hd[300];
+                        const int hn = snprintf(hd, sizeof(hd), "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: %d\r\n"
+                                                "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\n"
+                                                "Connection: close\r\n\r\n", gPhonePageN);
+                        WsSendAll(w->s, (const unsigned char*)hd, hn);
+                        WsSendAll(w->s, (const unsigned char*)gPhonePage, gPhonePageN);
+                        WsClose(i); continue;
+                    }
+                    if (r != 2) {               // (anything else: not found / not allowed)
+                        const char* no = r == 3 ? "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                                                : "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        WsSendAll(w->s, (const unsigned char*)no, (int)strlen(no));
+                        WsClose(i); continue;
+                    }
+                } else if (!WsAccept((char*)w->in, reply, 600)) {
                     const char* no = "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                     WsSendAll(w->s, (const unsigned char*)no, (int)strlen(no));
                     WsClose(i); continue;
                 }
                 WsSendAll(w->s, (const unsigned char*)reply, (int)strlen(reply));
                 w->ws = true; w->inN = 0;
-                PostMessageW(gWnd, WM_WS_CONN, (WPARAM)w->id, 1);
+                PostMessageW(gWnd, WM_WS_CONN, (WPARAM)w->id, w->phone ? 2 : 1);
                 continue;
             }
             bool dead = false;
@@ -20030,8 +20326,8 @@ static DWORD WINAPI WsThread(LPVOID arg)
             unsigned char* f = (unsigned char*)HeapAlloc(GetProcessHeap(), 0, n + 16);
             if (f) {
                 const int fl = WsFrame(1, q[j].msg, n, f);
-                for (int i = 0; i < WS_MAX; i++)
-                    if (gWsConn[i] && gWsConn[i]->ws && (q[j].id < 0 || q[j].id == gWsConn[i]->id)) WsSendAll(gWsConn[i]->s, f, fl);
+                for (int i = 0; i < WS_MAX; i++)   // (events for everyone go to this PC's apps only: phones ask for what they show)
+                    if (gWsConn[i] && gWsConn[i]->ws && (q[j].id < 0 ? !gWsConn[i]->phone : q[j].id == gWsConn[i]->id)) WsSendAll(gWsConn[i]->s, f, fl);
                 HeapFree(GetProcessHeap(), 0, f);
             }
             HeapFree(GetProcessHeap(), 0, q[j].msg);
@@ -20039,8 +20335,10 @@ static DWORD WINAPI WsThread(LPVOID arg)
     }
     for (int i = 0; i < WS_MAX; i++) if (gWsConn[i]) { closesocket(gWsConn[i]->s); HeapFree(GetProcessHeap(), 0, gWsConn[i]); gWsConn[i] = nullptr; }
     if (ls != INVALID_SOCKET) closesocket(ls);
+    if (lp != INVALID_SOCKET) closesocket(lp);
     return 0;
 }
+static void PhoneConnsClear(); static void PhoneConn(int id, bool came); static void RemoteLetGo(int id);
 static void WsStop()                            // closes the port and every connection, and ends the thread
 {
     if (gWsThread) {
@@ -20056,22 +20354,33 @@ static void WsStop()                            // closes the port and every con
     }
     if (gWsNetUp) { WSACleanup(); gWsNetUp = false; }
     gWsAuthedN = 0; gWsCount = 0; gWsState = 0; gWsLvN = 0;
+    gPhoneCount = 0; gPhoneState = 0; PhoneConnsClear();
 }
-static void WsStart()                           // (only when it's switched on in Settings)
+static void WsStart()                           // (only when it's switched on in Settings: remote control and / or the phone remote)
 {
     WsStop();
-    if (!gWsOn) return;
+    if (!gWsOn && !gPhoneOn) { PhoneStatusText(); return; }
+    if (gPhoneOn && !gPhonePage) {              // the page, from the exe (phone.html)
+        HRSRC rs = FindResourceW(nullptr, MAKEINTRESOURCEW(3), (LPCWSTR)RT_RCDATA);
+        HGLOBAL rg = rs ? LoadResource(nullptr, rs) : nullptr;
+        if (rg) { gPhonePage = (const char*)LockResource(rg); gPhonePageN = (int)SizeofResource(nullptr, rs); }
+    }
+    gWsRunLocal = gWsOn ? Iclamp(gWsPort, 1024, 65535) : 0;
+    gWsRunPhone = gPhoneOn ? Iclamp(gPhonePort, 1024, 65535) : 0;
     if (!gWsLockInit) { InitializeCriticalSection(&gWsLock); gWsLockInit = true; }
     WSADATA wd;
     if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) return;
     gWsNetUp = true;
     gWsStopNow = 0;
-    gWsThread = CreateThread(nullptr, 0, WsThread, (LPVOID)(INT_PTR)Iclamp(gWsPort, 1024, 65535), 0, nullptr);
+    gWsThread = CreateThread(nullptr, 0, WsThread, nullptr, 0, nullptr);
+    PhoneStatusText();
 }
 
 // ---- remote control: running a command (the window's thread) ----
+static bool PhoneIs(int id); static bool PhoneAuthed(int id); static bool PhoneCmd(int id, const char* what, const char* m);
 static bool WsAuthed(int id)
 {
+    if (PhoneIs(id)) return PhoneAuthed(id);    // (a phone: its own pairing, not the password)
     if (!gWsPass[0] || id == -2) return true;   // (-2: the command builder's Test, here)
     for (int i = 0; i < gWsAuthedN; i++) if (gWsAuthed[i] == id) return true;
     return false;
@@ -20417,6 +20726,7 @@ static void WsExec(int id, const char* m)
     char what[40] = ""; const char* p = m;
     if (!JsonString(m, "do", &p, what, 40)) { WsReply(id, "", "Send a command like: mute toggle  (or JSON: {\"do\":\"lag\",\"ms\":2000})"); return; }
     for (char* q = what; *q; q++) *q = (char)tolower((unsigned char)*q);
+    if (PhoneCmd(id, what, m)) return;          // (1.68.0) pair, hello, layout, state, key
     if (!strcmp(what, "auth")) {
         char pw[100] = ""; const char* pp = m; JsonString(m, "password", &pp, pw, 100);
         wchar_t w[100]; MultiByteToWideChar(CP_UTF8, 0, pw, -1, w, 100);
@@ -20424,7 +20734,7 @@ static void WsExec(int id, const char* m)
         if (!WsAuthed(id) && gWsAuthedN < 32) gWsAuthed[gWsAuthedN++] = id;
         WsReply(id, what, nullptr); return;
     }
-    if (!WsAuthed(id)) { WsReply(id, what, "Send the password first: auth YOUR PASSWORD"); return; }
+    if (!WsAuthed(id)) { WsReply(id, what, PhoneIs(id) ? "Pair this phone first." : "Send the password first: auth YOUR PASSWORD"); return; }
     const char* offLag = "The lag effect is off (Settings > Features).";
     const char* offFx = "Voice FX is off (Settings > Features).";
     const char* offSb = "The soundboard is off (Settings > Features).";
@@ -20789,6 +21099,8 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    plugin 1 mix 50   \x2014   its Mix knob (%%)\n"
         L"    plugin 1 set 'Threshold' -20   \x2014   one of its settings, in its own units (or '50%%' of its range)\n"
         L"    plugin 1 params   \x2014   replies with its settings' names and values\n\n"
+        L"Any hotkey action (advanced)\n"
+        L"    {\"do\":\"key\",\"name\":\"mute_hotkey\"}   \x2014   presses it, by its name in the settings file;  \"down\":true / false holds it / lets go\n\n"
         L"Music (Mic > Music)\n"
         L"    music toggle   \x2014   play / pause (also: play, pause, next, prev, stop);  music volume 60\n\n"
         L"Stream (Settings > Stream)\n"
@@ -21706,6 +22018,8 @@ static void BugInfoBuild(wchar_t* o, int cap)
         }
     }
     BugAdd(o, cap, L"Recorder: %ls", gRcd ? L"recording" : L"idle");
+    BugVbCable(o, cap);
+    BugPhone(o, cap);
     BugMacros(o, cap);
     {
         static const wchar_t* LS[5] = { L"empty", L"recording", L"playing", L"adding a layer", L"stopped" };
@@ -23708,6 +24022,590 @@ static void MacroShow()
     EnumChildWindows(w, ThemeChild, 0);
     MacroWndSync();
     ShowWindow(w, SW_SHOW);
+}
+
+// ======================= Phone remote (1.68.0) =======================
+// A page for a phone on the same Wi-Fi (phone.html, in the exe), served by the remote-control thread on its own port
+// (WsThread: gWsRunPhone). The page pairs once: you open Phone remote on the PC, scan its QR code, type the 4-digit
+// PIN it shows, and the phone gets a token it keeps (only the token's SHA-1 is saved here). Until then a phone can do
+// nothing but pair. Then it uses the same commands as Streamer.bot, plus: layout (what to show), state (what's on),
+// key (press, or hold down / let go, any hotkey action by its INI name).
+#define PHONE_MAX 8
+#define PHONE_BTNS 24
+struct PhonePaired { char hash[41]; wchar_t name[40]; wchar_t when[24]; };
+static PhonePaired gPhones[PHONE_MAX]; static int gPhonesN = 0;
+struct PhoneCon { int id; int paired; DWORD last; };   // paired: its gPhones index + 1 (0: not yet)
+static PhoneCon gPhCon[WS_MAX]; static int gPhConN = 0;
+static bool gPhonePairOpen = false; static char gPhonePin[5] = ""; static int gPhoneTries = 0;
+struct PhoneBtn { wchar_t label[40]; short slot; };
+static PhoneBtn gPhBtn[PHONE_BTNS]; static int gPhBtnN = 0;
+struct RHold { int id; short slot; };
+static RHold gRHold[32]; static int gRHoldN = 0;
+static HWND gPhoneWnd = nullptr;
+static wchar_t gPhoneAddr[64] = L"";            // the address shown (this PC on the Wi-Fi)
+static void PhoneWndSync();
+
+static PhoneCon* PhoneFind(int id) { for (int i = 0; i < gPhConN; i++) if (gPhCon[i].id == id) return &gPhCon[i]; return nullptr; }
+static bool PhoneIs(int id) { return id > 0 && PhoneFind(id) != nullptr; }
+static bool PhoneAuthed(int id) { PhoneCon* c = PhoneFind(id); return c && c->paired > 0; }
+static void RemoteHold(int id, int slot, bool down)   // a hold button: held until it's let go (or its phone goes quiet)
+{
+    for (int i = 0; i < gRHoldN; i++)
+        if (gRHold[i].id == id && gRHold[i].slot == slot) {
+            if (!down) { if (gRemoteDown[slot]) gRemoteDown[slot]--; gRHold[i] = gRHold[--gRHoldN]; }
+            return;
+        }
+    if (down && gRHoldN < 32) { gRHold[gRHoldN++] = { id, (short)slot }; gRemoteDown[slot]++; }
+}
+static void RemoteLetGo(int id)                 // every key this connection holds (-1: all)
+{
+    for (int i = 0; i < gRHoldN; )
+        if (id < 0 || gRHold[i].id == id) { if (gRemoteDown[gRHold[i].slot]) gRemoteDown[gRHold[i].slot]--; gRHold[i] = gRHold[--gRHoldN]; }
+        else i++;
+}
+static void PhoneConn(int id, bool came)        // (WM_WS_CONN) a phone connected / left
+{
+    if (came) { if (gPhConN < WS_MAX) { gPhCon[gPhConN++] = { id, 0, GetTickCount() }; gPhoneCount = gPhConN; } }
+    else {
+        RemoteLetGo(id);
+        for (int i = 0; i < gPhConN; i++) if (gPhCon[i].id == id) { gPhCon[i] = gPhCon[--gPhConN]; break; }
+        gPhoneCount = gPhConN;
+    }
+    PhoneStatusText();
+}
+static void PhoneConnsClear()                   // (WsStop: every connection closed)
+{
+    for (int i = 0; i < gPhConN; i++) RemoteLetGo(gPhCon[i].id);
+    gPhConN = 0;
+}
+static void PhoneTick()                         // (50 ms) a phone that's gone quiet lets go of what it holds
+{
+    if (!gRHoldN) return;
+    const DWORD now = GetTickCount();
+    for (int i = 0; i < gPhConN; i++) if (now - gPhCon[i].last > 4000) RemoteLetGo(gPhCon[i].id);
+}
+static bool PhoneRandom(void* out, ULONG n)     // (the PIN and the tokens) Windows' own random numbers
+{
+    return BCryptGenRandom(nullptr, (PUCHAR)out, n, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+}
+static void PhoneNewPin()
+{
+    unsigned v = 0;
+    if (!PhoneRandom(&v, sizeof(v))) v = GetTickCount() * 2654435761u;
+    snprintf(gPhonePin, 5, "%04u", v % 10000u);
+    gPhoneTries = 0;
+}
+static void PhoneHashHex(const char* token, char* out41)
+{
+    unsigned char dg[20]; Sha1((const unsigned char*)token, strlen(token), dg);
+    for (int i = 0; i < 20; i++) snprintf(out41 + i * 2, 3, "%02x", dg[i]);
+}
+static void PhonesLoad()                        // (LoadSettings) paired phones and your buttons
+{
+    gPhonesN = Iclamp(GetPrivateProfileIntW(L"settings", L"phone_count", 0, gIni), 0, PHONE_MAX);
+    for (int i = 0; i < gPhonesN; i++) {
+        wchar_t k[40], v[64];
+        wsprintfW(k, L"phone%d_hash", i + 1); GetPrivateProfileStringW(L"settings", k, L"", v, 64, gIni);
+        WideCharToMultiByte(CP_UTF8, 0, v, -1, gPhones[i].hash, 41, nullptr, nullptr);
+        wsprintfW(k, L"phone%d_name", i + 1); GetPrivateProfileStringW(L"settings", k, L"Phone", gPhones[i].name, 40, gIni);
+        wsprintfW(k, L"phone%d_when", i + 1); GetPrivateProfileStringW(L"settings", k, L"", gPhones[i].when, 24, gIni);
+    }
+    gPhBtnN = 0;
+    const int nb = Iclamp(GetPrivateProfileIntW(L"settings", L"phone_buttons", 0, gIni), 0, PHONE_BTNS);
+    for (int i = 0; i < nb; i++) {
+        wchar_t k[40], v[160];
+        wsprintfW(k, L"phone_button%d", i + 1); GetPrivateProfileStringW(L"settings", k, L"", v, 160, gIni);
+        wchar_t* bar = wcschr(v, L'|'); if (!bar) continue;
+        *bar = 0;
+        const int sl = SlotByIniName(bar + 1);
+        if (sl < 0) continue;
+        lstrcpynW(gPhBtn[gPhBtnN].label, v, 40); gPhBtn[gPhBtnN].slot = (short)sl; gPhBtnN++;
+    }
+}
+static void PhonesSave()                        // (inside SaveSettings' batch)
+{
+    SaveInt(L"phone_count", gPhonesN);
+    for (int i = 0; i < PHONE_MAX; i++) {
+        wchar_t k[40], h[48];
+        MultiByteToWideChar(CP_UTF8, 0, i < gPhonesN ? gPhones[i].hash : "", -1, h, 48);
+        wsprintfW(k, L"phone%d_hash", i + 1); IniSet(k, i < gPhonesN ? h : nullptr);
+        wsprintfW(k, L"phone%d_name", i + 1); IniSet(k, i < gPhonesN ? gPhones[i].name : nullptr);
+        wsprintfW(k, L"phone%d_when", i + 1); IniSet(k, i < gPhonesN ? gPhones[i].when : nullptr);
+    }
+    SaveInt(L"phone_buttons", gPhBtnN);
+    for (int i = 0; i < PHONE_BTNS; i++) {
+        wchar_t k[40], v[160];
+        wsprintfW(k, L"phone_button%d", i + 1);
+        if (i >= gPhBtnN) { IniSet(k, nullptr); continue; }
+        const wchar_t* kn = FxKeyIniName(gPhBtn[i].slot);
+        wchar_t lb[40]; lstrcpynW(lb, gPhBtn[i].label, 40); for (wchar_t* q = lb; *q; q++) if (*q == L'|') *q = L'/';
+        _snwprintf(v, 159, L"%ls|%ls", lb, kn ? kn : L""); v[159] = 0;
+        IniSet(k, v);
+    }
+}
+
+// ---- what the phone shows ----
+struct PJ {                                     // a JSON writer into a fixed buffer
+    char* b; int cap, n;
+    void raw(const char* s) { while (*s && n < cap - 1) b[n++] = *s++; b[n] = 0; }
+    void str(const wchar_t* w) {
+        char u[400], e[600]; WideCharToMultiByte(CP_UTF8, 0, w, -1, u, 400, nullptr, nullptr); JsonEsc(u, e, 600);
+        raw("\""); raw(e); raw("\"");
+    }
+    void key(const char* k) { if (n > 0 && b[n - 1] != '{' && b[n - 1] != '[') raw(","); raw("\""); raw(k); raw("\":"); }
+    void num(double v) { char t[32]; snprintf(t, 32, "%g", v); raw(t); }
+    void comma() { if (n > 0 && b[n - 1] != '{' && b[n - 1] != '[') raw(","); }
+};
+static const char* PhoneKind(int slot)          // tap (once), tog (lit while on), hold (while held)
+{
+    if (IsMacroSlot(slot)) { const int i = slot - SLOT_MACRO0; return i < gMacroN && gMacro[i].mode == 1 ? "hold" : "tap"; }
+    if (MacroHoldSlot(slot)) return "hold";
+    return MacroState(slot) >= 0 ? "tog" : "tap";
+}
+static void PhoneItem(PJ& j, const wchar_t* group, const wchar_t* name, int slot, const char* kind = nullptr)
+{
+    const wchar_t* kn = FxKeyIniName(slot);
+    if (!kn) return;
+    j.comma(); j.raw("{\"g\":"); j.str(group); j.raw(",\"name\":"); j.str(name);
+    j.raw(",\"k\":"); j.str(kn); j.raw(",\"t\":\""); j.raw(kind ? kind : PhoneKind(slot)); j.raw("\"}");
+}
+static unsigned PhoneLayout(char* out, int cap) // the tabs; returns its hash ("h": a phone asks again when it changes)
+{
+    PJ j = { out, cap, 0 }; out[0] = 0;
+    j.raw("{\"ok\":true,\"do\":\"layout\""); j.key("title"); j.raw("\"Lag Effect\"");
+    j.key("pads"); j.raw("[");
+    if (gFeatSound) for (int i = 0; i < PAD_N; i++) {   // (every page's pads that have a sound)
+        if (!gPadFile[i][0]) continue;
+        wchar_t nm[MAX_PATH]; if (gPadName[i][0]) lstrcpynW(nm, gPadName[i], MAX_PATH); else PadName(i, nm, MAX_PATH);
+        j.comma(); j.raw("{\"n\":"); j.num(i + 1); j.raw(",\"name\":"); j.str(nm); j.raw("}");
+    }
+    j.raw("]");
+    j.key("voice"); j.raw("[");
+    {
+        wchar_t ptt[40]; SlotName(SLOT_PTT, ptt, 40);
+        PhoneItem(j, L"Mic", L"Mute", SLOT_MUTE, "tog");
+        PhoneItem(j, L"Mic", ptt, SLOT_PTT, "hold");
+        PhoneItem(j, L"Mic", L"Live bleep", SLOT_BLLIVE, "hold");
+        if (gFeatSpeech) { PhoneItem(j, L"Mic", L"Bleep", SLOT_BLEEP, "hold"); PhoneItem(j, L"Mic", L"TTS voice", SLOT_SPTTS, "tog"); }
+        if (gFeatLag) {
+            j.comma(); j.raw("{\"g\":\"Lag\",\"name\":\"Stutter\",\"k\":\"lag\",\"t\":\"lag\"}");
+            PhoneItem(j, L"Lag", L"Rewind", SLOT_REWIND, "tap");
+            PhoneItem(j, L"Lag", L"Repeat word", SLOT_REPEAT, "tap");
+        }
+        if (gFeatFx) {
+            PhoneItem(j, L"Voice FX", L"Voice FX", 0, "tog");
+            for (int g = 0; g < FX_GROUPS; g++) PhoneItem(j, L"Voice FX", gFxGroups[g].title, 1 + g);
+            PhoneItem(j, L"Voice FX", L"Tape stop", SLOT_TAPESTOP, "tap");
+            PhoneItem(j, L"Voice FX", L"Pitch dive", SLOT_DIVE, "hold");
+        }
+        PhoneItem(j, L"Music", L"Play / pause", SLOT_MUSPLAY, "tog");
+        PhoneItem(j, L"Music", L"Next song", SLOT_MUSNEXT, "tap");
+        PhoneItem(j, L"Other", L"Recorder", SLOT_RECORD, "tog");
+        if (gFeatSound) PhoneItem(j, L"Other", L"Beatbox drums", SLOT_BEATBOX, "tog");
+        if (gProfCount > 1) PhoneItem(j, L"Other", L"Next profile", SLOT_PROFNEXT, "tap");
+    }
+    j.raw("]");
+    j.key("ch"); j.raw("[");
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        wchar_t nm[64]; ChanLabel(c, nm, 64);
+        j.comma(); j.raw("{\"n\":"); j.num(c + 1); j.raw(",\"name\":"); j.str(nm); j.raw("}");
+    }
+    j.raw("]");
+    j.key("out"); j.raw("[");
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) {
+        wchar_t nm[48]; OutName(k, nm, 48);
+        j.comma(); j.raw("{\"n\":"); j.num(k + 1); j.raw(",\"name\":"); j.str(nm); j.raw("}");
+    }
+    j.raw("]");
+    j.key("scenes"); j.raw("[");
+    for (int i = 0; i < gSceneN; i++) { j.comma(); j.raw("{\"n\":"); j.num(i + 1); j.raw(",\"name\":"); j.str(gSceneName[i]); j.raw("}"); }
+    j.raw("]");
+    j.key("macros"); j.raw("[");
+    for (int i = 0; i < gMacroN; i++) {
+        if (!gMacro[i].n) continue;
+        j.comma(); j.raw("{\"n\":"); j.num(i + 1); j.raw(",\"name\":"); j.str(gMacro[i].name);
+        j.raw(",\"k\":"); j.str(FxKeyIniName(SLOT_MACRO0 + i)); j.raw(gMacro[i].mode == 1 ? ",\"hold\":true}" : ",\"hold\":false}");
+    }
+    j.raw("]");
+    j.key("mine"); j.raw("[");
+    for (int i = 0; i < gPhBtnN; i++) PhoneItem(j, L"", gPhBtn[i].label, gPhBtn[i].slot);
+    j.raw("]");
+    unsigned h = 2166136261u;                   // (FNV-1a of what's above)
+    for (int i = 0; i < j.n; i++) { h ^= (unsigned char)out[i]; h *= 16777619u; }
+    char t[40]; snprintf(t, 40, ",\"h\":%u}", h); j.raw(t);
+    return h;
+}
+static void PhoneStateJson(char* out, int cap, unsigned h)   // what's on now
+{
+    PJ j = { out, cap, 0 }; out[0] = 0;
+    j.raw("{\"ok\":true,\"do\":\"state\""); j.key("h"); j.num(h);
+    j.key("lag"); j.raw(gLooping ? "true" : "false");
+    j.key("scene"); j.num(gSceneCur + 1);
+    j.key("on"); j.raw("{");
+    auto on = [&](int slot) {
+        const int st = MacroState(slot); const wchar_t* kn = FxKeyIniName(slot);
+        if (st < 0 || !kn) return;
+        char u[80]; WideCharToMultiByte(CP_UTF8, 0, kn, -1, u, 80, nullptr, nullptr);
+        j.comma(); j.raw("\""); j.raw(u); j.raw(st ? "\":true" : "\":false");
+    };
+    on(SLOT_MUTE); on(0); for (int g = 0; g < FX_GROUPS; g++) on(1 + g);
+    on(SLOT_SPTTS); on(SLOT_MUSPLAY); on(SLOT_RECORD); on(SLOT_BEATBOX);
+    for (int i = 0; i < gPhBtnN; i++) on(gPhBtn[i].slot);
+    for (int i = 0; i < gRHoldN; i++) {         // (held from a phone: lit too)
+        const wchar_t* kn = FxKeyIniName(gRHold[i].slot); if (!kn) continue;
+        char u[80]; WideCharToMultiByte(CP_UTF8, 0, kn, -1, u, 80, nullptr, nullptr);
+        j.comma(); j.raw("\""); j.raw(u); j.raw("\":true");
+    }
+    j.raw("}");
+    j.key("ch"); j.raw("[");
+    for (int c = 0; c < CH_MAX; c++) {
+        if (gCh[c].type == CH_NONE) continue;
+        char t[64]; snprintf(t, 64, "[%d,%.1f,%s]", c + 1, gCh[c].db10 / 10.0, gCh[c].mute ? "true" : "false");
+        j.comma(); j.raw(t);
+    }
+    j.raw("]");
+    j.key("out"); j.raw("[");
+    for (int k = 0; k < gRows && k < MAX_OUT; k++) {
+        char t[64]; snprintf(t, 64, "[%d,%d,%s]", k + 1, (int)gRowVol[k], gOutMute[k] ? "true" : "false");
+        j.comma(); j.raw(t);
+    }
+    j.raw("]");
+    j.key("mrun"); j.raw("[");
+    for (int i = 0; i < gMacroN; i++) if (gMRun[i].on) { j.comma(); j.num(i + 1); }
+    j.raw("]}");
+}
+static bool PhoneCmd(int id, const char* what, const char* m)   // (WsExec) the phone's own commands; false: not one of them
+{
+    PhoneCon* pc = PhoneFind(id);
+    if (pc) pc->last = GetTickCount();
+    if (!strcmp(what, "pair")) {
+        if (!pc) { WsReply(id, what, "Only the phone remote pairs."); return true; }
+        if (!gPhonePairOpen) { WsReply(id, what, "Open Phone remote on your PC (Settings > Stream) to see the PIN, then try again."); return true; }
+        char pin[16] = ""; const char* pp = m; JsonString(m, "pin", &pp, pin, 16);
+        if (strlen(pin) != 4 || strcmp(pin, gPhonePin) != 0) {
+            if (++gPhoneTries >= 5) {           // (guessing: the PIN is shut until you ask for a new one on the PC)
+                gPhonePairOpen = false; PhoneNewPin(); PhoneWndSync();
+                WsReply(id, what, "Too many wrong PINs. Click New PIN in Lag Effect's Phone remote window, then type the new one.");
+            } else WsReply(id, what, "Wrong PIN: it's the 4 digits in Lag Effect's Phone remote window.");
+            return true;
+        }
+        unsigned char rnd[16]; char tok[40];
+        if (!PhoneRandom(rnd, 16)) { WsReply(id, what, "Couldn't make a key for this phone."); return true; }
+        for (int i = 0; i < 16; i++) snprintf(tok + i * 2, 3, "%02x", rnd[i]);
+        if (gPhonesN >= PHONE_MAX) { for (int i = 0; i < PHONE_MAX - 1; i++) gPhones[i] = gPhones[i + 1]; gPhonesN--; }   // (the oldest goes)
+        PhonePaired& p = gPhones[gPhonesN];
+        PhoneHashHex(tok, p.hash);
+        char nm[64] = "Phone"; const char* np = m; JsonString(m, "name", &np, nm, 64);
+        MultiByteToWideChar(CP_UTF8, 0, nm, -1, p.name, 40); p.name[39] = 0;
+        for (wchar_t* q = p.name; *q; q++) if (*q < 32 || *q == L'|') *q = L' ';
+        SYSTEMTIME st; GetLocalTime(&st); swprintf(p.when, 24, L"%04d-%02d-%02d", st.wYear, st.wMonth, st.wDay);
+        gPhonesN++;
+        pc->paired = gPhonesN;
+        PhoneNewPin();                          // (one PIN, one phone)
+        SaveSettings(); PhoneWndSync();
+        char r[200]; snprintf(r, sizeof(r), "{\"ok\":true,\"do\":\"pair\",\"token\":\"%s\"}", tok);
+        WsQueue(id, r);
+        wchar_t o[80]; swprintf(o, 80, L"Phone remote: %ls paired", p.name); ShowOsd(o, true);
+        return true;
+    }
+    if (!strcmp(what, "hello")) {
+        if (!pc) { WsReply(id, what, "Only the phone remote says hello."); return true; }
+        char tok[80] = ""; const char* tp = m; JsonString(m, "token", &tp, tok, 80);
+        char h[41]; PhoneHashHex(tok, h);
+        for (int i = 0; i < gPhonesN && tok[0]; i++)
+            if (!strcmp(gPhones[i].hash, h)) { pc->paired = i + 1; WsReply(id, what, nullptr); PhoneStatusText(); return true; }
+        WsReply(id, what, "This phone isn't paired (any more): pair it again with the PIN.");
+        return true;
+    }
+    if (strcmp(what, "layout") && strcmp(what, "state") && strcmp(what, "key")) return false;
+    if (!WsAuthed(id)) { WsReply(id, what, pc ? "Pair this phone first." : "Send the password first: auth YOUR PASSWORD"); return true; }
+    static char big[32768];
+    if (!strcmp(what, "layout")) { PhoneLayout(big, sizeof(big)); WsQueue(id, big); return true; }
+    if (!strcmp(what, "state")) {
+        const unsigned h = PhoneLayout(big, sizeof(big));
+        PhoneStateJson(big, sizeof(big), h); WsQueue(id, big); return true;
+    }
+    // key: {"do":"key","name":"mute_hotkey"} presses it once; "down":true / false holds it / lets go
+    char nm[80] = ""; const char* np = m;
+    if (!JsonString(m, "name", &np, nm, 80)) { WsReply(id, what, "Give the key's \"name\" (like mute_hotkey)."); return true; }
+    wchar_t w[80]; MultiByteToWideChar(CP_UTF8, 0, nm, -1, w, 80);
+    const int slot = SlotByIniName(w);
+    if (slot < 0) { WsReply(id, what, "No action by that name."); return true; }
+    const int dn = JsonOnOff(m, "down");
+    if (dn == 1 || dn == 0) RemoteHold(id, slot, dn == 1);
+    else if (!gVoiceTap[slot]) gVoiceTap[slot] = 2;
+    WsReply(id, what, nullptr);
+    return true;
+}
+
+// ---- the window (Settings > Stream > Phone remote...) ----
+enum { IDC_PH_ON = 4930, IDC_PH_PORT, IDC_PH_ADDR, IDC_PH_STAT, IDC_PH_QR, IDC_PH_URL, IDC_PH_PIN, IDC_PH_NEWPIN, IDC_PH_LIST,
+       IDC_PH_FORGET, IDC_PH_BTNS, IDC_PH_ADD, IDC_PH_REN, IDC_PH_UP, IDC_PH_DOWN, IDC_PH_REM, IDC_PH_PINHDR, IDC_PH_LIC };
+static int PhoneAddrs(wchar_t (*out)[64], int cap)   // this PC's IPv4 addresses, the likely Wi-Fi / LAN one first
+{
+    ULONG sz = 32768; int n = 0;
+    IP_ADAPTER_ADDRESSES* aa = (IP_ADAPTER_ADDRESSES*)HeapAlloc(GetProcessHeap(), 0, sz);
+    if (!aa) return 0;
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                             nullptr, aa, &sz) == NO_ERROR) {
+        for (int pass = 0; pass < 2; pass++)     // (with a gateway first: that's the network your phone is on)
+            for (IP_ADAPTER_ADDRESSES* a = aa; a && n < cap; a = a->Next) {
+                if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->IfType == IF_TYPE_TUNNEL) continue;
+                if ((a->FirstGatewayAddress != nullptr) != (pass == 0)) continue;
+                for (IP_ADAPTER_UNICAST_ADDRESS* u = a->FirstUnicastAddress; u && n < cap; u = u->Next) {
+                    const sockaddr_in* sa = (const sockaddr_in*)u->Address.lpSockaddr;
+                    if (!sa || sa->sin_family != AF_INET) continue;
+                    const unsigned char* b = (const unsigned char*)&sa->sin_addr;
+                    if (b[0] == 127 || (b[0] == 169 && b[1] == 254)) continue;
+                    swprintf(out[n], 64, L"%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+                    bool dup = false; for (int k = 0; k < n; k++) if (!lstrcmpW(out[k], out[n])) dup = true;
+                    if (!dup) n++;
+                }
+            }
+    }
+    HeapFree(GetProcessHeap(), 0, aa);
+    return n;
+}
+static void PhoneUrl(wchar_t* out, int cap)
+{
+    if (gPhoneAddr[0]) swprintf(out, cap, L"http://%ls:%d/", gPhoneAddr, Iclamp(gPhonePort, 1024, 65535));
+    else lstrcpynW(out, L"", cap);
+}
+static void PhoneStatusText()
+{
+    if (!gPhoneWnd) return;
+    wchar_t t[200];
+    if (!gPhoneOn) lstrcpynW(t, L"Off: no phone can connect.", 200);
+    else if (gPhoneState == 2) swprintf(t, 200, L"Port %d is in use by another app: pick another one.", gPhonePort);
+    else if (gPhoneState == 1) {
+        int paired = 0; for (int i = 0; i < gPhConN; i++) if (gPhCon[i].paired) paired++;
+        swprintf(t, 200, L"On  \x00B7  %d phone%ls connected", paired, paired == 1 ? L"" : L"s");
+    }
+    else lstrcpynW(t, L"Starting...", 200);
+    SetDlgItemTextW(gPhoneWnd, IDC_PH_STAT, t);
+}
+static void PhoneWndSync()
+{
+    if (!gPhoneWnd) return;
+    HWND w = gPhoneWnd;
+    CheckDlgButton(w, IDC_PH_ON, gPhoneOn ? BST_CHECKED : BST_UNCHECKED);
+    wchar_t url[120]; PhoneUrl(url, 120);
+    SetDlgItemTextW(w, IDC_PH_URL, gPhoneOn ? (url[0] ? url : L"(no network found)") : L"");
+    InvalidateRect(GetDlgItem(w, IDC_PH_QR), nullptr, FALSE);
+    wchar_t pin[16]; swprintf(pin, 16, L"%hs", gPhonePairOpen && gPhoneOn ? gPhonePin : "----");
+    SetDlgItemTextW(w, IDC_PH_PIN, pin);
+    SetDlgItemTextW(w, IDC_PH_PINHDR, !gPhoneOn ? L"Switch it on (above), then pair a phone:" :
+                    gPhonePairOpen ? L"To pair a phone: scan the code with its camera (or type the address into its browser), then type this PIN:"
+                                   : L"Too many wrong PINs, so pairing stopped. Click New PIN to pair a phone:");
+    HWND l = GetDlgItem(w, IDC_PH_LIST);
+    SendMessageW(l, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gPhonesN; i++) {
+        wchar_t t[90]; swprintf(t, 90, L"%ls  (paired %ls)", gPhones[i].name, gPhones[i].when);
+        SendMessageW(l, LB_ADDSTRING, 0, (LPARAM)t);
+    }
+    if (!gPhonesN) SendMessageW(l, LB_ADDSTRING, 0, (LPARAM)L"(none yet)");
+    HWND b = GetDlgItem(w, IDC_PH_BTNS);
+    const int keep = (int)SendMessageW(b, LB_GETCURSEL, 0, 0);
+    SendMessageW(b, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gPhBtnN; i++) {
+        wchar_t a[120], t[180]; VcActionName(gPhBtn[i].slot, a, 120);
+        if (lstrcmpW(a, gPhBtn[i].label)) swprintf(t, 180, L"%ls   \x2192  %ls", gPhBtn[i].label, a); else lstrcpynW(t, a, 180);
+        SendMessageW(b, LB_ADDSTRING, 0, (LPARAM)t);
+    }
+    if (keep >= 0 && keep < gPhBtnN) SendMessageW(b, LB_SETCURSEL, keep, 0);
+    PhoneStatusText();
+}
+static void PhoneAddrFill()
+{
+    if (!gPhoneWnd) return;
+    wchar_t a[8][64]; const int n = PhoneAddrs(a, 8);
+    HWND c = GetDlgItem(gPhoneWnd, IDC_PH_ADDR);
+    SendMessageW(c, CB_RESETCONTENT, 0, 0);
+    int sel = 0;
+    for (int i = 0; i < n; i++) { SendMessageW(c, CB_ADDSTRING, 0, (LPARAM)a[i]); if (!lstrcmpW(a[i], gPhoneAddr)) sel = i; }
+    if (n) { SendMessageW(c, CB_SETCURSEL, sel, 0); lstrcpynW(gPhoneAddr, a[sel], 64); } else gPhoneAddr[0] = 0;
+    EnableWindow(c, n > 1);
+}
+static void PhoneDrawQr(const DRAWITEMSTRUCT* d)   // the address as a QR code (black on white, with its quiet border)
+{
+    RECT rc = d->rcItem;
+    HBRUSH white = CreateSolidBrush(RGB(255, 255, 255)), black = CreateSolidBrush(RGB(0, 0, 0));
+    FillRect(d->hDC, &rc, gPhoneOn ? white : BgSolid());
+    wchar_t url[120]; PhoneUrl(url, 120);
+    if (gPhoneOn && url[0]) {
+        char u8[160]; WideCharToMultiByte(CP_UTF8, 0, url, -1, u8, 160, nullptr, nullptr);
+        static uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(10)], tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
+        if (qrcodegen_encodeText(u8, tmp, qr, qrcodegen_Ecc_MEDIUM, 1, 10, qrcodegen_Mask_AUTO, true)) {
+            const int sz = qrcodegen_getSize(qr), quiet = 4, all = sz + 2 * quiet;
+            const int side = Imin(rc.right - rc.left, rc.bottom - rc.top), cell = Imax(1, side / all);
+            const int x0 = rc.left + (rc.right - rc.left - cell * all) / 2 + quiet * cell, y0 = rc.top + (rc.bottom - rc.top - cell * all) / 2 + quiet * cell;
+            for (int y = 0; y < sz; y++) for (int x = 0; x < sz; x++)
+                if (qrcodegen_getModule(qr, x, y)) { RECT m = { x0 + x * cell, y0 + y * cell, x0 + (x + 1) * cell, y0 + (y + 1) * cell }; FillRect(d->hDC, &m, black); }
+        }
+    }
+    DeleteObject(white); DeleteObject(black);
+}
+static LRESULT CALLBACK PhoneProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        HWND bl = GetDlgItem(h, IDC_PH_BTNS);
+        const int bs = (int)SendMessageW(bl, LB_GETCURSEL, 0, 0);
+        if (id == IDC_PH_ON && code == BN_CLICKED) {
+            gPhoneOn = IsDlgButtonChecked(h, IDC_PH_ON) == BST_CHECKED;
+            if (gPhoneOn) { gPhonePairOpen = true; PhoneNewPin(); }
+            if (gWsOn || gPhoneOn) WsStart(); else WsStop();
+            SaveSettings(); PhoneWndSync();
+        }
+        if (id == IDC_PH_PORT && code == EN_KILLFOCUS) {
+            BOOL ok = FALSE; const int v = (int)GetDlgItemInt(h, IDC_PH_PORT, &ok, FALSE);
+            if (ok && v >= 1024 && v <= 65535 && v != gPhonePort) {
+                if (v == gWsPort) { SetDlgItemTextW(h, IDC_PH_STAT, L"That's remote control's port: pick another one."); return 0; }
+                gPhonePort = v; if (gPhoneOn) WsStart(); SaveSettings(); PhoneWndSync();
+            }
+        }
+        if (id == IDC_PH_ADDR && code == CBN_SELCHANGE) {
+            const int i = (int)SendDlgItemMessageW(h, id, CB_GETCURSEL, 0, 0);
+            if (i >= 0) SendDlgItemMessageW(h, id, CB_GETLBTEXT, i, (LPARAM)gPhoneAddr);
+            PhoneWndSync();
+        }
+        if (id == IDC_PH_LIC && code == BN_CLICKED)
+            MessageBoxW(h, L"The pairing code is drawn with QR Code generator library (C)\n"
+                           L"Copyright (c) Project Nayuki. (MIT License)\nhttps://www.nayuki.io/page/qr-code-generator-library\n\n"
+                           L"Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated "
+                           L"documentation files (the \"Software\"), to deal in the Software without restriction, including without limitation "
+                           L"the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and "
+                           L"to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n"
+                           L"- The above copyright notice and this permission notice shall be included in all copies or substantial portions "
+                           L"of the Software.\n- The Software is provided \"as is\", without warranty of any kind, express or implied, including "
+                           L"but not limited to the warranties of merchantability, fitness for a particular purpose and noninfringement. In no "
+                           L"event shall the authors or copyright holders be liable for any claim, damages or other liability, whether in an "
+                           L"action of contract, tort or otherwise, arising from, out of or in connection with the Software or the use or other "
+                           L"dealings in the Software.\n\nQR Code is a registered trademark of DENSO WAVE INCORPORATED.",
+                        L"Lag Effect - Phone remote", MB_ICONINFORMATION);
+        if (id == IDC_PH_NEWPIN && code == BN_CLICKED) { PhoneNewPin(); gPhonePairOpen = true; PhoneWndSync(); }
+        if (id == IDC_PH_FORGET && code == BN_CLICKED) {
+            const int i = (int)SendDlgItemMessageW(h, IDC_PH_LIST, LB_GETCURSEL, 0, 0);
+            if (i < 0 || i >= gPhonesN) { SetDlgItemTextW(h, IDC_PH_STAT, L"Pick a phone in the list first."); return 0; }
+            wchar_t q[120]; swprintf(q, 120, L"Forget \"%ls\"? It will need the PIN again.", gPhones[i].name);
+            if (MessageBoxW(h, q, L"Lag Effect - Phone remote", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+            for (int k = i; k < gPhonesN - 1; k++) gPhones[k] = gPhones[k + 1];
+            gPhonesN--;
+            for (int k = 0; k < gPhConN; k++) {  // (connected now: it stops at once)
+                if (gPhCon[k].paired == i + 1) { gPhCon[k].paired = 0; RemoteLetGo(gPhCon[k].id); }
+                else if (gPhCon[k].paired > i + 1) gPhCon[k].paired--;
+            }
+            SaveSettings(); PhoneWndSync();
+        }
+        if (id == IDC_PH_ADD && code == BN_CLICKED) {
+            if (gPhBtnN >= PHONE_BTNS) { SetDlgItemTextW(h, IDC_PH_STAT, L"That's all 24 buttons."); return 0; }
+            HMENU pm = CreatePopupMenu(); MacroActionMenu(pm);
+            if (gMacroN) {
+                HMENU mm = CreatePopupMenu(); AppendMenuW(pm, MF_POPUP, (UINT_PTR)mm, L"Macros");
+                for (int i = 0; i < gMacroN; i++) { wchar_t t[80]; MacroLabel(i, t, 80); AppendMenuW(mm, MF_STRING, 10000 + SLOT_MACRO0 + i, t); }
+            }
+            RECT r; GetWindowRect(GetDlgItem(h, id), &r);
+            const int cmd = (int)TrackPopupMenu(pm, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, h, nullptr);
+            DestroyMenu(pm);
+            if (cmd < 10000 || cmd >= 20000) {
+                if (cmd >= 20000) SetDlgItemTextW(h, IDC_PH_STAT, L"A profile needs a macro (Macros... > Add action > Profiles), then add the macro here.");
+                return 0;
+            }
+            PhoneBtn& b = gPhBtn[gPhBtnN];
+            b.slot = (short)(cmd - 10000);
+            wchar_t a[120]; VcActionName(b.slot, a, 120);
+            if (IsMacroSlot(b.slot) && b.slot - SLOT_MACRO0 < gMacroN) lstrcpynW(a, gMacro[b.slot - SLOT_MACRO0].name, 40);
+            lstrcpynW(b.label, a, 40);
+            gPhBtnN++; SaveSettings(); PhoneWndSync();
+            SendMessageW(bl, LB_SETCURSEL, gPhBtnN - 1, 0);
+        }
+        if (id == IDC_PH_REN && code == BN_CLICKED && bs >= 0 && bs < gPhBtnN) {
+            wchar_t t[40]; lstrcpynW(t, gPhBtn[bs].label, 40);
+            if (InputBox(L"Button name", L"What the button says on the phone:", t, 40) && t[0]) { lstrcpynW(gPhBtn[bs].label, t, 40); SaveSettings(); PhoneWndSync(); }
+        }
+        if ((id == IDC_PH_UP || id == IDC_PH_DOWN) && code == BN_CLICKED && bs >= 0) {
+            const int to = bs + (id == IDC_PH_UP ? -1 : 1);
+            if (to < 0 || to >= gPhBtnN) return 0;
+            const PhoneBtn t = gPhBtn[bs]; gPhBtn[bs] = gPhBtn[to]; gPhBtn[to] = t;
+            SaveSettings(); PhoneWndSync(); SendMessageW(bl, LB_SETCURSEL, to, 0);
+        }
+        if (id == IDC_PH_REM && code == BN_CLICKED && bs >= 0 && bs < gPhBtnN) {
+            for (int k = bs; k < gPhBtnN - 1; k++) gPhBtn[k] = gPhBtn[k + 1];
+            gPhBtnN--; SaveSettings(); PhoneWndSync(); SendMessageW(bl, LB_SETCURSEL, Imin(bs, gPhBtnN - 1), 0);
+        }
+        return 0;
+    }
+    case WM_DRAWITEM:
+        if (w == IDC_PH_QR) { PhoneDrawQr((const DRAWITEMSTRUCT*)l); return TRUE; }
+        break;
+    case WM_CLOSE: gPhonePairOpen = false; DestroyWindow(h); return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, msg, w, l);
+    case WM_DESTROY: if (gPhoneWnd == h) { gPhoneWnd = nullptr; gPhonePairOpen = false; } return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+static void PhoneShow()
+{
+    if (gPhoneWnd) { gPhonePairOpen = true; PhoneNewPin(); PhoneAddrFill(); PhoneWndSync(); ShowWindow(gPhoneWnd, SW_SHOW); SetForegroundWindow(gPhoneWnd); return; }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = PhoneProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagPhone"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r = { 0, 0, SC(580), SC(560) }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND w = CreateWindowExW(0, L"LagPhone", L"Lag Effect - Phone remote", style,
+                             (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    gPhoneWnd = w;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x), SC(y), SC(w2), SC(h2), w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"BUTTON", L"Let my phone control Lag Effect (on the same Wi-Fi as this PC)", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 14, 470, 20, IDC_PH_ON);
+    mk(L"STATIC", L"Port:", 0, 16, 45, 40, 20, -1);
+    MiniMake(w, IDC_PH_PORT, 58, 42, 80, 23, 1024, 65535, gPhonePort, 8790, false);
+    mk(L"STATIC", L"This PC:", 0, 152, 45, 60, 20, -1);
+    mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 214, 42, 150, 200, IDC_PH_ADDR);
+    mk(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 376, 45, 188, 20, IDC_PH_STAT);
+    mk(L"STATIC", L"", SS_OWNERDRAW, 16, 80, 210, 210, IDC_PH_QR);
+    mk(L"STATIC", L"", SS_NOPREFIX | SS_CENTER, 16, 294, 210, 20, IDC_PH_URL);
+    mk(L"STATIC", L"", SS_NOPREFIX, 244, 82, 320, 54, IDC_PH_PINHDR);
+    HWND pin = mk(L"STATIC", L"----", SS_NOPREFIX, 244, 140, 200, 56, IDC_PH_PIN);
+    {
+        static HFONT big = nullptr;
+        if (!big) { LOGFONTW lf = {}; GetObjectW(gFontBold ? gFontBold : gFont, sizeof(lf), &lf); lf.lfHeight = -SC(42); lf.lfWeight = FW_BOLD; big = CreateFontIndirectW(&lf); }
+        SendMessageW(pin, WM_SETFONT, (WPARAM)big, TRUE);
+    }
+    mk(L"BUTTON", L"New PIN", WS_TABSTOP, 454, 152, 110, 28, IDC_PH_NEWPIN);
+    mk(L"STATIC", L"Paired phones", 0, 244, 206, 200, 18, -1);
+    mk(L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER, 244, 226, 320, 66, IDC_PH_LIST);
+    mk(L"BUTTON", L"Forget", WS_TABSTOP, 474, 296, 90, 26, IDC_PH_FORGET);
+    mk(L"STATIC", L"Your buttons (the phone's Mine tab). The other tabs fill in by themselves: pads, voice, mixer, scenes, macros.",
+       SS_NOPREFIX, 16, 332, 548, 34, IDC_HDR);
+    mk(L"LISTBOX", L"", LBS_NOTIFY | WS_VSCROLL | WS_TABSTOP | WS_BORDER, 16, 368, 440, 128, IDC_PH_BTNS);
+    mk(L"BUTTON", L"Add...", WS_TABSTOP, 466, 368, 98, 26, IDC_PH_ADD);
+    mk(L"BUTTON", L"Rename...", WS_TABSTOP, 466, 398, 98, 26, IDC_PH_REN);
+    mk(L"BUTTON", L"Up", WS_TABSTOP, 466, 432, 47, 26, IDC_PH_UP);
+    mk(L"BUTTON", L"Down", WS_TABSTOP, 517, 432, 47, 26, IDC_PH_DOWN);
+    mk(L"BUTTON", L"Remove", WS_TABSTOP, 466, 470, 98, 26, IDC_PH_REM);
+    mk(L"STATIC", L"The first time, Windows may ask whether Lag Effect can use networks: allow Private networks. Only phones that "
+                  L"paired with the PIN can do anything; anyone else on the Wi-Fi just sees the PIN page.",
+       SS_NOPREFIX, 16, 506, 440, 44, IDC_HDR);
+    mk(L"BUTTON", L"Licence...", WS_TABSTOP, 466, 510, 98, 26, IDC_PH_LIC);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    gPhonePairOpen = true; PhoneNewPin();
+    PhoneAddrFill(); PhoneWndSync();
+    ShowWindow(w, SW_SHOW);
+}
+static void BugPhone(wchar_t* o, int cap)
+{
+    BugAdd(o, cap, L"Phone remote: %ls, port %d, %ls; %d paired, %d connected, %d your buttons, %d held", gPhoneOn ? L"on" : L"off", gPhonePort,
+           gPhoneState == 1 ? L"listening" : gPhoneState == 2 ? L"port in use" : L"-", gPhonesN, gPhConN, gPhBtnN, gRHoldN);
 }
 static void TtsSay(const wchar_t* t)            // the TTS voice: one after another
 {
@@ -26586,7 +27484,8 @@ static void CreateUI()
     Ctl(L"EDIT", gWsPass, ES_AUTOHSCROLL | WS_TABSTOP, 304, 133, 106, 23, IDC_WSPASS);
     SendDlgItemMessageW(gWnd, IDC_WSPASS, EM_LIMITTEXT, 60, 0);
     Ctl(L"BUTTON", L"How to use...", WS_TABSTOP, 416, 131, 114, 27, IDC_WSGUIDE);
-    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 164, 500, 18, IDC_WSSTATUS);
+    Ctl(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 30, 164, 380, 18, IDC_WSSTATUS);
+    Ctl(L"BUTTON", L"Phone remote...", WS_TABSTOP, 416, 159, 114, 27, IDC_PHONEBTN);
     // (1.66.1) the command builder: its own box, labelled lists, the command in a box, one clear Copy button
     AddSection(14, 202, 532, 130, L"Command builder (Streamer.bot)");
     Ctl(L"STATIC", L"Do this", 0, 30, 218, 196, 16, IDC_CBLBLACT);
@@ -27219,7 +28118,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_WSON) {                       // remote control: on = the server starts; off = it's closed completely
         if (code != BN_CLICKED) return;
         gWsOn = Checked(id);
-        if (gWsOn) WsStart(); else WsStop();
+        if (gWsOn || gPhoneOn) WsStart(); else WsStop();
         WsStatusText(); SaveSettings();
         return;
     }
@@ -27377,6 +28276,7 @@ static void OnCommand(int id, int code)
     if (id == IDC_KEYSLIST)    { if (code == BN_CLICKED) KeysListShow(); return; }
     if (id == IDC_RCDBTN)      { if (code == BN_CLICKED) RcdShow(); return; }
     if (id == IDC_MACROBTN)    { if (code == BN_CLICKED) MacroShow(); return; }
+    if (id == IDC_PHONEBTN)    { if (code == BN_CLICKED) PhoneShow(); return; }
     if (id == IDC_ONSTRIP)     { if (code == STN_CLICKED) ChipsClick(); return; }
     if (id == IDC_HDRMETER)    { if (code == STN_CLICKED && PageOn(PAGE_MIC)) SetPage(PAGE_MIC); return; }
     if (id == IDC_HDRMETERON)  {
@@ -28239,7 +29139,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         DragAcceptFiles(h, TRUE);                // drop audio files onto soundboard pads
         ApplyTheme();
         StartWithWindowsFollow();
-        if (gWsOn) WsStart();                   // remote control (only if you switched it on)
+        if (gWsOn || gPhoneOn) WsStart();       // remote control / the phone remote (only if you switched them on)
         WsStatusText();
         // Keeps retrying quietly if the devices are still busy (e.g. the old version is closing).
         if ((gAutoStart || gResumeAudio) && !gSafe && !StartAudio(true)) SetTimer(h, TIMER_RECONNECT, 1000, nullptr);
@@ -28274,7 +29174,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            DropTick(); SilenceTick();
+            DropTick(); SilenceTick(); PhoneTick();
             UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick(); RcdTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
@@ -28339,9 +29239,11 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         HeapFree(GetProcessHeap(), 0, (void*)l);
         return 0;
     case WM_WS_CONN:
+        if (l == 2 || l == 3) { PhoneConn((int)w, l == 2); return 0; }   // (1.68.0) a phone came / went
         if (l) gWsCount++;
         else {
             gWsCount = Imax(0, gWsCount - 1);
+            RemoteLetGo((int)w);                // (keys it held down: let go)
             for (int i = 0; i < gWsAuthedN; i++) if (gWsAuthed[i] == (int)w) { gWsAuthed[i] = gWsAuthed[--gWsAuthedN]; break; }
             for (int i = 0; i < gWsLvN; i++) if (gWsLvId[i] == (int)w) { gWsLvN--; gWsLvId[i] = gWsLvId[gWsLvN]; gWsLvMs[i] = gWsLvMs[gWsLvN]; gWsLvT[i] = gWsLvT[gWsLvN]; break; }
         }
@@ -28349,7 +29251,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         WsStatusText();
         return 0;
     case WM_WS_STATE:
-        if (gWsThread) { gWsState = (int)w; WsStatusText(); }
+        if (gWsThread) { if (l) { gPhoneState = (int)w; PhoneStatusText(); } else { gWsState = (int)w; WsStatusText(); } }
         return 0;
     case WM_APPS_SCANNED: {                     // the background scan: the apps list, icons, and apps that just opened
         AppScan* sc = (AppScan*)l;
@@ -28429,6 +29331,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     }
+    case WM_APP + 70: VbInstallDone((DWORD)w); return 0;   // the VB-CABLE installer closed
     case WM_APP + 31:                           // Mic > Music: the decoder started / finished a song
         MusUi();
         return 0;
@@ -28719,8 +29622,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     LoadSettings();
     BackupOnNewVersion();                       // (a new version: the old settings are kept in Backups first)
     if (gSafe) {                                // safe start: these stay as saved, but are off for this run
-        gSafeVst = gFeatVst; gSafeFx = gFxOn; gSafeWs = gWsOn;
-        gFeatVst = false; gFxOn = false; gWsOn = false; gResumeAudio = false;
+        gSafeVst = gFeatVst; gSafeFx = gFxOn; gSafeWs = gWsOn; gSafePhone = gPhoneOn;
+        gFeatVst = false; gFxOn = false; gWsOn = false; gPhoneOn = false; gResumeAudio = false;
         if (gMicSub == 2) gMicSub = 0;
     }
     LoadThemeApis();

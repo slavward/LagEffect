@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#16181d">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Lag Effect remote</title>
+<style>
+:root {
+  --bg: #16181d; --card: #22252d; --card2: #2b2f39; --text: #e8eaf0; --dim: #9aa0ad;
+  --accent: #7c5cff; --on: #3ecf8e; --red: #ff5c6c; --amber: #ffb547;
+  --r: 14px; --gap: 10px;
+}
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+  font: 15px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+body { display: flex; flex-direction: column; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+header { display: flex; align-items: center; gap: 8px; padding: calc(10px + env(safe-area-inset-top)) 14px 8px; }
+header h1 { font-size: 17px; margin: 0; font-weight: 650; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#dot { width: 10px; height: 10px; border-radius: 50%; background: var(--red); flex: none; }
+#dot.ok { background: var(--on); }
+#banner { display: none; margin: 0 14px 8px; padding: 8px 12px; border-radius: 10px; background: #3a2a14; color: var(--amber); font-size: 14px; }
+#banner.show { display: block; }
+main { flex: 1; overflow-y: auto; padding: 4px 14px 14px; -webkit-overflow-scrolling: touch; }
+nav { display: flex; background: #1c1f26; border-top: 1px solid #2c303a; padding-bottom: env(safe-area-inset-bottom); }
+nav button { flex: 1; background: none; border: 0; color: var(--dim); font: inherit; font-size: 12px; padding: 9px 2px 8px; }
+nav button b { display: block; font-size: 19px; line-height: 1.1; font-weight: 400; margin-bottom: 2px; }
+nav button.sel { color: var(--text); }
+nav button.sel b { color: var(--accent); }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(104px, 1fr)); gap: var(--gap); }
+.btn { position: relative; min-height: 76px; border: 0; border-radius: var(--r); background: var(--card); color: var(--text);
+  font: inherit; font-weight: 560; padding: 10px 8px; display: flex; align-items: center; justify-content: center; text-align: center;
+  overflow-wrap: anywhere; touch-action: manipulation; transition: transform .06s, background .12s; }
+.btn:active, .btn.down { transform: scale(.96); background: var(--card2); }
+.btn.on { background: var(--accent); }
+.btn.run { box-shadow: inset 0 0 0 3px var(--on); }
+.btn .tag { position: absolute; top: 6px; right: 8px; font-size: 10px; font-weight: 600; color: var(--dim); letter-spacing: .04em; }
+.btn.on .tag { color: #e9e4ff; }
+h2 { font-size: 13px; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: .06em; margin: 16px 2px 8px; }
+h2:first-child { margin-top: 6px; }
+.empty { color: var(--dim); padding: 28px 8px; text-align: center; }
+.strip { display: flex; align-items: center; gap: 10px; background: var(--card); border-radius: var(--r); padding: 10px 12px; margin-bottom: 8px; }
+.strip .nm { width: 84px; flex: none; font-weight: 560; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.strip .val { width: 54px; flex: none; text-align: right; color: var(--dim); font-variant-numeric: tabular-nums; font-size: 13px; }
+.strip input { flex: 1; min-width: 0; accent-color: var(--accent); height: 30px; }
+.strip .m { flex: none; width: 48px; height: 36px; border-radius: 10px; border: 0; background: var(--card2); color: var(--text); font: inherit; font-size: 13px; font-weight: 600; }
+.strip .m.on { background: var(--red); }
+#pair { max-width: 360px; margin: 6vh auto 0; text-align: center; }
+#pair p { color: var(--dim); }
+#pin { width: 100%; font: 600 34px/1 ui-monospace, Menlo, monospace; letter-spacing: .4em; text-align: center; padding: 14px 0 14px .4em;
+  border-radius: var(--r); border: 2px solid var(--card2); background: var(--card); color: var(--text); outline: none; -webkit-user-select: text; user-select: text; }
+#pin:focus { border-color: var(--accent); }
+#pairgo { margin-top: 14px; width: 100%; min-height: 54px; background: var(--accent); }
+#pairmsg { min-height: 1.4em; color: var(--red); margin-top: 10px; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<header><div id="dot"></div><h1 id="title">Lag Effect</h1></header>
+<div id="banner"></div>
+<main id="main">
+  <div id="pair" class="hidden">
+    <h2 style="margin-top:0">Pair this phone</h2>
+    <p>Type the 4-digit PIN shown in Lag Effect's Phone remote window on your PC.</p>
+    <input id="pin" inputmode="numeric" pattern="[0-9]*" maxlength="4" autocomplete="one-time-code" placeholder="····">
+    <button id="pairgo" class="btn">Pair</button>
+    <div id="pairmsg"></div>
+  </div>
+  <div id="view"></div>
+</main>
+<nav id="nav" class="hidden"></nav>
+<script>
+"use strict";
+const TABS = [
+  { id: "pads",   icon: "▦", name: "Pads" },
+  { id: "voice",  icon: "◉", name: "Voice" },
+  { id: "mixer",  icon: "≡", name: "Mixer" },
+  { id: "scenes", icon: "◧", name: "Scenes" },
+  { id: "macros", icon: "▶", name: "Macros" },
+  { id: "mine",   icon: "★", name: "Mine" },
+];
+const KEY = "lagfx-token";
+let ws = null, authed = false, layout = null, state = null, tab = null, retry = 800, pollT = 0;
+const held = new Map();                 // hold buttons now down: key -> the message that lets go
+const dragging = new Set();             // sliders being moved (state updates leave them alone)
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+function token() { try { return localStorage.getItem(KEY) || ""; } catch (e) { return ""; } }
+function setToken(t) { try { if (t) localStorage.setItem(KEY, t); else localStorage.removeItem(KEY); } catch (e) {} }
+function banner(text) { const b = $("banner"); b.textContent = text || ""; b.classList.toggle("show", !!text); }
+function send(o) { if (ws && ws.readyState === 1) { ws.send(JSON.stringify(o)); return true; } return false; }
+
+function connect() {
+  banner(authed || layout ? "Reconnecting…" : "");
+  try { ws = new WebSocket("ws://" + location.host + "/ws"); } catch (e) { setTimeout(connect, retry); return; }
+  ws.onopen = () => {
+    retry = 800; $("dot").classList.add("ok");
+    const t = token();
+    if (t) send({ do: "hello", token: t }); else showPair();
+  };
+  ws.onclose = () => {
+    $("dot").classList.remove("ok"); authed = false; held.clear();
+    banner("Can't reach Lag Effect. Is it running, with the phone remote on? Trying again…");
+    setTimeout(connect, retry); retry = Math.min(retry * 1.6, 5000);
+  };
+  ws.onmessage = (ev) => { let m; try { m = JSON.parse(ev.data); } catch (e) { return; } onMsg(m); };
+}
+function onMsg(m) {
+  if (m.event) return;                  // (Streamer.bot's events: the state poll covers them)
+  switch (m.do) {
+    case "hello":
+      if (m.ok) { authed = true; banner(""); $("pair").classList.add("hidden"); send({ do: "layout" }); }
+      else { setToken(""); showPair(m.error); }
+      break;
+    case "pair":
+      if (m.ok && m.token) { setToken(m.token); authed = true; $("pair").classList.add("hidden"); banner(""); send({ do: "layout" }); }
+      else { $("pairmsg").textContent = m.error || "That didn't work."; $("pin").value = ""; $("pin").focus(); }
+      break;
+    case "layout":
+      if (m.ok) { layout = m; $("title").textContent = m.title || "Lag Effect"; buildNav(); render(); poll(); }
+      break;
+    case "state":
+      if (m.ok) { if (layout && m.h !== layout.h) send({ do: "layout" }); state = m; applyState(); }
+      break;
+    default:
+      if (m.ok === false && m.error) {
+        if (/pair/i.test(m.error)) { authed = false; setToken(""); showPair(m.error); }
+        else flash(m.error);
+      }
+  }
+}
+let flashT = 0;
+function flash(t) { banner(t); clearTimeout(flashT); flashT = setTimeout(() => banner(""), 3500); }
+function showPair(err) {
+  $("view").innerHTML = ""; $("nav").classList.add("hidden");
+  $("pair").classList.remove("hidden"); $("pairmsg").textContent = err || "";
+  setTimeout(() => $("pin").focus(), 50);
+}
+$("pairgo").onclick = () => {
+  const pin = $("pin").value.replace(/\D/g, "");
+  if (pin.length !== 4) { $("pairmsg").textContent = "The PIN has 4 digits."; return; }
+  const ua = navigator.userAgent;
+  const name = /iPhone/.test(ua) ? "iPhone" : /iPad/.test(ua) ? "iPad" : /Android/.test(ua) ? "Android phone" : "Phone";
+  if (!send({ do: "pair", pin: pin, name: name })) $("pairmsg").textContent = "Not connected yet.";
+};
+$("pin").addEventListener("input", () => { if ($("pin").value.replace(/\D/g, "").length === 4) $("pairgo").click(); });
+
+function poll() {
+  clearTimeout(pollT);
+  if (authed && document.visibilityState === "visible") send({ do: "state" });
+  pollT = setTimeout(poll, 1000);
+}
+function releaseAll() { for (const up of held.values()) send(up); held.clear(); document.querySelectorAll(".btn.down").forEach((b) => b.classList.remove("down")); }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState !== "visible") releaseAll(); else poll(); });
+window.addEventListener("pagehide", releaseAll);
+window.addEventListener("blur", releaseAll);
+
+function tabHas(id) {
+  if (!layout) return false;
+  if (id === "mixer") return (layout.ch && layout.ch.length) || (layout.out && layout.out.length);
+  if (id === "voice") return layout.voice && layout.voice.length;
+  return layout[id] && layout[id].length;
+}
+function buildNav() {
+  const nav = $("nav"); nav.innerHTML = "";
+  const shown = TABS.filter((t) => tabHas(t.id));
+  if (!shown.length) shown.push(TABS[1]);
+  if (!tab || !shown.some((t) => t.id === tab)) { let s = ""; try { s = localStorage.getItem("lagfx-tab") || ""; } catch (e) {} tab = shown.some((t) => t.id === s) ? s : shown[0].id; }
+  for (const t of shown) {
+    const b = document.createElement("button");
+    b.innerHTML = "<b>" + t.icon + "</b>" + esc(t.name);
+    b.className = t.id === tab ? "sel" : "";
+    b.onclick = () => { tab = t.id; try { localStorage.setItem("lagfx-tab", tab); } catch (e) {} buildNav(); render(); };
+    nav.appendChild(b);
+  }
+  nav.classList.remove("hidden");
+}
+
+// a button: kind "tap" (once), "tog" (lit while on), "hold" (down while you hold it)
+function keyButton(item, extraTag) {
+  const b = document.createElement("button");
+  b.className = "btn"; b.dataset.k = item.k || "";
+  b.innerHTML = esc(item.name) + (item.t === "hold" || extraTag ? '<span class="tag">' + (extraTag || "HOLD") + "</span>" : "");
+  if (item.t === "hold") holdable(b, item.k, () => ({ do: "key", name: item.k, down: true }), () => ({ do: "key", name: item.k, down: false }));
+  else b.onclick = () => { send({ do: "key", name: item.k }); later(); };
+  return b;
+}
+function holdable(b, k, downMsg, upMsg) {
+  const down = (e) => {
+    e.preventDefault(); if (held.has(k)) return;
+    if (b.setPointerCapture && e.pointerId !== undefined) try { b.setPointerCapture(e.pointerId); } catch (x) {}
+    held.set(k, upMsg()); b.classList.add("down"); send(downMsg());
+    if (navigator.vibrate) navigator.vibrate(12);
+  };
+  const up = () => { const m = held.get(k); if (!m) return; held.delete(k); b.classList.remove("down"); send(m); later(); };
+  b.addEventListener("pointerdown", down);
+  b.addEventListener("pointerup", up); b.addEventListener("pointercancel", up); b.addEventListener("lostpointercapture", up);
+  b.addEventListener("contextmenu", (e) => e.preventDefault());
+}
+let laterT = 0;
+function later() { clearTimeout(laterT); laterT = setTimeout(() => send({ do: "state" }), 150); }
+
+function section(view, title) { if (title) { const h = document.createElement("h2"); h.textContent = title; view.appendChild(h); } const g = document.createElement("div"); g.className = "grid"; view.appendChild(g); return g; }
+function render() {
+  const view = $("view"); view.innerHTML = "";
+  if (!layout) return;
+  if (tab === "pads") {
+    const g = section(view, "");
+    for (const p of layout.pads) { const b = document.createElement("button"); b.className = "btn"; b.textContent = p.name; b.onclick = () => { send({ do: "pad", n: p.n }); if (navigator.vibrate) navigator.vibrate(8); }; g.appendChild(b); }
+  } else if (tab === "voice") {
+    let g = null, grp = null;
+    for (const it of layout.voice) {
+      if (it.g !== grp) { grp = it.g; g = section(view, grp); }
+      if (it.t === "lag") {
+        const b = document.createElement("button"); b.className = "btn"; b.dataset.k = "lag";
+        b.innerHTML = esc(it.name) + '<span class="tag">HOLD</span>';
+        holdable(b, "lag", () => ({ do: "lag", ms: 30000 }), () => ({ do: "lag", on: false }));
+        g.appendChild(b);
+      } else g.appendChild(keyButton(it));
+    }
+  } else if (tab === "mixer") {
+    if (layout.ch && layout.ch.length) { const h = document.createElement("h2"); h.textContent = "Channels"; view.appendChild(h); }
+    for (const c of layout.ch || []) view.appendChild(strip("ch", c.n, c.name, -60, 6, 0.5, (v) => (v <= -60 ? "off" : (v > 0 ? "+" : "") + v.toFixed(1) + " dB"),
+      (v) => ({ do: "channel", n: c.n, db: v }), { do: "channel", n: c.n, mute: "toggle" }));
+    if (layout.out && layout.out.length) { const h = document.createElement("h2"); h.textContent = "Outputs"; view.appendChild(h); }
+    for (const o of layout.out || []) view.appendChild(strip("out", o.n, o.name, 0, 200, 1, (v) => Math.round(v) + "%",
+      (v) => ({ do: "output", n: o.n, volume: Math.round(v) }), { do: "output", n: o.n, mute: "toggle" }));
+  } else if (tab === "scenes") {
+    const g = section(view, "");
+    for (const s of layout.scenes) { const b = document.createElement("button"); b.className = "btn"; b.dataset.scene = s.n; b.textContent = s.name; b.onclick = () => { send({ do: "scene", n: s.n }); later(); }; g.appendChild(b); }
+  } else if (tab === "macros") {
+    const g = section(view, "");
+    for (const m of layout.macros) {
+      const item = { k: m.k, name: m.name, t: m.hold ? "hold" : "tap" };
+      const b = keyButton(item); b.dataset.macro = m.n; g.appendChild(b);
+    }
+  } else if (tab === "mine") {
+    const g = section(view, "");
+    for (const it of layout.mine) g.appendChild(it.t === "macro" ? keyButton({ k: it.k, name: it.name, t: "tap" }) : keyButton(it));
+  }
+  if (!view.children.length) view.innerHTML = '<div class="empty">Nothing here yet.</div>';
+  applyState();
+}
+function strip(kind, n, name, lo, hi, step, fmt, setMsg, muteMsg) {
+  const d = document.createElement("div"); d.className = "strip"; d.dataset[kind] = n;
+  d.innerHTML = '<div class="nm"></div><input type="range"><div class="val"></div><button class="m">Mute</button>';
+  d.querySelector(".nm").textContent = name;
+  const r = d.querySelector("input"), val = d.querySelector(".val"), key = kind + n;
+  r.min = lo; r.max = hi; r.step = step;
+  let last = 0, pend = null;
+  const push = () => { if (pend !== null) { send(setMsg(pend)); pend = null; last = Date.now(); } };
+  r.addEventListener("input", () => { dragging.add(key); val.textContent = fmt(+r.value); pend = +r.value; if (Date.now() - last > 70) push(); else setTimeout(push, 75); });
+  const end = () => { push(); setTimeout(() => dragging.delete(key), 400); };
+  r.addEventListener("change", end); r.addEventListener("pointerup", end); r.addEventListener("touchend", end);
+  d.querySelector(".m").onclick = () => { send(muteMsg); later(); };
+  d._fmt = fmt;
+  return d;
+}
+function applyState() {
+  if (!state || !layout) return;
+  const on = state.on || {};
+  document.querySelectorAll(".btn[data-k]").forEach((b) => {
+    const k = b.dataset.k;
+    if (k === "lag") b.classList.toggle("on", !!state.lag);
+    else if (k in on) b.classList.toggle("on", !!on[k]);
+  });
+  const run = new Set(state.mrun || []);
+  document.querySelectorAll(".btn[data-macro]").forEach((b) => b.classList.toggle("run", run.has(+b.dataset.macro)));
+  document.querySelectorAll(".btn[data-scene]").forEach((b) => b.classList.toggle("on", +b.dataset.scene === state.scene));
+  const upd = (kind, rows) => {
+    for (const [n, v, mute] of rows || []) {
+      const d = document.querySelector('.strip[data-' + kind + '="' + n + '"]'); if (!d) continue;
+      const r = d.querySelector("input");
+      if (!dragging.has(kind + n)) { r.value = v; d.querySelector(".val").textContent = d._fmt(v); }
+      d.querySelector(".m").classList.toggle("on", !!mute);
+    }
+  };
+  upd("ch", state.ch); upd("out", state.out);
+}
+connect();
+</script>
+</body>
+</html>
