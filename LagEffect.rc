@@ -1,2 +1,4 @@
 1 ICON "LagEffect.ico"
 1 24 "LagEffect.manifest"
+2 RCDATA "vbcable.zip"
+3 RCDATA "phone.html"

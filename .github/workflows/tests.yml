@@ -54,8 +54,13 @@ jobs:
           done
           ls "$RUNNER_TEMP/esc" | wc -l
 
+      # (1.68.0) the phone remote's page, run in jsdom against a fake Lag Effect
+      - name: Get jsdom
+        run: npm install --silent --prefix "$RUNNER_TEMP/js" jsdom@24
+
       - name: Run the tests
         env:
+          NODE_PATH: ${{ runner.temp }}/js/node_modules
           WHISPER_DIR: ${{ runner.temp }}/whisper.cpp
           WHISPER_MODELS: ${{ runner.temp }}/ggml-tiny.en-q5_1.bin ${{ runner.temp }}/ggml-base.en-q5_1.bin
           NOISE_DIR: ${{ runner.temp }}/esc
