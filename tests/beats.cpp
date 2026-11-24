@@ -284,6 +284,42 @@ int main()
             }
             check("a 100 ms delay moves the sound 4800 samples later", at == 10 + 4800);
             gOutEq[1].on = false; OutEqPublish(1);
+            {   // (1.70.0) the faster EQ (every band per sample, L and R together) gives exactly the old band-at-a-time result
+                auto ref = [](const OutEqCo& c, float (*z)[2][2], float* Lp, float* Rp, int nn) {
+                    for (int i = 0; i < c.n; i++) {
+                        const float b0 = c.b0[i], b1 = c.b1[i], b2 = c.b2[i], a1 = c.a1[i], a2 = c.a2[i];
+                        float zl1 = z[i][0][0], zl2 = z[i][0][1], zr1 = z[i][1][0], zr2 = z[i][1][1];
+                        for (int f = 0; f < nn; f++) {
+                            const float xl = Lp[f], yl = b0 * xl + zl1; zl1 = b1 * xl - a1 * yl + zl2; zl2 = b2 * xl - a2 * yl; Lp[f] = yl;
+                            const float xr = Rp[f], yr = b0 * xr + zr1; zr1 = b1 * xr - a1 * yr + zr2; zr2 = b2 * xr - a2 * yr; Rp[f] = yr;
+                        }
+                        z[i][0][0] = zl1; z[i][0][1] = zl2; z[i][1][0] = zr1; z[i][1][1] = zr2;
+                    }
+                };
+                bool same = true; int bandsSeen = 0; unsigned rs = 7;
+                auto rnd = [&]() { rs = rs * 1664525u + 1013904223u; return (rs >> 8) / 16777216.0f; };
+                static float L1[480], R1[480], L2[480], R2[480];
+                for (int nb = 1; nb <= OEQ_BANDS; nb++) {
+                    OutEqSet e; OutEqDefaults(e); e.on = true;
+                    for (int b = 0; b < OEQ_BANDS; b++) {
+                        if (b >= nb) { e.type[b] = OEQ_OFF; continue; }
+                        e.type[b] = 1 + (int)(rnd() * 5) % 5; e.freq[b] = 40 + rnd() * 15000; e.gain[b] = rnd() * 24 - 12; e.q[b] = 0.3f + rnd() * 4;
+                        if (fabsf(e.gain[b]) < 1) e.gain[b] = 3;
+                    }
+                    OutEqCo c; OutEqDesign(e, c); if (c.n == nb) bandsSeen++;
+                    float zA[OEQ_BANDS][2][2] = {}, zB[OEQ_BANDS][2][2] = {};
+                    for (int blk = 0; blk < 50; blk++) {
+                        for (int i = 0; i < 480; i++) { L1[i] = L2[i] = rnd() - 0.5f; R1[i] = R2[i] = rnd() - 0.5f; }
+                        ref(c, zA, L1, R1, 480);
+                        switch (c.n) { case 1: OutEqBands<1>(c, zB, L2, R2, 480); break; case 2: OutEqBands<2>(c, zB, L2, R2, 480); break;
+                                       case 3: OutEqBands<3>(c, zB, L2, R2, 480); break; case 4: OutEqBands<4>(c, zB, L2, R2, 480); break;
+                                       case 5: OutEqBands<5>(c, zB, L2, R2, 480); break; case 6: OutEqBands<6>(c, zB, L2, R2, 480); break; }
+                        if (memcmp(L1, L2, sizeof L1) || memcmp(R1, R2, sizeof R1) || memcmp(zA, zB, sizeof zA)) same = false;
+                    }
+                }
+                printf("  faster EQ vs the old loop: 1-6 bands, 50 blocks each (%d / 6 with every band in use)\n", bandsSeen);
+                check("the faster EQ gives exactly the same samples as the old loop (1-6 bands)", same && bandsSeen == 6);
+            }
         }
         gMusPlay = false; run(10, silence); gMusR = 0; gMusW = 0; gMicMuted = false;
     }
