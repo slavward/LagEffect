@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.68.0"
+#define APP_VERSION L"1.69.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -115,6 +115,7 @@ static inline int FocusRectIfKeys(HDC dc, const RECT* r) { return gKbdNav ? Draw
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "winmm.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 #endif
 
@@ -1335,9 +1336,10 @@ static int     gPhoneCount = 0;                 // phones connected now
 static volatile int gWsRunLocal = 0, gWsRunPhone = 0;   // what the server thread listens on this run (0 = not)
 static const char* gPhonePage = nullptr; static int gPhonePageN = 0;   // the page (resource RCDATA 3, phone.html)
 static volatile DWORD gWsLagUntil = 0;          // {"do":"lag","ms":...}: stutter until then
-enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16, FEAT_SPEECH = 32, FEAT_AVATAR = 64, FEAT_CAPTIONS = 128 };
+enum { FEAT_LAG = 1, FEAT_FX = 2, FEAT_SOUND = 4, FEAT_CLIPS = 8, FEAT_VST = 16, FEAT_SPEECH = 32, FEAT_AVATAR = 64, FEAT_CAPTIONS = 128, FEAT_TRIG = 256, FEAT_MIDI = 512 };
+static volatile bool gFeatTrig = false, gFeatMidi = false;   // (1.69.0) sound triggers (on = listening), a MIDI controller (on = its devices open)
 static bool FeatOn(int mask) { return (mask & FEAT_LAG && gFeatLag) || (mask & FEAT_FX && gFeatFx) || (mask & FEAT_SOUND && gFeatSound) || (mask & FEAT_CLIPS && gFeatClips) || (mask & FEAT_VST && gFeatVst) || (mask & FEAT_SPEECH && gFeatSpeech)
-                                   || (mask & FEAT_AVATAR && gFeatAvatar) || (mask & FEAT_CAPTIONS && gFeatCaptions); }
+                                   || (mask & FEAT_AVATAR && gFeatAvatar) || (mask & FEAT_CAPTIONS && gFeatCaptions) || (mask & FEAT_TRIG && gFeatTrig) || (mask & FEAT_MIDI && gFeatMidi); }
 static int  gBuildFeat = 0;                     // (while building the window: which feature these controls belong to)
 static int  gBuildCond = 0;                     // (...and when they show: 0 always, 1 vocoder style isn't Synth plugin, 2 it is)
 static bool CondOn(int c);
@@ -1734,6 +1736,111 @@ static inline void LimitStereo(int k, float& l, float& r)
     if (a * limGain[k] > ceil) { limGain[k] = ceil / a; if (limGain[k] < 0.89f) gLimHit[k] = true; }   // (more than ~1 dB)
     l *= limGain[k]; r *= limGain[k];
     limGain[k] += (1.0f - limGain[k]) * 0.00014f;
+}
+
+// ======================= (1.69.0) an output's EQ and delay (#47) =======================
+// Each output can have a 6-band EQ (low cut, shelves, peaks, high cut: RBJ biquads) and a delay (to line it up with
+// video), after its plugins and before its volume and limiter. Off = not run at all (the old path, bit for bit).
+// The window designs the filters (OutEqDesign) into one of 3 slots and points gOutEqCur at it; the audio thread copies
+// a slot when that changes, so it never reads one being written.
+#define OEQ_BANDS 6
+#define OEQ_DELAY_MAX 32768                     // frames (0.68 s at 48 kHz; the setting goes to 500 ms)
+enum { OEQ_OFF = 0, OEQ_LOWCUT, OEQ_LOWSHELF, OEQ_PEAK, OEQ_HIGHSHELF, OEQ_HIGHCUT, OEQ_TYPES };
+struct OutEqSet { bool on; int type[OEQ_BANDS]; float freq[OEQ_BANDS], gain[OEQ_BANDS], q[OEQ_BANDS]; int delayMs; };
+struct OutEqCo { int n, delay; float b0[OEQ_BANDS], b1[OEQ_BANDS], b2[OEQ_BANDS], a1[OEQ_BANDS], a2[OEQ_BANDS]; };   // n = bands that do something
+static OutEqSet gOutEq[MAX_OUT];
+static OutEqCo  gOutEqSlot[MAX_OUT][3];
+static std::atomic<int> gOutEqCur[MAX_OUT];     // the live slot + 1 (0 = off)
+static void OutEqDefaults(OutEqSet& e)
+{
+    static const int t[OEQ_BANDS] = { OEQ_LOWCUT, OEQ_LOWSHELF, OEQ_PEAK, OEQ_PEAK, OEQ_HIGHSHELF, OEQ_HIGHCUT };
+    static const float f[OEQ_BANDS] = { 20, 120, 400, 2500, 8000, 20000 };   // (the cuts at the ends: off until moved)
+    e.on = false; e.delayMs = 0;
+    for (int b = 0; b < OEQ_BANDS; b++) { e.type[b] = t[b]; e.freq[b] = f[b]; e.gain[b] = 0; e.q[b] = t[b] == OEQ_PEAK ? 1.0f : 0.707f; }
+}
+static bool OutEqBandActive(const OutEqSet& e, int b)   // (a cut at its far end, or a shelf / peak at 0 dB, does nothing)
+{
+    const int t = e.type[b];
+    if (t == OEQ_LOWCUT) return e.freq[b] > 20.5f;
+    if (t == OEQ_HIGHCUT) return e.freq[b] < 19999.0f;
+    return (t == OEQ_LOWSHELF || t == OEQ_PEAK || t == OEQ_HIGHSHELF) && fabsf(e.gain[b]) >= 0.05f;
+}
+static void OutEqDesign(const OutEqSet& e, OutEqCo& c)
+{
+    c.n = 0; c.delay = e.on ? (int)lround(Iclamp(e.delayMs, 0, 500) * (RATE / 1000.0)) : 0;
+    if (!e.on) return;
+    for (int b = 0; b < OEQ_BANDS; b++) {
+        if (!OutEqBandActive(e, b)) continue;
+        const double fr = e.freq[b] < 10 ? 10 : e.freq[b] > 22000 ? 22000 : e.freq[b];
+        const double w0 = 2 * 3.141592653589793 * fr / RATE, cw = cos(w0), sw = sin(w0);
+        const double q = e.q[b] < 0.1f ? 0.1 : e.q[b] > 18 ? 18 : e.q[b], al = sw / (2 * q);
+        const double A = pow(10.0, e.gain[b] / 40.0), sa = 2 * sqrt(A) * al;
+        double b0, b1, b2, a0, a1, a2;
+        switch (e.type[b]) {
+        case OEQ_LOWCUT:   b0 = (1 + cw) / 2; b1 = -(1 + cw); b2 = (1 + cw) / 2; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; break;
+        case OEQ_HIGHCUT:  b0 = (1 - cw) / 2; b1 = 1 - cw;    b2 = (1 - cw) / 2; a0 = 1 + al; a1 = -2 * cw; a2 = 1 - al; break;
+        case OEQ_PEAK:     b0 = 1 + al * A; b1 = -2 * cw; b2 = 1 - al * A; a0 = 1 + al / A; a1 = -2 * cw; a2 = 1 - al / A; break;
+        case OEQ_LOWSHELF:
+            b0 = A * ((A + 1) - (A - 1) * cw + sa); b1 = 2 * A * ((A - 1) - (A + 1) * cw); b2 = A * ((A + 1) - (A - 1) * cw - sa);
+            a0 = (A + 1) + (A - 1) * cw + sa; a1 = -2 * ((A - 1) + (A + 1) * cw); a2 = (A + 1) + (A - 1) * cw - sa; break;
+        default:           // OEQ_HIGHSHELF
+            b0 = A * ((A + 1) + (A - 1) * cw + sa); b1 = -2 * A * ((A - 1) + (A + 1) * cw); b2 = A * ((A + 1) + (A - 1) * cw - sa);
+            a0 = (A + 1) - (A - 1) * cw + sa; a1 = 2 * ((A - 1) - (A + 1) * cw); a2 = (A + 1) - (A - 1) * cw - sa; break;
+        }
+        c.b0[c.n] = (float)(b0 / a0); c.b1[c.n] = (float)(b1 / a0); c.b2[c.n] = (float)(b2 / a0); c.a1[c.n] = (float)(a1 / a0); c.a2[c.n] = (float)(a2 / a0);
+        c.n++;
+    }
+}
+static double OutEqResponseDb(const OutEqCo& c, double hz)   // (the window's curve) the filters' gain at a frequency
+{
+    const double w = 2 * 3.141592653589793 * hz / RATE;
+    double db = 0;
+    for (int i = 0; i < c.n; i++) {
+        const double cr = cos(w), ci = -sin(w), c2r = cos(2 * w), c2i = -sin(2 * w);
+        const double nr = c.b0[i] + c.b1[i] * cr + c.b2[i] * c2r, ni = c.b1[i] * ci + c.b2[i] * c2i;
+        const double dr = 1 + c.a1[i] * cr + c.a2[i] * c2r, di = c.a1[i] * ci + c.a2[i] * c2i;
+        db += 10 * log10((nr * nr + ni * ni) / (dr * dr + di * di) + 1e-30);
+    }
+    return db;
+}
+static void OutEqPublish(int k)                 // (window) the settings of output k take effect
+{
+    const int cur = gOutEqCur[k].load(), next = cur % 3;   // (the slot after the live one: never the one being read)
+    OutEqDesign(gOutEq[k], gOutEqSlot[k][next]);
+    const OutEqCo& c = gOutEqSlot[k][next];
+    gOutEqCur[k].store(c.n || c.delay ? next + 1 : 0, std::memory_order_release);
+}
+struct OutEqRunState { int cur; OutEqCo co; float z[OEQ_BANDS][2][2]; float dl[OEQ_DELAY_MAX][2]; int dw; };
+static OutEqRunState gOutEqRun[MAX_OUT];        // (audio thread only)
+static inline bool OutEqLive(int k) { return gOutEqCur[k].load(std::memory_order_acquire) != 0; }
+static void OutEqRun(int k, float* L, float* R, int n)   // (audio thread) the block through output k's EQ, then its delay
+{
+    OutEqRunState& s = gOutEqRun[k];
+    const int cur = gOutEqCur[k].load(std::memory_order_acquire);
+    if (cur != s.cur) {                         // (new settings: their filters, keeping the state so it doesn't click)
+        if (!s.cur) { memset(s.z, 0, sizeof(s.z)); memset(s.dl, 0, sizeof(s.dl)); s.dw = 0; }
+        s.cur = cur;
+        if (cur) s.co = gOutEqSlot[k][cur - 1]; else { s.co.n = 0; s.co.delay = 0; }
+    }
+    const OutEqCo& c = s.co;
+    for (int i = 0; i < c.n; i++) {             // (transposed direct form II, a band at a time)
+        const float b0 = c.b0[i], b1 = c.b1[i], b2 = c.b2[i], a1 = c.a1[i], a2 = c.a2[i];
+        float zl1 = s.z[i][0][0], zl2 = s.z[i][0][1], zr1 = s.z[i][1][0], zr2 = s.z[i][1][1];
+        for (int f = 0; f < n; f++) {
+            const float xl = L[f], yl = b0 * xl + zl1; zl1 = b1 * xl - a1 * yl + zl2; zl2 = b2 * xl - a2 * yl; L[f] = yl;
+            const float xr = R[f], yr = b0 * xr + zr1; zr1 = b1 * xr - a1 * yr + zr2; zr2 = b2 * xr - a2 * yr; R[f] = yr;
+        }
+        s.z[i][0][0] = zl1; s.z[i][0][1] = zl2; s.z[i][1][0] = zr1; s.z[i][1][1] = zr2;
+    }
+    if (c.delay > 0) {
+        const int d = c.delay < OEQ_DELAY_MAX - 1 ? c.delay : OEQ_DELAY_MAX - 1;
+        for (int f = 0; f < n; f++) {
+            s.dl[s.dw][0] = L[f]; s.dl[s.dw][1] = R[f];
+            const int rd = (s.dw - d) & (OEQ_DELAY_MAX - 1);
+            L[f] = s.dl[rd][0]; R[f] = s.dl[rd][1];
+            s.dw = (s.dw + 1) & (OEQ_DELAY_MAX - 1);
+        }
+    }
 }
 
 // ======================= mixer channels (audio side) =======================
@@ -4465,6 +4572,120 @@ static float BlOut(BlOutState& st, const float* rb, long long t, long long td, f
 // Talk through a TTS voice: your real voice is muted on every output while it's on (the TTS voice plays as a sound).
 static std::atomic<bool> gSpMuteVoice{ false };
 
+// ======================= (1.69.0) Sound triggers (N7): a clap, snap, whistle or tongue click runs an action =======================
+// Only while it's switched on (Soundboard > Triggers): otherwise nothing here runs. The audio thread finds short,
+// sharp sounds that stand alone (quiet before, gone within 150 ms: not words) and steady whistles; it measures them
+// and queues them. The window decides which sound it was (nearest of your taught sounds, or the defaults) and runs
+// its action, so this part only listens and never touches the sound.
+#define TRIG_N 4
+enum { TRIG_CLAP = 0, TRIG_SNAP, TRIG_WHISTLE, TRIG_CLICK };
+#define TRIG_FEAT 7                             // 5 band shares (<700, -1.8k, -3.5k, -7k, above), how long (/40 ms), zero crossings (x4)
+struct TrigEv { int kind; float f[TRIG_FEAT]; };   // kind: -1 a short sound (the window says which), TRIG_WHISTLE (f[0] = its pitch)
+static TrigEv gTrigQ[16]; static std::atomic<unsigned> gTrigQW{0}, gTrigQR{0};
+static std::atomic<bool> gTrigOn{false};        // listening (Soundboard > Triggers, its hotkey, Streamer.bot)
+static std::atomic<int>  gTrigSens{5};          // 1 (only loud, clear sounds) .. 10 (quieter ones too)
+#define TRIG_RING 16384                         // the last 0.34 s of the mic
+struct TrigCore {
+    float ring[TRIG_RING]; long n;              // samples seen
+    float fast, slow; long lastOn, due, onAt;   // envelopes; the last onset; when to measure it (-1: nothing waiting)
+    float wbuf[512]; int wn; int tonal, quiet; float lastF0; bool fired;   // whistle: 512-sample frames
+    bool active;
+};
+static void TrigReset(TrigCore& t) { memset(&t, 0, sizeof(t)); t.due = -1; t.lastOn = -100000; }
+static void TrigPush(const TrigEv& e)
+{
+    const unsigned w = gTrigQW.load(std::memory_order_relaxed);
+    if (w - gTrigQR.load(std::memory_order_acquire) >= 16) return;   // (the window is behind: dropped)
+    gTrigQ[w & 15] = e; gTrigQW.store(w + 1, std::memory_order_release);
+}
+static void TrigMeasure(TrigCore& t)            // a sound that started at onAt: is it short and alone? its features
+{
+    auto at = [&](long i) { return t.ring[i & (TRIG_RING - 1)]; };
+    const long o = t.onAt;
+    double pre = 0, e1 = 0, e2 = 0;
+    for (long i = o - 2400; i < o - 96; i++) pre += at(i) * at(i);
+    for (long i = o; i < o + 960; i++) e1 += at(i) * at(i);
+    for (long i = o + 2880; i < o + 7200; i++) e2 += at(i) * at(i);
+    pre /= 2304; e1 /= 960; e2 /= 4320;
+    if (e1 <= 1e-12 || pre > e1 * 0.05 || e2 > e1 * 0.06) return;   // not alone, or it goes on (a word, music...)
+    TrigEv ev; ev.kind = -1;
+    double en[5] = {}, blk[43] = {}; int zc = 0; float prev = 0;
+    static float win[1024]; static bool wInit = false;   // (a Hann window: set up once)
+    if (!wInit) { for (int i = 0; i < 1024; i++) win[i] = 0.5f - 0.5f * cosf(2 * 3.14159265f * i / 1023); wInit = true; }
+    static const double lo[5] = { 150, 700, 1800, 3500, 7000 }, hi[5] = { 700, 1800, 3500, 7000, 16000 };
+    for (int b = 0; b < 5; b++)                 // band power: 6 frequencies in each band (Goertzel on the first 21 ms)
+        for (int j = 0; j < 6; j++) {
+            const double hz = lo[b] * pow(hi[b] / lo[b], (j + 0.5) / 6), c = 2 * cos(2 * 3.141592653589793 * hz / RATE);
+            double s1 = 0, s2 = 0;
+            for (int i = 0; i < 1024; i++) { const double s0 = at(o - 64 + i) * win[i] + c * s1 - s2; s2 = s1; s1 = s0; }
+            en[b] += s1 * s1 + s2 * s2 - c * s1 * s2;
+        }
+    for (long i = o - 64; i < o + 1984; i++) {
+        const double x = at(i);
+        blk[(i - (o - 64)) / 48] += x * x;
+        if (i >= o && i < o + 480) { if ((x >= 0) != (prev >= 0)) zc++; prev = (float)x; }
+    }
+    double tot = 0; for (int b = 0; b < 5; b++) tot += en[b];
+    for (int b = 0; b < 5; b++) ev.f[b] = (float)(tot > 0 ? en[b] / tot : 0.2);
+    double mx = 0; for (int i = 0; i < 43; i++) if (blk[i] > mx) mx = blk[i];
+    int dur = 0; for (int i = 0; i < 43; i++) if (blk[i] > mx * 0.1) dur++;   // (ms above a tenth of the peak's power)
+    ev.f[5] = dur / 40.0f; ev.f[6] = zc / 480.0f * 4.0f;
+    TrigPush(ev);
+}
+static void TrigBlock(TrigCore& t, const float* in, unsigned frames, int inCh, int inSide, float boost, int sens)
+{
+    if (!t.active) { TrigReset(t); t.active = true; }
+    const float ratio = 8.5f - 0.5f * sens, thr = 0.1f * powf(0.7f, (float)sens);   // (sens 5: x6 the room, above about -35 dBFS)
+    for (unsigned f = 0; f < frames; f++) {
+        const float x = (inCh == 1 ? in[f] : inSide == 1 ? in[f * 2] : inSide == 2 ? in[f * 2 + 1] : (in[f * 2] + in[f * 2 + 1]) * 0.5f) * boost;
+        t.ring[t.n & (TRIG_RING - 1)] = x;
+        const float a = fabsf(x);
+        t.fast += (a - t.fast) * (a > t.fast ? 0.5f : 0.003f);
+        t.slow += (a - t.slow) * 0.0002f;
+        if (t.due < 0 && t.n - t.lastOn > RATE * 3 / 10 && t.fast > thr && t.fast > t.slow * ratio && t.n > 2400) {
+            t.lastOn = t.n; t.onAt = t.n - 24; t.due = t.n + 7300;   // (measured 150 ms on, when it's had time to end)
+        }
+        if (t.due >= 0 && t.n >= t.due) { t.due = -1; TrigMeasure(t); }
+        t.wbuf[t.wn++] = x;                     // whistle: a steady pure tone, 500 Hz - 4 kHz, for a quarter second
+        if (t.wn == 512) {
+            t.wn = 0;
+            double e = 0; int zc = 0;
+            for (int i = 0; i < 512; i++) { e += t.wbuf[i] * t.wbuf[i]; if (i && (t.wbuf[i] >= 0) != (t.wbuf[i - 1] >= 0)) zc++; }
+            const float rms = (float)sqrt(e / 512), f0 = zc * (float)RATE / (2 * 512);
+            bool tone = false;
+            if (rms > thr * 0.25f && f0 >= 500 && f0 <= 4000) {
+                const int L = (int)lroundf(RATE / f0);
+                double c = 0, a1 = 0, a2 = 0;
+                for (int i = 0; i + L < 512; i++) { c += t.wbuf[i] * t.wbuf[i + L]; a1 += t.wbuf[i] * t.wbuf[i]; a2 += t.wbuf[i + L] * t.wbuf[i + L]; }
+                tone = a1 > 0 && a2 > 0 && c / sqrt(a1 * a2) > 0.9 && (t.lastF0 <= 0 || fabsf(f0 - t.lastF0) < 0.1f * f0);
+                t.lastF0 = f0;
+            } else t.lastF0 = 0;
+            if (tone) { t.quiet = 0; if (++t.tonal == 24 && !t.fired) { TrigEv ev = {}; ev.kind = TRIG_WHISTLE; ev.f[0] = f0; TrigPush(ev); t.fired = true; } }
+            else { t.tonal = 0; if (++t.quiet >= 10) t.fired = false; }
+        }
+        t.n++;
+    }
+}
+// (the window) which of the short sounds it was: the nearest of the ones switched on, if near enough; -1: none
+static int TrigClassify(const float* f, const float cent[TRIG_N][TRIG_FEAT], const bool* use, int sens)
+{
+    int best = -1; float bd = 1e9f;
+    for (int k = 0; k < TRIG_N; k++) {
+        if (k == TRIG_WHISTLE || !use[k]) continue;
+        float d = 0;
+        for (int i = 0; i < TRIG_FEAT; i++) { const float w = i == 5 ? 0.5f : 1.0f, x = (f[i] - cent[k][i]) * w; d += x * x; }
+        if (d < bd) { bd = d; best = k; }
+    }
+    const float maxD = 0.06f + 0.012f * sens;   // (further than this from all of them: something else)
+    return bd <= maxD ? best : -1;
+}
+static const float TRIG_DEFAULTS[TRIG_N][TRIG_FEAT] = {   // (from made-up sounds: teaching it yours is better)
+    { 0.06f, 0.35f, 0.40f, 0.15f, 0.04f, 0.30f, 0.85f },   // clap: broad, 0.7-3.5 kHz, ~12 ms
+    { 0.01f, 0.06f, 0.30f, 0.50f, 0.13f, 0.15f, 1.05f },   // snap: higher, shorter
+    { 0, 0, 0, 0, 0, 0, 0 },                               // (whistle: found by its pitch, not by these)
+    { 0.42f, 0.50f, 0.05f, 0.02f, 0.01f, 0.10f, 0.25f },   // tongue click: low, very short
+};
+
 static void AudioCallback(ma_device* dev, void* output, const void* input, ma_uint32 frames)
 {
     DropWatch dropWatch(dev, frames);
@@ -4838,6 +5059,11 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
 
     bool padsIdle = true;                       // nothing playing / starting / stopping: skip the soundboard mixer this block
     for (int i = 0; i < SB_N && padsIdle; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) padsIdle = false; }
+    {                                           // (1.69.0) sound triggers: only while they're on (they just listen)
+        static TrigCore tg;
+        if (gTrigOn.load(std::memory_order_relaxed) && in) TrigBlock(tg, in, frames, inCh, inSide, boost, gTrigSens.load(std::memory_order_relaxed));
+        else tg.active = false;
+    }
     // Your mic up to the end of the Mic tab (cleanup, then tone), one sample at a time.
     auto micPre = [&](ma_uint32 f) -> float {
         float s;
@@ -5027,6 +5253,11 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             chVst[c] = true;
         }
         for (int k = 0; k < MAX_OUT; k++) outVst[k] = (k == 0 || on[k]) && VstRangeOn(VST_OUT0 + k * VST_PER, VST_PER);
+    }
+    bool outPlug[MAX_OUT];                      // (1.69.0) an output with EQ / delay on takes the same road: collected in the loop, finished after it
+    for (int k = 0; k < MAX_OUT; k++) {
+        outPlug[k] = outVst[k];
+        if (frames <= VST_MAXFRAMES && (k == 0 || on[k]) && OutEqLive(k)) outVst[k] = true;
     }
     const unsigned rcdW0 = rcdOut > 0 ? w[rcdOut] : 0;   // Recorder, an output: where this block starts in its ring
     // Looper and Beatbox to drums (Soundboard tab, 1.56.0): only while in use (otherwise nothing below changes)
@@ -5358,7 +5589,8 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     for (int k = 0; k < MAX_OUT; k++) {         // outputs with plugins: the block through them, then volume, limiter and out as usual
         if (!outVst[k]) continue;
         float* L = gVstOutL[k]; float* R = gVstOutR[k];
-        VstRunRange(VST_OUT0 + k * VST_PER, VST_PER, L, R, (int)frames);
+        if (outPlug[k]) VstRunRange(VST_OUT0 + k * VST_PER, VST_PER, L, R, (int)frames);
+        if (gOutEqCur[k].load(std::memory_order_relaxed) || gOutEqRun[k].cur) OutEqRun(k, L, R, (int)frames);   // (1.69.0) its EQ and delay
         for (ma_uint32 f = 0; f < frames; f++) {
             if (k > 0 && (w[k] - r[k]) >= RING_FRAMES) break;
             float oL = L[f] * vol[k], oR = R[f] * vol[k];
@@ -5559,7 +5791,9 @@ enum {
     IDC_MICSUB5,                                // (1.63.0: Mic > Music, moved from the Soundboard)
     IDC_MIXHIDDEN, IDC_HDRMETER, IDC_HDRMETERON,
     IDC_MACROBTN,                               // (1.67.0) the bottom bar's Macros button
-    IDC_PHONEBTN,                               // (1.68.0) Settings > Stream: Phone remote...   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
+    IDC_PHONEBTN,                               // (1.68.0) Settings > Stream: Phone remote...
+    IDC_FEATTRIG, IDC_FEATMIDI, IDC_TRIGSET, IDC_MIDISET,   // (1.69.0) Settings > Features
+    IDC_OEQ0, IDC_OEQLAST = IDC_OEQ0 + MAX_OUT - 1,   // (1.69.0) each output's EQ button   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
     IDC_VSTMIX0 = 4490,                         // .. +4: a mic plugin slot's Mix %
@@ -5953,10 +6187,13 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define SLOT_NEW0    SLOT_LPREC                  // (slots after the plugins' and the recorder's)
 #define MACRO_MAX    16                          // (1.67.0) macros: one key each
 #define SLOT_MACRO0  (SLOT_MUSNEXT + 1)
-#define KEY_SLOTS    (SLOT_MACRO0 + MACRO_MAX)
+#define SLOT_TRIGON  (SLOT_MACRO0 + MACRO_MAX)    // (1.69.0) sound triggers on / off
+#define KEY_SLOTS    (SLOT_TRIGON + 1)
 static void MacroLabel(int i, wchar_t* out, int cap);   // (1.67.0: defined with the macros)
 static const char* MacroRemote(int k, int on); static int MacroFind(const wchar_t* name);
-static void BugMacros(wchar_t* o, int cap); static void BugVbCable(wchar_t* o, int cap); static void BugPhone(wchar_t* o, int cap);
+static void BugMacros(wchar_t* o, int cap); static void BugVbCable(wchar_t* o, int cap); static void BugPhone(wchar_t* o, int cap); static void BugTrigMidi(wchar_t* o, int cap);
+static void SetFeatTrig(bool on); static void SetFeatMidi(bool on); static void TrigShow(); static void MidiShow();
+static void OutEqSave(int k); static void OutEqLoad(int k); static void OutEqMoveUp(int from, int to); static void OutEqShow(int k); static void OutEqClose();
 static void PhonesLoad(); static void PhonesSave(); static void PhoneShow(); static void PhoneTick(); static void PhoneStatusText();
 static void MacroShow(); static void MacrosLoad(); static void MacrosSave(); static int gMacroSel = -1, gMacroN = 0;
 static inline bool IsMacroSlot(int slot) { return slot >= SLOT_MACRO0 && slot < SLOT_MACRO0 + MACRO_MAX; }
@@ -6627,6 +6864,7 @@ static const wchar_t* FxKeyIniName(int slot)
     if (slot == SLOT_BLLIVE)  return L"bleep_live_hotkey";
     if (slot == SLOT_MUSPLAY) return L"music_play_hotkey";
     if (slot == SLOT_MUSNEXT) return L"music_next_hotkey";
+    if (slot == SLOT_TRIGON) return L"triggers_hotkey";   // (1.69.0)
     if (IsMacroSlot(slot)) {                    // "macro3_hotkey" (1.67.0)
         static wchar_t mn[MACRO_MAX][20];
         wchar_t* n = mn[slot - SLOT_MACRO0];
@@ -6945,6 +7183,7 @@ static void LoadSettings()
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_width", k); int v = INI_INT(key, 0); gOutW[k] = v ? Iclamp(v, 84, 320) : 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); gOutMute[k] = INI_INT(key, 0) != 0; }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_limit", k); OutCeilSet(k, INI_INT(key, -10)); }
+    for (int k = 0; k < MAX_OUT; k++) OutEqLoad(k);   // (1.69.0) each output's EQ and delay
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_name", k); GetPrivateProfileStringW(L"settings", key, L"", gOutName[k], 32, gIni); }
     gTtsVol = Iclamp(INI_INT(L"tts_volume", 100), 0, 200);
     gTtsRate = Iclamp(INI_INT(L"tts_speed", 0), -10, 10); gTtsPitch = Iclamp(INI_INT(L"tts_pitch", 0), -12, 12);
@@ -7871,7 +8110,8 @@ static void SaveSettings()
         wsprintfW(k, L"ch_%d_routes", c); SaveInt(k, (int)gCh[c].routes);
     }
     for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_mute", k); SaveInt(key, gOutMute[k]); }
-    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_limit", k); SaveInt(key, gOutCeil10[k]); } SaveInt(L"tts_volume", gTtsVol);
+    for (int k = 0; k < MAX_OUT; k++) { wchar_t key[24]; wsprintfW(key, L"out_%d_limit", k); SaveInt(key, gOutCeil10[k]); }
+    for (int k = 0; k < MAX_OUT; k++) OutEqSave(k);   // (1.69.0) SaveInt(L"tts_volume", gTtsVol);
     SaveInt(L"mixer_duck_db", gDuckDb); SaveInt(L"mixer_key_step", gMixStep); SaveInt(L"mixer_fade_secs", gMixFadeSecs); SaveInt(L"mixer_talkback_out", gTalkbackOut); SaveInt(L"mixer_chatmix", gChatMix);
     for (int c = 0; c < CH_MAX; c++) { wchar_t k[24]; wsprintfW(k, L"ch_%d_chatmix", c); SaveInt(k, gCh[c].chatRole); }
     for (int c = 0; c < CH_MAX; c++) {
@@ -11240,6 +11480,7 @@ static void SlotName(int slot, wchar_t* out, int cap)
     if (slot == SLOT_MUSPLAY) { lstrcpynW(out, L"Music: play / pause", cap); return; }
     if (slot == SLOT_MUSNEXT) { lstrcpynW(out, L"Music: next song", cap); return; }
     if (IsMacroSlot(slot)) { MacroLabel(slot - SLOT_MACRO0, out, cap); return; }
+    if (slot == SLOT_TRIGON) { lstrcpynW(out, L"Sound triggers on / off", cap); return; }
     if (slot >= SLOT_VST0) { lstrcpynW(out, L"switching a plugin on / off", cap); return; }
     if (slot == 0) lstrcpynW(out, L"Voice effects", cap);
     else if (slot < FX_KEY_SLOTS) wsprintfW(out, L"%s (Voice FX)", gFxGroups[slot - 1].title);
@@ -13055,7 +13296,11 @@ static void DrawToggleC(DRAWITEMSTRUCT* d, bool on, COLORREF fillOn, COLORREF te
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, on ? textOn : (IsWindowEnabled(d->hwndItem) ? TXT_C : (gDark ? DK_DIM : gLtDim)));
     HGDIOBJ of = SelectObject(dc, gFontBold);
-    DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    {                                           // (1.69.0) text wider than the button: the normal font, then smaller, then "..."
+        SIZE sz; GetTextExtentPoint32W(dc, t, lstrlenW(t), &sz);
+        for (int lv = 0; sz.cx > rc.right - rc.left - SC(8) && lv <= 3; lv++) { SelectObject(dc, lv ? FitFont(lv) : gFont); GetTextExtentPoint32W(dc, t, lstrlenW(t), &sz); }
+    }
+    DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_END_ELLIPSIS);
     SelectObject(dc, of);
     if (d->itemState & ODS_FOCUS) { RECT f = rc; InflateRect(&f, -2, -2); DrawFocusRect(dc, &f); }
 }
@@ -13369,7 +13614,10 @@ static void MixerPlace()                        // the Mixer fills the window: s
         PlaceFree(GetDlgItem(gWnd, IDC_ODEV0 + k), tx, oy + SC(25), tw, SC(18));
         PlaceFree(GetDlgItem(gWnd, IDC_ODB0 + k),  tx, oy + SC(44), tw, SC(18));
         PlaceFree(GetDlgItem(gWnd, IDC_OLIM0 + k), tx, oy + SC(63), tw, SC(16));           // (its limiter: with the level readout)
-        PlaceFree(GetDlgItem(gWnd, IDC_OFX0 + k),  tx, oy + oh - SC(56), tw, SC(20));      // (plugins: with the buttons)
+        if (gFeatVst) {                         // (plugins and EQ share a row; EQ alone without plugins)
+            PlaceFree(GetDlgItem(gWnd, IDC_OFX0 + k), tx, oy + oh - SC(56), tw / 2 - SC(1), SC(20));
+            PlaceFree(GetDlgItem(gWnd, IDC_OEQ0 + k), tx + tw / 2 + SC(1), oy + oh - SC(56), tw - tw / 2 - SC(1), SC(20));
+        } else PlaceFree(GetDlgItem(gWnd, IDC_OEQ0 + k), tx, oy + oh - SC(56), tw, SC(20));
         PlaceFree(GetDlgItem(gWnd, IDC_OMUTE0 + k), tx, oy + oh - SC(30), tw - SC(26), SC(22));
         PlaceFree(GetDlgItem(gWnd, IDC_OTEST0 + k), tx + tw - SC(22), oy + oh - SC(30), SC(22), SC(22));
         if (k < gRows) x += w + SC(5);
@@ -15351,6 +15599,8 @@ static void AddTips()
         TipId(IDC_OMUTE0 + k, L"Mute: silence this output (everything going to it).");
         TipId(IDC_OTEST0 + k, L"Test: play a short beep on just this output, so you can tell which device it is.");
         TipId(IDC_OFX0 + k,   L"Plugins on everything this output plays (VST3 or CLAP), before its volume and limiter. Lit while one is on.");
+        TipId(IDC_OEQ0 + k,   L"This output's EQ (6 bands you drag on a curve) and delay (to line it up with your video). After its plugins, "
+                              L"before its volume and limiter. Lit while it's on.");
         TipId(IDC_OMETER0 + k, L"How loud this output is right now.");
         TipId(IDC_OLIM0 + k,  L"Lights up when this output is so loud the limiter has to turn peaks down. Often lit? Lower some volumes. Click to pick how loud peaks may get (normally -1 dB; lower it for a stream that should stay quieter).");
         TipId(IDC_ODEV0 + k,  L"The device this output plays on (change it on the Main tab).");
@@ -15502,7 +15752,7 @@ static void AddTips()
     TipId(IDC_CBTGT,   L"Which one (channel, output, scene, character, profile, pad, macro, plugin...).");
     TipId(IDC_CBOPT,   L"How: on / off, mute, volume, fade...");
     TipId(IDC_CBVAL,   L"The number (or text) it needs, if any: dB, %, seconds, milliseconds, what to say.");
-    TipId(IDC_CBLINE,  L"The command it sends. You can also type this into anything that sends WebSocket text; \"Copy C# for Streamer.bot\" gives you the whole code.");
+    TipId(IDC_CBLINE,  L"The command it sends. You can also type this into anything that sends WebSocket text; \"Copy C# code\" gives you the whole code.");
     TipId(IDC_CBCOPY,  L"Copies the whole C# for Streamer.bot with this command in it. In Streamer.bot: an action > Sub-Actions > Core > C# > Execute C# Code: paste, Compile, Save.");
     TipId(IDC_CBTEST,  L"Does it now, here, as if Streamer.bot had sent it (the remote control doesn't need to be on).");
     TipId(IDC_AVPIC0,  L"Your picture while you're not talking (needed). A PNG with a see-through background works best; GIFs move. Right-click to remove it.");
@@ -16374,6 +16624,10 @@ static void PollFxKeys()
         if (gVoiceTap[slot]) { if (gVoiceTap[slot] == 2) down = true; gVoiceTap[slot]--; }   // a voice command (Mic > Speech)
         bool pressed = down && !gFxKeyWasDown[slot], released = !down && gFxKeyWasDown[slot];
         gFxKeyWasDown[slot] = down;
+        if (slot == SLOT_TRIGON) {              // (1.69.0) sound triggers on / off
+            if (pressed) { SetFeatTrig(!gFeatTrig); ShowOsd(gFeatTrig ? L"Sound triggers: on" : L"Sound triggers: off", gFeatTrig); }
+            continue;
+        }
         if (IsMacroSlot(slot)) {                // (1.67.0) a macro's key
             if (pressed) { gTapTog[slot] = tapped; MacroPress(slot - SLOT_MACRO0, tapped); }
             else if (released) { if (gTapTog[slot]) gTapTog[slot] = false; else MacroRelease(slot - SLOT_MACRO0); }
@@ -17374,7 +17628,7 @@ static void Layout()
         }
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
-                cid == IDC_ODEV0 + k || cid == IDC_ODB0 + k || cid == IDC_OLIM0 + k || cid == IDC_OTEST0 + k || cid == IDC_OFX0 + k) vis = false;
+                cid == IDC_ODEV0 + k || cid == IDC_ODB0 + k || cid == IDC_OLIM0 + k || cid == IDC_OTEST0 + k || cid == IDC_OFX0 + k || cid == IDC_OEQ0 + k) vis = false;
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
@@ -17496,7 +17750,10 @@ static void RemoveOutput(int k)
         SetRowMode(j, gRowMode[j + 1]);
         SetRowVol(j, gRowVol[j + 1]);
         lstrcpynW(gOutName[j], gOutName[j + 1], 32); gOutW[j] = gOutW[j + 1]; gOutMute[j] = gOutMute[j + 1]; OutCeilSet(j, gOutCeil10[j + 1]);
+        OutEqMoveUp(j + 1, j);
     }
+    OutEqDefaults(gOutEq[gRows - 1]); OutEqPublish(gRows - 1);
+    OutEqClose();
     gOutName[gRows - 1][0] = 0; gOutW[gRows - 1] = 0; gOutMute[gRows - 1] = false; OutCeilSet(gRows - 1, -10);
     gHearListStale = true;
     gRows--;
@@ -19713,7 +19970,13 @@ static void ShowHelp()
         L"them all when you let go. Voice commands and Streamer.bot (macro NAME) can run them too.\n"
         L"Phone remote (Settings > Stream > Phone remote...): your phone's browser becomes a control pad, on the same Wi-Fi. "
         L"Scan the QR code, type the PIN once, and it shows your pads, voice effects, the Mixer, scenes, macros and your own buttons. "
-        L"Hold buttons (push-to-talk, the stutter...) work while you hold them.\n\n"
+        L"Hold buttons (push-to-talk, the stutter...) work while you hold them.\n"
+        L"Sound triggers (Settings > Features): a clap, finger snap, whistle or tongue click can press a hotkey action. "
+        L"Off until you switch it on, with its own on / off hotkey; Teach records your own clap so it knows it.\n"
+        L"MIDI controller (Settings > Features): any USB knob / fader box. Add a button / pad or a knob / fader, pick what it does, "
+        L"then press or move it. Its lights follow what's on, where the controller can.\n"
+        L"EQ on each output (the Mixer's Outputs): an EQ with a draggable curve, and a delay to line one output up with another "
+        L"(a stream behind your speakers, say).\n\n"
         L"MIC\n"
         L"The meter shows your mic level (green = the gate lets it through). Noise suppression (AI) removes "
         L"background noise. The noise gate mutes you between words: open it on Volume (set Threshold just above "
@@ -19851,7 +20114,8 @@ static void FxKeyButtonText(int slot, wchar_t* buf, int cap)
     wsprintfW(buf, L"%s%s", pre, k);
 }
 
-static int MacroKeyButton(int i);
+static void TrigSave(); static void TrigLoad(); static void TrigTick(); static void MidiSave(); static void MidiLoad(); static void MidiTick(); static void MidiMsg(int dev, DWORD msg); static void MidiOpen(); static void MidiClose();
+static int MacroKeyButton(int i); static int TrigKeyButton(); static void TrigShow(); static void SetFeatTrig(bool on); static void MidiShow(); static void SetFeatMidi(bool on);
 static int FxKeyButtonId(int slot)
 {
     if (slot == SLOT_RECORD) return 4545;       // (IDC_RCD_KEY, in the Recorder window)
@@ -19862,7 +20126,8 @@ static int FxKeyButtonId(int slot)
     if (slot == SLOT_BLLIVE)  return IDC_BLLIVEKEY;
     if (slot == SLOT_MUSPLAY) return IDC_MUSKEYPLAY;
     if (slot == SLOT_MUSNEXT) return IDC_MUSKEYNEXT;
-    if (IsMacroSlot(slot)) return MacroKeyButton(slot - SLOT_MACRO0);   // (1.67.0: in the Macros window, while that macro shows)
+    if (IsMacroSlot(slot)) return MacroKeyButton(slot - SLOT_MACRO0);
+    if (slot == SLOT_TRIGON) return TrigKeyButton();   // (1.69.0: in the Sound triggers window)   // (1.67.0: in the Macros window, while that macro shows)
     if (slot >= SLOT_VST0) {                    // a plugin slot: on the Mic tab, or in the open channel / output plugins window
         const int k = slot - SLOT_VST0;
         if (k < VST_MIC) return IDC_VSTKEY0 + k;
@@ -21060,7 +21325,7 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    OK, then right-click it > Connect. Here it now says \"1 connected\".\n\n"
         L"3. Actions tab > right-click > Add an action (e.g. \"Lag chat\"), and give it a trigger,\n"
         L"    like a channel point reward or a chat command.\n\n"
-        L"4. Here, in the Command builder (under Remote control): pick what it should do, press \"Copy C# for Streamer.bot\".\n"
+        L"4. Here, in the Command builder (under Remote control): pick what it should do, press \"Copy C# code\".\n"
         L"    In the action: right-click Sub-Actions > Core > C# > Execute C# Code, paste it in, then Compile and Save.\n"
         L"    The 0 in WebsocketSend is the connection's number in Websocket Clients (the first is 0).\n\n"
         L"5. Run the action (right-click > Test Trigger). Lag Effect does it.\n\n"
@@ -21703,12 +21968,13 @@ static const SecIntro SEC_INTROS[] = {
                       L"copy / paste its settings, a compact or hidden strip, resync, a bus. "
                       L"A bus (pick \"A bus\" as a channel's source) is a sub-mix: channels you put in it (their menu > Bus) go through its fader, EQ, compressor, mute and outputs, "
                       L"so one fader turns them all down together. Their own output buttons show the bus's, greyed. Drag a name to reorder; drag a strip's right edge to resize it." },
-    { L"Outputs",     L"Each output's volume, limit and mute, as the Mixer sends them. The buttons at the bottom of each channel pick which outputs it goes to." },
+    { L"Outputs",     L"Each output's volume, limit and mute, as the Mixer sends them. EQ... gives one output its own EQ and a delay (up to 500 ms). The buttons at the bottom of each channel pick which outputs it goes to." },
     { L"Mixer hotkeys", L"Keys for each channel (volume, mute, solo, duck, hold, fade) and each output, working from any app." },
-    { L"Features",    L"Turn whole parts of Lag Effect on or off. Off means hidden and not using any time on the audio." },
+    { L"Features",    L"Turn whole parts of Lag Effect on or off. Off means hidden and not using any time on the audio. "
+                      L"Sound triggers listen for a clap, snap, whistle or click; MIDI controller lets a knob box drive the Mixer and your hotkeys. Set up... opens each." },
     { L"Remote control (Streamer.bot)", L"Lets Streamer.bot, a Stream Deck or a script control Lag Effect over a local WebSocket. Off until you turn it on. "
                                         L"\"How to use...\" walks you through connecting Streamer.bot." },
-    { L"Command builder (Streamer.bot)", L"Pick what it should do (and which channel, output, scene... and how). Then press \"Copy C# for Streamer.bot\" and, in Streamer.bot, "
+    { L"Command builder (Streamer.bot)", L"Pick what it should do (and which channel, output, scene... and how). Then press \"Copy C# code\" and, in Streamer.bot, "
                                          L"paste it into an action: Sub-Actions > Core > C# > Execute C# Code, then Compile and Save. Test does it here right away." },
     { L"Latency",     L"How much delay the audio has. Lower is snappier but can crackle on a busy PC." },
     { L"Layout",      L"Move any control or box, saved per profile." },
@@ -22020,6 +22286,7 @@ static void BugInfoBuild(wchar_t* o, int cap)
     BugAdd(o, cap, L"Recorder: %ls", gRcd ? L"recording" : L"idle");
     BugVbCable(o, cap);
     BugPhone(o, cap);
+    BugTrigMidi(o, cap);
     BugMacros(o, cap);
     {
         static const wchar_t* LS[5] = { L"empty", L"recording", L"playing", L"adding a layer", L"stopped" };
@@ -22217,6 +22484,7 @@ static int ChipsBuild(Chip* c)
     if (gFeatCaptions && gCapOn && gFeatSpeech) add(L"Captions", 0, PAGE_SETTINGS, 4);   // (1.60.0)
     if (gFeatAvatar && gAvOpen) add(L"Avatar", 0, PAGE_SETTINGS, 4);
     if (gMusPlay.load()) add(L"\x266B Music", 0, PAGE_MIC, 5);   // (1.61.0; Mic > Music since 1.63.0)
+    if (gFeatTrig) add(L"Sound triggers", 0, PAGE_SETTINGS, 3);   // (1.69.0)
     return n;
 }
 static void ChipsTick()                         // every 50 ms: redraw the chips only when they changed
@@ -22546,6 +22814,7 @@ static void KeyRowsBuild()
         const int di = DesignOf(r.btn);
         if (di >= 0 && gDesign[di].page >= 0) { r.page = gDesign[di].page; r.sub = gDesign[di].sub; LocText(r.page, r.sub, gDesign[di].sec, r.where, 110); }
         else if (slot == SLOT_RECORD) { r.page = -2; r.sub = -1; r.btn = nullptr; lstrcpynW(r.where, L"The Recorder window (bottom bar)", 110); }
+        else if (slot == SLOT_TRIGON) { r.page = -7; r.sub = 0; r.btn = nullptr; lstrcpynW(r.where, L"The Sound triggers window (Settings > Features)", 110); }
         else if (IsMacroSlot(slot)) { r.page = -6; r.sub = slot - SLOT_MACRO0; r.btn = nullptr; lstrcpynW(r.where, L"The Macros window (bottom bar)", 110); }
         else if (slot == SLOT_VST0 + VST_SYNTH) { r.page = PAGE_FX; r.sub = 1; r.btn = nullptr; lstrcpynW(r.where, L"Voice FX > Tune > Synth plugin", 110); }
         else if (slot >= SLOT_VST0) { r.page = PAGE_MIXER; r.sub = 0; r.btn = nullptr; lstrcpynW(r.where, L"Mixer > a channel's or output's plugins (FX)", 110); }
@@ -22691,6 +22960,7 @@ static void KeysListShow()
         const KeyRow r = gKeyRows[gKeysGo];
         if (r.page == -2) RcdShow();
         else if (r.page == -6) { gMacroSel = r.sub; MacroShow(); }
+        else if (r.page == -7) TrigShow();
         else if (r.page >= 0) {
             wchar_t b[96]; swprintf(b, 96, L"Hotkey: %ls", r.key);
             GoTo(r.page, r.sub, r.btn, r.what, b);
@@ -23511,6 +23781,7 @@ static void VcActionName(int slot, wchar_t* out, int cap)
     if (slot == SLOT_MUSPLAY) { lstrcpynW(out, L"Music: play / pause", cap); return; }
     if (slot == SLOT_MUSNEXT) { lstrcpynW(out, L"Music: next song", cap); return; }
     if (IsMacroSlot(slot)) { MacroLabel(slot - SLOT_MACRO0, out, cap); return; }
+    if (slot == SLOT_TRIGON) { lstrcpynW(out, L"Sound triggers on / off", cap); return; }
     if (slot == SLOT_RECORD) { lstrcpynW(out, L"Recorder: start / stop", cap); return; }
     if (slot == SLOT_MUTE) { lstrcpynW(out, L"Mute / unmute mic", cap); return; }
     if (slot > 0 && slot < FX_KEY_SLOTS) { swprintf(out, cap, L"%ls on / off (Voice FX)", gFxGroups[slot - 1].title); return; }
@@ -23536,6 +23807,7 @@ static int VcActions(int* out, int cap)          // the actions a command can pi
     add(SLOT_RECORD); add(SLOT_SPTTS);
     add(SLOT_MUSPLAY); add(SLOT_MUSNEXT);       // (Mic > Music: no feature switch since 1.63.0)
     for (int i = 0; i < gMacroN; i++) add(SLOT_MACRO0 + i);   // (1.67.0)
+    add(SLOT_TRIGON);                           // (1.69.0)
     return n;
 }
 static void VoiceCmdRun(int i)
@@ -23600,13 +23872,14 @@ static int MacroState(int s)                    // a switch: 1 on, 0 off, -1 can
     if (s == SLOT_BEATBOX) return gBbOn.load() ? 1 : 0;
     if (s == SLOT_SPTTS) return gSpTts ? 1 : 0;
     if (s == SLOT_MUSPLAY) return gMusPlay.load() ? 1 : 0;
+    if (s == SLOT_TRIGON) return gFeatTrig ? 1 : 0;
     return -1;
 }
 static int MacroUndoKind(int s, int* other)     // how a step is undone; *other: the key that goes the other way
 {
     *other = -1;
     if (s == SLOT_MUTE || s < FX_KEY_SLOTS || (s >= SLOT_FADE0 && s < SLOT_FADE0 + CH_MAX) || (s >= SLOT_VST0 && s < SLOT_VST_END) ||
-        s == SLOT_RECORD || s == SLOT_BEATBOX || s == SLOT_SPTTS || s == SLOT_MUSPLAY) return 0;
+        s == SLOT_RECORD || s == SLOT_BEATBOX || s == SLOT_SPTTS || s == SLOT_MUSPLAY || s == SLOT_TRIGON) return 0;
     if (s >= SLOT_MIX0 && s < SLOT_MIXOUT0) {
         const int a = (s - SLOT_MIX0) % MIXA_N;
         if (a == MIXA_UP || a == MIXA_DOWN) { *other = s + (a == MIXA_UP ? 1 : -1); return 1; }
@@ -23849,6 +24122,7 @@ static void MacroActionMenu(HMENU m)            // every action, grouped: item i
         if (!any) AppendMenuW(pl, MF_STRING | MF_GRAYED, 0, L"(no plugins loaded)");
     }
     HMENU mu = sub(L"Music and recorder"); item(mu, SLOT_MUSPLAY); item(mu, SLOT_MUSNEXT); item(mu, SLOT_RECORD);
+    item(m, SLOT_TRIGON);                       // (1.69.0)
     HMENU pr = sub(L"Profiles");
     item(pr, SLOT_PROFNEXT);
     for (int i = 0; i < gProfCount; i++) { wchar_t t[90]; swprintf(t, 90, L"Load \"%ls\"", gProfNames[i]); AppendMenuW(pr, MF_STRING, 20000 + i, t); }
@@ -24606,6 +24880,746 @@ static void BugPhone(wchar_t* o, int cap)
 {
     BugAdd(o, cap, L"Phone remote: %ls, port %d, %ls; %d paired, %d connected, %d your buttons, %d held", gPhoneOn ? L"on" : L"off", gPhonePort,
            gPhoneState == 1 ? L"listening" : gPhoneState == 2 ? L"port in use" : L"-", gPhonesN, gPhConN, gPhBtnN, gRHoldN);
+}
+
+// ======================= (1.69.0) an output's EQ and delay: the window (Mixer > an output's EQ button) =======================
+enum { IDC_EQ_ON = 5000, IDC_EQ_RESET, IDC_EQ_DELAY, IDC_EQ_STAT, IDC_EQ_T0 = 5010, IDC_EQ_F0 = 5020, IDC_EQ_G0 = 5030, IDC_EQ_Q0 = 5040 };
+static HWND gEqWnd = nullptr; static int gEqK = 0, gEqDrag = -1;
+static const wchar_t* OEQ_NAMES[OEQ_TYPES] = { L"Off", L"Low cut", L"Low shelf", L"Peak", L"High shelf", L"High cut" };
+static RECT EqGraphRc() { RECT r = { SC(16), SC(44), SC(564), SC(214) }; return r; }
+static float EqXHz(const RECT& g, int x) { const double t = (double)(x - g.left) / Imax(1, g.right - g.left); return (float)(20.0 * pow(1000.0, t < 0 ? 0 : t > 1 ? 1 : t)); }
+static int EqHzX(const RECT& g, double hz) { return g.left + (int)lround(log(hz / 20.0) / log(1000.0) * (g.right - g.left)); }
+static int EqDbY(const RECT& g, double db) { if (db > 18) db = 18; if (db < -18) db = -18; return g.top + (int)lround((18 - db) / 36.0 * (g.bottom - g.top)); }
+static void OutEqSave(int k)                    // (into SaveSettings' batch, or on its own)
+{
+    const OutEqSet& e = gOutEq[k];
+    wchar_t v[400]; int n = swprintf(v, 400, L"%d;%d", e.on ? 1 : 0, e.delayMs);
+    for (int b = 0; b < OEQ_BANDS && n < 380; b++) n += swprintf(v + n, 400 - n, L";%d,%g,%g,%g", e.type[b], e.freq[b], e.gain[b], e.q[b]);
+    wchar_t key[24]; wsprintfW(key, L"out_%d_eq", k); IniSet(key, v);
+}
+static void OutEqLoad(int k)
+{
+    OutEqSet& e = gOutEq[k]; OutEqDefaults(e);
+    wchar_t key[24], v[400]; wsprintfW(key, L"out_%d_eq", k);
+    GetPrivateProfileStringW(L"settings", key, L"", v, 400, gIni);
+    if (v[0]) {
+        wchar_t* p = v; e.on = _wtoi(p) != 0;
+        p = wcschr(p, L';'); if (p) { e.delayMs = Iclamp(_wtoi(++p), 0, 500); p = wcschr(p, L';'); }
+        for (int b = 0; b < OEQ_BANDS && p; b++) {
+            p++; int t = 0; float f = 1000, g = 0, q = 1;
+            if (swscanf(p, L"%d,%f,%f,%f", &t, &f, &g, &q) == 4) {
+                e.type[b] = Iclamp(t, 0, OEQ_TYPES - 1); e.freq[b] = f < 20 ? 20 : f > 20000 ? 20000 : f;
+                e.gain[b] = g < -18 ? -18 : g > 18 ? 18 : g; e.q[b] = q < 0.1f ? 0.1f : q > 18 ? 18 : q;
+            }
+            p = wcschr(p, L';');
+        }
+    }
+    OutEqPublish(k);
+}
+static void OutEqMoveUp(int from, int to)       // (an output was removed: the later ones move up, with their EQ)
+{
+    gOutEq[to] = gOutEq[from]; OutEqPublish(to);
+}
+static void EqRows()                            // the band rows show the settings
+{
+    if (!gEqWnd) return;
+    const OutEqSet& e = gOutEq[gEqK];
+    CheckDlgButton(gEqWnd, IDC_EQ_ON, e.on ? BST_CHECKED : BST_UNCHECKED);
+    for (int b = 0; b < OEQ_BANDS; b++) {
+        SendDlgItemMessageW(gEqWnd, IDC_EQ_T0 + b, CB_SETCURSEL, e.type[b], 0);
+        wchar_t t[32];
+        swprintf(t, 32, e.freq[b] >= 1000 ? L"%.0f" : L"%.0f", e.freq[b]); SetDlgItemTextW(gEqWnd, IDC_EQ_F0 + b, t);
+        swprintf(t, 32, L"%.1f", e.gain[b]); SetDlgItemTextW(gEqWnd, IDC_EQ_G0 + b, t);
+        swprintf(t, 32, L"%.2f", e.q[b]); SetDlgItemTextW(gEqWnd, IDC_EQ_Q0 + b, t);
+        const bool gn = e.type[b] == OEQ_LOWSHELF || e.type[b] == OEQ_PEAK || e.type[b] == OEQ_HIGHSHELF;
+        EnableWindow(GetDlgItem(gEqWnd, IDC_EQ_F0 + b), e.type[b] != OEQ_OFF);
+        EnableWindow(GetDlgItem(gEqWnd, IDC_EQ_G0 + b), gn);
+        EnableWindow(GetDlgItem(gEqWnd, IDC_EQ_Q0 + b), e.type[b] != OEQ_OFF);
+    }
+    MiniSetH(GetDlgItem(gEqWnd, IDC_EQ_DELAY), e.delayMs);
+    SetDlgItemTextW(gEqWnd, IDC_EQ_STAT, e.on ? L"Drag a point: left / right = frequency, up / down = boost or cut. Scroll on it: wider / narrower."
+                                              : L"Tick \"On\" to hear it. Drag a point: left / right = frequency, up / down = boost or cut.");
+}
+static void EqChanged(bool rows)                // a setting moved: it's heard at once
+{
+    OutEqPublish(gEqK);
+    if (rows) EqRows();
+    if (gEqWnd) { RECT g = EqGraphRc(); InvalidateRect(gEqWnd, &g, FALSE); }
+    InvalidateRect(GetDlgItem(gWnd, IDC_OEQ0 + gEqK), nullptr, FALSE);
+}
+static void EqPaintGraph(HDC dc)
+{
+    RECT g = EqGraphRc();
+    const int w = g.right - g.left, h = g.bottom - g.top;
+    HDC m = CreateCompatibleDC(dc); HBITMAP bm = CreateCompatibleBitmap(dc, w, h); HGDIOBJ ob = SelectObject(m, bm);
+    RECT r = { 0, 0, w, h };
+    HBRUSH bg = CreateSolidBrush(gDark ? Mix(DK_BG, RGB(0, 0, 0), 0.25f) : LT_CARD); FillRect(m, &r, bg); DeleteObject(bg);
+    RECT g0 = { 0, 0, w, h };
+    HPEN grid = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER); HGDIOBJ op = SelectObject(m, grid);
+    SetBkMode(m, TRANSPARENT); SetTextColor(m, gDark ? DK_DIM : gLtDim); SelectObject(m, FitFont(2));
+    static const int hz[] = { 50, 100, 200, 500, 1000, 2000, 5000, 10000 };
+    static const wchar_t* hzT[] = { L"50", L"100", L"200", L"500", L"1k", L"2k", L"5k", L"10k" };
+    for (int i = 0; i < 8; i++) { const int x = EqHzX(g0, hz[i]); MoveToEx(m, x, 0, nullptr); LineTo(m, x, h); TextOutW(m, x + 2, h - SC(14), hzT[i], lstrlenW(hzT[i])); }
+    for (int db = -12; db <= 12; db += 6) {
+        const int y = EqDbY(g0, db); MoveToEx(m, 0, y, nullptr); LineTo(m, w, y);
+        wchar_t t[8]; swprintf(t, 8, db > 0 ? L"+%d" : L"%d", db); TextOutW(m, SC(2), y - SC(13), t, lstrlenW(t));
+    }
+    SelectObject(m, op); DeleteObject(grid);
+    OutEqSet e = gOutEq[gEqK]; e.on = true;     // (the curve shows even while it's off: dimmer)
+    OutEqCo c; OutEqDesign(e, c);
+    HPEN cv = CreatePen(PS_SOLID, SC(2), gOutEq[gEqK].on ? ACCENT : (gDark ? DK_DIM : gLtDim)); op = SelectObject(m, cv);
+    for (int x = 0; x < w; x += 2) {
+        const int y = EqDbY(g0, OutEqResponseDb(c, EqXHz(g0, x)));
+        if (x == 0) MoveToEx(m, x, y, nullptr); else LineTo(m, x, y);
+    }
+    SelectObject(m, op); DeleteObject(cv);
+    for (int b = 0; b < OEQ_BANDS; b++) {       // the points (numbered)
+        if (e.type[b] == OEQ_OFF) continue;
+        const bool gn = e.type[b] == OEQ_LOWSHELF || e.type[b] == OEQ_PEAK || e.type[b] == OEQ_HIGHSHELF;
+        const int x = EqHzX(g0, e.freq[b]), y = EqDbY(g0, gn ? e.gain[b] : 0), rr = SC(8);
+        HBRUSH pb = CreateSolidBrush(b == gEqDrag ? ACCENT : (gDark ? DK_CTL : RGB(255, 255, 255)));
+        HPEN pp = CreatePen(PS_SOLID, SC(2), ACCENT);
+        HGDIOBJ o1 = SelectObject(m, pb), o2 = SelectObject(m, pp);
+        Ellipse(m, x - rr, y - rr, x + rr, y + rr);
+        SelectObject(m, o1); SelectObject(m, o2); DeleteObject(pb); DeleteObject(pp);
+        wchar_t t[4]; swprintf(t, 4, L"%d", b + 1); SetTextColor(m, gDark ? DK_TEXT : gLtText);
+        RECT tr = { x - rr, y - rr, x + rr, y + rr }; DrawTextW(m, t, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    BitBlt(dc, g.left, g.top, w, h, m, 0, 0, SRCCOPY);
+    SelectObject(m, ob); DeleteObject(bm); DeleteDC(m);
+}
+static int EqHit(int mx, int my)                // the point under the mouse (-1: none)
+{
+    RECT g = EqGraphRc(); const OutEqSet& e = gOutEq[gEqK];
+    int best = -1, bd = SC(14) * SC(14);
+    for (int b = 0; b < OEQ_BANDS; b++) {
+        if (e.type[b] == OEQ_OFF) continue;
+        const bool gn = e.type[b] == OEQ_LOWSHELF || e.type[b] == OEQ_PEAK || e.type[b] == OEQ_HIGHSHELF;
+        const int dx = mx - EqHzX(g, e.freq[b]), dy = my - EqDbY(g, gn ? e.gain[b] : 0);
+        if (dx * dx + dy * dy < bd) { bd = dx * dx + dy * dy; best = b; }
+    }
+    return best;
+}
+static LRESULT CALLBACK EqProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_PAINT: { PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps); EqPaintGraph(dc); EndPaint(h, &ps); return 0; }
+    case WM_LBUTTONDOWN: {
+        gEqDrag = EqHit((short)LOWORD(l), (short)HIWORD(l));
+        if (gEqDrag >= 0) { SetCapture(h); RECT g = EqGraphRc(); InvalidateRect(h, &g, FALSE); }
+        return 0;
+    }
+    case WM_MOUSEMOVE:
+        if (gEqDrag >= 0 && GetCapture() == h) {
+            RECT g = EqGraphRc(); OutEqSet& e = gOutEq[gEqK]; const int b = gEqDrag;
+            const int mx = (short)LOWORD(l), my = (short)HIWORD(l);
+            e.freq[b] = EqXHz(g, mx);
+            if (e.type[b] == OEQ_LOWSHELF || e.type[b] == OEQ_PEAK || e.type[b] == OEQ_HIGHSHELF) {
+                float db = 18.0f - 36.0f * (my - g.top) / (float)Imax(1, g.bottom - g.top);
+                db = db < -18 ? -18 : db > 18 ? 18 : db; if (fabsf(db) < 0.4f) db = 0;   // (snaps to 0)
+                e.gain[b] = roundf(db * 2) / 2;
+            }
+            EqChanged(true);
+        }
+        return 0;
+    case WM_LBUTTONUP: if (gEqDrag >= 0) { ReleaseCapture(); gEqDrag = -1; RECT g = EqGraphRc(); InvalidateRect(h, &g, FALSE); SaveSettings(); } return 0;
+    case WM_MOUSEWHEEL: {
+        POINT p = { (short)LOWORD(l), (short)HIWORD(l) }; ScreenToClient(h, &p);
+        const int b = EqHit(p.x, p.y);
+        if (b >= 0) { OutEqSet& e = gOutEq[gEqK]; e.q[b] *= GET_WHEEL_DELTA_WPARAM(w) > 0 ? 1.15f : 1 / 1.15f; e.q[b] = e.q[b] < 0.1f ? 0.1f : e.q[b] > 18 ? 18 : e.q[b]; EqChanged(true); SaveSettings(); }
+        return 0;
+    }
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        OutEqSet& e = gOutEq[gEqK];
+        if (id == IDC_EQ_ON && code == BN_CLICKED) { e.on = IsDlgButtonChecked(h, id) == BST_CHECKED; EqChanged(true); SaveSettings(); }
+        if (id == IDC_EQ_RESET && code == BN_CLICKED) { const bool was = e.on; OutEqDefaults(e); e.on = was; EqChanged(true); SaveSettings(); }
+        if (id == IDC_EQ_DELAY && code == EN_CHANGE) { BOOL ok = FALSE; const int v = (int)GetDlgItemInt(h, id, &ok, FALSE); if (ok) { e.delayMs = Iclamp(v, 0, 500); EqChanged(false); } }
+        if (id == IDC_EQ_DELAY && code == EN_KILLFOCUS) SaveSettings();
+        if (id >= IDC_EQ_T0 && id < IDC_EQ_T0 + OEQ_BANDS && code == CBN_SELCHANGE) {
+            const int b = id - IDC_EQ_T0; e.type[b] = Iclamp((int)SendDlgItemMessageW(h, id, CB_GETCURSEL, 0, 0), 0, OEQ_TYPES - 1);
+            if (e.type[b] == OEQ_LOWCUT && e.freq[b] <= 20.5f) e.freq[b] = 80;      // (a cut picked: somewhere it does something)
+            if (e.type[b] == OEQ_HIGHCUT && e.freq[b] >= 19999) e.freq[b] = 12000;
+            EqChanged(true); SaveSettings();
+        }
+        if (code == EN_KILLFOCUS && id >= IDC_EQ_F0 && id < IDC_EQ_Q0 + OEQ_BANDS) {
+            const int b = (id - IDC_EQ_F0) % 10; wchar_t t[32]; GetDlgItemTextW(h, id, t, 32); const float v = (float)_wtof(t);
+            if (id < IDC_EQ_G0) e.freq[b] = v < 20 ? 20 : v > 20000 ? 20000 : v;
+            else if (id < IDC_EQ_Q0) e.gain[b] = v < -18 ? -18 : v > 18 ? 18 : v;
+            else e.q[b] = v < 0.1f ? 0.1f : v > 18 ? 18 : v;
+            EqChanged(true); SaveSettings();
+        }
+        return 0;
+    }
+    case WM_CLOSE: DestroyWindow(h); return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, msg, w, l);
+    case WM_DESTROY: if (gEqWnd == h) gEqWnd = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+static void OutEqClose() { if (gEqWnd) DestroyWindow(gEqWnd); }
+static void OutEqShow(int k)
+{
+    if (k < 0 || k >= MAX_OUT) return;
+    if (gEqWnd) DestroyWindow(gEqWnd);          // (one at a time: the output clicked)
+    gEqK = k;
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = EqProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagOutEq"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r = { 0, 0, SC(580), SC(478) }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    wchar_t nm[48], title[96]; OutName(k, nm, 48); swprintf(title, 96, L"Lag Effect - %ls: EQ and delay", nm);
+    HWND w = CreateWindowExW(0, L"LagOutEq", title, style, (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    gEqWnd = w;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x), SC(y), SC(w2), SC(h2), w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"BUTTON", L"On", BS_AUTOCHECKBOX | WS_TABSTOP, 16, 14, 80, 20, IDC_EQ_ON);
+    mk(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 100, 16, 360, 20, IDC_EQ_STAT);
+    mk(L"BUTTON", L"Reset", WS_TABSTOP, 474, 10, 90, 26, IDC_EQ_RESET);
+    mk(L"STATIC", L"Band", 0, 16, 224, 60, 18, IDC_HDR);
+    mk(L"STATIC", L"Kind", 0, 50, 224, 110, 18, IDC_HDR);
+    mk(L"STATIC", L"Hz", 0, 168, 224, 70, 18, IDC_HDR);
+    mk(L"STATIC", L"dB", 0, 246, 224, 60, 18, IDC_HDR);
+    mk(L"STATIC", L"Width (Q)", 0, 314, 224, 90, 18, IDC_HDR);
+    for (int b = 0; b < OEQ_BANDS; b++) {
+        const int y = 244 + b * 30;
+        wchar_t n[4]; swprintf(n, 4, L"%d", b + 1); mk(L"STATIC", n, 0, 22, y + 3, 20, 18, -1);
+        HWND cb = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 50, y, 110, 200, IDC_EQ_T0 + b);
+        for (int t = 0; t < OEQ_TYPES; t++) SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)OEQ_NAMES[t]);
+        mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 168, y, 70, 23, IDC_EQ_F0 + b, WS_EX_CLIENTEDGE);
+        mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 246, y, 60, 23, IDC_EQ_G0 + b, WS_EX_CLIENTEDGE);
+        mk(L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, 314, y, 60, 23, IDC_EQ_Q0 + b, WS_EX_CLIENTEDGE);
+    }
+    mk(L"STATIC", L"Low cut / High cut: everything below / above goes. Shelves: below / above goes up or down. Peak: around it.",
+       SS_NOPREFIX, 390, 244, 174, 110, IDC_HDR);
+    mk(L"STATIC", L"Delay", 0, 16, 432, 50, 20, -1);
+    MiniMake(w, IDC_EQ_DELAY, 70, 429, 80, 23, 0, 500, gOutEq[k].delayMs, 0, false);
+    mk(L"STATIC", L"ms: everything this output plays comes this much later (to line it up with your video in OBS).", SS_NOPREFIX, 160, 426, 404, 36, IDC_HDR);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    EqRows();
+    ShowWindow(w, SW_SHOW);
+}
+
+// ======================= (1.69.0) Sound triggers: settings, what they run, the window (Settings > Features > Set up...) =======================
+static const wchar_t* TRIG_NAMES[TRIG_N] = { L"Clap", L"Finger snap", L"Whistle", L"Tongue click" };
+struct TrigSet { bool use; short slot; bool taught; float cent[TRIG_FEAT]; };
+static TrigSet gTrig[TRIG_N] = { { true, -1 }, { true, -1 }, { true, -1 }, { true, -1 } };
+static int gTrigSensUi = 5, gTrigTeach = -1, gTrigTeachN = 0; static float gTrigTeachSum[TRIG_FEAT];
+static HWND gTrigWnd = nullptr; static wchar_t gTrigHeard[80] = L"";
+enum { IDC_TG_SENS = 5100, IDC_TG_KEY, IDC_TG_STAT, IDC_TG_USE0 = 5110, IDC_TG_ACT0 = 5120, IDC_TG_TEACH0 = 5130, IDC_TG_FORGET0 = 5140 };
+static int TrigKeyButton() { return gTrigWnd ? IDC_TG_KEY : 0; }
+static void SetFeatTrig(bool on)
+{
+    gFeatTrig = on; gTrigOn = on;
+    if (!on) gTrigTeach = -1;
+    if (gWnd) CheckDlgButton(gWnd, IDC_FEATTRIG, on ? BST_CHECKED : BST_UNCHECKED);
+}
+static void TrigSave()
+{
+    SaveInt(L"feat_triggers", gFeatTrig); SaveInt(L"triggers_sens", gTrigSensUi);
+    for (int k = 0; k < TRIG_N; k++) {
+        wchar_t key[40], v[200];
+        swprintf(key, 40, L"trigger%d_use", k + 1); SaveInt(key, gTrig[k].use);
+        swprintf(key, 40, L"trigger%d_action", k + 1); const wchar_t* kn = gTrig[k].slot >= 0 ? FxKeyIniName(gTrig[k].slot) : nullptr; IniSet(key, kn);
+        swprintf(key, 40, L"trigger%d_taught", k + 1);
+        if (gTrig[k].taught) { int n = 0; for (int i = 0; i < TRIG_FEAT; i++) n += swprintf(v + n, 200 - n, i ? L",%.4f" : L"%.4f", gTrig[k].cent[i]); IniSet(key, v); }
+        else IniSet(key, nullptr);
+    }
+}
+static void TrigLoad()
+{
+    auto I = [](const wchar_t* k, int d) { return (int)GetPrivateProfileIntW(L"settings", k, d, gIni); };
+    gFeatTrig = I(L"feat_triggers", 0) != 0; gTrigOn = gFeatTrig;
+    gTrigSensUi = Iclamp(I(L"triggers_sens", 5), 1, 10); gTrigSens = gTrigSensUi;
+    for (int k = 0; k < TRIG_N; k++) {
+        wchar_t key[40], v[200];
+        swprintf(key, 40, L"trigger%d_use", k + 1); gTrig[k].use = I(key, 1) != 0;
+        swprintf(key, 40, L"trigger%d_action", k + 1); GetPrivateProfileStringW(L"settings", key, L"", v, 200, gIni);
+        gTrig[k].slot = (short)(v[0] ? SlotByIniName(v) : -1);
+        swprintf(key, 40, L"trigger%d_taught", k + 1); GetPrivateProfileStringW(L"settings", key, L"", v, 200, gIni);
+        float f[TRIG_FEAT]; gTrig[k].taught = v[0] && swscanf(v, L"%f,%f,%f,%f,%f,%f,%f", &f[0], &f[1], &f[2], &f[3], &f[4], &f[5], &f[6]) == TRIG_FEAT;
+        if (gTrig[k].taught) memcpy(gTrig[k].cent, f, sizeof(f));
+    }
+}
+static void TrigWndSync()
+{
+    if (!gTrigWnd) return;
+    for (int k = 0; k < TRIG_N; k++) {
+        CheckDlgButton(gTrigWnd, IDC_TG_USE0 + k, gTrig[k].use ? BST_CHECKED : BST_UNCHECKED);
+        wchar_t a[120] = L"Pick what it does...";
+        if (gTrig[k].slot >= 0) VcActionName(gTrig[k].slot, a, 120);
+        SetDlgItemTextW(gTrigWnd, IDC_TG_ACT0 + k, a);
+        if (k != TRIG_WHISTLE) {
+            wchar_t t[40];
+            if (gTrigTeach == k) swprintf(t, 40, L"%d of 4...", gTrigTeachN); else lstrcpynW(t, gTrig[k].taught ? L"Teach again" : L"Teach", 40);
+            SetDlgItemTextW(gTrigWnd, IDC_TG_TEACH0 + k, t);
+            EnableWindow(GetDlgItem(gTrigWnd, IDC_TG_FORGET0 + k), gTrig[k].taught);
+        }
+    }
+    wchar_t k[100]; FxKeyButtonText(SLOT_TRIGON, k, 100); SetDlgItemTextW(gTrigWnd, IDC_TG_KEY, k);
+    wchar_t st[200];
+    if (!gFeatTrig) lstrcpynW(st, L"Off: not listening. Switch it on in Settings > Features (or with its hotkey).", 200);
+    else if (gTrigTeach >= 0) swprintf(st, 200, L"Teaching \"%ls\": make the sound %d more time%ls, a second or so apart.", TRIG_NAMES[gTrigTeach], 4 - gTrigTeachN, 4 - gTrigTeachN == 1 ? L"" : L"s");
+    else if (gTrigHeard[0]) swprintf(st, 200, L"Listening. Heard: %ls", gTrigHeard);
+    else lstrcpynW(st, L"Listening.", 200);
+    SetDlgItemTextW(gTrigWnd, IDC_TG_STAT, st);
+}
+static void TrigTick()                          // (50 ms) what the audio thread heard: which sound, and its action
+{
+    for (unsigned r = gTrigQR.load(); r != gTrigQW.load(std::memory_order_acquire); r++) {
+        TrigEv e = gTrigQ[r & 15]; gTrigQR.store(r + 1, std::memory_order_release);
+        if (!gFeatTrig) continue;
+        int k = -1;
+        if (e.kind == TRIG_WHISTLE) k = gTrig[TRIG_WHISTLE].use || gTrigTeach >= 0 ? TRIG_WHISTLE : -1;
+        else if (gTrigTeach >= 0 && gTrigTeach != TRIG_WHISTLE) {   // (teaching: every short sound counts toward it)
+            for (int i = 0; i < TRIG_FEAT; i++) gTrigTeachSum[i] += e.f[i];
+            if (++gTrigTeachN >= 4) {
+                TrigSet& t = gTrig[gTrigTeach];
+                for (int i = 0; i < TRIG_FEAT; i++) t.cent[i] = gTrigTeachSum[i] / 4;
+                t.taught = true; swprintf(gTrigHeard, 80, L"learned your %ls", TRIG_NAMES[gTrigTeach]);
+                gTrigTeach = -1; SaveSettings();
+            }
+            TrigWndSync(); continue;
+        } else {
+            float cent[TRIG_N][TRIG_FEAT]; bool use[TRIG_N];
+            for (int i = 0; i < TRIG_N; i++) { use[i] = gTrig[i].use; memcpy(cent[i], gTrig[i].taught ? gTrig[i].cent : TRIG_DEFAULTS[i], sizeof(cent[i])); }
+            k = TrigClassify(e.f, cent, use, gTrigSensUi);
+        }
+        if (k < 0) continue;
+        swprintf(gTrigHeard, 80, L"%ls", TRIG_NAMES[k]);
+        if (gTrig[k].slot >= 0 && gTrig[k].slot < KEY_SLOTS && gTrig[k].slot != SLOT_TRIGON) {
+            if (!gVoiceTap[gTrig[k].slot]) gVoiceTap[gTrig[k].slot] = 2;   // (pressed once, as a voice command does)
+            wchar_t a[96], o[140]; VcActionName(gTrig[k].slot, a, 96); swprintf(o, 140, L"%ls: %ls", TRIG_NAMES[k], a); ShowOsd(o, true);
+        }
+        TrigWndSync();
+    }
+}
+static LRESULT CALLBACK TrigProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        if (id >= IDC_TG_USE0 && id < IDC_TG_USE0 + TRIG_N && code == BN_CLICKED) { gTrig[id - IDC_TG_USE0].use = IsDlgButtonChecked(h, id) == BST_CHECKED; SaveSettings(); }
+        if (id >= IDC_TG_ACT0 && id < IDC_TG_ACT0 + TRIG_N && code == BN_CLICKED) {
+            const int k = id - IDC_TG_ACT0;
+            HMENU pm = CreatePopupMenu(); MacroActionMenu(pm);
+            if (gMacroN) { HMENU mm = CreatePopupMenu(); AppendMenuW(pm, MF_POPUP, (UINT_PTR)mm, L"Macros"); for (int i = 0; i < gMacroN; i++) { wchar_t t[80]; MacroLabel(i, t, 80); AppendMenuW(mm, MF_STRING, 10000 + SLOT_MACRO0 + i, t); } }
+            AppendMenuW(pm, MF_SEPARATOR, 0, nullptr); AppendMenuW(pm, MF_STRING, 1, L"Nothing");
+            RECT r; GetWindowRect(GetDlgItem(h, id), &r);
+            const int cmd = (int)TrackPopupMenu(pm, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, h, nullptr);
+            DestroyMenu(pm);
+            if (cmd == 1) gTrig[k].slot = -1;
+            else if (cmd >= 10000 && cmd < 20000) gTrig[k].slot = (short)(cmd - 10000);
+            else if (cmd >= 20000) { SetDlgItemTextW(h, IDC_TG_STAT, L"A profile needs a macro (Macros... > Add action > Profiles); then pick the macro here."); return 0; }
+            else return 0;
+            SaveSettings(); TrigWndSync();
+        }
+        if (id >= IDC_TG_TEACH0 && id < IDC_TG_TEACH0 + TRIG_N && code == BN_CLICKED) {
+            if (!gFeatTrig) SetFeatTrig(true);
+            const int k = id - IDC_TG_TEACH0;
+            gTrigTeach = gTrigTeach == k ? -1 : k; gTrigTeachN = 0; memset(gTrigTeachSum, 0, sizeof(gTrigTeachSum));
+            TrigWndSync();
+        }
+        if (id >= IDC_TG_FORGET0 && id < IDC_TG_FORGET0 + TRIG_N && code == BN_CLICKED) { gTrig[id - IDC_TG_FORGET0].taught = false; SaveSettings(); TrigWndSync(); }
+        if (id == IDC_TG_SENS && code == EN_CHANGE) { BOOL ok = FALSE; const int v = (int)GetDlgItemInt(h, id, &ok, FALSE); if (ok) { gTrigSensUi = Iclamp(v, 1, 10); gTrigSens = gTrigSensUi; } }
+        if (id == IDC_TG_SENS && code == EN_KILLFOCUS) SaveSettings();
+        if (id == IDC_TG_KEY && code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_TRIGON], IDC_TG_KEY, h);
+        return 0;
+    }
+    case WM_CONTEXTMENU:
+        if ((HWND)w == GetDlgItem(h, IDC_TG_KEY)) { if (gCapturingKey) EndKeyCapture(); for (int i = 0; i < MAX_KEYS; i++) gFxKeys[SLOT_TRIGON][i] = 0; TrigWndSync(); SaveSettings(); return 0; }
+        break;
+    case WM_CLOSE: if (gCapturingKey && gCapWnd == h) EndKeyCapture(); gTrigTeach = -1; DestroyWindow(h); return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, msg, w, l);
+    case WM_DESTROY: if (gTrigWnd == h) gTrigWnd = nullptr; return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+static void TrigShow()
+{
+    if (gTrigWnd) { TrigWndSync(); ShowWindow(gTrigWnd, SW_SHOW); SetForegroundWindow(gTrigWnd); return; }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = TrigProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagTriggers"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r = { 0, 0, SC(560), SC(330) }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND w = CreateWindowExW(0, L"LagTriggers", L"Lag Effect - Sound triggers", style, (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    gTrigWnd = w;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x), SC(y), SC(w2), SC(h2), w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"STATIC", L"Make the sound near your mic. Each one can press any hotkey action or run a macro. Talking, laughing and "
+                  L"music are ignored: a sound counts when it's short and on its own (or a whistle held for a moment).", SS_NOPREFIX, 16, 12, 528, 48, IDC_HDR);
+    mk(L"STATIC", L"Does", 0, 176, 66, 100, 18, IDC_HDR);
+    for (int k = 0; k < TRIG_N; k++) {
+        const int y = 86 + k * 34;
+        mk(L"BUTTON", TRIG_NAMES[k], BS_AUTOCHECKBOX | WS_TABSTOP, 16, y + 3, 150, 20, IDC_TG_USE0 + k);
+        mk(L"BUTTON", L"", WS_TABSTOP, 176, y, 196, 26, IDC_TG_ACT0 + k);
+        if (k != TRIG_WHISTLE) { mk(L"BUTTON", L"Teach", WS_TABSTOP, 380, y, 90, 26, IDC_TG_TEACH0 + k); mk(L"BUTTON", L"Forget", WS_TABSTOP, 474, y, 70, 26, IDC_TG_FORGET0 + k); }
+        else mk(L"STATIC", L"(any steady whistle)", 0, 384, y + 4, 160, 20, IDC_HDR);
+    }
+    mk(L"STATIC", L"Sensitivity", 0, 16, 230, 90, 20, -1);
+    MiniMake(w, IDC_TG_SENS, 110, 227, 70, 23, 1, 10, gTrigSensUi, 5, false);
+    mk(L"STATIC", L"1 = only loud, clear sounds; 10 = quieter ones too", SS_NOPREFIX, 188, 230, 356, 20, IDC_HDR);
+    mk(L"STATIC", L"On / off key", 0, 16, 264, 90, 20, -1);
+    mk(L"BUTTON", L"", WS_TABSTOP, 110, 259, 190, 28, IDC_TG_KEY);
+    mk(L"STATIC", L"(right-click to clear)", 0, 308, 264, 140, 20, IDC_HDR);
+    mk(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 16, 298, 528, 20, IDC_TG_STAT);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    TrigWndSync();
+    ShowWindow(w, SW_SHOW);
+}
+
+// ======================= (1.69.0) MIDI controller (#48): learn a knob, fader, button or pad; lights where it can =======================
+// Off unless switched on (Settings > Features): then every MIDI input is opened (winmm), and its messages come to the
+// window (WM_APP + 72). A button / pad presses a hotkey action, held while you hold it (like the phone remote's hold
+// buttons: RemoteHold, id -1000 - its map). A knob / fader sets a level. The controller's MIDI output (same name),
+// when there is one, gets each button's on / off and each knob's level back, so its lights and LED rings follow.
+#define MIDI_MAPS 64
+#define MIDI_DEVS 8
+enum { MT_KEY = 0, MT_CHVOL, MT_OUTVOL, MT_CHATMIX, MT_MUSVOL, MT_CHPAN, MT_N };
+static const wchar_t* MT_NAMES[MT_N] = { L"key", L"chvol", L"outvol", L"chatmix", L"musvol", L"chpan" };
+struct MidiMap { wchar_t dev[64]; unsigned char kind, ch, num, endless; short tgt, arg; int lastOut, lastIn; };   // kind: 0 note, 1 CC, 2 pitch bend
+static MidiMap gMidi[MIDI_MAPS]; static int gMidiN = 0;
+struct MidiDev { HMIDIIN in; HMIDIOUT out; wchar_t name[64]; };
+static MidiDev gMidiDev[MIDI_DEVS]; static int gMidiDevN = 0;
+static int gMidiLearn = 0, gMidiLearnTgt = 0, gMidiLearnArg = 0;   // 0 not learning, 1 a button, 2 a knob
+static HWND gMidiWnd = nullptr; static wchar_t gMidiLast[140] = L"";
+static int gMidiSel = -1;
+enum { IDC_MD_LIST = 5200, IDC_MD_ADDBTN, IDC_MD_ADDKNOB, IDC_MD_REM, IDC_MD_CLEAR, IDC_MD_REFRESH, IDC_MD_ENDLESS, IDC_MD_DEVS, IDC_MD_LAST, IDC_MD_STAT };
+static void MidiWndSync();
+static void CALLBACK MidiInProc(HMIDIIN, UINT msg, DWORD_PTR inst, DWORD_PTR p1, DWORD_PTR)   // (winmm's thread: only posts)
+{
+    if (msg == MIM_DATA) PostMessageW(gWnd, WM_APP + 72, (WPARAM)inst, (LPARAM)p1);
+}
+static bool MidiNameMatch(const wchar_t* a, const wchar_t* b)   // the same device's input and output ("nanoKONTROL2" / "nanoKONTROL2")
+{
+    if (!a[0] || !b[0]) return false;
+    if (!lstrcmpiW(a, b)) return true;
+    wchar_t la[64], lb[64]; lstrcpynW(la, a, 64); lstrcpynW(lb, b, 64); CharLowerW(la); CharLowerW(lb);
+    return (lstrlenW(la) >= 4 && wcsstr(lb, la)) || (lstrlenW(lb) >= 4 && wcsstr(la, lb));
+}
+static void MidiClose()
+{
+    for (int i = 0; i < gMidiDevN; i++) {
+        if (gMidiDev[i].in) { midiInStop(gMidiDev[i].in); midiInReset(gMidiDev[i].in); midiInClose(gMidiDev[i].in); }
+        if (gMidiDev[i].out) { midiOutReset(gMidiDev[i].out); midiOutClose(gMidiDev[i].out); }
+    }
+    gMidiDevN = 0;
+    for (int i = 0; i < gMidiN; i++) RemoteLetGo(-1000 - i);
+}
+static void MidiOpen()                          // every MIDI input, and the outputs with the same names (for the lights)
+{
+    MidiClose();
+    const UINT ni = midiInGetNumDevs(), no = midiOutGetNumDevs();
+    for (UINT i = 0; i < ni && gMidiDevN < MIDI_DEVS; i++) {
+        MIDIINCAPSW c = {}; if (midiInGetDevCapsW(i, &c, sizeof(c)) != MMSYSERR_NOERROR) continue;
+        MidiDev& d = gMidiDev[gMidiDevN]; d = MidiDev(); lstrcpynW(d.name, c.szPname, 64);
+        if (midiInOpen(&d.in, i, (DWORD_PTR)MidiInProc, (DWORD_PTR)gMidiDevN, CALLBACK_FUNCTION) != MMSYSERR_NOERROR) { d.in = nullptr; continue; }
+        midiInStart(d.in);
+        for (UINT j = 0; j < no; j++) {
+            MIDIOUTCAPSW oc = {}; if (midiOutGetDevCapsW(j, &oc, sizeof(oc)) != MMSYSERR_NOERROR) continue;
+            if (MidiNameMatch(d.name, oc.szPname) && midiOutOpen(&d.out, j, 0, 0, CALLBACK_NULL) == MMSYSERR_NOERROR) break;
+            d.out = nullptr;
+        }
+        gMidiDevN++;
+    }
+    for (int i = 0; i < gMidiN; i++) gMidi[i].lastOut = -1;   // (the lights are sent again)
+    MidiWndSync();
+}
+static void SetFeatMidi(bool on)
+{
+    gFeatMidi = on;
+    if (on) MidiOpen(); else MidiClose();
+    if (gWnd) CheckDlgButton(gWnd, IDC_FEATMIDI, on ? BST_CHECKED : BST_UNCHECKED);
+    MidiWndSync();
+}
+static float MidiTargetGet(int tgt, int a)      // a knob's target now, 0..1 (-1: gone)
+{
+    switch (tgt) {
+    case MT_CHVOL:   if (a < 0 || a >= CH_MAX || gCh[a].type == CH_NONE) return -1; return gCh[a].db10 <= -600 ? 0.0f : fminf(1.0f, 0.75f * powf(10.0f, gCh[a].db10 / 400.0f));
+    case MT_OUTVOL:  if (a < 0 || a >= gRows) return -1; return fminf(1.0f, gRowVol[a] / 100.0f);
+    case MT_CHATMIX: return (gChatMix + 100) / 200.0f;
+    case MT_MUSVOL:  return fminf(1.0f, gMusVolPc.load() / 100.0f);
+    case MT_CHPAN:   if (a < 0 || a >= CH_MAX || gCh[a].type == CH_NONE) return -1; return (gCh[a].pan + 100) / 200.0f;
+    }
+    return -1;
+}
+static void MidiTargetSet(int tgt, int a, float t, int step)   // t 0..1 (a knob that stops), else step (one that turns forever)
+{
+    switch (tgt) {
+    case MT_CHVOL: {
+        if (a < 0 || a >= CH_MAX || gCh[a].type == CH_NONE) return;
+        int db10;
+        if (t >= 0) db10 = t < 0.01f ? -600 : Iclamp((int)lroundf(400.0f * log10f(t / 0.75f)), -600, 60);   // (75% = 0 dB, the top = +5 dB)
+        else db10 = Iclamp(gCh[a].db10 + step * 5, -600, 60);
+        FaderSet(IDC_CHVOL0 + a, db10);
+        break;
+    }
+    case MT_OUTVOL: {
+        if (a < 0 || a >= gRows) return;
+        const int v = t >= 0 ? (int)lroundf(t * 100) : Iclamp(gRowVol[a] + step * 2, 0, 200);
+        gRowVol[a] = v; MiniSet(IDC_ROWVOL + a, v); InvalidateRect(GetDlgItem(gWnd, IDC_OVOL0 + a), nullptr, FALSE);
+        break;
+    }
+    case MT_CHATMIX: ChatMixSet(t >= 0 ? (int)lroundf(t * 200 - 100) : Iclamp(gChatMix + step * 4, -100, 100)); break;
+    case MT_MUSVOL: { const int v = t >= 0 ? (int)lroundf(t * 100) : Iclamp(gMusVolPc.load() + step * 2, 0, 200); gMusVolPc = v; MiniSet(IDC_MUSVOL, v); break; }
+    case MT_CHPAN: if (a >= 0 && a < CH_MAX && gCh[a].type != CH_NONE) PanSet(a, t >= 0 ? (int)lroundf(t * 200 - 100) : Iclamp(gCh[a].pan + step * 4, -100, 100)); break;
+    }
+}
+static void MidiMapText(const MidiMap& m, wchar_t* out, int cap)
+{
+    wchar_t src[60], what[120] = L"";
+    if (m.kind == 0) swprintf(src, 60, L"note %d", m.num); else if (m.kind == 1) swprintf(src, 60, L"CC %d", m.num); else lstrcpynW(src, L"pitch bend", 60);
+    if (m.tgt == MT_KEY) VcActionName(m.arg, what, 120);
+    else {
+        wchar_t nm[48] = L"";
+        if (m.tgt == MT_CHVOL || m.tgt == MT_CHPAN) { if (m.arg >= 0 && m.arg < CH_MAX && gCh[m.arg].type != CH_NONE) ChanLabel(m.arg, nm, 48); else swprintf(nm, 48, L"channel %d", m.arg + 1); }
+        if (m.tgt == MT_OUTVOL) OutName(m.arg, nm, 48);
+        swprintf(what, 120, m.tgt == MT_CHVOL ? L"%ls volume" : m.tgt == MT_CHPAN ? L"%ls pan" : m.tgt == MT_OUTVOL ? L"Output %ls volume" : m.tgt == MT_CHATMIX ? L"ChatMix" : L"Music volume", nm);
+        if (m.endless) lstrcatW(what, L"  (turns forever)");
+    }
+    swprintf(out, cap, L"%ls  %ls (ch %d)   \x2192  %ls", m.dev[0] ? m.dev : L"any", src, m.ch + 1, what);
+}
+static void MidiMsg(int dev, DWORD msg)         // (WM_APP + 72) one message from a controller
+{
+    if (dev < 0 || dev >= gMidiDevN || !gFeatMidi) return;
+    const int st = msg & 0xFF, d1 = (msg >> 8) & 0x7F, d2 = (msg >> 16) & 0x7F, type = st & 0xF0, ch = st & 0x0F;
+    int kind, num = d1, val = d2; bool press;
+    if (type == 0x90) { kind = 0; press = d2 > 0; }
+    else if (type == 0x80) { kind = 0; press = false; val = 0; }
+    else if (type == 0xB0) { kind = 1; press = d2 >= 64; }
+    else if (type == 0xE0) { kind = 2; num = 0; val = d1 | (d2 << 7); press = false; }
+    else return;
+    swprintf(gMidiLast, 140, L"Last: %ls  %ls %d = %d (channel %d)", gMidiDev[dev].name, kind == 0 ? L"note" : kind == 1 ? L"CC" : L"pitch bend", num, val, ch + 1);
+    if (gMidiWnd) SetDlgItemTextW(gMidiWnd, IDC_MD_LAST, gMidiLast);
+    if (gMidiLearn) {                           // learning: this is the one
+        const bool ok = gMidiLearn == 1 ? (kind == 0 && press) || (kind == 1 && val > 0) : kind == 1 || kind == 2;
+        if (!ok || gMidiN >= MIDI_MAPS) return;
+        MidiMap& m = gMidi[gMidiN]; m = MidiMap();
+        lstrcpynW(m.dev, gMidiDev[dev].name, 64); m.kind = (unsigned char)kind; m.ch = (unsigned char)ch; m.num = (unsigned char)num;
+        m.tgt = (short)(gMidiLearn == 1 ? MT_KEY : gMidiLearnTgt); m.arg = (short)gMidiLearnArg; m.lastOut = -1; m.lastIn = -1;
+        m.endless = kind == 1 && gMidiLearn == 2 && (val == 1 || val == 127 || val == 65 || val == 63);   // (a first step of +1 / -1: probably turns forever)
+        gMidiSel = gMidiN++; gMidiLearn = 0;
+        if (m.tgt == MT_KEY) RemoteHold(-1000 - gMidiSel, m.arg, false);
+        SaveSettings(); MidiWndSync();
+        return;
+    }
+    for (int i = 0; i < gMidiN; i++) {
+        MidiMap& m = gMidi[i];
+        if (m.kind != kind || m.ch != ch || m.num != num || (m.dev[0] && !MidiNameMatch(m.dev, gMidiDev[dev].name))) continue;
+        if (m.tgt == MT_KEY) { if (kind != 2 && m.arg >= 0 && m.arg < KEY_SLOTS) RemoteHold(-1000 - i, m.arg, press); continue; }
+        if (m.endless && kind == 1) MidiTargetSet(m.tgt, m.arg, -1, val < 64 ? val : val - 128);
+        else MidiTargetSet(m.tgt, m.arg, kind == 2 ? val / 16383.0f : val / 127.0f, 0);
+        m.lastIn = val;                         // (no echo of what it just sent: its own rounding back, say 0.1 dB, would jitter a motor fader)
+        const float t = MidiTargetGet(m.tgt, m.arg); if (t >= 0) m.lastOut = m.kind == 2 ? (int)lroundf(t * 16383) : (int)lroundf(t * 127);
+    }
+}
+static void MidiSend(int dev, int st, int d1, int d2)
+{
+    if (dev >= 0 && dev < gMidiDevN && gMidiDev[dev].out) midiOutShortMsg(gMidiDev[dev].out, (DWORD)(st | (d1 << 8) | (d2 << 16)));
+}
+static void MidiTick()                          // (50 ms) the lights: each mapped button's on / off, each knob's level, when they change
+{
+    if (!gFeatMidi || !gMidiDevN) return;
+    for (int i = 0; i < gMidiN; i++) {
+        MidiMap& m = gMidi[i];
+        for (int d = 0; d < gMidiDevN; d++) {
+            if (!gMidiDev[d].out || (m.dev[0] && !MidiNameMatch(m.dev, gMidiDev[d].name))) continue;
+            int v;
+            if (m.tgt == MT_KEY) {
+                if (m.arg < 0 || m.arg >= KEY_SLOTS) break;
+                int s = MacroState(m.arg); if (s < 0) s = gRemoteDown[m.arg] ? 1 : 0;
+                v = s ? 127 : 0;
+            } else {
+                const float t = MidiTargetGet(m.tgt, m.arg); if (t < 0) break;
+                v = m.kind == 2 ? (int)lroundf(t * 16383) : (int)lroundf(t * 127);
+            }
+            if (v == m.lastOut) break;
+            m.lastOut = v;
+            if (m.kind == 0) MidiSend(d, 0x90 | m.ch, m.num, v);
+            else if (m.kind == 1) MidiSend(d, 0xB0 | m.ch, m.num, v);
+            else MidiSend(d, 0xE0 | m.ch, v & 0x7F, (v >> 7) & 0x7F);
+            break;
+        }
+    }
+}
+static void MidiSave()
+{
+    SaveInt(L"feat_midi", gFeatMidi); SaveInt(L"midi_count", gMidiN);
+    for (int i = 0; i < MIDI_MAPS; i++) {
+        wchar_t k[24], v[200]; swprintf(k, 24, L"midi%d", i + 1);
+        if (i >= gMidiN) { IniSet(k, nullptr); continue; }
+        const MidiMap& m = gMidi[i];
+        wchar_t dv[64]; lstrcpynW(dv, m.dev, 64); for (wchar_t* q = dv; *q; q++) if (*q == L'|') *q = L'/';
+        wchar_t arg[64]; if (m.tgt == MT_KEY) { const wchar_t* kn = FxKeyIniName(m.arg); lstrcpynW(arg, kn ? kn : L"", 64); } else swprintf(arg, 64, L"%d", m.arg);
+        swprintf(v, 200, L"%ls|%d|%d|%d|%d|%ls|%ls", dv, m.kind, m.ch, m.num, m.endless, MT_NAMES[Iclamp(m.tgt, 0, MT_N - 1)], arg);
+        IniSet(k, v);
+    }
+}
+static void MidiLoad()
+{
+    gFeatMidi = GetPrivateProfileIntW(L"settings", L"feat_midi", 0, gIni) != 0;
+    const int n = Iclamp(GetPrivateProfileIntW(L"settings", L"midi_count", 0, gIni), 0, MIDI_MAPS);
+    gMidiN = 0;
+    for (int i = 0; i < n; i++) {
+        wchar_t k[24], v[200]; swprintf(k, 24, L"midi%d", i + 1); GetPrivateProfileStringW(L"settings", k, L"", v, 200, gIni);
+        wchar_t* f[7] = {}; int nf = 0; wchar_t* p = v;
+        while (nf < 7) { f[nf++] = p; wchar_t* b = wcschr(p, L'|'); if (!b) break; *b = 0; p = b + 1; }
+        if (nf < 7) continue;
+        MidiMap& m = gMidi[gMidiN]; m = MidiMap();
+        lstrcpynW(m.dev, f[0], 64); m.kind = (unsigned char)Iclamp(_wtoi(f[1]), 0, 2); m.ch = (unsigned char)Iclamp(_wtoi(f[2]), 0, 15);
+        m.num = (unsigned char)Iclamp(_wtoi(f[3]), 0, 127); m.endless = _wtoi(f[4]) != 0; m.lastOut = m.lastIn = -1;
+        int t = -1; for (int j = 0; j < MT_N; j++) if (!lstrcmpiW(f[5], MT_NAMES[j])) t = j;
+        if (t < 0) continue;
+        m.tgt = (short)t; m.arg = (short)(t == MT_KEY ? SlotByIniName(f[6]) : _wtoi(f[6]));
+        if (t == MT_KEY && m.arg < 0) continue;
+        gMidiN++;
+    }
+}
+static void MidiWndSync()
+{
+    if (!gMidiWnd) return;
+    HWND w = gMidiWnd;
+    wchar_t d[300];
+    if (!gFeatMidi) lstrcpynW(d, L"Off: switch \"MIDI controller\" on in Settings > Features.", 300);
+    else if (!gMidiDevN) lstrcpynW(d, L"No MIDI controller found. Plug one in, then click Refresh.", 300);
+    else {
+        int n = swprintf(d, 300, L"Connected: ");
+        for (int i = 0; i < gMidiDevN && n < 260; i++) n += swprintf(d + n, 300 - n, L"%ls%ls%ls", i ? L", " : L"", gMidiDev[i].name, gMidiDev[i].out ? L" (lights)" : L"");
+    }
+    SetDlgItemTextW(w, IDC_MD_DEVS, d);
+    SetDlgItemTextW(w, IDC_MD_LAST, gMidiLast[0] ? gMidiLast : L"Last: (nothing yet: move a knob to see it here)");
+    HWND l = GetDlgItem(w, IDC_MD_LIST);
+    SendMessageW(l, LB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < gMidiN; i++) { wchar_t t[260]; MidiMapText(gMidi[i], t, 260); SendMessageW(l, LB_ADDSTRING, 0, (LPARAM)t); }
+    if (gMidiSel >= gMidiN) gMidiSel = gMidiN - 1;
+    SendMessageW(l, LB_SETCURSEL, gMidiSel, 0);
+    const bool knob = gMidiSel >= 0 && gMidi[gMidiSel].tgt != MT_KEY && gMidi[gMidiSel].kind == 1;
+    EnableWindow(GetDlgItem(w, IDC_MD_ENDLESS), knob);
+    CheckDlgButton(w, IDC_MD_ENDLESS, knob && gMidi[gMidiSel].endless ? BST_CHECKED : BST_UNCHECKED);
+    EnableWindow(GetDlgItem(w, IDC_MD_REM), gMidiSel >= 0);
+    EnableWindow(GetDlgItem(w, IDC_MD_CLEAR), gMidiN > 0);
+    SetDlgItemTextW(w, IDC_MD_ADDBTN, gMidiLearn == 1 ? L"Stop" : L"Add a button / pad...");
+    SetDlgItemTextW(w, IDC_MD_ADDKNOB, gMidiLearn == 2 ? L"Stop" : L"Add a knob / fader...");
+    SetDlgItemTextW(w, IDC_MD_STAT, gMidiLearn == 1 ? L"Now press the button or pad you want for it..." :
+                                    gMidiLearn == 2 ? L"Now move the knob or fader you want for it..." :
+                                    L"Buttons work while held (push-to-talk); lit buttons show what's on, where the controller can.");
+}
+static void MidiKnobMenu(HMENU m)               // the levels a knob / fader can set: id 100 + target * 16 + which
+{
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) { wchar_t nm[48], t[80]; ChanLabel(c, nm, 48); swprintf(t, 80, L"%ls volume", nm); AppendMenuW(m, MF_STRING, 100 + MT_CHVOL * 16 + c, t); }
+    for (int c = 0; c < CH_MAX; c++) if (gCh[c].type != CH_NONE) { wchar_t nm[48], t[80]; ChanLabel(c, nm, 48); swprintf(t, 80, L"%ls pan", nm); AppendMenuW(m, MF_STRING, 100 + MT_CHPAN * 16 + c, t); }
+    for (int k = 0; k < gRows; k++) { wchar_t nm[48], t[80]; OutName(k, nm, 48); swprintf(t, 80, L"Output %ls volume", nm); AppendMenuW(m, MF_STRING, 100 + MT_OUTVOL * 16 + k, t); }
+    AppendMenuW(m, MF_STRING, 100 + MT_CHATMIX * 16, L"ChatMix (game / chat)");
+    AppendMenuW(m, MF_STRING, 100 + MT_MUSVOL * 16, L"Music volume");
+}
+static LRESULT CALLBACK MidiProc(HWND h, UINT msg, WPARAM w, LPARAM l)
+{
+    switch (msg) {
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        if (id == IDC_MD_LIST && code == LBN_SELCHANGE) { gMidiSel = (int)SendDlgItemMessageW(h, id, LB_GETCURSEL, 0, 0); MidiWndSync(); }
+        if ((id == IDC_MD_ADDBTN || id == IDC_MD_ADDKNOB) && code == BN_CLICKED) {
+            const int want = id == IDC_MD_ADDBTN ? 1 : 2;
+            if (gMidiLearn == want) { gMidiLearn = 0; MidiWndSync(); return 0; }
+            if (!gFeatMidi) SetFeatMidi(true);
+            if (gMidiN >= MIDI_MAPS) { SetDlgItemTextW(h, IDC_MD_STAT, L"That's all 64."); return 0; }
+            HMENU pm = CreatePopupMenu();
+            if (want == 1) {
+                MacroActionMenu(pm);
+                if (gMacroN) { HMENU mm = CreatePopupMenu(); AppendMenuW(pm, MF_POPUP, (UINT_PTR)mm, L"Macros"); for (int i = 0; i < gMacroN; i++) { wchar_t t[80]; MacroLabel(i, t, 80); AppendMenuW(mm, MF_STRING, 10000 + SLOT_MACRO0 + i, t); } }
+            } else MidiKnobMenu(pm);
+            RECT r; GetWindowRect(GetDlgItem(h, id), &r);
+            const int cmd = (int)TrackPopupMenu(pm, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_NONOTIFY, r.left, r.bottom, 0, h, nullptr);
+            DestroyMenu(pm);
+            if (cmd <= 0) return 0;
+            if (want == 1) {
+                if (cmd >= 20000) { SetDlgItemTextW(h, IDC_MD_STAT, L"A profile needs a macro (Macros... > Add action > Profiles); then pick the macro here."); return 0; }
+                if (cmd < 10000) return 0;
+                gMidiLearnArg = cmd - 10000;
+            } else { gMidiLearnTgt = (cmd - 100) / 16; gMidiLearnArg = (cmd - 100) % 16; }
+            gMidiLearn = want; MidiWndSync();
+        }
+        if (id == IDC_MD_ENDLESS && code == BN_CLICKED && gMidiSel >= 0) { gMidi[gMidiSel].endless = IsDlgButtonChecked(h, id) == BST_CHECKED; SaveSettings(); MidiWndSync(); }
+        if (id == IDC_MD_REM && code == BN_CLICKED && gMidiSel >= 0 && gMidiSel < gMidiN) {
+            for (int i = 0; i < gMidiN; i++) RemoteLetGo(-1000 - i);
+            for (int i = gMidiSel; i < gMidiN - 1; i++) gMidi[i] = gMidi[i + 1];
+            gMidiN--; SaveSettings(); MidiWndSync();
+        }
+        if (id == IDC_MD_CLEAR && code == BN_CLICKED && gMidiN) {
+            if (MessageBoxW(h, L"Forget every knob and button you've set up?", L"Lag Effect - MIDI controller", MB_YESNO | MB_ICONQUESTION) != IDYES) return 0;
+            for (int i = 0; i < gMidiN; i++) RemoteLetGo(-1000 - i);
+            gMidiN = 0; gMidiSel = -1; SaveSettings(); MidiWndSync();
+        }
+        if (id == IDC_MD_REFRESH && code == BN_CLICKED) { if (gFeatMidi) MidiOpen(); else MidiWndSync(); }
+        return 0;
+    }
+    case WM_VKEYTOITEM:
+        if (LOWORD(w) == VK_DELETE && (HWND)l == GetDlgItem(h, IDC_MD_LIST)) { SendMessageW(h, WM_COMMAND, MAKEWPARAM(IDC_MD_REM, BN_CLICKED), 0); return -2; }
+        return -1;
+    case WM_CLOSE: gMidiLearn = 0; DestroyWindow(h); return 0;
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, msg, w, l);
+    case WM_DESTROY: if (gMidiWnd == h) { gMidiWnd = nullptr; gMidiLearn = 0; } return 0;
+    }
+    return DefWindowProcW(h, msg, w, l);
+}
+static void MidiShow()
+{
+    if (gMidiWnd) { MidiWndSync(); ShowWindow(gMidiWnd, SW_SHOW); SetForegroundWindow(gMidiWnd); return; }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = MidiProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagMidi"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    RECT r = { 0, 0, SC(600), SC(420) }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND w = CreateWindowExW(0, L"LagMidi", L"Lag Effect - MIDI controller", style, (mr.left + mr.right - ww) / 2, Imax((int)mr.top, (mr.top + mr.bottom - wh) / 2), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!w) return;
+    gMidiWnd = w;
+    auto mk = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int w2, int h2, int id, DWORD ex = 0) {
+        HWND c = CreateWindowExW(ex, cls, t, WS_CHILD | WS_VISIBLE | st, SC(x), SC(y), SC(w2), SC(h2), w, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    mk(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 16, 14, 470, 20, IDC_MD_DEVS);
+    mk(L"BUTTON", L"Refresh", WS_TABSTOP, 494, 10, 90, 26, IDC_MD_REFRESH);
+    mk(L"STATIC", L"", SS_NOPREFIX | SS_ENDELLIPSIS, 16, 40, 568, 20, IDC_MD_LAST);
+    mk(L"LISTBOX", L"", LBS_NOTIFY | LBS_WANTKEYBOARDINPUT | WS_VSCROLL | WS_TABSTOP | WS_BORDER, 16, 68, 410, 260, IDC_MD_LIST);
+    mk(L"BUTTON", L"", WS_TABSTOP, 434, 68, 150, 28, IDC_MD_ADDBTN);
+    mk(L"BUTTON", L"", WS_TABSTOP, 434, 102, 150, 28, IDC_MD_ADDKNOB);
+    mk(L"BUTTON", L"Knob turns forever", BS_AUTOCHECKBOX | WS_TABSTOP, 434, 146, 150, 20, IDC_MD_ENDLESS);
+    mk(L"STATIC", L"(an endless knob: tick it if the level jumps instead of following)", SS_NOPREFIX, 434, 168, 150, 64, IDC_HDR);
+    mk(L"BUTTON", L"Remove", WS_TABSTOP, 434, 266, 150, 28, IDC_MD_REM);
+    mk(L"BUTTON", L"Clear all", WS_TABSTOP, 434, 300, 150, 28, IDC_MD_CLEAR);
+    mk(L"STATIC", L"", SS_NOPREFIX, 16, 338, 568, 40, IDC_MD_STAT);
+    mk(L"STATIC", L"Any USB MIDI controller works (Korg nanoKONTROL2, Behringer X-Touch Mini, Akai LPD8 / MPK Mini...). A fader at 3/4 = 0 dB.",
+       SS_NOPREFIX, 16, 380, 568, 36, IDC_HDR);
+    ThemeTitleBar(w);
+    EnumChildWindows(w, ThemeChild, 0);
+    MidiWndSync();
+    ShowWindow(w, SW_SHOW);
+}
+static void BugTrigMidi(wchar_t* o, int cap)
+{
+    int taught = 0; for (int k = 0; k < TRIG_N; k++) taught += gTrig[k].taught;
+    BugAdd(o, cap, L"Sound triggers: %ls, sensitivity %d, %d taught; MIDI: %ls, %d device(s), %d mapped", gFeatTrig ? L"on" : L"off", gTrigSensUi, taught,
+           gFeatMidi ? L"on" : L"off", gMidiDevN, gMidiN);
+    int eq = 0; for (int k = 0; k < MAX_OUT; k++) eq += OutEqLive(k);
+    BugAdd(o, cap, L"Output EQ / delay on: %d output(s)", eq);
 }
 static void TtsSay(const wchar_t* t)            // the TTS voice: one after another
 {
@@ -26220,12 +27234,14 @@ static void StreamStartup()                     // (after the window is made) la
 {
     if (gFeatAvatar) { for (int i = 0; i < AV_PICS; i++) if (gAvFile[i][0]) PicOpen(gAvImg[i], gAvFile[i]); if (gAvOpen) AvShow(true); }
     if (gFeatCaptions && gCapOpen) CapShow(true);
+    if (gFeatMidi) MidiOpen();                  // (1.69.0)
     AvUiRefresh(); CapUiRefresh();
     SendDlgItemMessageW(gWnd, IDC_CBACT, CB_SETCURSEL, 0, 0); CbFillTargets(); CbRefresh();
 }
 static void StreamSave()
 {
     SaveInt(L"feat_avatar", gFeatAvatar); SaveInt(L"feat_captions", gFeatCaptions);
+    TrigSave(); MidiSave();                     // (1.69.0)
     SaveInt(L"music_volume", gMusVolPc.load()); SaveInt(L"music_outputs", (int)gMusOuts.load());   // (Mic > Music, 1.61.0)
     SaveInt(L"music_shuffle", gMusShuffle); SaveInt(L"music_repeat", gMusRepeat); SaveInt(L"music_song", gMusCur);
     for (int i = 0; i < AV_PICS; i++) { wchar_t k[24]; swprintf(k, 24, L"avatar_pic%d", i + 1); IniSet(k, gAvFile[i][0] ? gAvFile[i] : nullptr); }
@@ -26243,6 +27259,7 @@ static void StreamLoad()
 {
     auto I = [](const wchar_t* k, int d) { return (int)GetPrivateProfileIntW(L"settings", k, d, gIni); };
     gFeatAvatar = I(L"feat_avatar", 0) != 0; gFeatCaptions = I(L"feat_captions", 0) != 0;
+    TrigLoad(); MidiLoad();                     // (1.69.0)
     gMusVolPc = Iclamp(I(L"music_volume", 100), 0, 200); gMusOuts = (unsigned)I(L"music_outputs", 1) & ((1u << MAX_OUT) - 1);
     gMusShuffle = I(L"music_shuffle", 0) != 0; gMusRepeat = Iclamp(I(L"music_repeat", 1), 0, 2); gMusCur = I(L"music_song", -1);
     for (int i = 0; i < AV_PICS; i++) { wchar_t k[24]; swprintf(k, 24, L"avatar_pic%d", i + 1); GetPrivateProfileStringW(L"settings", k, L"", gAvFile[i], MAX_PATH, gIni); }
@@ -27451,7 +28468,7 @@ static void CreateUI()
 
     // ---- Features ----
     gBuildSub = 3;
-    AddSection(14, 88, 532, 390, L"Features");
+    AddSection(14, 88, 532, 448, L"Features");
     Ctl(L"STATIC", L"Turn on only what you use. A feature that's off is hidden and doesn't run at all, so it costs nothing.",
         0, 30, 110, 500, 36, IDC_HDR);
     {
@@ -27464,9 +28481,13 @@ static void CreateUI()
             { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice (Mic > Speech). Downloads a speech model once.", gFeatSpeech },
             { IDC_FEATAVATAR, L"Avatar (PNGtuber)", L"Your pictures that talk when you talk, in a window for OBS (Settings > Stream).", gFeatAvatar },
             { IDC_FEATCAPS,  L"Live captions", L"What you say as text, in a window or a text file for OBS (Settings > Stream). Uses Speech.", gFeatCaptions },
+            { IDC_FEATTRIG,  L"Sound triggers", L"A clap, snap, whistle or tongue click runs any action. Listens only while this is on.", gFeatTrig },
+            { IDC_FEATMIDI,  L"MIDI controller", L"Knobs, faders and pads on a USB MIDI controller control Lag Effect, with lights.", gFeatMidi },
         };
-        for (int i = 0; i < 8; i++) {           // (1.66.1: 40 apart, so the line under each isn't covered by the next box)
-            const int y = 148 + i * 40;
+        Ctl(L"BUTTON", L"Set up...", WS_TABSTOP, 440, 148 + 8 * 38 - 3, 90, 24, IDC_TRIGSET);   // (1.69.0)
+        Ctl(L"BUTTON", L"Set up...", WS_TABSTOP, 440, 148 + 9 * 38 - 3, 90, 24, IDC_MIDISET);
+        for (int i = 0; i < 10; i++) {          // (38 apart: the line under each ends where the next box starts)
+            const int y = 148 + i * 38;
             Ctl(L"BUTTON", f[i].name, BS_AUTOCHECKBOX | WS_TABSTOP | (i == 0 ? WS_GROUP : 0), 30, y, 220, 20, f[i].id);
             CheckDlgButton(gWnd, f[i].id, f[i].on ? BST_CHECKED : BST_UNCHECKED);
             Ctl(L"STATIC", f[i].what, SS_NOPREFIX | SS_ENDELLIPSIS, 50, y + 20, 480, 18, IDC_HDR);
@@ -27504,7 +28525,7 @@ static void CreateUI()
         Ctl(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_TABSTOP, 230, 266, 300, 23, IDC_CBLINE);
         Ctl(L"STATIC", L"Pick above, then copy it into a Streamer.bot action.", SS_NOPREFIX, 30, 298, 260, 30, IDC_CBSTAT);
         Ctl(L"BUTTON", L"Test", WS_TABSTOP, 296, 298, 60, 28, IDC_CBTEST);
-        Ctl(L"BUTTON", L"Copy C# for Streamer.bot", BS_OWNERDRAW | WS_TABSTOP, 362, 298, 168, 28, IDC_CBCOPY);
+        Ctl(L"BUTTON", L"Copy C# code", BS_OWNERDRAW | WS_TABSTOP, 362, 298, 168, 28, IDC_CBCOPY);
     }
     gBuildFeat = FEAT_AVATAR;
     AddSection(14, 342, 532, 120, L"Avatar (PNGtuber)");
@@ -27714,6 +28735,7 @@ static void CreateUI()
         gBuildFeat = FEAT_VST;                  // (Settings > Features > Plugins)
         Ctl(L"BUTTON", L"FX", BS_OWNERDRAW | WS_TABSTOP, x + 40, 484, 56, 20, IDC_OFX0 + k);
         gBuildFeat = 0;
+        Ctl(L"BUTTON", L"EQ", BS_OWNERDRAW | WS_TABSTOP, x + 40, 484, 56, 20, IDC_OEQ0 + k);   // (1.69.0; MixerPlace puts it beside FX)
     }
     // the Mixer's hotkeys (sub-view 1): a row per channel in use and per output; MixerPlace lays it out
     gBuildSub = 1;
@@ -28206,9 +29228,13 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id == IDC_VSTLIC) { if (code == BN_CLICKED) MessageBoxW(gWnd, VST_LICENCE, L"Lag Effect - Plugins", MB_ICONINFORMATION); return; }
-    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST || id == IDC_FEATSPEECH || id == IDC_FEATAVATAR || id == IDC_FEATCAPS) {   // Settings > Features
+    if (id == IDC_TRIGSET) { if (code == BN_CLICKED) TrigShow(); return; }   // (1.69.0)
+    if (id == IDC_MIDISET) { if (code == BN_CLICKED) MidiShow(); return; }
+    if ((id >= IDC_FEATLAG && id <= IDC_FEATCLIPS) || id == IDC_FEATVST || id == IDC_FEATSPEECH || id == IDC_FEATAVATAR || id == IDC_FEATCAPS || id == IDC_FEATTRIG || id == IDC_FEATMIDI) {   // Settings > Features
         if (code != BN_CLICKED) return;
         const bool on = Checked(id);
+        if (id == IDC_FEATTRIG) SetFeatTrig(on);
+        if (id == IDC_FEATMIDI) SetFeatMidi(on);
         if (id == IDC_FEATSPEECH) { SetFeatSpeech(on); if (!on && gFeatCaptions) { SetFeatCaptions(false); CheckDlgButton(gWnd, IDC_FEATCAPS, BST_UNCHECKED); } }
         if (id == IDC_FEATAVATAR) SetFeatAvatar(on);
         if (id == IDC_FEATCAPS) SetFeatCaptions(on);
@@ -28722,6 +29748,7 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_OFX0 && id < IDC_OFX0 + MAX_OUT) { if (code == BN_CLICKED) RackOpen(100 + id - IDC_OFX0); return; }   // an output's plugins
+    if (id >= IDC_OEQ0 && id < IDC_OEQ0 + MAX_OUT) { if (code == BN_CLICKED) OutEqShow(id - IDC_OEQ0); return; }   // (1.69.0) its EQ and delay
     if (id >= IDC_OTEST0 && id < IDC_OTEST0 + MAX_OUT) {   // a short beep on just this output
         if (code == BN_CLICKED) {
             const int k = id - IDC_OTEST0;
@@ -29046,6 +30073,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w >= IDC_OMUTE0 && w < IDC_OMUTE0 + MAX_OUT) { DrawToggle(d, gOutMute[w - IDC_OMUTE0], true); return true; }
     if (w >= IDC_OTEST0 && w < IDC_OTEST0 + MAX_OUT) { DrawToggle(d, gTestTone[w - IDC_OTEST0] > 0, false); return true; }
     if (w >= IDC_OFX0 && w < IDC_OFX0 + MAX_OUT) { DrawToggle(d, VstTargetOn(100 + (int)(w - IDC_OFX0)), false); return true; }
+    if (w >= IDC_OEQ0 && w < IDC_OEQ0 + MAX_OUT) { DrawToggle(d, OutEqLive((int)(w - IDC_OEQ0)), false); return true; }
     if (w >= IDC_CHMETER0 && w < IDC_CHMETER0 + CH_MAX) {
         int c = (int)(w - IDC_CHMETER0);
         DrawVMeter2(d, gChShownL[c], gChShownR[c], gChA[c].live, gChHoldL[c], gChHoldR[c], GetTickCount() - gChClipT[c] < 2000 && gChClipT[c]);
@@ -29174,7 +30202,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (w == TIMER_STATUS) {
             if (gMoving) return 0;              // you're dragging the window: meters and checks wait (no stutter)
             SongTick(); PadTick();
-            DropTick(); SilenceTick(); PhoneTick();
+            DropTick(); SilenceTick(); PhoneTick(); TrigTick(); MidiTick();
             UpdateStatus(); UpdateMeter(); WsEvents(); MixUndoTick(); ChipsTick(); RcdTick();
             static int chTick = 0;
             if (++chTick >= 40) {               // every 2 s
@@ -29332,6 +30360,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         break;
     }
     case WM_APP + 70: VbInstallDone((DWORD)w); return 0;   // the VB-CABLE installer closed
+    case WM_APP + 72: MidiMsg((int)w, (DWORD)l); return 0;  // (1.69.0) a MIDI controller
     case WM_APP + 31:                           // Mic > Music: the decoder started / finished a song
         MusUi();
         return 0;
@@ -29548,6 +30577,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         KillTimer(h, TIMER_VST);
         VstStopAll(true);                       // each plugin's settings are saved, its window closed, and it's shut down
         WsStop();
+        MidiClose();                            // (1.69.0)
         StopAudio();
         RemoveTray();
         DestroyWindow(h);

@@ -256,6 +256,35 @@ int main()
             gCh[1].busId = 0; gCh[2].src[0] = 0;
             gCh[1].type = CH_NONE; gChA[1].live = false; gCh[1].db10 = 0; gMusOuts = 1;
         }
+        {                                       // (1.69.0) output 1's EQ and delay: the music (660 Hz) straight to output 1
+            printf("Output EQ and delay (1.69.0)\n");
+            auto lvl = [&]() { gMusR = 0; gMusW = MUS_RING - 1; run(40, silence); rec.clear(); run(50, silence); return goertzel(rec, 2400, 19200, 660); };
+            const double plain = lvl();
+            OutEqDefaults(gOutEq[0]); gOutEq[0].on = true; gOutEq[0].type[2] = OEQ_PEAK; gOutEq[0].freq[2] = 660; gOutEq[0].gain[2] = 6; gOutEq[0].q[2] = 1;
+            OutEqPublish(0); const double boosted = lvl();
+            gOutEq[0].freq[2] = 6000; OutEqPublish(0); const double away = lvl();
+            gOutEq[0].gain[2] = 0; gOutEq[0].type[0] = OEQ_LOWCUT; gOutEq[0].freq[0] = 2000; OutEqPublish(0); const double cut = lvl();
+            OutEqDefaults(gOutEq[0]); gOutEq[0].on = true; OutEqPublish(0); const bool flatOff = !OutEqLive(0);
+            gOutEq[0].on = false; OutEqPublish(0); const double back = lvl();
+            printf("  660 Hz: plain %.4f, +6 dB at 660 %.4f (%.1f dB), the peak at 6 kHz %.4f, a 2 kHz low cut %.4f, off again %.4f\n",
+                   plain, boosted, 20 * log10(boosted / plain), away, cut, back);
+            check("a +6 dB peak at 660 Hz makes it 6 dB louder", fabs(20 * log10(boosted / plain) - 6) < 0.5);
+            check("the same peak at 6 kHz leaves it alone", fabs(20 * log10(away / plain)) < 0.5);
+            check("a low cut at 2 kHz takes it well down", cut < plain * 0.15);
+            check("on but flat (every band at 0 dB, cuts at the ends): not run at all", flatOff);
+            check("off: exactly as before", back == plain || fabs(back / plain - 1) < 1e-6);
+            static float dL[960], dR[960];      // the delay: an impulse comes out 100 ms (4800 frames) later
+            OutEqDefaults(gOutEq[1]); gOutEq[1].on = true; gOutEq[1].delayMs = 100; OutEqPublish(1);
+            long at = -1, n = 0;
+            for (int b = 0; b < 12 && at < 0; b++) {
+                for (int i = 0; i < 960; i++) { dL[i] = dR[i] = (b == 0 && i == 10) ? 1.0f : 0.0f; }
+                OutEqRun(1, dL, dR, 960);
+                for (int i = 0; i < 960; i++) if (dL[i] > 0.5f && at < 0) at = n + i;
+                n += 960;
+            }
+            check("a 100 ms delay moves the sound 4800 samples later", at == 10 + 4800);
+            gOutEq[1].on = false; OutEqPublish(1);
+        }
         gMusPlay = false; run(10, silence); gMusR = 0; gMusW = 0; gMicMuted = false;
     }
     printf("Beatbox to drums\n");
