@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.69.1"
+#define APP_VERSION L"1.70.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4597,6 +4597,191 @@ static float BlOut(BlOutState& st, const float* rb, long long t, long long td, f
 // Talk through a TTS voice: your real voice is muted on every output while it's on (the TTS voice plays as a sound).
 static std::atomic<bool> gSpMuteVoice{ false };
 
+// ======================= (1.70.0) Morse voice: what you say, played as Morse code =======================
+// The window turns each sentence Whisper hears into a list of key-down / key-up times (MorseEncode, MoPush); the
+// audio thread plays it (MoSample): a tone with 5 ms edges, or a telegraph sounder's click on each key-down and clack
+// on each key-up. Timing is the PARIS standard: a unit = 1.2 s / words per minute; dot 1, dash 3, gaps 1 / 3 / 7.
+// It keeps up with you: Morse at a speed you can follow is several times slower than talking, so each sentence
+// plays at least fast enough to take about as long as you took to say it (from Whisper's word times, up to 10x);
+// the words-per-minute setting is the slowest it goes. Still behind: up to 2x faster on top, then it skips ahead.
+#define MO_Q 16384                               // (queued elements: a power of 2)
+static unsigned char gMoQ[MO_Q];                 // each: bit 7 key down, bits 0-6 its length in units
+static unsigned gMoCum[MO_Q];                    // hundredths of a unit (at its sentence's speed) up to and including each element
+static unsigned short gMoSpd[MO_Q];              // each element's speed, % of the set words per minute (its sentence's)
+static std::atomic<unsigned> gMoW{ 0 }, gMoR{ 0 }, gMoSkip{ 0 }, gMoLast{ 0 };   // (gMoLast: where the newest sentence starts)
+static std::atomic<bool> gMoOn{ false };
+static std::atomic<int> gMoWpm{ 20 }, gMoHz{ 700 }, gMoVolPc{ 100 }, gMoSound{ 0 };   // sound: 0 tone, 1 telegraph clicks
+static std::atomic<int> gMoSpeedPc{ 100 };       // (how fast it's playing now, for the window)
+static const char* MorseOf(wchar_t c)
+{
+    static const char* AZ[26] = { ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", ".---", "-.-", ".-..", "--",
+                                  "-.", "---", ".--.", "--.-", ".-.", "...", "-", "..-", "...-", ".--", "-..-", "-.--", "--.." };
+    static const char* D[10] = { "-----", ".----", "..---", "...--", "....-", ".....", "-....", "--...", "---..", "----." };
+    if (c >= L'a' && c <= L'z') return AZ[c - L'a'];
+    if (c >= L'A' && c <= L'Z') return AZ[c - L'A'];
+    if (c >= L'0' && c <= L'9') return D[c - L'0'];
+    switch (c) {
+    case L'.': return ".-.-.-"; case L',': return "--..--"; case L'?': return "..--.."; case L'\'': case 0x2019: return ".----.";
+    case L'!': return "-.-.--"; case L'/': return "-..-.";  case L'(': return "-.--.";  case L')': return "-.--.-";
+    case L'&': return ".-...";  case L':': return "---..."; case L';': return "-.-.-."; case L'=': return "-...-";
+    case L'+': return ".-.-.";  case L'-': return "-....-"; case L'_': return "..--.-"; case L'"': case 0x201C: case 0x201D: return ".-..-.";
+    case L'$': return "...-..-"; case L'@': return ".--.-.";
+    }
+    return nullptr;
+}
+// Text to elements: letters' marks 1 unit apart, letters 3, words 7 (and 7 after the last word, before the next
+// sentence). Anything without a code is skipped. Returns how many elements (0: nothing to play).
+static int MorseEncode(const wchar_t* text, unsigned char* out, int cap)
+{
+    int n = 0; bool any = false, inWord = false, wordHas = false;
+    auto put = [&](bool down, int units) {
+        if (!down && n > 0 && !(out[n - 1] & 0x80)) { out[n - 1] = (unsigned char)Imax(out[n - 1] & 0x7F, units); return; }   // (gaps don't add up)
+        if (n < cap) out[n++] = (unsigned char)((down ? 0x80 : 0) | units);
+    };
+    for (const wchar_t* p = text; ; p++) {
+        const wchar_t c = *p;
+        if (!c || c == L' ' || c == L'\t' || c == L'\n') {
+            if (inWord && wordHas) put(false, 7);
+            inWord = wordHas = false;
+            if (!c) break;
+            continue;
+        }
+        inWord = true;
+        const char* m = MorseOf(c); if (!m) continue;
+        if (wordHas) put(false, 3);
+        for (const char* q = m; *q; q++) { if (q != m) put(false, 1); put(true, *q == '-' ? 3 : 1); }
+        wordHas = any = true;
+        if (n >= cap - 16) break;
+    }
+    return any ? n : 0;
+}
+// Dots and dashes as text (captions): letters with a space between, words with " / "; a word with no code
+// (a bleeped "****") is kept as it is.
+static void MorseText(const wchar_t* in, wchar_t* out, int cap)
+{
+    int o = 0; out[0] = 0;
+    auto add = [&](const wchar_t* s) { while (*s && o < cap - 1) out[o++] = *s++; out[o] = 0; };
+    const wchar_t* p = in;
+    while (*p) {
+        while (*p == L' ') p++;
+        if (!*p) break;
+        const wchar_t* e = p; while (*e && *e != L' ') e++;
+        bool has = false; for (const wchar_t* q = p; q < e; q++) if (MorseOf(*q)) has = true;
+        if (o) add(L" / ");
+        if (!has) { for (const wchar_t* q = p; q < e && o < cap - 1; q++) out[o++] = *q; out[o] = 0; }
+        else {
+            bool first = true;
+            for (const wchar_t* q = p; q < e; q++) {
+                const char* m = MorseOf(*q); if (!m) continue;
+                if (!first) add(L" ");
+                first = false;
+                for (const char* c = m; *c && o < cap - 1; c++) out[o++] = *c == '-' ? L'-' : L'.';
+                out[o] = 0;
+            }
+        }
+        p = e;
+    }
+}
+static double MoUnitF(int wpm) { return RATE * 1.2 / Iclamp(wpm, 5, 60); }   // samples per unit
+static double MoBehindS()                         // (either side) seconds of Morse still to play, at each sentence's speed
+{
+    const unsigned w = gMoW.load(std::memory_order_acquire), r = gMoR.load(std::memory_order_relaxed);
+    if (w == r) return 0.0;
+    const unsigned before = r ? gMoCum[(r - 1) & (MO_Q - 1)] : 0u;
+    return (gMoCum[(w - 1) & (MO_Q - 1)] - before) / 100.0 * MoUnitF(gMoWpm.load(std::memory_order_relaxed)) / RATE;
+}
+// (window) a sentence, queued behind what's playing. saidS = how long you took to say it (0: not known): it plays
+// at least fast enough to take about that long (+10%), up to 10x the set speed.
+static void MoPush(const wchar_t* text, double saidS = 0.0)
+{
+    static unsigned char e[4096];
+    const int n = MorseEncode(text, e, 4096);
+    if (!n) return;
+    int units = 0; for (int i = 0; i < n; i++) units += e[i] & 0x7F;
+    const double atSet = units * MoUnitF(gMoWpm.load()) / RATE;
+    const int spd = saidS > 0.2 ? (int)lround(100.0 * fmin(10.0, fmax(1.0, atSet / (saidS * 1.1)))) : 100;
+    const unsigned w = gMoW.load(std::memory_order_relaxed);
+    if (MoBehindS() / 2.0 > 4.0) gMoSkip.store(w, std::memory_order_release);   // (still over 4 s behind at double speed: skip to this one)
+    if (w + n - gMoR.load() > MO_Q - 16) return;  // (no room: can only happen when nothing is playing it)
+    unsigned cum = w ? gMoCum[(w - 1) & (MO_Q - 1)] : 0u;
+    gMoLast.store(w, std::memory_order_relaxed);
+    for (int i = 0; i < n; i++) {
+        gMoQ[(w + i) & (MO_Q - 1)] = e[i]; gMoSpd[(w + i) & (MO_Q - 1)] = (unsigned short)spd;
+        cum += (unsigned)((e[i] & 0x7F) * 10000 / spd); gMoCum[(w + i) & (MO_Q - 1)] = cum;
+    }
+    gMoW.store(w + n, std::memory_order_release);
+}
+static void MoClear() { gMoSkip.store(gMoW.load(), std::memory_order_release); }   // (window) stop after the mark that's sounding
+struct MoState {
+    unsigned r = 0; int left = 0; bool down = false;
+    float env = 0.0f, speed = 1.0f, ramp = 1.0f / 240; double ph = 0.0;
+    int ct = -1; bool clack = false; float cph1 = 0, cph2 = 0; unsigned seed = 12345;
+    bool busy() const { return left > 0 || down || env > 0.0f || ct >= 0 || r != gMoW.load(std::memory_order_relaxed); }
+};
+struct MoParams { double unit; float hz, amp; int sound; };
+static void MoBlockStart(MoState& m, MoParams& p, bool on)   // (audio, per block) settings, and faster while behind
+{
+    p.unit = MoUnitF(gMoWpm.load(std::memory_order_relaxed));
+    p.hz = (float)Iclamp(gMoHz.load(std::memory_order_relaxed), 200, 2000);
+    p.amp = 0.3f * Iclamp(gMoVolPc.load(std::memory_order_relaxed), 0, 300) / 100.0f;
+    p.sound = gMoSound.load(std::memory_order_relaxed) ? 1 : 0;
+    const unsigned w = gMoW.load(std::memory_order_acquire);
+    if (!on) { m.r = w; m.left = 0; m.down = false; gMoR.store(w, std::memory_order_relaxed); return; }   // (switched off: stops now, with its fade)
+    const double behind = MoBehindS() + m.left * m.speed / RATE;
+    const bool waiting = (int)(gMoLast.load(std::memory_order_relaxed) - m.r) > 0;   // (a newer sentence waits behind this one)
+    const float want = !waiting || behind <= 2.0 ? 1.0f : (float)fmin(2.0, 1.0 + (behind - 2.0) / 4.0);   // (on top of the sentence's own speed)
+    m.speed += (want - m.speed) * 0.05f;
+    if (fabsf(m.speed - want) < 0.002f) m.speed = want;
+    gMoSpeedPc.store((int)lroundf(m.speed * 100), std::memory_order_relaxed);
+}
+static void MoKey(MoState& m, bool down, int left, float ramp)   // the key goes down / up (or stays) for this many samples
+{
+    if (down != m.down) { m.ct = 0; m.clack = !down; m.cph1 = m.cph2 = 0; }
+    m.down = down; m.left = left; m.ramp = ramp;
+}
+static float MoTone(MoState& m, const MoParams& p);
+static float MoSample(MoState& m, const MoParams& p)
+{
+    if (m.left <= 0) {                           // the next mark or gap
+        const unsigned w = gMoW.load(std::memory_order_acquire), sk = gMoSkip.load(std::memory_order_acquire);
+        if ((int)(sk - m.r) > 0 && (int)(w - sk) >= 0) m.r = sk;
+        if (m.r != w) {
+            const unsigned char e = gMoQ[m.r & (MO_Q - 1)]; m.r++;
+            gMoR.store(m.r, std::memory_order_relaxed);
+            const double u = p.unit * 100.0 / (gMoSpd[(m.r - 1) & (MO_Q - 1)] * m.speed);   // (this element's unit, in samples)
+            MoKey(m, (e & 0x80) != 0, Imax(1, (int)lround((e & 0x7F) * u)), 1.0f / (float)fmin(240.0, fmax(24.0, u / 3)));   // (edges: 5 ms, shorter for dots under 15 ms)
+        } else MoKey(m, false, 0, m.ramp);
+    }
+    return MoTone(m, p);
+}
+static float MoTone(MoState& m, const MoParams& p)   // the sound of the key: a tone, or the sounder's clicks
+{
+    if (m.left > 0) m.left--;
+    float y = 0.0f;
+    if (p.sound == 0) {                          // a tone: 5 ms up and down, so no clicks
+        const float tgt = m.down ? 1.0f : 0.0f;
+        if (m.env != tgt) { m.env += m.down ? m.ramp : -m.ramp; if (m.env > 1) m.env = 1; if (m.env < 0) m.env = 0; }
+        if (m.env > 0.0f) {
+            const float e = m.env * m.env * (3 - 2 * m.env);   // (smooth edges)
+            y = (float)sin(m.ph) * e * p.amp;
+            m.ph += 2 * 3.141592653589793 * p.hz / RATE; if (m.ph > 2 * 3.141592653589793) m.ph -= 2 * 3.141592653589793;
+        } else m.ph = 0.0;
+        m.ct = -1;
+    } else {                                     // a sounder: its arm hits the stop going down (click) and coming back (clack)
+        m.env = 0.0f;
+        if (m.ct >= 0) {
+            const float t = (float)m.ct, tau = m.clack ? 130.0f : 190.0f;
+            const float f1 = m.clack ? 2500.0f : 1700.0f, f2 = m.clack ? 4100.0f : 3100.0f, a = m.clack ? 0.6f : 1.0f;
+            m.cph1 += 2 * 3.1415927f * f1 / RATE; m.cph2 += 2 * 3.1415927f * f2 / RATE;
+            float v = (sinf(m.cph1) + 0.5f * sinf(m.cph2)) * expf(-t / tau);
+            if (m.ct < 48) { m.seed = m.seed * 1664525u + 1013904223u; v += ((int)m.seed / 2147483648.0f) * (1.0f - t / 48.0f) * 0.8f; }
+            y = v * a * p.amp * 1.4f;
+            if (++m.ct > 1440) m.ct = -1;
+        }
+    }
+    return y;
+}
+
 // ======================= (1.69.0) Sound triggers (N7): a clap, snap, whistle or tongue click runs an action =======================
 // Only while it's switched on (Soundboard > Triggers): otherwise nothing here runs. The audio thread finds short,
 // sharp sounds that stand alone (quiet before, gone within 150 ms: not words) and steady whistles; it measures them
@@ -5306,6 +5491,9 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool spFeed = gSpFeed.load(std::memory_order_relaxed);
     static float spG = 1.0f;                     // your voice (0 while the TTS voice talks for you)
     const bool spMute = gFeatSpeech && gSpMuteVoice.load(std::memory_order_relaxed), spMuteRun = spMute || spG < 1.0f;
+    static MoState mo; MoParams moP{};          // (1.70.0) Morse voice: plays where your voice plays
+    const bool moOn = gFeatSpeech && gMoOn.load(std::memory_order_relaxed), moRun = moOn || mo.busy();
+    if (moRun) MoBlockStart(mo, moP, moOn);
     static BlOutState blSt[MAX_OUT];
     const bool blOn = gFeatSpeech && gBlOn.load(std::memory_order_relaxed);
     const unsigned blOuts = blOn ? gBlOuts.load(std::memory_order_relaxed) : 0u;
@@ -5410,6 +5598,7 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             if (spG > 0.9999f) spG = 1.0f; else if (spG < 0.0001f) spG = 0.0f;
             s *= spG; clean *= spG;
         }
+        if (moRun) { const float mv = MoSample(mo, moP); s += mv; clean += mv; }
 
         float effect = 0.0f, everything;
         if (looping) {
@@ -5818,6 +6007,7 @@ enum {
     IDC_MACROBTN,                               // (1.67.0) the bottom bar's Macros button
     IDC_PHONEBTN,                               // (1.68.0) Settings > Stream: Phone remote...
     IDC_FEATTRIG, IDC_FEATMIDI, IDC_TRIGSET, IDC_MIDISET,   // (1.69.0) Settings > Features
+    IDC_MORSEON, IDC_MORSEKEY, IDC_MORSEOPT,   // (1.70.0) Mic > Speech: the Morse voice
     IDC_OEQ0, IDC_OEQLAST = IDC_OEQ0 + MAX_OUT - 1,   // (1.69.0) each output's EQ button   // (1.65.0: the Mixer's "2 hidden" button; the mic level under the tabs, and its Look option)
     IDC_MICSUB3 = 4512, IDC_VOLNOW = 4513, IDC_WINLVL = 4514, IDC_HWBOOST = 4515, IDC_MICVOLINFO = 4516,   // Mic > Volume (1.50.0)                           // Mic > Cleanup: Remove whine (1.49.0)
     IDC_LVTHR = 4505, IDC_LVRATIO = 4506, IDC_LVATK = 4507, IDC_LVREL = 4508, IDC_LVMAKE = 4509, IDC_LVGR = 4510,
@@ -6213,7 +6403,8 @@ enum { MIXO_UP, MIXO_DOWN, MIXO_MUTE, MIXO_N };
 #define MACRO_MAX    16                          // (1.67.0) macros: one key each
 #define SLOT_MACRO0  (SLOT_MUSNEXT + 1)
 #define SLOT_TRIGON  (SLOT_MACRO0 + MACRO_MAX)    // (1.69.0) sound triggers on / off
-#define KEY_SLOTS    (SLOT_TRIGON + 1)
+#define SLOT_MORSE   (SLOT_TRIGON + 1)           // (1.70.0) Mic > Speech: the Morse voice on / off
+#define KEY_SLOTS    (SLOT_MORSE + 1)
 static void MacroLabel(int i, wchar_t* out, int cap);   // (1.67.0: defined with the macros)
 static const char* MacroRemote(int k, int on); static int MacroFind(const wchar_t* name);
 static void BugMacros(wchar_t* o, int cap); static void BugVbCable(wchar_t* o, int cap); static void BugPhone(wchar_t* o, int cap); static void BugTrigMidi(wchar_t* o, int cap);
@@ -6890,6 +7081,7 @@ static const wchar_t* FxKeyIniName(int slot)
     if (slot == SLOT_MUSPLAY) return L"music_play_hotkey";
     if (slot == SLOT_MUSNEXT) return L"music_next_hotkey";
     if (slot == SLOT_TRIGON) return L"triggers_hotkey";   // (1.69.0)
+    if (slot == SLOT_MORSE) return L"morse_voice_hotkey";   // (1.70.0)
     if (IsMacroSlot(slot)) {                    // "macro3_hotkey" (1.67.0)
         static wchar_t mn[MACRO_MAX][20];
         wchar_t* n = mn[slot - SLOT_MACRO0];
@@ -11501,6 +11693,7 @@ static void SlotName(int slot, wchar_t* out, int cap)
     if (slot == SLOT_BEATBOX) { lstrcpynW(out, L"Beatbox drums on / off", cap); return; }
     if (slot == SLOT_BLEEP)   { lstrcpynW(out, L"Bleep (while held)", cap); return; }
     if (slot == SLOT_SPTTS)   { lstrcpynW(out, L"TTS voice on / off", cap); return; }
+    if (slot == SLOT_MORSE)   { lstrcpynW(out, L"Morse voice on / off", cap); return; }
     if (slot == SLOT_BLLIVE)  { lstrcpynW(out, L"Live bleep (while held, no delay)", cap); return; }
     if (slot == SLOT_MUSPLAY) { lstrcpynW(out, L"Music: play / pause", cap); return; }
     if (slot == SLOT_MUSNEXT) { lstrcpynW(out, L"Music: next song", cap); return; }
@@ -15721,6 +15914,11 @@ static void AddTips()
     TipId(IDC_SPTTS, L"Your own voice is muted; what you say is typed out by Whisper and spoken by the voice set in "
                      L"Soundboard > Text to speech (Windows' default voice if that's not set). Each sentence plays after you finish it.");
     TipId(IDC_SPTTSKEY, L"A hotkey that switches the TTS voice on and off (right-click clears it).");
+    TipId(IDC_MORSEON, L"What you say is typed out by Whisper and played as Morse code where your voice plays. It keeps up with you: each "
+                       L"sentence plays in about the time you took to say it (faster than your set speed when it has to). Live captions show "
+                       L"dots and dashes while it's on. One or the other: turning this on turns the TTS voice off.");
+    TipId(IDC_MORSEKEY, L"A hotkey that switches the Morse voice on and off (right-click clears it).");
+    TipId(IDC_MORSEOPT, L"Beep or telegraph clicks, the slowest speed, pitch, volume, whether your own voice is muted, and a sample.");
     TipId(IDC_SBSUB1, L"Looper: record a few seconds, it plays round and round; add layers on top.");
     TipId(IDC_SBSUB2, L"Beatbox to drums: your mouth sounds play a drum kit.");
     TipId(IDC_LPREC,   L"Empty: start recording. Recording: close the loop, it plays. Playing: add a layer on top (press again to finish it).");
@@ -16622,6 +16820,7 @@ static void VstKeyEdge(int k, bool pressed, bool released);   // (plugins: defin
 static void RcdToggle();
 static void LoopKey(int slot); static void BbSetOn(bool on, bool fromKey);   // (Soundboard > Looper / Beatbox)
 static void BlKey(bool down); static void SpTtsSet(bool on, bool fromKey); static void BlLiveKey(bool down);   // (Mic > Speech)
+static void MoSet(bool on, bool fromKey); extern bool gMoMute;   // (1.70.0)
 static void MusToggle(); static void MusNext(); static void MusPrev(); static void MusStop(); static void MusUi();   // (Mic > Music, 1.61.0)
 static bool MusActive();
 static unsigned char gVoiceTap[KEY_SLOTS];      // a voice command "presses" a hotkey: seen down for one tick, then let go
@@ -16641,7 +16840,7 @@ static void PollFxKeys()
                          ((slot == SLOT_REWIND || slot == SLOT_REPEAT) && !gFeatLag) ||
                          (slot >= SLOT_VST0 && slot < SLOT_VST_END && !gFeatVst) ||
                          ((slot >= SLOT_NEW0 && slot <= SLOT_BEATBOX) && !gFeatSound) ||
-                         ((slot == SLOT_BLEEP || slot == SLOT_SPTTS) && !gFeatSpeech);
+                         ((slot == SLOT_BLEEP || slot == SLOT_SPTTS || slot == SLOT_MORSE) && !gFeatSpeech);
         if (off) { gVoiceTap[slot] = 0; gFxKeyWasDown[slot] = false; if (slot == SLOT_DIVE) gDiveHeld = false; continue; }   // (its feature is off)
         bool down = !gCapturingKey && KeysDownCached(gFxKeys[slot], cache);
         if (gMacroDown[slot] || gRemoteDown[slot]) down = true;      // (held by a macro)
@@ -16668,6 +16867,7 @@ static void PollFxKeys()
         if (slot == SLOT_BEATBOX) { if (pressed) BbSetOn(!gBbOn.load(), true); continue; }
         if (slot == SLOT_BLEEP) { if (pressed) BlKey(true); else if (released) BlKey(false); continue; }
         if (slot == SLOT_SPTTS) { if (pressed) SpTtsSet(!gSpTts, true); continue; }
+        if (slot == SLOT_MORSE) { if (pressed) MoSet(!gMoOn.load(), true); continue; }   // (1.70.0)
         if (slot == SLOT_BLLIVE) { if (pressed) BlLiveKey(true); else if (released) BlLiveKey(false); continue; }
         if (slot == SLOT_MUSPLAY) { if (pressed) { MusToggle(); ShowOsd(gMusPlay.load() ? L"Music: playing" : L"Music: paused", gMusPlay.load()); } continue; }
         if (slot == SLOT_MUSNEXT) { if (pressed) { MusNext(); ShowOsd(L"Music: next song", true); } continue; }
@@ -20094,7 +20294,8 @@ static void ShowHelp()
         L"Bleep: your voice on the outputs you pick runs a little behind, so words from your list are bleeped before they're heard; "
         L"hold the bleep key to bleep anything (it reaches back a little). Sound: a beep (pitch, volume), silence, static, muffled, "
         L"the word backwards, or your own sound files (one, or a random one each time); Hear it plays a sample. TTS voice: what you say is spoken by a text-to-speech voice "
-        L"and your own is muted.\n\n"
+        L"and your own is muted. Morse voice: what you say plays as Morse code (a beep or telegraph clicks), keeping up with you: each sentence "
+        L"plays in about the time you took to say it; your own voice muted or heard too; live captions show the dots and dashes.\n\n"
         L"STREAM (Settings > Stream)\n"
         L"Remote control for Streamer.bot, with a command builder. Avatar (PNGtuber): pick your Quiet and Talking pictures (Blink, "
         L"Talk + blink and Loud are optional); its window shows them as you talk, hops and blinks: capture it in OBS (Window Capture, "
@@ -20148,6 +20349,7 @@ static int FxKeyButtonId(int slot)
     if (slot == SLOT_BEATBOX) return IDC_BBKEY;
     if (slot == SLOT_BLEEP)   return IDC_BLKEY;
     if (slot == SLOT_SPTTS)   return IDC_SPTTSKEY;
+    if (slot == SLOT_MORSE)   return IDC_MORSEKEY;
     if (slot == SLOT_BLLIVE)  return IDC_BLLIVEKEY;
     if (slot == SLOT_MUSPLAY) return IDC_MUSKEYPLAY;
     if (slot == SLOT_MUSNEXT) return IDC_MUSKEYNEXT;
@@ -20977,7 +21179,7 @@ static bool WsPlain(const char* m, char* out, int cap)   // false: no command in
             else { char w[16]; lstrcpynA(w, tk[i].t, 16); for (char* q = w; *q; q++) *q = (char)tolower((unsigned char)*q); addStr("action", w); }
         }
     }
-    else if (!strcmp(cmd, "mute") || !strcmp(cmd, "fx") || !strcmp(cmd, "avatar") || !strcmp(cmd, "captions")) {
+    else if (!strcmp(cmd, "mute") || !strcmp(cmd, "fx") || !strcmp(cmd, "avatar") || !strcmp(cmd, "captions") || !strcmp(cmd, "morse")) {
         if (n > 1 && WsIsOnOff(tk[1])) onOff("on", tk[1]);
         else if (n > 1 && !_stricmp(tk[1].t, "clear")) addRaw("clear", "true");
     }
@@ -21126,6 +21328,10 @@ static void WsExec(int id, const char* m)
             else { WsReply(id, what, "Say play, pause, toggle, next, prev, stop or volume 60."); return; }
         }
         WsReply(id, what, nullptr); return;
+    }
+    if (!strcmp(what, "morse")) {               // (1.70.0) {"do":"morse","on":"toggle"}: the Morse voice
+        if (!gFeatSpeech) { WsReply(id, what, "Speech is off (Settings > Features)."); return; }
+        WsBool(m, "on", gMoOn.load(), &b); MoSet(b, true); WsReply(id, what, nullptr); return;
     }
     if (!strcmp(what, "avatar")) {              // (1.60.0) {"do":"avatar","on":true}: its window
         if (!gFeatAvatar) { WsReply(id, what, "The avatar is off (Settings > Features)."); return; }
@@ -21391,6 +21597,8 @@ static void WsGuide()                           // Settings: the walkthrough, an
         L"    plugin 1 params   \x2014   replies with its settings' names and values\n\n"
         L"Any hotkey action (advanced)\n"
         L"    {\"do\":\"key\",\"name\":\"mute_hotkey\"}   \x2014   presses it, by its name in the settings file;  \"down\":true / false holds it / lets go\n\n"
+        L"Speech (Mic > Speech)\n"
+        L"    morse on   \x2014   the Morse voice (off, toggle)\n\n"
         L"Music (Mic > Music)\n"
         L"    music toggle   \x2014   play / pause (also: play, pause, next, prev, stop);  music volume 60\n\n"
         L"Stream (Settings > Stream)\n"
@@ -21995,6 +22203,7 @@ static const SecIntro SEC_INTROS[] = {
                       L"so one fader turns them all down together. Their own output buttons show the bus's, greyed. Drag a name to reorder; drag a strip's right edge to resize it." },
     { L"Outputs",     L"Each output's volume, limit and mute, as the Mixer sends them. EQ... gives one output its own EQ and a delay (up to 500 ms). The buttons at the bottom of each channel pick which outputs it goes to." },
     { L"Mixer hotkeys", L"Keys for each channel (volume, mute, solo, duck, hold, fade) and each output, working from any app." },
+    { L"Talk for me", L"Your words, said for you: by a text-to-speech voice, or as Morse code. One at a time; each has its own hotkey." },
     { L"Features",    L"Turn whole parts of Lag Effect on or off. Off means hidden and not using any time on the audio. "
                       L"Sound triggers listen for a clap, snap, whistle or click; MIDI controller lets a knob box drive the Mixer and your hotkeys. Set up... opens each." },
     { L"Remote control (Streamer.bot)", L"Lets Streamer.bot, a Stream Deck or a script control Lag Effect over a local WebSocket. Off until you turn it on. "
@@ -22503,6 +22712,7 @@ static int ChipsBuild(Chip* c)
     }
     if (gFeatSpeech) {                          // Mic > Speech (1.57.0)
         if (gSpTts) add(L"TTS voice", 1, PAGE_MIC, 4);   // (red: your own voice is muted)
+        if (gMoOn.load()) add(L"Morse voice", gMoMute ? 1 : 0, PAGE_MIC, 4);   // (1.70.0)
         if (gBlOn.load() && gBlOuts.load()) { wchar_t t[32]; swprintf(t, 32, L"Bleep %.1f s", gBlDelayMs / 1000.0); add(t, 0, PAGE_MIC, 4); }
         if (gSpCmdOn && gVcN > 0) add(L"Voice commands", 0, PAGE_MIC, 4);
     }
@@ -23622,7 +23832,7 @@ static void WsDownload(int m)
 
 static bool SpeechWanted()
 {
-    return gFeatSpeech && ((gSpCmdOn && gVcN > 0) || (gBlOn.load() && gBlWords[0]) || gSpTts || (gFeatCaptions && gCapOn));
+    return gFeatSpeech && ((gSpCmdOn && gVcN > 0) || (gBlOn.load() && gBlWords[0]) || gSpTts || gMoOn.load() || (gFeatCaptions && gCapOn));
 }
 static void WsPrompt()                          // words it should expect: your command phrases (helps it hear them)
 {
@@ -23781,6 +23991,7 @@ static void SpeechResult(const WsResult* r)     // WM_APP + 21: what Whisper hea
     }
     if (gSpCmdOn && gVcN > 0) { const int c = VcMatch(text); if (c >= 0) VoiceCmdRun(c); }
     if (gSpTts) TtsSay(text);
+    if (gMoOn.load()) MoPush(text, r->n > 0 ? (r->w[r->n - 1].b - r->w[0].a) / (double)RATE : 0.0);   // (1.70.0: as long as you took to say it)
     SpeechStatus();
 }
 
@@ -23802,6 +24013,7 @@ static void VcActionName(int slot, wchar_t* out, int cap)
     if (slot >= SLOT_PAD0 && slot < SLOT_PAD0 + PADS) { swprintf(out, cap, L"Play pad %d", slot - SLOT_PAD0 + 1); return; }
     if (slot >= SLOT_VST0 && slot < SLOT_VST0 + VST_MIC) { swprintf(out, cap, L"Mic plugin %d on / off", slot - SLOT_VST0 + 1); return; }
     if (slot == SLOT_SPTTS) { lstrcpynW(out, L"TTS voice on / off", cap); return; }
+    if (slot == SLOT_MORSE) { lstrcpynW(out, L"Morse voice on / off", cap); return; }
     if (slot == SLOT_BLLIVE) { lstrcpynW(out, L"Live bleep (while held)", cap); return; }
     if (slot == SLOT_MUSPLAY) { lstrcpynW(out, L"Music: play / pause", cap); return; }
     if (slot == SLOT_MUSNEXT) { lstrcpynW(out, L"Music: next song", cap); return; }
@@ -23829,7 +24041,7 @@ static int VcActions(int* out, int cap)          // the actions a command can pi
     add(SLOT_CHATG); add(SLOT_CHATC);
     for (int i = 0; i < gSceneN; i++) add(SLOT_SCENE0 + i);
     if (gFeatVst) for (int k = 0; k < VST_MIC; k++) if (gVstUi[k].path[0]) add(SLOT_VST0 + k);
-    add(SLOT_RECORD); add(SLOT_SPTTS);
+    add(SLOT_RECORD); add(SLOT_SPTTS); add(SLOT_MORSE);
     add(SLOT_MUSPLAY); add(SLOT_MUSNEXT);       // (Mic > Music: no feature switch since 1.63.0)
     for (int i = 0; i < gMacroN; i++) add(SLOT_MACRO0 + i);   // (1.67.0)
     add(SLOT_TRIGON);                           // (1.69.0)
@@ -23896,6 +24108,7 @@ static int MacroState(int s)                    // a switch: 1 on, 0 off, -1 can
     if (s == SLOT_RECORD) return gRcd ? 1 : 0;
     if (s == SLOT_BEATBOX) return gBbOn.load() ? 1 : 0;
     if (s == SLOT_SPTTS) return gSpTts ? 1 : 0;
+    if (s == SLOT_MORSE) return gMoOn.load() ? 1 : 0;
     if (s == SLOT_MUSPLAY) return gMusPlay.load() ? 1 : 0;
     if (s == SLOT_TRIGON) return gFeatTrig ? 1 : 0;
     return -1;
@@ -23904,7 +24117,7 @@ static int MacroUndoKind(int s, int* other)     // how a step is undone; *other:
 {
     *other = -1;
     if (s == SLOT_MUTE || s < FX_KEY_SLOTS || (s >= SLOT_FADE0 && s < SLOT_FADE0 + CH_MAX) || (s >= SLOT_VST0 && s < SLOT_VST_END) ||
-        s == SLOT_RECORD || s == SLOT_BEATBOX || s == SLOT_SPTTS || s == SLOT_MUSPLAY || s == SLOT_TRIGON) return 0;
+        s == SLOT_RECORD || s == SLOT_BEATBOX || s == SLOT_SPTTS || s == SLOT_MUSPLAY || s == SLOT_TRIGON || s == SLOT_MORSE) return 0;
     if (s >= SLOT_MIX0 && s < SLOT_MIXOUT0) {
         const int a = (s - SLOT_MIX0) % MIXA_N;
         if (a == MIXA_UP || a == MIXA_DOWN) { *other = s + (a == MIXA_UP ? 1 : -1); return 1; }
@@ -24112,7 +24325,7 @@ static void MacroActionMenu(HMENU m)            // every action, grouped: item i
     auto sub = [&](const wchar_t* name) { HMENU h = CreatePopupMenu(); AppendMenuW(m, MF_POPUP, (UINT_PTR)h, name); return h; };
     HMENU mic = sub(L"Mic");
     item(mic, SLOT_MUTE); item(mic, SLOT_PTT); item(mic, SLOT_BLLIVE);
-    if (gFeatSpeech) { item(mic, SLOT_BLEEP); item(mic, SLOT_SPTTS); }
+    if (gFeatSpeech) { item(mic, SLOT_BLEEP); item(mic, SLOT_SPTTS); item(mic, SLOT_MORSE); }
     if (gFeatFx) {
         HMENU fx = sub(L"Voice FX");
         item(fx, 0); for (int g = 0; g < FX_GROUPS; g++) item(fx, 1 + g);
@@ -24485,7 +24698,7 @@ static unsigned PhoneLayout(char* out, int cap) // the tabs; returns its hash ("
         PhoneItem(j, L"Mic", L"Mute", SLOT_MUTE, "tog");
         PhoneItem(j, L"Mic", ptt, SLOT_PTT, "hold");
         PhoneItem(j, L"Mic", L"Live bleep", SLOT_BLLIVE, "hold");
-        if (gFeatSpeech) { PhoneItem(j, L"Mic", L"Bleep", SLOT_BLEEP, "hold"); PhoneItem(j, L"Mic", L"TTS voice", SLOT_SPTTS, "tog"); }
+        if (gFeatSpeech) { PhoneItem(j, L"Mic", L"Bleep", SLOT_BLEEP, "hold"); PhoneItem(j, L"Mic", L"TTS voice", SLOT_SPTTS, "tog"); PhoneItem(j, L"Mic", L"Morse voice", SLOT_MORSE, "tog"); }
         if (gFeatLag) {
             j.comma(); j.raw("{\"g\":\"Lag\",\"name\":\"Stutter\",\"k\":\"lag\",\"t\":\"lag\"}");
             PhoneItem(j, L"Lag", L"Rewind", SLOT_REWIND, "tap");
@@ -24549,7 +24762,7 @@ static void PhoneStateJson(char* out, int cap, unsigned h)   // what's on now
         j.comma(); j.raw("\""); j.raw(u); j.raw(st ? "\":true" : "\":false");
     };
     on(SLOT_MUTE); on(0); for (int g = 0; g < FX_GROUPS; g++) on(1 + g);
-    on(SLOT_SPTTS); on(SLOT_MUSPLAY); on(SLOT_RECORD); on(SLOT_BEATBOX);
+    on(SLOT_SPTTS); on(SLOT_MORSE); on(SLOT_MUSPLAY); on(SLOT_RECORD); on(SLOT_BEATBOX);
     for (int i = 0; i < gPhBtnN; i++) on(gPhBtn[i].slot);
     for (int i = 0; i < gRHoldN; i++) {         // (held from a phone: lit too)
         const wchar_t* kn = FxKeyIniName(gRHold[i].slot); if (!kn) continue;
@@ -25709,12 +25922,104 @@ static void BlLiveKey(bool down)
         gBlLiveSlot = -1;
     }
 }
+static void MoSet(bool on, bool fromKey); static void MoVoiceApply(); static void CapUpdate(bool final);
 static void SpTtsSet(bool on, bool fromKey)
 {
-    gSpTts = on; gSpMuteVoice = on;
+    gSpTts = on;
+    if (on && gMoOn.load()) MoSet(false, false);   // (1.70.0: one or the other)
+    MoVoiceApply();
     if (gWnd) CheckDlgButton(gWnd, IDC_SPTTS, on ? BST_CHECKED : BST_UNCHECKED);
     if (fromKey) ShowOsd(on ? L"TTS voice: on (your own is muted)" : L"TTS voice: off", on);
     SpeechApply();
+}
+// ---- (1.70.0) Morse voice: what you say, as Morse code (Mic > Speech, beside the TTS voice) ----
+bool gMoMute = true;                            // your own voice: muted while it's on (else heard too, the Morse after each sentence)
+static void MoVoiceApply() { gSpMuteVoice = gSpTts || (gMoOn.load() && gMoMute); }
+static void MoSet(bool on, bool fromKey)
+{
+    if (on && gSpTts) SpTtsSet(false, false);   // (one or the other: both would say the same thing)
+    gMoOn = on;
+    if (!on) MoClear();
+    MoVoiceApply();
+    if (gWnd) CheckDlgButton(gWnd, IDC_MORSEON, on ? BST_CHECKED : BST_UNCHECKED);
+    if (fromKey) ShowOsd(on ? (gMoMute ? L"Morse voice: on (your own is muted)" : L"Morse voice: on") : L"Morse voice: off", on);
+    CapUpdate(true);                            // (captions switch between words and dots / dashes)
+    SpeechApply();
+}
+static void MoHear()                            // a sample ("Lag Effect") with the settings as they are, on Windows' default speakers
+{
+    typedef BOOL (WINAPI* PPlaySound)(LPCWSTR, HMODULE, DWORD);
+    static HMODULE wm = LoadLibraryW(L"winmm.dll");
+    static PPlaySound play = wm ? (PPlaySound)(void*)GetProcAddress(wm, "PlaySoundW") : nullptr;
+    if (!play) return;
+    unsigned char e[256]; const int n = MorseEncode(L"Lag Effect", e, 256);
+    MoParams p{}; p.unit = MoUnitF(gMoWpm.load()); p.hz = (float)gMoHz.load(); p.amp = 0.3f * gMoVolPc.load() / 100.0f; p.sound = gMoSound.load() ? 1 : 0;
+    long total = RATE / 4; for (int i = 0; i < n; i++) total += lround((e[i] & 0x7F) * p.unit);
+    play(nullptr, nullptr, 0);
+    static BYTE* wav = nullptr; static long wavCap = 0;
+    const long bytes = 44 + total * 2;
+    if (wavCap < bytes) { free(wav); wav = (BYTE*)malloc(bytes); wavCap = wav ? bytes : 0; }
+    if (!wav) return;
+    auto u32 = [&](int at, DWORD v) { memcpy(wav + at, &v, 4); }; auto u16 = [&](int at, WORD v) { memcpy(wav + at, &v, 2); };
+    memcpy(wav, "RIFF", 4); u32(4, bytes - 8); memcpy(wav + 8, "WAVEfmt ", 8); u32(16, 16); u16(20, 1); u16(22, 1);
+    u32(24, RATE); u32(28, RATE * 2); u16(32, 2); u16(34, 16); memcpy(wav + 36, "data", 4); u32(40, total * 2);
+    short* pcm = (short*)(wav + 44); long o = 0;
+    MoState m; m.r = gMoW.load();               // (its own key: not the live queue)
+    auto out = [&](float y) { if (o < total) { y = y > 1 ? 1 : y < -1 ? -1 : y; pcm[o++] = (short)lrintf(y * 32767.0f); } };
+    const float ramp = 1.0f / (float)fmin(240.0, fmax(24.0, p.unit / 3));
+    for (int i = 0; i < n; i++) { MoKey(m, (e[i] & 0x80) != 0, Imax(1, (int)lround((e[i] & 0x7F) * p.unit)), ramp); while (m.left > 0) out(MoTone(m, p)); }
+    MoKey(m, false, 0, ramp); while (o < total) out(MoTone(m, p));
+    play((LPCWSTR)wav, nullptr, 0x0004 | 0x0001 | 0x0002);   // SND_MEMORY | SND_ASYNC | SND_NODEFAULT
+}
+static void MoOptText()
+{
+    wchar_t t[80]; swprintf(t, 80, L"%ls, %d wpm  \x25BE", gMoSound.load() ? L"Clicks" : L"Beep", gMoWpm.load());
+    SetTextIfChanged(gWnd, IDC_MORSEOPT, t);
+}
+static void MoMenu()                            // the Morse voice's settings
+{
+    HMENU m = CreatePopupMenu(), sp = CreatePopupMenu(), pi = CreatePopupMenu(), vo = CreatePopupMenu();
+    AppendMenuW(m, MF_STRING | (!gMoSound.load() ? MF_CHECKED : 0), 1, L"Beep (a clean tone)");
+    AppendMenuW(m, MF_STRING | (gMoSound.load() ? MF_CHECKED : 0), 2, L"Telegraph clicks (an old sounder)");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    static const int WPM[] = { 10, 15, 20, 25, 30, 40 };
+    for (int i = 0; i < 6; i++) { wchar_t t[48]; swprintf(t, 48, L"%d words a minute", WPM[i]); AppendMenuW(sp, MF_STRING | (gMoWpm.load() == WPM[i] ? MF_CHECKED : 0), 10 + i, t); }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sp, L"Slowest speed (it goes faster to keep up with you)");
+    static const int HZ[] = { 500, 600, 700, 800, 900 };
+    for (int i = 0; i < 5; i++) { wchar_t t[32]; swprintf(t, 32, L"%d Hz", HZ[i]); AppendMenuW(pi, MF_STRING | (gMoHz.load() == HZ[i] ? MF_CHECKED : 0), 20 + i, t); }
+    AppendMenuW(m, MF_POPUP | (gMoSound.load() ? MF_GRAYED : 0), (UINT_PTR)pi, L"Beep pitch");
+    static const int VO[] = { 50, 75, 100, 150 };
+    for (int i = 0; i < 4; i++) { wchar_t t[32]; swprintf(t, 32, L"%d%%", VO[i]); AppendMenuW(vo, MF_STRING | (gMoVolPc.load() == VO[i] ? MF_CHECKED : 0), 30 + i, t); }
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)vo, L"Volume");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (gMoMute ? MF_CHECKED : 0), 40, L"Your voice muted: only the Morse is heard");
+    AppendMenuW(m, MF_STRING | (!gMoMute ? MF_CHECKED : 0), 41, L"Your voice heard too: the Morse after each sentence");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, 50, L"\x25B6  Hear a sample");
+    RECT r; GetWindowRect(GetDlgItem(gWnd, IDC_MORSEOPT), &r);
+    const int c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, r.left, r.bottom, 0, gWnd, nullptr);
+    DestroyMenu(m);
+    if (c <= 0) return;
+    if (c == 1 || c == 2) gMoSound = c - 1;
+    else if (c >= 10 && c < 16) gMoWpm = WPM[c - 10];
+    else if (c >= 20 && c < 25) gMoHz = HZ[c - 20];
+    else if (c >= 30 && c < 34) gMoVolPc = VO[c - 30];
+    else if (c == 40 || c == 41) { gMoMute = c == 40; MoVoiceApply(); }
+    if (c == 50 || c <= 2 || (c >= 10 && c < 34)) MoHear();   // (so you know what you picked)
+    MoOptText(); SaveSettings();
+}
+static void MoSave()
+{
+    SaveInt(L"morse_sound", gMoSound.load()); SaveInt(L"morse_wpm", gMoWpm.load()); SaveInt(L"morse_pitch_hz", gMoHz.load());
+    SaveInt(L"morse_volume", gMoVolPc.load()); SaveInt(L"morse_mutes_voice", gMoMute);
+}
+static void MoLoad()
+{
+    gMoSound = GetPrivateProfileIntW(L"settings", L"morse_sound", 0, gIni) ? 1 : 0;
+    gMoWpm = Iclamp(GetPrivateProfileIntW(L"settings", L"morse_wpm", 20, gIni), 5, 60);
+    gMoHz = Iclamp(GetPrivateProfileIntW(L"settings", L"morse_pitch_hz", 700, gIni), 200, 2000);
+    gMoVolPc = Iclamp(GetPrivateProfileIntW(L"settings", L"morse_volume", 100, gIni), 0, 300);
+    gMoMute = GetPrivateProfileIntW(L"settings", L"morse_mutes_voice", 1, gIni) != 0;
 }
 
 // ---- the page ----
@@ -26021,13 +26326,15 @@ static void SpeechStatus()
     else if (gWs.running.load()) swprintf(t, 400, L"Listening (%ls). Say something...", gSpEngine);
     else if (gSpErr[0] && SpeechWanted()) lstrcpynW(t, gSpErr, 400);
     else if (SpeechWanted() && !gRunning) lstrcpyW(t, L"Starts listening when the audio is on.");
-    else lstrcpyW(t, L"Not listening: switch on voice commands (with one in the list), bleep words or the TTS voice.");
+    else lstrcpyW(t, L"Not listening: switch on voice commands (with one in the list), bleep words, the TTS voice or the Morse voice.");
     SetTextIfChanged(gWnd, IDC_SPSTAT, t);
 }
 static void SpeechBugInfo(wchar_t* o, int cap)
 {
     BugAdd(o, cap, L"Whisper: model %ls (%ls), CPU %ls, state %d, %u passes, last %u ms, %d threads", WS_MODELS[gWsModel].name,
            WsModelHave(gWsModel) ? L"downloaded" : L"not downloaded", WsCpuOk() ? L"ok" : L"no AVX2", gWs.state.load(), gWs.passes.load(), gWs.lastMs.load(), gWs.threads);
+    BugAdd(o, cap, L"Morse voice: %ls, %ls, %d wpm, %d Hz, %d%%, your voice %ls, playing at %d%%, %.1f s behind", gMoOn.load() ? L"on" : L"off",
+           gMoSound.load() ? L"clicks" : L"beep", gMoWpm.load(), gMoHz.load(), gMoVolPc.load(), gMoMute ? L"muted" : L"heard", gMoSpeedPc.load(), MoBehindS());
 }
 static void WsModelMenu()                       // Model: which (Fast / Good / Best), download, delete
 {
@@ -26090,6 +26397,7 @@ static void SpeechSave()                        // (SaveSettings)
     SaveInt(L"bleep_pitch_hz", gBlHz.load()); SaveInt(L"bleep_volume", gBlVolPc.load()); SaveInt(L"bleep_cover", gBlCover);
     SaveInt(L"bleep_files_finish", gBlFinish.load()); SaveInt(L"bleep_file_pick", gBlClipSel.load());
     for (int i = 0; i < BL_CLIPS; i++) { wchar_t k[32]; swprintf(k, 32, L"bleep_file%d", i + 1); IniSet(k, gBlFile[i][0] ? gBlFile[i] : nullptr); }
+    MoSave();                                   // (1.70.0)
 }
 static void SpeechLoad()                        // (LoadSettings)
 {
@@ -26120,12 +26428,13 @@ static void SpeechLoad()                        // (LoadSettings)
     for (int i = 0; i < BL_CLIPS; i++) { wchar_t k[32]; swprintf(k, 32, L"bleep_file%d", i + 1); GetPrivateProfileStringW(L"settings", k, L"", gBlFile[i], MAX_PATH, gIni); }
     BlFilesLoad();
     gBlBackMs = Iclamp(GetPrivateProfileIntW(L"settings", L"bleep_reach_back_ms", 600, gIni), 0, 2000);
+    MoLoad();                                   // (1.70.0)
     GetPrivateProfileStringW(L"settings", L"bleep_words", L"", gBlWords, 600, gIni);
 }
 static void SetFeatSpeech(bool on)
 {
     gFeatSpeech = on;
-    if (!on) { if (gMicSub == 4) gMicSub = 0; if (gSpTts) SpTtsSet(false, false); }
+    if (!on) { if (gMicSub == 4) gMicSub = 0; if (gSpTts) SpTtsSet(false, false); if (gMoOn.load()) MoSet(false, false); }
     SpeechApply();
 }
 
@@ -26937,9 +27246,12 @@ static void CapUpdate(bool final)               // what shows now: the end of wh
 {
     static wchar_t all[2600]; swprintf(all, 2600, L"%ls %ls", gCapDone, gCapPart);
     static wchar_t clean[2600]; CapClean(all, clean, 2600);
+    static wchar_t mo[10400];                   // (1.70.0) the Morse voice on: dots and dashes
+    const wchar_t* src = clean;
+    if (gMoOn.load()) { MorseText(clean, mo, 10400); src = mo; }
     const int keep = gCapLines * 64;            // (the window trims to its lines by what fits; the file gets this much)
-    const wchar_t* s = clean; const int len = lstrlenW(clean);
-    if (len > keep) { s = clean + len - keep; while (*s && *s != L' ') s++; while (*s == L' ') s++; }
+    const wchar_t* s = src; const int len = lstrlenW(src);
+    if (len > keep) { s = src + len - keep; while (*s && *s != L' ') s++; while (*s == L' ') s++; }
     if (!lstrcmpW(s, gCapShown)) return;
     lstrcpynW(gCapShown, s, 1400);
     if (gCapsWnd) InvalidateRect(gCapsWnd, nullptr, FALSE);
@@ -27119,6 +27431,7 @@ static const CbAct CB_ACTS[] = {
     { L"Music player", "music", CBT_NONE, CBO_MUSIC, CBV_NONE, 0 },
     { L"Music volume (%)", "music volume", CBT_NONE, CBO_NONE, CBV_NUM, 60 },
     { L"Avatar window", "avatar", CBT_NONE, CBO_ONOFF, CBV_NONE, 0 },
+    { L"Morse voice", "morse", CBT_NONE, CBO_ONOFF, CBV_NONE, 0 },
     { L"Start the audio", "start", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
     { L"Stop the audio", "stop", CBT_NONE, CBO_NONE, CBV_NONE, 0 },
 };
@@ -28018,12 +28331,15 @@ static void CreateUI()
         Ctl(L"STATIC", L"ms", 0, 398, 434, 24, 20, -1);
         Ctl(L"STATIC", L"Sound:", 0, 30, 466, 52, 20, IDC_BLSNDLBL);
         Ctl(L"BUTTON", L"Beep  \x25BE", WS_TABSTOP, 84, 460, 446, 28, IDC_BLSOUND);
-        AddSection(14, 502, 532, 44, L"TTS voice");
-        Ctl(L"BUTTON", L"Talk through a TTS voice: it says what you say, your own voice is muted",
-            BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 518, 398, 20, IDC_SPTTS);
-        { wchar_t kn[120]; FxKeyButtonText(SLOT_SPTTS, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 434, 514, 96, 26, IDC_SPTTSKEY); }
+        AddSection(14, 502, 532, 44, L"Talk for me");   // (1.70.0: the TTS voice and the Morse voice, one at a time)
+        Ctl(L"BUTTON", L"TTS voice", BS_AUTOCHECKBOX | WS_TABSTOP | WS_GROUP, 30, 518, 90, 20, IDC_SPTTS);
+        { wchar_t kn[120]; FxKeyButtonText(SLOT_SPTTS, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 122, 514, 92, 26, IDC_SPTTSKEY); }
+        Ctl(L"BUTTON", L"Morse voice", BS_AUTOCHECKBOX | WS_TABSTOP, 228, 518, 104, 20, IDC_MORSEON);
+        CheckDlgButton(gWnd, IDC_MORSEON, gMoOn.load() ? BST_CHECKED : BST_UNCHECKED);
+        { wchar_t kn[120]; FxKeyButtonText(SLOT_MORSE, kn, 120); Ctl(L"BUTTON", kn, WS_TABSTOP, 334, 514, 92, 26, IDC_MORSEKEY); }
+        Ctl(L"BUTTON", L"", WS_TABSTOP, 432, 514, 98, 26, IDC_MORSEOPT);
         gBuildSub = -1; gBuildFeat = 0;
-        SpCmdList(); BlOutsText(); SpActFill(); BlSoundText();
+        SpCmdList(); BlOutsText(); SpActFill(); BlSoundText(); MoOptText();
     }
     // ---- Music (1.61.0 on the Soundboard; Mic > Music since 1.63.0) ----
     gBuildSub = 5; gBuildFeat = 0;
@@ -28527,7 +28843,7 @@ static void CreateUI()
             { IDC_FEATSOUND, L"Soundboard", L"Sounds on hotkeys, text to speech, a looper and beatbox drums. Adds a tab.", gFeatSound },
             { IDC_FEATCLIPS, L"Clips", L"Keeps the last few seconds so you can save them as a clip. Adds a tab.", gFeatClips },
             { IDC_FEATVST,   L"Plugins (VST3, CLAP)", L"VST3 and CLAP effect plugins on your mic (Mic > Plugins), Mixer channels and outputs.", gFeatVst },
-            { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice (Mic > Speech). Downloads a speech model once.", gFeatSpeech },
+            { IDC_FEATSPEECH, L"Speech", L"Voice commands, bleeping words, talking through a TTS voice or Morse code (Mic > Speech). Downloads a speech model once.", gFeatSpeech },
             { IDC_FEATAVATAR, L"Avatar (PNGtuber)", L"Your pictures that talk when you talk, in a window for OBS (Settings > Stream).", gFeatAvatar },
             { IDC_FEATCAPS,  L"Live captions", L"What you say as text, in a window or a text file for OBS (Settings > Stream). Uses Speech.", gFeatCaptions },
             { IDC_FEATTRIG,  L"Sound triggers", L"A clap, snap, whistle or tongue click runs any action. Listens only while this is on.", gFeatTrig },
@@ -29155,6 +29471,9 @@ static void OnCommand(int id, int code)
     }
     if (id == IDC_SPTTS)    { if (code == BN_CLICKED) SpTtsSet(Checked(id), false); return; }
     if (id == IDC_SPTTSKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_SPTTS], id); return; }
+    if (id == IDC_MORSEON)  { if (code == BN_CLICKED) MoSet(Checked(id), false); return; }   // (1.70.0)
+    if (id == IDC_MORSEKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_MORSE], id); return; }
+    if (id == IDC_MORSEOPT) { if (code == BN_CLICKED) MoMenu(); return; }
     if (id == IDC_BLLIVEKEY) { if (code == BN_CLICKED) BeginKeyCapture(gFxKeys[SLOT_BLLIVE], id); return; }
     // Soundboard > Looper / Beatbox (1.56.0)
     if (id == IDC_LPREC)   { if (code == BN_CLICKED) LoopPress(LPC_REC); return; }
@@ -30535,6 +30854,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (id == IDC_BBKEY)       { ClearFxKey(SLOT_BEATBOX); return 0; }
         if (id == IDC_BLKEY)       { ClearFxKey(SLOT_BLEEP); return 0; }
         if (id == IDC_SPTTSKEY)    { ClearFxKey(SLOT_SPTTS); return 0; }
+        if (id == IDC_MORSEKEY)    { ClearFxKey(SLOT_MORSE); return 0; }
         if (id == IDC_BLLIVEKEY)   { ClearFxKey(SLOT_BLLIVE); return 0; }
         if (id == IDC_MUSKEYPLAY)  { ClearFxKey(SLOT_MUSPLAY); return 0; }
         if (id == IDC_MUSKEYNEXT)  { ClearFxKey(SLOT_MUSNEXT); return 0; }

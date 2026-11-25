@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Lag Effect's tests, on Linux (GitHub runs them on every push: .github/workflows/tests.yml).
-#   tests/run.sh [base.cpp]     (tests: gate, synth, beats, sound triggers, speech, [whisper], outputs, names, plain commands, phone remote, recorder; "same sound": mic, a Mixer channel, the vocoder)
+#   tests/run.sh [base.cpp]     (tests: gate, synth, beats, sound triggers, morse, speech, [whisper], outputs, names, plain commands, phone remote, recorder; "same sound": mic, a Mixer channel, the vocoder)
 # Cuts the audio code out of LagEffect.cpp and runs it with stubs for Windows / miniaudio. With a base file (main's
 # LagEffect.cpp), also checks that default settings sound bit-for-bit the same as there.
 # Skip that one check for a commit meant to change the sound: put [audio-change] in its message (AUDIO_CHANGE=1 here).
@@ -52,6 +52,7 @@ run() { echo; echo "== $1"; shift; if ! "$@"; then fail=1; fi; }
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/synth" "$T/synth.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/beats" "$T/beats.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/triggers" "$T/triggers.cpp" "$B/rn.a"
+"$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/morse" "$T/morse.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/speech" "$T/speech.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -o "$B/noise" "$T/noise.cpp" "$B/rn.a"
 "$CXX" "${CF[@]}" -DAUDIO="\"$B/audio.inc\"" -DEXT="\"$B/ext.inc\"" -o "$B/outputs" "$T/outputs.cpp" "$B/rn.a"
@@ -65,6 +66,7 @@ run "Mixer channel gate" "$B/gate"
 run "vocoder: Synth plugin style (a fake synth)" "$B/synth"
 run "Soundboard: looper and beatbox to drums" "$B/beats"
 run "Sound triggers (1.69.0)" "$B/triggers"
+run "Morse voice (1.70.0)" "$B/morse"
 run "Mic > Speech: the clock, the recognizer's feed, bleeps, muting your voice" "$B/speech"
 run "Mic > Noise suppression: Classic and New models" "$B/noise"
 # Whisper (Mic > Speech, 1.58.0) with a real model: only where whisper.cpp is built and a model is there (tests.yml does both)
