@@ -30,6 +30,8 @@ static void match(const wchar_t* have, const wchar_t* want, int q)
 int main()
 {
     same("mute toggle", "{\"do\":\"mute\",\"on\":\"toggle\"}");                    // (as before)
+    same("morse toggle", "{\"do\":\"morse\",\"on\":\"toggle\"}");                  // (1.70.0)
+    same("morse off", "{\"do\":\"morse\",\"on\":false}");
     same("channel Spotify -12 mute", "{\"do\":\"channel\",\"name\":\"Spotify\",\"db\":-12,\"mute\":true}");
     same("macro Intro", "{\"do\":\"macro\",\"name\":\"Intro\"}");
     same("macro Big laugh", "{\"do\":\"macro\",\"name\":\"Big laugh\"}");
