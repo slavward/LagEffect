@@ -25,6 +25,14 @@ static void run(int blocks, Src src)
         for (int j = 0; j < BLK; j++) rec.push_back(outb[2 * j]);
     }
 }
+static float saw(long n) { return (float)(n % 1000) * 0.0005f - 0.25f; }   // its value says which sample it was
+static void dirs(size_t a, size_t b, int& fw, int& bw)   // steps forward / backward through the sawtooth in rec[a, b)
+{
+    for (size_t i = a + 1; i < b && i < rec.size(); i++) {
+        const int d = ((int)lrintf((rec[i] + 0.25f) / 0.0005f) - (int)lrintf((rec[i - 1] + 0.25f) / 0.0005f) + 1000) % 1000;
+        if (d == 1) fw++; else if (d == 999) bw++;
+    }
+}
 static double goertzel(const std::vector<float>& x, size_t a, size_t n, double hz, double rate = R)
 {
     const double w = 2 * M_PI * hz / rate, c = 2 * cos(w); double s1 = 0, s2 = 0;
@@ -178,15 +186,29 @@ int main()
     gBlOn = false; run(60, tone300);
     rec.clear(); run(20, tone300);
     check("off: no delay again", goertzel(rec, 0, 4800, 300) > 0.17);
+    {   // (1.70.2) back on later: the delay starts with silence, not what was said the last time it was on
+        run(100, silence); gBlOn = true; rec.clear(); run(45, silence);
+        double e = 0; for (float v : rec) e += v * v;
+        printf("  on again: the first 0.45 s %.4f\n", sqrt(e / rec.size()));
+        check("on again: no old talk replayed (it was, unbleeped)", sqrt(e / rec.size()) < 0.0005);
+        gBlOn = false; run(60, tone300);
+    }
 
     printf("Live bleep key (1.59.1)\n");
     gBlLive = true; rec.clear(); run(10, tone300);
     check("held: a bleep at once (no delay), no voice", goertzel(rec, 480, 3840, 1000) > 0.18 && goertzel(rec, 480, 3840, 300) < 0.01);
     gBlLive = false; rec.clear(); run(10, tone300);
     check("let go: your voice at once", goertzel(rec, 480, 3840, 300) > 0.17 && goertzel(rec, 480, 3840, 1000) < 0.01);
-    gBlSound = BLS_BACK; gBlLive = true; rec.clear(); run(10, tone300);
-    check("Backwards can't be live: a beep instead", goertzel(rec, 480, 3840, 1000) > 0.18);
-    gBlLive = false; gBlSound = 0; run(10, tone300);
+    {   // (1.70.2) Backwards live: what was just said, reversed (a sawtooth's value says where it came from)
+        gBlSound = BLS_BACK; run(60, saw);
+        rec.clear(); run(10, saw); gBlLive = true; run(40, saw); gBlLive = false; run(30, saw);
+        int bw = 0, fw = 0; dirs(10 * BLK + 480, 50 * BLK - 480, fw, bw);
+        int bw2 = 0, fw2 = 0; dirs(50 * BLK + 960, 80 * BLK, fw2, bw2);
+        printf("  live backwards: %d steps back, %d forward; after: %d forward\n", bw, fw, fw2);
+        check("Backwards live: what you just said, reversed (was a beep)", bw > 18000 && fw == 0 && goertzel(rec, 10 * BLK + 480, 3840, 1000) < 0.01);
+        check("let go: your voice forwards again", fw2 > 13000 && bw2 == 0);
+    }
+    gBlSound = 0; run(10, tone300);
     gRowMode[0] = MODE_APPS; gBlLive = true; rec.clear(); run(10, tone300);
     double ea = 0; for (float v : rec) ea += v * v;
     check("not on an output without your voice (Apps only)", sqrt(ea / rec.size()) < 0.001);
@@ -205,9 +227,29 @@ int main()
         const size_t a = (size_t)(c2 + R / 2 - rc);
         check("a word bleep plays there, as late as the delay", goertzel(rec, a + 480, 3840, 1000) > 0.18 && goertzel(rec, a - 9600, 4800, 1000) < 0.005);
     }
+    {   // (1.70.2) Muffled and Backwards there too (they were a beep): made from your voice as the bleeped outputs have it
+        auto lowhigh = [](long n) { return 0.12f * (float)sin(2 * M_PI * 150 * n / R) + 0.12f * (float)sin(2 * M_PI * 3000 * n / R); };
+        gBlSound = BLS_MUFFLE; run(60, lowhigh);
+        const long long c2 = gAudT.load() + 4800; BlAdd(c2, c2 + 9600);
+        rec.clear(); const long long rc = gAudT.load(); run(100, lowhigh);
+        const size_t a = (size_t)(c2 + R / 2 - rc);
+        const double lo = goertzel(rec, a + 960, 7680, 150), hi = goertzel(rec, a + 960, 7680, 3000), bp = goertzel(rec, a + 960, 7680, 1000);
+        printf("  Any effect, muffled: 150 Hz %.3f, 3 kHz %.4f, beep %.4f\n", lo, hi, bp);
+        check("Any effect: Muffled is your word, dull (not a beep)", lo > 0.08 && hi < 0.01 && bp < 0.01);
+        gBlSound = BLS_BACK; run(60, saw);
+        const long long c3 = gAudT.load() + 4800; BlAdd(c3, c3 + 9600);
+        rec.clear(); const long long rc3 = gAudT.load(); run(100, saw);
+        const size_t a3 = (size_t)(c3 + R / 2 - rc3);
+        int fw = 0, bw = 0; dirs(a3 + 480, a3 + 9600 - 480, fw, bw);
+        double e = 0; for (size_t i = a3 - 9600; i < a3 - 480; i++) e += rec[i] * rec[i];
+        printf("  Any effect, backwards: %d steps back, %d forward; before it %.4f\n", bw, fw, sqrt(e / 9120));
+        check("Any effect: Backwards is your word reversed, silent around it", bw > 8000 && fw == 0 && sqrt(e / 9120) < 0.001);
+        gBlSound = 0; run(60, tone300);
+    }
     gBlOn = false; gRowMode[0] = MODE_ALL; run(20, tone300);
 
     printf("Talk through a TTS voice\n");
+    gSpRead.store(gSpW.load());                 // (as if the recognizer took it all: nothing reads it here, and the tests above fill its 32 s)
     const unsigned w0 = gSpW.load();
     gSpMuteVoice = true; run(20, tone300); rec.clear(); run(50, tone300);
     double e = 0; for (float v : rec) e += v * v;
