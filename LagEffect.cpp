@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.70.1"
+#define APP_VERSION L"1.70.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4532,8 +4532,9 @@ struct BlOutState {
     int ci = -1, pos = 0;                        // the sound file playing, where
 };
 struct BlParams { int sound, delay; float hz, vol; bool finish; int sel; };
-// One sample of a bleeped output: d is your voice from behind (time td), rb the output's ring (written up to t).
-static float BlOut(BlOutState& st, const float* rb, long long t, long long td, float d,
+// One sample of a bleeped output: d is your voice from behind (time td), rb the output's ring (written up to t, and
+// from clock `from` on: older is silence), src the voice Muffled muffles (d, except on Any effect outputs).
+static float BlOut(BlOutState& st, const float* rb, long long from, long long t, long long td, float d, float src,
                    const long long* A, const long long* B, int n, const BlParams& p)
 {
     int hit = -1;
@@ -4554,7 +4555,7 @@ static float BlOut(BlOutState& st, const float* rb, long long t, long long td, f
         }
     }
     st.g += ((in ? 1.0f : 0.0f) - st.g) * 0.007f;   // (~3 ms in and out)
-    if (p.sound == BLS_MUFFLE && st.g < 0.0001f) { st.m1 = st.m2 = st.m3 = d; }   // (warm: no thump when it starts)
+    if (p.sound == BLS_MUFFLE && st.g < 0.0001f) { st.m1 = st.m2 = st.m3 = src; }   // (warm: no thump when it starts)
     if (st.g < 0.0001f && st.ci < 0) { st.g = 0.0f; return d; }
     float y = 0.0f, tail = 0.0f;
     switch (p.sound) {
@@ -4567,19 +4568,22 @@ static float BlOut(BlOutState& st, const float* rb, long long t, long long td, f
         st.n1 += (w - st.n1) * 0.6f; y = 0.16f * p.vol * st.n1; break; }
     case BLS_MUFFLE: {                           // your word through a pillow (three ~350 Hz low-passes)
         const float c = 0.045f;
-        st.m1 += (d - st.m1) * c; st.m2 += (st.m1 - st.m2) * c; st.m3 += (st.m2 - st.m3) * c;
+        st.m1 += (src - st.m1) * c; st.m2 += (st.m1 - st.m2) * c; st.m3 += (st.m2 - st.m3) * c;
         y = 1.6f * p.vol * st.m3; break; }
     case BLS_BACK: {                             // your word played backwards
+        if (!rb) break;
         long long m;
         if (st.backFull) m = st.ra + st.rb - 1 - td;   // (the whole stretch, mirrored: it has all come in by now)
-        else {                                   // (end not known yet, or longer than the delay: 250 ms pieces)
+        else if (p.delay < 960) {                // (1.70.2) live, no delay: the quarter second before, backwards, piece by piece
+            const long long L = 12000, c0 = st.ra + ((td - st.ra) / L) * L;
+            m = 2 * c0 - 1 - td;
+        } else {                                 // (end not known yet, or longer than the delay: 250 ms pieces)
             const long long L = p.delay < 12000 ? p.delay : 12000;
-            if (L < 960) break;                  // (no delay: nothing to play backwards; silence)
             const long long c0 = st.ra + ((td - st.ra) / L) * L;
             m = 2 * c0 + L - 1 - td;
         }
         if (m > t) m = t;
-        y = p.vol * rb[(unsigned long long)m & (BL_RING - 1)]; break; }
+        y = m >= from ? p.vol * rb[(unsigned long long)m & (BL_RING - 1)] : 0.0f; break; }
     case BLS_FILE:
         if (st.ci >= 0) {
             const BlClip* c = gBlClip[st.ci].load(std::memory_order_acquire);
@@ -5513,7 +5517,10 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     const bool blLiveOn = blLive;
     for (int k = 0; k < MAX_OUT && !blLive; k++) if (blLiveSt[k].g > 0.0f || blLiveSt[k].ci >= 0) blLive = true;   // (fading out)
     BlParams blPL{}, blPA{}, blPLA{};
-    const long long blLA = blLiveOn ? 0 : LLONG_MAX, blLB = LLONG_MAX;   // (held: "in" from the clock's start; let go: never)
+    static long long blLivePress = 0; static bool blLiveWas = false;
+    if (blLiveOn && !blLiveWas) blLivePress = T0;
+    blLiveWas = blLiveOn;
+    const long long blLA = blLiveOn ? blLivePress : LLONG_MAX, blLB = LLONG_MAX;   // (held: "in" from the press; let go: never)
     static BlOutState blAnySt[MAX_OUT];           // "Any effect" outputs (1.61.0): the bleep sound itself as the bleeped outputs play it
     bool blAny = false;                         // (any of those still sounding / fading)
     for (int k = 0; k < MAX_OUT && !blAny; k++) if (blAnySt[k].g > 0.0f || blAnySt[k].ci >= 0) blAny = true;
@@ -5523,12 +5530,15 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         blP.vol = Iclamp(gBlVolPc.load(std::memory_order_relaxed), 0, 300) * 0.01f;
         blP.finish = gBlFinish.load(std::memory_order_relaxed);
         blP.sel = Iclamp(gBlClipSel.load(std::memory_order_relaxed), -1, BL_CLIPS - 1);
-        blPL = blP; blPL.delay = 0;
-        if (blPL.sound == BLS_BACK) blPL.sound = BLS_BEEP;   // (nothing to play backwards live)
-        blPA = blP;                             // (Any effect: your voice isn't there to muffle or reverse: a beep)
-        if (blPA.sound == BLS_BACK || blPA.sound == BLS_MUFFLE) blPA.sound = BLS_BEEP;
+        blPL = blP; blPL.delay = 0;             // (live: Backwards plays the quarter second before, backwards)
+        blPA = blP;                             // (Any effect: Muffled / Backwards use your voice as the bleeped outputs have it)
         blPLA = blPA; blPLA.delay = 0;
     }
+    // (1.70.2) Rings for outputs that aren't bleeped: Any effect outputs keep your whole voice for Muffled / Backwards
+    // (theirs is silent with no effect on), and outputs the live key can bleep keep theirs for Backwards. A ring is
+    // only read from where its writing last began (blFrom): what's older is from before, so it plays as silence.
+    const int blSnd = Iclamp(gBlSound.load(std::memory_order_relaxed), 0, BLS_N - 1);
+    static long long blFrom[MAX_OUT], blNext[MAX_OUT]; static signed char blKind[MAX_OUT];   // (kind: 0 the output's own voice, 1 your whole voice)
     long long blA[8], blB[8]; int blN = 0;      // the stretches to bleep that come out during this block
     if (blOn) {
         const long long t0 = T0 - blD, t1 = t0 + frames;
@@ -5761,22 +5771,32 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             }
             return RowSignal(mode[k], effect, everything, clean) * tbG[k] + everything * tbE[k];
         };
+        auto blWrite = [&](int k, long long t, float x, int kind) {   // ring k gets x at clock t (a gap or a new kind: starts afresh)
+            if (blNext[k] != t || blKind[k] != kind) { blFrom[k] = t; blKind[k] = (signed char)kind; }
+            blNext[k] = t + 1;
+            gBlBuf[k][(unsigned long long)t & (BL_RING - 1)] = x;
+        };
         auto vsig = [&](int k) -> float {       // your voice on output k (bleeped outputs: from behind, bleeps put in)
             const float v = micSig(k);
+            const long long t = T0 + (long long)f;
             if (!(blOuts >> k & 1)) {
-                const long long t = T0 + (long long)f;
+                const bool any = mode[k] == MODE_ANYFX, carries = any || mode[k] == MODE_ALL || mode[k] == MODE_CLEAN;
+                const float* rb = nullptr;
+                if (carries && (blSnd == BLS_BACK || (any && blOn && blSnd == BLS_MUFFLE))) { blWrite(k, t, any ? everything : v, any ? 1 : 0); rb = gBlBuf[k]; }
                 float y = v;
-                if (mode[k] == MODE_ANYFX && (blN || blAny))   // (Any effect: word bleeps, when the bleeped outputs play them)
-                    y = BlOut(blAnySt[k], nullptr, t, t - blD, y, blA, blB, blN, blPA);
-                if (blLive && (mode[k] == MODE_ALL || mode[k] == MODE_CLEAN || mode[k] == MODE_ANYFX))   // (live bleep key)
-                    y = BlOut(blLiveSt[k], nullptr, t, t, y, &blLA, &blLB, 1, mode[k] == MODE_ANYFX ? blPLA : blPL);
+                if (any && (blN || blAny)) {     // (Any effect: word bleeps, when the bleeped outputs play them)
+                    const long long td = t - blD;
+                    const float dv = rb && td >= blFrom[k] ? rb[(unsigned long long)td & (BL_RING - 1)] : 0.0f;
+                    y = BlOut(blAnySt[k], rb, blFrom[k], t, td, y, dv, blA, blB, blN, blPA);
+                }
+                if (blLive && carries)           // (live bleep key)
+                    y = BlOut(blLiveSt[k], rb, blFrom[k], t, t, y, any ? everything : y, &blLA, &blLB, 1, any ? blPLA : blPL);
                 return y;
             }
-            float* rb = gBlBuf[k];
-            const long long t = T0 + (long long)f;
-            rb[(unsigned)t & (BL_RING - 1)] = v;
-            const float d = rb[(unsigned)(t - blD) & (BL_RING - 1)];
-            return BlOut(blSt[k], rb, t, t - blD, d, blA, blB, blN, blP);
+            blWrite(k, t, v, 0);
+            const long long td = t - blD;       // (1.70.2: what's from before Bleep was last switched on is silence, not old talk)
+            const float d = td >= blFrom[k] ? gBlBuf[k][(unsigned long long)td & (BL_RING - 1)] : 0.0f;
+            return BlOut(blSt[k], gBlBuf[k], blFrom[k], t, td, d, d, blA, blB, blN, blP);
         };
         float m0 = soloMask && soloOut == 0 ? 0.0f : vsig(0) + sounds(0);
         if (outVst[0]) { gVstOutL[0][f] = m0 + cL[0]; gVstOutR[0][f] = m0 + cR[0]; }   // (plugins on it: finished after the loop)
@@ -14610,7 +14630,11 @@ static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural, split, vary; short* data; unsigned len; bool ok; };
+#define TTS_ALTS 4
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural, split, vary; short* data; unsigned len; bool ok;
+                // (1.70.2) the accent's other voices to try if its first one won't speak, before Windows' default; what happened
+                wchar_t name[128], alt[TTS_ALTS][512], altName[TTS_ALTS][128], used[128], failed[300]; int nAlt; };
+static wchar_t gTtsLastUsed[128], gTtsLastFailed[300];   // (bug info) the last line: which voice spoke it, which wouldn't
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -14741,6 +14765,26 @@ static int TtsVoiceFor(int accent)              // index into the voice list, -1
             if (pass == 2 && a.primary && (l & 0x3FF) == a.primary) return i;
         }
     return -1;
+}
+static int TtsVoicesFor(int accent, int* out, int max)   // (1.70.2) every voice that fits the accent, best first
+{
+    int n = 0;
+    if (accent <= 0 || accent >= TTS_ACCENT_N) return 0;
+    const TtsAccent& a = TTS_ACCENTS[accent];
+    auto add = [&](int i) { for (int k = 0; k < n; k++) if (out[k] == i) return; if (n < max) out[n++] = i; };
+    for (const auto& pr : TTS_PREFER) {
+        if (lstrcmpiW(pr.accent, a.name)) continue;
+        for (const wchar_t* nm : pr.names) {
+            if (!nm) break;
+            for (int i = 0; i < gTtsCount; i++) if (gTtsLang[i] == a.lang && TtsIsNatural(gTtsNames[i]) && wcsstr(gTtsNames[i], nm)) add(i);
+        }
+    }
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = 0; i < gTtsCount; i++) {
+            const int l = gTtsLang[i];
+            if ((pass == 0 && l == a.lang) || (pass == 1 && a.alt && l == a.alt) || (pass == 2 && a.primary && (l & 0x3FF) == a.primary)) add(i);
+        }
+    return n;
 }
 static bool TtsIsWordChar(wchar_t c) { return iswalnum(c) || c == L'\''; }
 static void TtsSwapWord(wchar_t* t, int cap, const TtsSwap& sw)   // whole words, any case, a random choice each time
@@ -14913,12 +14957,13 @@ static bool TtsRender(TtsJob* j, bool useVoice)
     bool ok = false;
     ISpVoice* v = nullptr; ISpStream* ss = nullptr; IStream* mem = nullptr;
     if (FAILED(CoCreateInstance(kCLSID_SpVoice, nullptr, CLSCTX_ALL, kIID_ISpVoice, (void**)&v))) return false;
-    if (useVoice && j->voice[0]) {
-        ISpObjectToken* tok = nullptr;
+    if (useVoice && j->voice[0]) {              // (1.70.2) if Windows won't switch to it, say so: it used to speak in the default voice
+        ISpObjectToken* tok = nullptr; bool set = false;
         if (SUCCEEDED(CoCreateInstance(kCLSID_SpObjectToken, nullptr, CLSCTX_ALL, kIID_ISpObjectToken, (void**)&tok))) {
-            if (SUCCEEDED(tok->SetId(nullptr, j->voice, FALSE))) v->SetVoice(tok);
+            if (SUCCEEDED(tok->SetId(nullptr, j->voice, FALSE)) && SUCCEEDED(v->SetVoice(tok))) set = true;
             tok->Release();
         }
+        if (!set) { v->Release(); return false; }
     }
     // Taken at (about) the voice's own rate: Windows' converter up to 48 kHz just joins the dots, which sounds
     // crackly / harsh. TtsResample does it properly afterwards.
@@ -15005,7 +15050,19 @@ static DWORD WINAPI TtsThread(LPVOID arg)
 {
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    // Newer voices can refuse (an online one with no connection, one Windows won't hand to older apps): then the
+    // accent's other voices, then Windows' default. j->used / j->failed say what happened.
+    j->ok = TtsRender(j, true);
+    if (j->ok) lstrcpynW(j->used, j->voice[0] ? j->name : L"Windows' default voice", 128);
+    else if (j->voice[0]) {
+        lstrcpynW(j->failed, j->name, 300);
+        for (int k = 0; k < j->nAlt && !j->ok; k++) {
+            lstrcpynW(j->voice, j->alt[k], 512);
+            if (TtsRender(j, true)) { j->ok = true; lstrcpynW(j->used, j->altName[k], 128); }
+            else { const int n = lstrlenW(j->failed); if (n < 250) { wsprintfW(j->failed + n, L", "); lstrcpynW(j->failed + n + 2, j->altName[k], 300 - n - 2); } }
+        }
+        if (!j->ok && TtsRender(j, false)) { j->ok = true; lstrcpynW(j->used, L"Windows' default voice", 128); }
+    }
     if (j->ok) TtsResample(j->data, j->len, j->srcRate);
     if (j->ok) TtsRepitch(j->data, j->len, j->pitch);
     if (j->ok && j->natural) TtsHumanize(j->data, j->len, j->room);
@@ -15113,7 +15170,12 @@ static void TtsSpeakNow(const wchar_t* given)
         int v = TtsVoiceFor(gTtsAccent);
         if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 512);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
+        int all[TTS_ALTS + 1]; const int n = TtsVoicesFor(gTtsAccent, all, TTS_ALTS + 1);   // (its others, if that one won't speak)
+        for (int k = 0; k < n && j->nAlt < TTS_ALTS; k++) if (all[k] != v) {
+            lstrcpynW(j->alt[j->nAlt], gTtsIds[all[k]], 512); lstrcpynW(j->altName[j->nAlt], gTtsNames[all[k]], 128); j->nAlt++;
+        }
     }
+    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsIds[i], j->voice)) lstrcpynW(j->name, gTtsNames[i], 128);
     j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
     // The realistic ("Natural") voices already sound human: they only get the pauses, not the per-sentence
     // pace / pitch changes or the processing (which only made them worse, and could crackle).
@@ -15129,6 +15191,19 @@ static void TtsSpeakNow(const wchar_t* given)
 
 static void OnTtsDone(TtsJob* j)
 {
+    lstrcpynW(gTtsLastUsed, j->ok ? j->used : L"nothing", 128); lstrcpynW(gTtsLastFailed, j->failed, 300);
+    if (j->ok && j->failed[0] && !gTtsQuiet) {   // (1.70.2) once per voice per run: which one wouldn't speak, and who did
+        static wchar_t told[300];
+        if (lstrcmpiW(told, j->failed)) {
+            lstrcpynW(told, j->failed, 300);
+            wchar_t a[128], b[128], m[900]; TtsShortName(j->failed, a, 128); TtsShortName(j->used, b, 128);
+            wsprintfW(m, L"Windows wouldn't speak with %s, so %s spoke instead.\n\n"
+                         L"Online (natural) voices need the internet; some of Windows' newer voices refuse older apps. "
+                         L"Try another voice in the list, or reinstall it in Windows' Settings > Time & language > Speech. "
+                         L"(\"Copy bug report info\" lists the voices it tried.)", a, b);
+            MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_ICONINFORMATION);
+        }
+    }
     if (j->ok) {
         PadSetData(TTS_SLOT, j->data, j->len);
         gPads[TTS_SLOT].vol = gTtsVol;
@@ -15917,9 +15992,10 @@ static void AddTips()
     TipId(IDC_BLDELAY, L"How far behind. Longer catches words more surely (Whisper needs one to two seconds). 0: no delay, the key only bleeps from when you press it.");
     TipId(IDC_BLSOUND, L"What a bleeped word sounds like: a beep (pick its pitch), silence, static, your word muffled or backwards, "
                        L"or your own sound files (one, or a random one each time). Also its volume and how much around each word is covered.");
-    TipId(IDC_BLHEAR, L"Hear the bleep on your speakers: say a sentence first, and it plays it back with a word bleeped (one from your list if you said one).");
+    TipId(IDC_BLHEAR, L"Hear the bleep on your speakers: say a sentence first, and it plays it back with a word bleeped (one from your list if you said one). "
+                      L"Nothing said lately: a sample sentence in Windows' voice, with its middle word bleeped.");
     TipId(IDC_BLLIVEKEY, L"Hold this key and your voice is the bleep sound right away, on every output that has your voice (Mic > Speech > Sound picks the sound). "
-                         L"No delay needed. Outputs that run behind for Bleep get the same moment bleeped. Right-click to clear it.");
+                         L"No delay needed. Backwards plays what you said just before, reversed, a quarter second at a time. Outputs that run behind for Bleep get the same moment bleeped. Right-click to clear it.");
     TipId(IDC_BLWORDS, L"Words it bleeps by itself, commas between. word* = anything starting with it (shit* catches shitty).");
     TipId(IDC_BLCOMMON, L"Add the usual English swear words to the list.");
     TipId(IDC_BLKEY, L"Hold to bleep: from a little before you pressed it (Reach back) until you let go. Right-click clears it.");
@@ -20308,7 +20384,7 @@ static void ShowHelp()
         L"Whisper (speech recognition that runs on this PC; its model is downloaded once) listens to your mic. Voice commands: say a phrase, it does what a hotkey would. "
         L"Bleep: your voice on the outputs you pick runs a little behind, so words from your list are bleeped before they're heard; "
         L"hold the bleep key to bleep anything (it reaches back a little). Sound: a beep (pitch, volume), silence, static, muffled, "
-        L"the word backwards, or your own sound files (one, or a random one each time); Hear it plays a sample. TTS voice: what you say is spoken by a text-to-speech voice "
+        L"the word backwards, or your own sound files (one, or a random one each time); these play on Any effect outputs too; Hear it plays a sample (your last sentence, or a sample one). TTS voice: what you say is spoken by a text-to-speech voice "
         L"and your own is muted. Morse voice: what you say plays as Morse code (a beep or telegraph clicks). Talking is several times faster "
         L"than Morse, so it speeds up (up to 2x, or as fast as you allow in its settings) and skips to your newest sentence when behind (or plays "
         L"every word); your own voice muted or heard too; live captions show the dots and dashes.\n\n"
@@ -22543,6 +22619,13 @@ static void BugInfoBuild(wchar_t* o, int cap)
         BugAdd(o, cap, L"Looper: %ls, %d layer(s), %d ms; beatbox %ls (mode %d, kit %d, sensitivity %d, volume %d, taught %u)",
                LS[Iclamp(gLpState.load(), 0, 4)], gLpLayers.load(), (int)(gLpLen.load() * 1000LL / RATE), gBbOn.load() ? L"on" : L"off",
                gBbMode.load(), gBbKit.load(), gBbSens.load(), gBbVolPct.load(), gBbTaught);
+        {   // (1.70.2) text to speech: the accent, the voices that fit it, what spoke the last line
+            wchar_t vs[700] = L""; int all[8]; const int n = TtsVoicesFor(gTtsAccent, all, 8);
+            for (int k = 0; k < n; k++) { wchar_t sh[128]; TtsShortName(gTtsNames[all[k]], sh, 128); const int l = lstrlenW(vs); if (l < 560) wsprintfW(vs + l, L"%s%s (%x)", k ? L", " : L"", sh, gTtsLang[all[k]]); }
+            BugAdd(o, cap, L"TTS: %d voices; accent %ls (voices for it: %ls); voice picked %ls; last line spoken by %ls%ls%ls",
+                   gTtsCount, TTS_ACCENTS[Iclamp(gTtsAccent, 0, TTS_ACCENT_N - 1)].name, n ? vs : L"none", gTtsVoice[0] ? gTtsVoice : L"(default)",
+                   gTtsLastUsed[0] ? gTtsLastUsed : L"-", gTtsLastFailed[0] ? L"; wouldn't speak: " : L"", gTtsLastFailed);
+        }
         int nf = 0; for (int i = 0; i < BL_CLIPS; i++) if (gBlClip[i].load()) nf++;
         BugAdd(o, cap, L"Speech: %ls; recognizer %ls%ls%ls; commands %ls (%d); bleep %ls (outputs %u, %d ms, %d words chars, key reach %d ms, "
                L"sound %d, %d Hz, %d%%, cover %d, %d files, pick %d, %ls); TTS voice %ls",
@@ -26221,6 +26304,62 @@ static void BlSoundMenu()
     BlSoundText(); SaveSettings();
     if ((c >= 1 && c <= 5) || (c >= 10 && c <= 19) || (c >= 40 && c < 56)) BlHear(true);   // (so you know what you picked)
 }
+// (1.70.2) A sample sentence for Hear it when you haven't said anything lately: "This is what a / bleeped / word sounds
+// like." spoken by Windows' default voice (each part on its own, so the middle word's place is known), made once on its
+// own thread (WM_APP + 73), then kept. So every sound, Muffled and Backwards too, can be heard on a voice.
+struct BlSample { float* v; int n, a, b; };
+static BlSample* gBlSample = nullptr;
+static bool gBlSampleBusy = false, gBlSampleFailed = false, gBlSampleQuiet = false;
+static DWORD WINAPI BlSampleThread(LPVOID)
+{
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    static const wchar_t* PART[3] = { L"This is what a", L"bleeped", L"word sounds like." };
+    short* seg[3] = {}; unsigned len[3] = {}; bool ok = true;
+    for (int i = 0; i < 3 && ok; i++) {
+        TtsJob* j = (TtsJob*)calloc(1, sizeof(TtsJob));
+        if (!j) { ok = false; break; }
+        lstrcpynW(j->text, PART[i], 600); j->srcRate = 22050;
+        if (TtsRender(j, false)) {
+            TtsResample(j->data, j->len, j->srcRate);
+            unsigned b = 0, e = j->len;          // (the voice's own silence off both ends, 10 ms kept)
+            while (b < e && abs(j->data[b]) < 200) b++;
+            while (e > b && abs(j->data[e - 1]) < 200) e--;
+            b = b > RATE / 100 ? b - RATE / 100 : 0; e = e + RATE / 100 < j->len ? e + RATE / 100 : j->len;
+            if (e > b) { seg[i] = j->data + b; len[i] = e - b; } else ok = false;
+            if (!ok) HeapFree(GetProcessHeap(), 0, j->data);
+            else { short* keep = (short*)malloc(len[i] * sizeof(short)); if (keep) memcpy(keep, seg[i], len[i] * sizeof(short)); HeapFree(GetProcessHeap(), 0, j->data); seg[i] = keep; ok = keep != nullptr; }
+        } else ok = false;
+        free(j);
+    }
+    BlSample* r = nullptr;
+    if (ok) {
+        const int lead = RATE * 3 / 10, gap = RATE * 6 / 100, n = lead + (int)len[0] + gap + (int)len[1] + gap + (int)len[2] + lead;
+        r = (BlSample*)calloc(1, sizeof(BlSample));
+        float* v = r ? (float*)calloc(n, sizeof(float)) : nullptr;
+        if (v) {
+            int at = lead;
+            for (int i = 0; i < 3; i++) {
+                if (i == 1) r->a = at;
+                for (unsigned k = 0; k < len[i]; k++) v[at + k] = seg[i][k] * (1.0f / 32768.0f);
+                at += (int)len[i];
+                if (i == 1) r->b = at;
+                at += gap;
+            }
+            r->v = v; r->n = n;
+        } else { free(r); r = nullptr; }
+    }
+    for (int i = 0; i < 3; i++) free(seg[i]);
+    CoUninitialize();
+    PostMessageW(gWnd, WM_APP + 73, 0, (LPARAM)r);
+    return 0;
+}
+static void BlHear(bool quiet);
+static void BlSampleDone(BlSample* r)           // (WM_APP + 73)
+{
+    gBlSampleBusy = false;
+    if (r) gBlSample = r; else gBlSampleFailed = true;
+    BlHear(gBlSampleQuiet);
+}
 // Hear it (1.59.1): what you said last (Whisper's words and the speech feed: 16 kHz, the last 30 s) with one word bleeped,
 // the one from your list if there is one, else the longest: played on Windows' default speakers. Nothing said yet:
 // the sound alone, and a pop-up says why.
@@ -26241,12 +26380,22 @@ static void BlHear(bool quiet)
         if (pick < 0) { int best = -1; for (int i = first; i <= last; i++) if (lstrlenW(gSpLast[i].t) > best) { best = lstrlenW(gSpLast[i].t); pick = i; } }
     }
     const bool voice = pick >= 0;
+    if (!voice && !gBlSample && !gBlSampleFailed) {   // (1.70.2) a sample sentence instead: made the first time
+        if (!gBlSampleBusy) {
+            gBlSampleBusy = true;
+            HANDLE th = CreateThread(nullptr, 0, BlSampleThread, nullptr, 0, nullptr);
+            if (th) CloseHandle(th); else { gBlSampleBusy = false; gBlSampleFailed = true; }
+        }
+        gBlSampleQuiet = quiet;                 // (it plays when it's ready)
+        if (gBlSampleBusy) return;
+    }
+    const bool sample = !voice && gBlSample;
     if (!voice && !quiet) {
-        CalloutShow(GetDlgItem(gWnd, IDC_BLHEAR), L"That was the sound alone",
+        CalloutShow(GetDlgItem(gWnd, IDC_BLHEAR), sample ? L"That was a sample voice" : L"That was the sound alone",
                     !gFeatSpeech || !SpeechRunning() ? L"To hear it on your own words, Speech has to be listening: switch on Bleep (or Voice commands), say a sentence, then press Hear it."
                                                      : L"Say a sentence, then press Hear it within about 20 seconds: you'll hear it back with a word bleeped.");
     }
-    if (!voice && (s == BLS_MUFFLE || s == BLS_BACK)) return;   // (made from your words: nothing to play)
+    if (!voice && !sample && (s == BLS_MUFFLE || s == BLS_BACK)) return;   // (made from your words: nothing to play)
     play(nullptr, nullptr, 0);                  // (stop the last one: its memory is about to be reused)
     long long c0, A, B;                         // the clip's start (clock), the bleep in it (samples from c0)
     int n;
@@ -26256,6 +26405,11 @@ static void BlHear(bool quiet)
         A = gSpLast[pick].a - RATE * BL_COVER_PRE[gBlCover] / 1000 - c0;
         B = gSpLast[pick].b + RATE * BL_COVER_POST[gBlCover] / 1000 - c0;
         n = (int)(c1 - c0);
+    } else if (sample) {
+        c0 = 0; n = gBlSample->n;
+        A = gBlSample->a - RATE * BL_COVER_PRE[gBlCover] / 1000; B = gBlSample->b + RATE * BL_COVER_POST[gBlCover] / 1000;
+        if (A < 0) A = 0;
+        if (B > n) B = n;
     } else { c0 = 0; A = RATE * 2 / 10; B = A + RATE * 6 / 10; n = (int)B + RATE / 4; }
     int longest = 0; for (int i = 0; i < BL_CLIPS; i++) { const BlClip* c = gBlClip[i].load(); if (c && c->n > longest) longest = c->n; }
     if (s == BLS_FILE && gBlFinish.load() && B + longest > n) n = (int)(B + longest);
@@ -26265,7 +26419,8 @@ static void BlHear(bool quiet)
     if (!ring) return;
     for (int i = 0; i < n; i++) {               // your words, from the speech feed (16 kHz: one sample per 3 frames)
         float v = 0.0f;
-        if (voice) {
+        if (sample) v = i < gBlSample->n ? gBlSample->v[i] : 0.0f;
+        else if (voice) {
             const double q = (double)(c0 + i - T0) / 3.0;
             const long long k = (long long)floor(q);
             const unsigned at = base + (unsigned)k;
@@ -26287,7 +26442,7 @@ static void BlHear(bool quiet)
     u32(24, RATE); u32(28, RATE * 2); u16(32, 2); u16(34, 16); memcpy(h + 36, "data", 4); u32(40, n * 2);
     short* pcm = (short*)(h + 44);
     for (int i = 0; i < n; i++) {
-        float y = BlOut(st, ring, n, i, ring[i], &A, &B, 1, p) * 0.8f;
+        float y = BlOut(st, ring, 0, n, i, ring[i], ring[i], &A, &B, 1, p) * 0.8f;
         y = y > 1.0f ? 1.0f : y < -1.0f ? -1.0f : y;
         pcm[i] = (short)lrintf(y * 32767.0f);
     }
@@ -30760,6 +30915,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     }
     case WM_APP + 70: VbInstallDone((DWORD)w); return 0;   // the VB-CABLE installer closed
     case WM_APP + 72: MidiMsg((int)w, (DWORD)l); return 0;  // (1.69.0) a MIDI controller
+    case WM_APP + 73: BlSampleDone((BlSample*)l); return 0;  // (1.70.2) Hear it's sample sentence is ready
     case WM_APP + 31:                           // Mic > Music: the decoder started / finished a song
         MusUi();
         return 0;
