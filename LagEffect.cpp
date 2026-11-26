@@ -14617,12 +14617,16 @@ static DWORD WINAPI TtsListThread(LPVOID)       // at startup, so opening the wi
     CoUninitialize();
     return 0;
 }
+// "Microsoft Saleh Online (Natural) - Arabic" -> "Saleh (Natural, online) - Arabic" (1.70.2: online ones say so). Works on a
+// list of names joined by ", " too.
 static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 {
-    if (!wcsncmp(in, L"Microsoft ", 10)) in += 10;
     int o = 0;
+    auto put = [&](const wchar_t* t) { while (*t && o < cap - 1) out[o++] = *t++; };
     for (const wchar_t* q = in; *q && o < cap - 1; ) {
-        if (!wcsncmp(q, L" Online", 7)) { q += 7; continue; }
+        if ((q == in || (q - in >= 2 && q[-2] == L',' && q[-1] == L' ')) && !wcsncmp(q, L"Microsoft ", 10)) { q += 10; continue; }
+        if (!wcsncmp(q, L" Online (Natural)", 17)) { put(L" (Natural, online)"); q += 17; continue; }
+        if (!wcsncmp(q, L" Online", 7)) { put(L" (online)"); q += 7; continue; }
         out[o++] = *q++;
     }
     out[o] = 0;
@@ -14745,46 +14749,39 @@ static const struct { const wchar_t* accent; const wchar_t* names[6]; } TTS_PREF
     { L"Syrian",   { L"Laith", L"Amany" } },
     { L"Arabic",   { L"Hamed", L"Zariyah" } },
 };
-static int TtsVoiceFor(int accent)              // index into the voice list, -1 if none installed
-{
-    if (accent <= 0 || accent >= TTS_ACCENT_N) return -1;
-    const TtsAccent& a = TTS_ACCENTS[accent];
-    for (const auto& pr : TTS_PREFER) {         // 1. a favourite natural voice in exactly that language / region
-        if (lstrcmpiW(pr.accent, a.name)) continue;
-        for (const wchar_t* nm : pr.names) {
-            if (!nm) break;
-            for (int i = 0; i < gTtsCount; i++)
-                if (gTtsLang[i] == a.lang && TtsIsNatural(gTtsNames[i]) && wcsstr(gTtsNames[i], nm)) return i;
-        }
-    }
-    for (int pass = 0; pass < 3; pass++)
-        for (int i = 0; i < gTtsCount; i++) {
-            int l = gTtsLang[i];
-            if (pass == 0 && l == a.lang) return i;
-            if (pass == 1 && a.alt && l == a.alt) return i;
-            if (pass == 2 && a.primary && (l & 0x3FF) == a.primary) return i;
-        }
-    return -1;
-}
-static int TtsVoicesFor(int accent, int* out, int max)   // (1.70.2) every voice that fits the accent, best first
+static bool TtsIsOnline(const wchar_t* name) { return wcsstr(name, L" Online") != nullptr; }   // (Edge's voices: need the internet)
+// (1.70.2) Every voice that fits the accent, best first: its favourite natural voices downloaded to this PC (Narrator's),
+// then the same ones online, then any voice in exactly that language / region (downloaded natural, online natural,
+// older), then the accent's second language, then any of its main language. The first is the one that speaks; the
+// rest are tried in turn if it won't.
+static int TtsVoicesFor(int accent, int* out, int max)
 {
     int n = 0;
     if (accent <= 0 || accent >= TTS_ACCENT_N) return 0;
     const TtsAccent& a = TTS_ACCENTS[accent];
     auto add = [&](int i) { for (int k = 0; k < n; k++) if (out[k] == i) return; if (n < max) out[n++] = i; };
-    for (const auto& pr : TTS_PREFER) {
-        if (lstrcmpiW(pr.accent, a.name)) continue;
-        for (const wchar_t* nm : pr.names) {
-            if (!nm) break;
-            for (int i = 0; i < gTtsCount; i++) if (gTtsLang[i] == a.lang && TtsIsNatural(gTtsNames[i]) && wcsstr(gTtsNames[i], nm)) add(i);
+    for (int online = 0; online < 2; online++)
+        for (const auto& pr : TTS_PREFER) {
+            if (lstrcmpiW(pr.accent, a.name)) continue;
+            for (const wchar_t* nm : pr.names) {
+                if (!nm) break;
+                for (int i = 0; i < gTtsCount; i++)
+                    if (gTtsLang[i] == a.lang && TtsIsNatural(gTtsNames[i]) && (int)TtsIsOnline(gTtsNames[i]) == online && wcsstr(gTtsNames[i], nm)) add(i);
+            }
         }
-    }
     for (int pass = 0; pass < 3; pass++)
-        for (int i = 0; i < gTtsCount; i++) {
-            const int l = gTtsLang[i];
-            if ((pass == 0 && l == a.lang) || (pass == 1 && a.alt && l == a.alt) || (pass == 2 && a.primary && (l & 0x3FF) == a.primary)) add(i);
-        }
+        for (int kind = 0; kind < 3; kind++)    // downloaded natural, online natural, older
+            for (int i = 0; i < gTtsCount; i++) {
+                const int l = gTtsLang[i];
+                const bool nat = TtsIsNatural(gTtsNames[i]), onl = TtsIsOnline(gTtsNames[i]);
+                if ((kind == 0) != (nat && !onl) || (kind == 1) != (nat && onl)) continue;
+                if ((pass == 0 && l == a.lang) || (pass == 1 && a.alt && l == a.alt) || (pass == 2 && a.primary && (l & 0x3FF) == a.primary)) add(i);
+            }
     return n;
+}
+static int TtsVoiceFor(int accent)              // index into the voice list, -1 if none installed
+{
+    int v; return TtsVoicesFor(accent, &v, 1) ? v : -1;
 }
 static bool TtsIsWordChar(wchar_t c) { return iswalnum(c) || c == L'\''; }
 static void TtsSwapWord(wchar_t* t, int cap, const TtsSwap& sw)   // whole words, any case, a random choice each time
@@ -15196,9 +15193,11 @@ static void OnTtsDone(TtsJob* j)
         static wchar_t told[300];
         if (lstrcmpiW(told, j->failed)) {
             lstrcpynW(told, j->failed, 300);
-            wchar_t a[128], b[128], m[900]; TtsShortName(j->failed, a, 128); TtsShortName(j->used, b, 128);
+            wchar_t a[300], b[128], m[1100]; TtsShortName(j->failed, a, 300); TtsShortName(j->used, b, 128);
             wsprintfW(m, L"Windows wouldn't speak with %s, so %s spoke instead.\n\n"
-                         L"Online (natural) voices need the internet; some of Windows' newer voices refuse older apps. "
+                         L"Online voices need the internet (and Microsoft's service); downloaded ones don't: Narrator's natural voices "
+                         L"(Windows + Ctrl + N > Add natural voices, then restart Lag Effect) are used before online ones. "
+                         L"Some of Windows' newer voices refuse older apps. "
                          L"Try another voice in the list, or reinstall it in Windows' Settings > Time & language > Speech. "
                          L"(\"Copy bug report info\" lists the voices it tried.)", a, b);
             MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_ICONINFORMATION);
