@@ -87,7 +87,15 @@ int main()
     check("muted: only the Morse", goertzel(rec, 4800, 4800, 300) < 0.005 && goertzel(rec, 480, 2400, 700) > 0.2);
     gSpMuteVoice = false; run(30, silence);
 
-    printf("Keeping up with you\n");
+    printf("An \"Any effect\" output (1.70.1)\n");
+    gRowMode[0] = MODE_ANYFX; run(60, silence); rec.clear(); MoPush(L"T"); run(40, tone300);
+    printf("  no effect on: 300 Hz (your voice) %.4f, 700 Hz (the Morse) %.3f\n", goertzel(rec, 4800, 4800, 300), goertzel(rec, 480, 2400, 700));
+    check("no effect on: the Morse plays there, your voice doesn't", goertzel(rec, 4800, 4800, 300) < 0.005 && goertzel(rec, 480, 2400, 700) > 0.2);
+    run(30, silence);
+    gRowMode[0] = MODE_ALL; run(30, silence);
+
+    printf("Keeping up with you, no limit (\"as fast as it needs\")\n");
+    gMoMaxPc = 0;
     const wchar_t* longText = L"the quick brown fox jumps over the lazy dog";
     n = MorseEncode(longText, e, 512); units = 0; for (int i = 0; i < n; i++) units += e[i] & 0x7F;
     const double nominal = units * unit / R;
@@ -113,6 +121,35 @@ int main()
     run(400, silence);
     check("far behind: skips ahead to the newest sentence", gMoSkip.load() > before && drained());
     for (int i = 0; i < 2000 && !drained(); i++) run(1, silence);
+    run(60, silence);
+
+    printf("The fastest it may play (1.70.1: the default 2x, so it still sounds like Morse)\n");
+    gMoMaxPc = 200;
+    took = playTime(longText, 3.0);
+    printf("  a sentence said in 3 s (%.1f s at 20 wpm): plays in %.2f s (2x = %.2f s)\n", nominal, took, nominal / 2);
+    check("never faster than 2x: a dot stays 30 ms or longer", took > nominal / 2.05 && took < nominal / 1.9);
+    gMoMaxPc = 100;
+    took = playTime(L"paris paris", 0.5);
+    check("\"never faster than the speed you set\": PARIS PARIS at 20 wpm, even said fast", fabs(took - 93 * unit / R) < 0.05);
+    gMoMaxPc = 200; run(60, silence);
+    {   // skip ahead (the default): a second sentence while over 4 s behind skips the rest
+        MoPush(longText, 3.0); run(100, silence);
+        const unsigned b4 = gMoR.load(); MoPush(L"E", 0.3); run(5, silence);
+        check("limited, still behind: skips to the newest sentence", gMoSkip.load() > b4);
+        for (int i = 0; i < 2000 && !drained(); i++) run(1, silence);
+        run(60, silence);
+    }
+    {   // play every word: nothing skipped, it all plays (later)
+        gMoPlayAll = 1;
+        const unsigned sk = gMoSkip.load();
+        MoPush(longText, 3.0); run(100, silence); MoPush(longText, 3.0);
+        int bl = 0; while (!drained() && bl < 8000) { run(1, silence); bl++; }
+        const double t2 = (bl + 100) * BLK / (double)R;
+        printf("  play every word: two sentences (%.1f s at 20 wpm) took %.1f s\n", 2 * nominal, t2);
+        check("\"play every word\": nothing is skipped", gMoSkip.load() == sk && drained());
+        check("... and none of it faster than 2x", t2 > 2 * nominal / 2.05);
+        gMoPlayAll = 0; run(60, silence);
+    }
 
     printf("The sounder\n");
     gMoSound = 1; run(30, silence); rec.clear();
