@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.70.0"
+#define APP_VERSION L"1.70.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -4612,6 +4612,11 @@ static std::atomic<unsigned> gMoW{ 0 }, gMoR{ 0 }, gMoSkip{ 0 }, gMoLast{ 0 };  
 static std::atomic<bool> gMoOn{ false };
 static std::atomic<int> gMoWpm{ 20 }, gMoHz{ 700 }, gMoVolPc{ 100 }, gMoSound{ 0 };   // sound: 0 tone, 1 telegraph clicks
 static std::atomic<int> gMoSpeedPc{ 100 };       // (how fast it's playing now, for the window)
+// (1.70.1) Fast enough to keep up with talking (6-10x) it stops sounding like Morse (dots of a few ms are clicks), so:
+// the fastest it may play, % of the set speed (0 = as fast as it needs: 10x a sentence, 2x more when behind), and
+// what it does when that isn't enough: skip to the newest sentence, or play every word (falling behind).
+static std::atomic<int> gMoMaxPc{ 200 }, gMoPlayAll{ 0 };
+static double MoCapF() { const int m = gMoMaxPc.load(std::memory_order_relaxed); return m <= 0 ? 20.0 : m / 100.0; }
 static const char* MorseOf(wchar_t c)
 {
     static const char* AZ[26] = { ".-", "-...", "-.-.", "-..", ".", "..-.", "--.", "....", "..", ".---", "-.-", ".-..", "--",
@@ -4699,9 +4704,13 @@ static void MoPush(const wchar_t* text, double saidS = 0.0)
     if (!n) return;
     int units = 0; for (int i = 0; i < n; i++) units += e[i] & 0x7F;
     const double atSet = units * MoUnitF(gMoWpm.load()) / RATE;
-    const int spd = saidS > 0.2 ? (int)lround(100.0 * fmin(10.0, fmax(1.0, atSet / (saidS * 1.1)))) : 100;
+    const double cap = fmin(10.0, MoCapF());
+    const int spd = saidS > 0.2 ? (int)lround(100.0 * fmin(cap, fmax(1.0, atSet / (saidS * 1.1)))) : 100;
     const unsigned w = gMoW.load(std::memory_order_relaxed);
-    if (MoBehindS() / 2.0 > 4.0) gMoSkip.store(w, std::memory_order_release);   // (still over 4 s behind at double speed: skip to this one)
+    // (skip to this one: still over 4 s behind even at double speed (no limit), or over 4 s behind (limited: it can't
+    //  catch up much); never when it plays every word)
+    const double behind = MoBehindS();
+    if (!gMoPlayAll.load() && (gMoMaxPc.load() <= 0 ? behind / 2.0 > 4.0 : behind > 4.0)) gMoSkip.store(w, std::memory_order_release);
     if (w + n - gMoR.load() > MO_Q - 16) return;  // (no room: can only happen when nothing is playing it)
     unsigned cum = w ? gMoCum[(w - 1) & (MO_Q - 1)] : 0u;
     gMoLast.store(w, std::memory_order_relaxed);
@@ -4748,7 +4757,7 @@ static float MoSample(MoState& m, const MoParams& p)
         if (m.r != w) {
             const unsigned char e = gMoQ[m.r & (MO_Q - 1)]; m.r++;
             gMoR.store(m.r, std::memory_order_relaxed);
-            const double u = p.unit * 100.0 / (gMoSpd[(m.r - 1) & (MO_Q - 1)] * m.speed);   // (this element's unit, in samples)
+            const double u = p.unit / fmin(gMoSpd[(m.r - 1) & (MO_Q - 1)] / 100.0 * m.speed, MoCapF());   // (this element's unit, in samples: never past the limit)
             MoKey(m, (e & 0x80) != 0, Imax(1, (int)lround((e & 0x7F) * u)), 1.0f / (float)fmin(240.0, fmax(24.0, u / 3)));   // (edges: 5 ms, shorter for dots under 15 ms)
         } else MoKey(m, false, 0, m.ramp);
     }
@@ -5598,7 +5607,8 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
             if (spG > 0.9999f) spG = 1.0f; else if (spG < 0.0001f) spG = 0.0f;
             s *= spG; clean *= spG;
         }
-        if (moRun) { const float mv = MoSample(mo, moP); s += mv; clean += mv; }
+        float moV = 0.0f;                       // (1.70.1: kept for the Any effect outputs too)
+        if (moRun) { moV = MoSample(mo, moP); s += moV; clean += moV; }
 
         float effect = 0.0f, everything;
         if (looping) {
@@ -5745,7 +5755,10 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
         anyG += ((looping || spMode != SP_NONE || fxAny || diveBend != 0.0f ? 1.0f : 0.0f) - anyG) * 0.004f;   // "Any effect" outputs: open while one is on
         auto micSig = [&](int k) {               // your mic on output k (talkback can take it away, or add it)
             tbG[k] += (tbT[k] - tbG[k]) * 0.004f; tbE[k] += (tbX[k] - tbE[k]) * 0.004f;
-            if (mode[k] == MODE_ANYFX) return everything * Max(anyG * tbG[k], tbE[k]);
+            if (mode[k] == MODE_ANYFX) {         // (1.70.1) the Morse voice plays there even with no effect on (it's in everything when one is)
+                const float g = Max(anyG * tbG[k], tbE[k]);
+                return everything * g + (moRun ? moV * Max(0.0f, tbG[k] - g) : 0.0f);
+            }
             return RowSignal(mode[k], effect, everything, clean) * tbG[k] + everything * tbE[k];
         };
         auto vsig = [&](int k) -> float {       // your voice on output k (bleeped outputs: from behind, bleeps put in)
@@ -15914,11 +15927,13 @@ static void AddTips()
     TipId(IDC_SPTTS, L"Your own voice is muted; what you say is typed out by Whisper and spoken by the voice set in "
                      L"Soundboard > Text to speech (Windows' default voice if that's not set). Each sentence plays after you finish it.");
     TipId(IDC_SPTTSKEY, L"A hotkey that switches the TTS voice on and off (right-click clears it).");
-    TipId(IDC_MORSEON, L"What you say is typed out by Whisper and played as Morse code where your voice plays. It keeps up with you: each "
-                       L"sentence plays in about the time you took to say it (faster than your set speed when it has to). Live captions show "
+    TipId(IDC_MORSEON, L"What you say is typed out by Whisper and played as Morse code where your voice plays. It speeds up to keep up with you, "
+                       L"up to 2x your speed (change that in its settings: faster keeps up better but sounds like clicks), and skips to your "
+                       L"newest sentence when it's still behind (or plays every word, if you pick that). Live captions show "
                        L"dots and dashes while it's on. One or the other: turning this on turns the TTS voice off.");
     TipId(IDC_MORSEKEY, L"A hotkey that switches the Morse voice on and off (right-click clears it).");
-    TipId(IDC_MORSEOPT, L"Beep or telegraph clicks, the slowest speed, pitch, volume, whether your own voice is muted, and a sample.");
+    TipId(IDC_MORSEOPT, L"Beep or telegraph clicks, speed, how fast it may go to keep up with you (faster than about 2x sounds like clicks, not Morse), "
+                        L"what it does when it falls behind (skip ahead or play every word), pitch, volume, whether your own voice is muted, and a sample.");
     TipId(IDC_SBSUB1, L"Looper: record a few seconds, it plays round and round; add layers on top.");
     TipId(IDC_SBSUB2, L"Beatbox to drums: your mouth sounds play a drum kit.");
     TipId(IDC_LPREC,   L"Empty: start recording. Recording: close the loop, it plays. Playing: add a layer on top (press again to finish it).");
@@ -20294,8 +20309,9 @@ static void ShowHelp()
         L"Bleep: your voice on the outputs you pick runs a little behind, so words from your list are bleeped before they're heard; "
         L"hold the bleep key to bleep anything (it reaches back a little). Sound: a beep (pitch, volume), silence, static, muffled, "
         L"the word backwards, or your own sound files (one, or a random one each time); Hear it plays a sample. TTS voice: what you say is spoken by a text-to-speech voice "
-        L"and your own is muted. Morse voice: what you say plays as Morse code (a beep or telegraph clicks), keeping up with you: each sentence "
-        L"plays in about the time you took to say it; your own voice muted or heard too; live captions show the dots and dashes.\n\n"
+        L"and your own is muted. Morse voice: what you say plays as Morse code (a beep or telegraph clicks). Talking is several times faster "
+        L"than Morse, so it speeds up (up to 2x, or as fast as you allow in its settings) and skips to your newest sentence when behind (or plays "
+        L"every word); your own voice muted or heard too; live captions show the dots and dashes.\n\n"
         L"STREAM (Settings > Stream)\n"
         L"Remote control for Streamer.bot, with a command builder. Avatar (PNGtuber): pick your Quiet and Talking pictures (Blink, "
         L"Talk + blink and Loud are optional); its window shows them as you talk, hops and blinks: capture it in OBS (Window Capture, "
@@ -25984,7 +26000,16 @@ static void MoMenu()                            // the Morse voice's settings
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     static const int WPM[] = { 10, 15, 20, 25, 30, 40 };
     for (int i = 0; i < 6; i++) { wchar_t t[48]; swprintf(t, 48, L"%d words a minute", WPM[i]); AppendMenuW(sp, MF_STRING | (gMoWpm.load() == WPM[i] ? MF_CHECKED : 0), 10 + i, t); }
-    AppendMenuW(m, MF_POPUP, (UINT_PTR)sp, L"Slowest speed (it goes faster to keep up with you)");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)sp, L"Speed");
+    HMENU fa = CreatePopupMenu(), be = CreatePopupMenu();   // (1.70.1) keeping up vs sounding like Morse
+    static const int FAST[] = { 100, 150, 200, 300, 0 };
+    static const wchar_t* FASTN[] = { L"Never faster than the speed you set", L"1.5x", L"2x (still sounds like Morse)", L"3x",
+                                      L"As fast as it needs (keeps up with talking, but sounds like clicks)" };
+    for (int i = 0; i < 5; i++) AppendMenuW(fa, MF_STRING | (gMoMaxPc.load() == FAST[i] ? MF_CHECKED : 0), 60 + i, FASTN[i]);
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)fa, L"Fastest it plays to keep up");
+    AppendMenuW(be, MF_STRING | (!gMoPlayAll.load() ? MF_CHECKED : 0), 70, L"Skip to your newest sentence (some words are left out)");
+    AppendMenuW(be, MF_STRING | (gMoPlayAll.load() ? MF_CHECKED : 0), 71, L"Play every word (it gets further behind)");
+    AppendMenuW(m, MF_POPUP, (UINT_PTR)be, L"When it falls behind");
     static const int HZ[] = { 500, 600, 700, 800, 900 };
     for (int i = 0; i < 5; i++) { wchar_t t[32]; swprintf(t, 32, L"%d Hz", HZ[i]); AppendMenuW(pi, MF_STRING | (gMoHz.load() == HZ[i] ? MF_CHECKED : 0), 20 + i, t); }
     AppendMenuW(m, MF_POPUP | (gMoSound.load() ? MF_GRAYED : 0), (UINT_PTR)pi, L"Beep pitch");
@@ -26005,6 +26030,8 @@ static void MoMenu()                            // the Morse voice's settings
     else if (c >= 20 && c < 25) gMoHz = HZ[c - 20];
     else if (c >= 30 && c < 34) gMoVolPc = VO[c - 30];
     else if (c == 40 || c == 41) { gMoMute = c == 40; MoVoiceApply(); }
+    else if (c >= 60 && c < 65) gMoMaxPc = FAST[c - 60];
+    else if (c == 70 || c == 71) gMoPlayAll = c == 71;
     if (c == 50 || c <= 2 || (c >= 10 && c < 34)) MoHear();   // (so you know what you picked)
     MoOptText(); SaveSettings();
 }
@@ -26012,6 +26039,7 @@ static void MoSave()
 {
     SaveInt(L"morse_sound", gMoSound.load()); SaveInt(L"morse_wpm", gMoWpm.load()); SaveInt(L"morse_pitch_hz", gMoHz.load());
     SaveInt(L"morse_volume", gMoVolPc.load()); SaveInt(L"morse_mutes_voice", gMoMute);
+    SaveInt(L"morse_fastest_pc", gMoMaxPc.load()); SaveInt(L"morse_play_every_word", gMoPlayAll.load());   // (1.70.1)
 }
 static void MoLoad()
 {
@@ -26020,6 +26048,8 @@ static void MoLoad()
     gMoHz = Iclamp(GetPrivateProfileIntW(L"settings", L"morse_pitch_hz", 700, gIni), 200, 2000);
     gMoVolPc = Iclamp(GetPrivateProfileIntW(L"settings", L"morse_volume", 100, gIni), 0, 300);
     gMoMute = GetPrivateProfileIntW(L"settings", L"morse_mutes_voice", 1, gIni) != 0;
+    { const int f = GetPrivateProfileIntW(L"settings", L"morse_fastest_pc", 200, gIni); gMoMaxPc = f <= 0 ? 0 : Iclamp(f, 100, 1000); }
+    gMoPlayAll = GetPrivateProfileIntW(L"settings", L"morse_play_every_word", 0, gIni) ? 1 : 0;
 }
 
 // ---- the page ----
@@ -26333,8 +26363,9 @@ static void SpeechBugInfo(wchar_t* o, int cap)
 {
     BugAdd(o, cap, L"Whisper: model %ls (%ls), CPU %ls, state %d, %u passes, last %u ms, %d threads", WS_MODELS[gWsModel].name,
            WsModelHave(gWsModel) ? L"downloaded" : L"not downloaded", WsCpuOk() ? L"ok" : L"no AVX2", gWs.state.load(), gWs.passes.load(), gWs.lastMs.load(), gWs.threads);
-    BugAdd(o, cap, L"Morse voice: %ls, %ls, %d wpm, %d Hz, %d%%, your voice %ls, playing at %d%%, %.1f s behind", gMoOn.load() ? L"on" : L"off",
-           gMoSound.load() ? L"clicks" : L"beep", gMoWpm.load(), gMoHz.load(), gMoVolPc.load(), gMoMute ? L"muted" : L"heard", gMoSpeedPc.load(), MoBehindS());
+    BugAdd(o, cap, L"Morse voice: %ls, %ls, %d wpm, %d Hz, %d%%, your voice %ls, fastest %d%% (0 = no limit), %ls, playing at %d%%, %.1f s behind", gMoOn.load() ? L"on" : L"off",
+           gMoSound.load() ? L"clicks" : L"beep", gMoWpm.load(), gMoHz.load(), gMoVolPc.load(), gMoMute ? L"muted" : L"heard", gMoMaxPc.load(),
+           gMoPlayAll.load() ? L"plays every word" : L"skips when behind", gMoSpeedPc.load(), MoBehindS());
 }
 static void WsModelMenu()                       // Model: which (Fast / Good / Best), download, delete
 {
