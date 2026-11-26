@@ -14630,7 +14630,11 @@ static void TtsShortName(const wchar_t* in, wchar_t* out, int cap)
 static void TtsFillVoices();
 static void TtsEnsureListed() { if (!gTtsListed) { TtsListVoices(); TtsFillVoices(); } }
 
-struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural, split, vary; short* data; unsigned len; bool ok; };
+#define TTS_ALTS 4
+struct TtsJob { wchar_t text[600]; wchar_t xml[3000]; wchar_t voice[512]; int rate, pitch, room, srcRate; bool natural, split, vary; short* data; unsigned len; bool ok;
+                // (1.70.2) the accent's other voices to try if its first one won't speak, before Windows' default; what happened
+                wchar_t name[128], alt[TTS_ALTS][512], altName[TTS_ALTS][128], used[128], failed[300]; int nAlt; };
+static wchar_t gTtsLastUsed[128], gTtsLastFailed[300];   // (bug info) the last line: which voice spoke it, which wouldn't
 
 // Accents: your words read by a real Windows voice for that language / region (a Spanish (Mexico) voice reading
 // English sounds Mexican, and so on), at that accent's own pace (a little different every line), with some of
@@ -14761,6 +14765,26 @@ static int TtsVoiceFor(int accent)              // index into the voice list, -1
             if (pass == 2 && a.primary && (l & 0x3FF) == a.primary) return i;
         }
     return -1;
+}
+static int TtsVoicesFor(int accent, int* out, int max)   // (1.70.2) every voice that fits the accent, best first
+{
+    int n = 0;
+    if (accent <= 0 || accent >= TTS_ACCENT_N) return 0;
+    const TtsAccent& a = TTS_ACCENTS[accent];
+    auto add = [&](int i) { for (int k = 0; k < n; k++) if (out[k] == i) return; if (n < max) out[n++] = i; };
+    for (const auto& pr : TTS_PREFER) {
+        if (lstrcmpiW(pr.accent, a.name)) continue;
+        for (const wchar_t* nm : pr.names) {
+            if (!nm) break;
+            for (int i = 0; i < gTtsCount; i++) if (gTtsLang[i] == a.lang && TtsIsNatural(gTtsNames[i]) && wcsstr(gTtsNames[i], nm)) add(i);
+        }
+    }
+    for (int pass = 0; pass < 3; pass++)
+        for (int i = 0; i < gTtsCount; i++) {
+            const int l = gTtsLang[i];
+            if ((pass == 0 && l == a.lang) || (pass == 1 && a.alt && l == a.alt) || (pass == 2 && a.primary && (l & 0x3FF) == a.primary)) add(i);
+        }
+    return n;
 }
 static bool TtsIsWordChar(wchar_t c) { return iswalnum(c) || c == L'\''; }
 static void TtsSwapWord(wchar_t* t, int cap, const TtsSwap& sw)   // whole words, any case, a random choice each time
@@ -14933,12 +14957,13 @@ static bool TtsRender(TtsJob* j, bool useVoice)
     bool ok = false;
     ISpVoice* v = nullptr; ISpStream* ss = nullptr; IStream* mem = nullptr;
     if (FAILED(CoCreateInstance(kCLSID_SpVoice, nullptr, CLSCTX_ALL, kIID_ISpVoice, (void**)&v))) return false;
-    if (useVoice && j->voice[0]) {
-        ISpObjectToken* tok = nullptr;
+    if (useVoice && j->voice[0]) {              // (1.70.2) if Windows won't switch to it, say so: it used to speak in the default voice
+        ISpObjectToken* tok = nullptr; bool set = false;
         if (SUCCEEDED(CoCreateInstance(kCLSID_SpObjectToken, nullptr, CLSCTX_ALL, kIID_ISpObjectToken, (void**)&tok))) {
-            if (SUCCEEDED(tok->SetId(nullptr, j->voice, FALSE))) v->SetVoice(tok);
+            if (SUCCEEDED(tok->SetId(nullptr, j->voice, FALSE)) && SUCCEEDED(v->SetVoice(tok))) set = true;
             tok->Release();
         }
+        if (!set) { v->Release(); return false; }
     }
     // Taken at (about) the voice's own rate: Windows' converter up to 48 kHz just joins the dots, which sounds
     // crackly / harsh. TtsResample does it properly afterwards.
@@ -15025,7 +15050,19 @@ static DWORD WINAPI TtsThread(LPVOID arg)
 {
     TtsJob* j = (TtsJob*)arg;
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    j->ok = TtsRender(j, true) || (j->voice[0] && TtsRender(j, false));   // newer voices can refuse: use the default
+    // Newer voices can refuse (an online one with no connection, one Windows won't hand to older apps): then the
+    // accent's other voices, then Windows' default. j->used / j->failed say what happened.
+    j->ok = TtsRender(j, true);
+    if (j->ok) lstrcpynW(j->used, j->voice[0] ? j->name : L"Windows' default voice", 128);
+    else if (j->voice[0]) {
+        lstrcpynW(j->failed, j->name, 300);
+        for (int k = 0; k < j->nAlt && !j->ok; k++) {
+            lstrcpynW(j->voice, j->alt[k], 512);
+            if (TtsRender(j, true)) { j->ok = true; lstrcpynW(j->used, j->altName[k], 128); }
+            else { const int n = lstrlenW(j->failed); if (n < 250) { wsprintfW(j->failed + n, L", "); lstrcpynW(j->failed + n + 2, j->altName[k], 300 - n - 2); } }
+        }
+        if (!j->ok && TtsRender(j, false)) { j->ok = true; lstrcpynW(j->used, L"Windows' default voice", 128); }
+    }
     if (j->ok) TtsResample(j->data, j->len, j->srcRate);
     if (j->ok) TtsRepitch(j->data, j->len, j->pitch);
     if (j->ok && j->natural) TtsHumanize(j->data, j->len, j->room);
@@ -15133,7 +15170,12 @@ static void TtsSpeakNow(const wchar_t* given)
         int v = TtsVoiceFor(gTtsAccent);
         if (v >= 0) lstrcpynW(j->voice, gTtsIds[v], 512);
         j->rate = TtsPhrase(j->text, 600, gTtsAccent);
+        int all[TTS_ALTS + 1]; const int n = TtsVoicesFor(gTtsAccent, all, TTS_ALTS + 1);   // (its others, if that one won't speak)
+        for (int k = 0; k < n && j->nAlt < TTS_ALTS; k++) if (all[k] != v) {
+            lstrcpynW(j->alt[j->nAlt], gTtsIds[all[k]], 512); lstrcpynW(j->altName[j->nAlt], gTtsNames[all[k]], 128); j->nAlt++;
+        }
     }
+    for (int i = 0; i < gTtsCount; i++) if (!lstrcmpiW(gTtsIds[i], j->voice)) lstrcpynW(j->name, gTtsNames[i], 128);
     j->rate += gTtsRate; j->pitch = gTtsPitch; j->room = gTtsRoom; j->natural = gTtsNatural;
     // The realistic ("Natural") voices already sound human: they only get the pauses, not the per-sentence
     // pace / pitch changes or the processing (which only made them worse, and could crackle).
@@ -15149,6 +15191,19 @@ static void TtsSpeakNow(const wchar_t* given)
 
 static void OnTtsDone(TtsJob* j)
 {
+    lstrcpynW(gTtsLastUsed, j->ok ? j->used : L"nothing", 128); lstrcpynW(gTtsLastFailed, j->failed, 300);
+    if (j->ok && j->failed[0] && !gTtsQuiet) {   // (1.70.2) once per voice per run: which one wouldn't speak, and who did
+        static wchar_t told[300];
+        if (lstrcmpiW(told, j->failed)) {
+            lstrcpynW(told, j->failed, 300);
+            wchar_t a[128], b[128], m[900]; TtsShortName(j->failed, a, 128); TtsShortName(j->used, b, 128);
+            wsprintfW(m, L"Windows wouldn't speak with %s, so %s spoke instead.\n\n"
+                         L"Online (natural) voices need the internet; some of Windows' newer voices refuse older apps. "
+                         L"Try another voice in the list, or reinstall it in Windows' Settings > Time & language > Speech. "
+                         L"(\"Copy bug report info\" lists the voices it tried.)", a, b);
+            MessageBoxW(gWnd, m, L"Lag Effect - Text to speech", MB_ICONINFORMATION);
+        }
+    }
     if (j->ok) {
         PadSetData(TTS_SLOT, j->data, j->len);
         gPads[TTS_SLOT].vol = gTtsVol;
@@ -22564,6 +22619,13 @@ static void BugInfoBuild(wchar_t* o, int cap)
         BugAdd(o, cap, L"Looper: %ls, %d layer(s), %d ms; beatbox %ls (mode %d, kit %d, sensitivity %d, volume %d, taught %u)",
                LS[Iclamp(gLpState.load(), 0, 4)], gLpLayers.load(), (int)(gLpLen.load() * 1000LL / RATE), gBbOn.load() ? L"on" : L"off",
                gBbMode.load(), gBbKit.load(), gBbSens.load(), gBbVolPct.load(), gBbTaught);
+        {   // (1.70.2) text to speech: the accent, the voices that fit it, what spoke the last line
+            wchar_t vs[700] = L""; int all[8]; const int n = TtsVoicesFor(gTtsAccent, all, 8);
+            for (int k = 0; k < n; k++) { wchar_t sh[128]; TtsShortName(gTtsNames[all[k]], sh, 128); const int l = lstrlenW(vs); if (l < 560) wsprintfW(vs + l, L"%s%s (%x)", k ? L", " : L"", sh, gTtsLang[all[k]]); }
+            BugAdd(o, cap, L"TTS: %d voices; accent %ls (voices for it: %ls); voice picked %ls; last line spoken by %ls%ls%ls",
+                   gTtsCount, TTS_ACCENTS[Iclamp(gTtsAccent, 0, TTS_ACCENT_N - 1)].name, n ? vs : L"none", gTtsVoice[0] ? gTtsVoice : L"(default)",
+                   gTtsLastUsed[0] ? gTtsLastUsed : L"-", gTtsLastFailed[0] ? L"; wouldn't speak: " : L"", gTtsLastFailed);
+        }
         int nf = 0; for (int i = 0; i < BL_CLIPS; i++) if (gBlClip[i].load()) nf++;
         BugAdd(o, cap, L"Speech: %ls; recognizer %ls%ls%ls; commands %ls (%d); bleep %ls (outputs %u, %d ms, %d words chars, key reach %d ms, "
                L"sound %d, %d Hz, %d%%, cover %d, %d files, pick %d, %ls); TTS voice %ls",
