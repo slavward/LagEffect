@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.92.0"
+#define APP_VERSION L"1.92.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -8715,6 +8715,7 @@ static int TabBotH()  { return gLayoutNew && !gCompact && gTabPos == 3 ? 40 : 0;
 static int BaseH() { return BASE_H + (gLayoutNew ? 50 : 0) + TabBotH(); }   // (1.90.0) New: 50 px taller (fewer pages need scrolling)
 #define COMPACT_H 84                           // compact mode: status + a few buttons
 #define ROW_Y0    134
+static int HomeDy() { return gLayoutNew ? 70 : 0; }   // (1.92.1, New) Home's Audio box sits this much lower (the mic level is above it)
 #define ROW_H     30
 #define TAB_COUNT 8                             // (1.90.0: + Speech, the New layout's)
 #define TAB_SLOTS 7                             // tabs on show in either layout
@@ -8736,8 +8737,8 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_HMETER    4990                      // (1.91.0, New) Home: your mic's level
 #define IDC_HTOG0     4991                      // .. + HOME_TOGS - 1: Home > What's on switches
 #define HOME_TOGS     9
-#define HOME_METER_Y  320                       // (design px, moved down with the output list like the buttons above)
-#define HOME_TOP      398                       // Home: where What's on starts (and the part that scrolls)
+#define HOME_METER_Y  52                        // (design px) at the top, above the Audio box (1.92.1; was under the buttons)
+#define HOME_TOP      348                       // Home: where What's on starts (and the part that scrolls), moved with the output list
 #define IDC_MCVOL     4960                      // (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's quick controls
 #define IDC_MCDB      4961
 #define IDC_MCMUTE    4962
@@ -8760,7 +8761,7 @@ static bool PageOn(int page)                    // Voice FX, Soundboard and Clip
     if (gLayoutNew) {                           // (New: Clips is on Sounds; Effects has the stutter too; Sounds has Music)
         if (page < 0 || page >= TAB_COUNT || page == PAGE_CLIPS) return false;
         if (page == PAGE_FX) return gFeatFx || gFeatLag;
-        if (page == PAGE_SPEECH) return gFeatSpeech || gFeatSound || gFeatCaptions;
+        if (page == PAGE_SPEECH) return gFeatSpeech || gFeatCaptions;   // (1.92.1: with Speech off, typed TTS is on Sounds instead)
         return true;
     }
     if (page == PAGE_SPEECH) return false;
@@ -9133,7 +9134,7 @@ static void AssignSections()                    // which section each control si
             // the Outputs box grows with the list: all its rows belong to it (the "+ Add output" row too)
             const bool dev = k == gDevSectionIdx;
             if (!dev && d.shifted != s.shifts) continue;
-            const int bottom = dev && !d.shifted ? ROW_Y0 + ROW_H * MAX_OUT + 6 : s.y + s.h;
+            const int bottom = dev && !d.shifted ? ROW_Y0 + HomeDy() + ROW_H * MAX_OUT + 6 : s.y + s.h;
             if (d.rx >= s.x && d.rx < s.x + s.w && d.ry >= s.y - 10 && d.ry < bottom) { d.sec = k; break; }
         }
     }
@@ -12928,7 +12929,7 @@ static void SliderRange(HWND h, int* lo, int* hi, int* step)
         else if (id == CFX_GRANGE) { *lo = 10; *hi = 80; *step = 5; }      // (dB; 80 = silent)
         else if (id >= CFX_SEND0) { *lo = -400; *hi = 60; *step = 10; }   // (tenths of a dB)
         else { *lo = -120; *hi = 120; *step = 5; }
-    } else if (id == IDC_MCVOL) { *lo = -600; *hi = 60; *step = 10; }   // (1.90.2) Sounds > Music: the Music channel (tenths of a dB)
+    }
 }
 static void CfxValText(int id, wchar_t* t)
 {
@@ -12944,9 +12945,6 @@ static void ChanFxBadge(int c);
 static int  SliderGet(HWND h)
 {
     if (gCfxWnd && GetParent(h) == gCfxWnd) { volatile int* v = CfxVar(GetDlgCtrlID(h)); return v ? *v : 0; }
-    {   const int id = GetDlgCtrlID(h), mc = id == IDC_MCVOL || id == IDC_MCPAN ? MusChanIdx() : -1;   // (1.90.2) the Music channel
-        if (id == IDC_MCVOL) return mc >= 0 ? Imax(-600, (int)gCh[mc].db10) : 0;
-        if (id == IDC_MCPAN) return mc >= 0 ? (int)gCh[mc].pan : 0; }
     int c; return SliderIsPan(h, &c) ? (int)gCh[c].pan : (int)gChatMix;
 }
 static void FaderLabel(int id);
@@ -12963,16 +12961,6 @@ static void SliderSet(HWND h, int v)
         wchar_t t[24]; CfxValText(id, t); SetDlgItemTextW(gCfxWnd, CFX_VAL + id, t);
         ChanFxBadge(gCfxCh);
         return;
-    }
-    {   const int id = GetDlgCtrlID(h);        // (1.90.2) Sounds > Music: the Music channel's volume / pan
-        if (id == IDC_MCVOL || id == IDC_MCPAN) {
-            const int mc = MusChanIdx(); if (mc < 0) return;
-            wchar_t t[24];
-            if (id == IDC_MCVOL) { FaderSet(IDC_CHVOL0 + mc, v); DbText(gCh[mc].db10, t); SetDlgItemTextW(gWnd, IDC_MCDB, t); }
-            else { PanSet(mc, v); PanText(gCh[mc].pan, t); SetDlgItemTextW(gWnd, IDC_MCPANT, t); }
-            InvalidateRect(h, nullptr, FALSE);
-            return;
-        }
     }
     int c;
     if (!SliderIsPan(h, &c)) { ChatMixSet(v); return; }
@@ -14055,6 +14043,36 @@ static void PlaceTabs()                         // the tabs whose feature is on,
         ShowWindow(mt, gHdrMeter && !gCompact ? SW_SHOWNA : SW_HIDE);
     }
 }
+static int gMsCh = -1;                          // (1.92.1, New) the music's Mixer channel while its strip shows on Sounds > Music (-1: not now)
+static void MsPlace();
+static void StripPlace(int c, int x, int sy, int w, int sh)   // one channel strip's controls, in px (the Mixer, and Sounds > Music)
+{
+    const int n = Imax(1, Imin(gRows, MAX_OUT));
+    const bool full = gCh[c].view == 0;
+    gStripRc[c] = { x, sy, x + w, sy + sh };
+        PlaceFree(GetDlgItem(gWnd, IDC_CHSRC0 + c), x + SC(3), sy + SC(6), w - SC(6), SC(40));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHDB0 + c), x + SC(2), sy + SC(47), w - SC(4), SC(16));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHPAN0 + c), x + SC(6), sy + SC(65), w - SC(12), SC(14));
+        // from the bottom up: output buttons (as many rows as they need), Duck, Mute / Solo
+        const int rg = SC(2), inner = w - SC(8);
+        const int perRow = Iclamp((inner + rg) / (SC(15) + rg), 1, n), rows = (n + perRow - 1) / perRow;
+        const int rh = SC(18), routesTop = sy + sh - SC(6) - rows * rh - (rows - 1) * rg;
+        const int duckTop = routesTop - SC(4) - SC(20), msTop = full ? duckTop - SC(3) - SC(20) : sy + sh - SC(6) - SC(20);
+        const int gx = x + (w - SC(38)) / 2, ft = full ? sy + SC(83) : sy + SC(67), fb = Imax(ft + SC(40), msTop - SC(6));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHVOL0 + c), gx, ft, SC(22), fb - ft);
+        PlaceFree(GetDlgItem(gWnd, IDC_CHMETER0 + c), gx + SC(26), ft + SC(2), SC(12), fb - ft - SC(4));
+        const int bw = full ? (inner - SC(3)) / 2 : inner;   // (compact: Mute across the bottom)
+        PlaceFree(GetDlgItem(gWnd, IDC_CHMUTE0 + c), x + SC(4), msTop, bw, SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHSOLO0 + c), x + SC(4) + bw + SC(3), msTop, bw, SC(20));
+        PlaceFree(GetDlgItem(gWnd, IDC_CHDUCK0 + c), x + SC(4), duckTop, inner, SC(20));
+        for (int k = 0; k < MAX_OUT; k++) {
+            const int kk = Imin(k, n - 1), row = kk / perRow, col = kk % perRow;
+            const int inRow = Imin(perRow, n - row * perRow);           // (the last row may be shorter: same button size)
+            (void)inRow;
+            const int rw = (inner - rg * (perRow - 1)) / perRow;
+            PlaceFree(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), x + SC(4) + col * (rw + rg), routesTop + row * (rh + rg), rw, rh);
+        }
+}
 static void MixerPlace()                        // the Mixer fills the window: strips side by side, taller faders when there's room
 {
     if (!gWnd || gSecChan < 0 || gSecOut < 0 || gCompact) return;
@@ -14097,36 +14115,14 @@ static void MixerPlace()                        // the Mixer fills the window: s
     // channel strips
     const int sy = chTop + SC(72), sh = chH - SC(88);
     int x = cx0 + SC(7);
-    const int n = Imax(1, Imin(gRows, MAX_OUT));
     for (int c = 0; c < CH_MAX; c++) {
         if (!ChanShown(c)) { gStripRc[c] = { 0, 0, 0, 0 }; continue; }   // (empty: no strip, "+ Add channel" fills it; or hidden)
-        const int w = SC(ChW(c)); const bool full = gCh[c].view == 0;
-        gStripRc[c] = { x, sy, x + w, sy + sh };
-        PlaceFree(GetDlgItem(gWnd, IDC_CHSRC0 + c), x + SC(3), sy + SC(6), w - SC(6), SC(40));
-        PlaceFree(GetDlgItem(gWnd, IDC_CHDB0 + c), x + SC(2), sy + SC(47), w - SC(4), SC(16));
-        PlaceFree(GetDlgItem(gWnd, IDC_CHPAN0 + c), x + SC(6), sy + SC(65), w - SC(12), SC(14));
-        // from the bottom up: output buttons (as many rows as they need), Duck, Mute / Solo
-        const int rg = SC(2), inner = w - SC(8);
-        const int perRow = Iclamp((inner + rg) / (SC(15) + rg), 1, n), rows = (n + perRow - 1) / perRow;
-        const int rh = SC(18), routesTop = sy + sh - SC(6) - rows * rh - (rows - 1) * rg;
-        const int duckTop = routesTop - SC(4) - SC(20), msTop = full ? duckTop - SC(3) - SC(20) : sy + sh - SC(6) - SC(20);
-        const int gx = x + (w - SC(38)) / 2, ft = full ? sy + SC(83) : sy + SC(67), fb = Imax(ft + SC(40), msTop - SC(6));
-        PlaceFree(GetDlgItem(gWnd, IDC_CHVOL0 + c), gx, ft, SC(22), fb - ft);
-        PlaceFree(GetDlgItem(gWnd, IDC_CHMETER0 + c), gx + SC(26), ft + SC(2), SC(12), fb - ft - SC(4));
-        const int bw = full ? (inner - SC(3)) / 2 : inner;   // (compact: Mute across the bottom)
-        PlaceFree(GetDlgItem(gWnd, IDC_CHMUTE0 + c), x + SC(4), msTop, bw, SC(20));
-        PlaceFree(GetDlgItem(gWnd, IDC_CHSOLO0 + c), x + SC(4) + bw + SC(3), msTop, bw, SC(20));
-        PlaceFree(GetDlgItem(gWnd, IDC_CHDUCK0 + c), x + SC(4), duckTop, inner, SC(20));
-        for (int k = 0; k < MAX_OUT; k++) {
-            const int kk = Imin(k, n - 1), row = kk / perRow, col = kk % perRow;
-            const int inRow = Imin(perRow, n - row * perRow);           // (the last row may be shorter: same button size)
-            (void)inRow;
-            const int rw = (inner - rg * (perRow - 1)) / perRow;
-            PlaceFree(GetDlgItem(gWnd, IDC_CHRT0 + c * MAX_OUT + k), x + SC(4) + col * (rw + rg), routesTop + row * (rh + rg), rw, rh);
-        }
+        const int w = SC(ChW(c));
+        if (c != gMsCh) StripPlace(c, x, sy, w, sh);   // (1.92.1: the music's strip is on Sounds > Music right now)
         PlaceFree(GetDlgItem(gWnd, IDC_CHADD0 + c), x + SC(4), sy + SC(6), w - SC(8), sh - SC(12));
         x += w + SC(3);
     }
+    if (gMsCh >= 0) MsPlace();
     // output strips
     const int oy = oTop + SC(14), oh = oH - SC(22);
     x = cx0 + SC(7);
@@ -14277,8 +14273,11 @@ static void MixerEdgeSet(int i, int w)          // design px; 0 = normal
 }
 static void MixerPaintStrips(HDC dc)            // (from the window's paint) the strips' outlines and colours
 {
-    if (gCompact || gPage != PAGE_MIXER || gMixSub != 0) return;
+    if (gCompact) return;
+    const bool mixer = gPage == PAGE_MIXER && gMixSub == 0;
+    if (!mixer && gMsCh < 0) return;            // (1.92.1: or just the music's, on Sounds > Music)
     for (int i = 0; i < CH_MAX + gRows; i++) {
+        if (!mixer && i != gMsCh) continue;
         RECT r; if (!MixerStripRect(i, &r)) continue;
         if (i < CH_MAX && gCh[i].type == CH_NONE) continue;   // (an empty one is just its Add box)
         const bool solo = i < CH_MAX && gCh[i].solo;
@@ -14335,8 +14334,7 @@ static void MixerMeterTick()                    // (~60 times a second) meters a
         static long long lastC[CH_MAX] = { -999, -999, -999, -999, -999, -999, -999, -999 };
         const long long v = (long long)(q(gChShownL[c]) + 300) + (q(gChShownR[c]) + 300) * 1000LL + (q(gChHoldL[c]) + 300) * 1000000LL
                           + (q(gChHoldR[c]) + 300) * 1000000000LL + (tn - gChClipT[c] < 2000 ? 1LL << 50 : 0);
-        if (v != lastC[c]) { lastC[c] = v; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE);
-                             if (gLayoutNew && gCh[c].type == CH_MUS) InvalidateRect(GetDlgItem(gWnd, IDC_MCMETER), nullptr, FALSE); }
+        if (v != lastC[c]) { lastC[c] = v; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
         const float pk = gOutPeakMix[k]; gOutPeakMix[k] = 0;   // (its own copy: the Main tab's meter reads the other)
@@ -16627,15 +16625,7 @@ static void AddTips()
                 L"TTS voice on / off: what you say is spoken by the TTS voice (Speech > TTS & Morse).",
                 L"Live captions on / off (Speech > Captions)." };
             for (int t = 0; t < HOME_TOGS; t++) TipId(IDC_HTOG0 + t, T[t]); }
-        TipId(IDC_MCVOL,   L"The Music channel's volume (its Mixer fader). Drag; double-click: 0 dB; right / left arrow keys: 1 dB.");
-        TipId(IDC_MCPAN,   L"The Music channel's pan: drag left or right. Double-click: the middle.");
-        TipId(IDC_MCMUTE,  L"Mute the music (its Mixer channel).");
-        TipId(IDC_MCSOLO,  L"Solo: hear only the music on your listening output.");
-        TipId(IDC_MCDUCK,  L"Duck: the music gets quieter while you talk, then comes back up.");
-        for (int k = 0; k < MAX_OUT; k++) TipId(IDC_MCRT0 + k, L"Send the music to that output (lit = on), as on its Mixer strip.");
-        TipId(IDC_MCMETER, L"How loud the music is right now, after its volume (left and right).");
-        TipId(IDC_MCGO,    L"The Music channel's strip in the Mixer: EQ, compressor, plugins, links, hotkeys.");
-        TipId(IDC_MCADD,   L"Put the music player in the Mixer as a channel, so it gets a fader, mute, solo, duck, pan, EQ and plugins.");
+        TipId(IDC_MCADD,   L"Put the music player in the Mixer as a channel: its strip (volume, pan, mute, solo, duck, outputs, level) then shows here and in the Mixer.");
         NSubTips();                             // (each sub-tab: what's in it)
     }
     TipId(IDC_PHONEBTN, L"Control Lag Effect from your phone's browser, on the same Wi-Fi: pads, voice effects, the Mixer, scenes, "
@@ -18361,20 +18351,21 @@ static const NSubDef NEW_SUBS_T[] = {
     { PAGE_FX, L"Stutter", FEAT_LAG | FEAT_FX, { { PAGE_MAIN, L"Effect", 0, false }, { PAGE_MAIN, L"Lag extras", 0, false }, { PAGE_FX, L"Hotkey tricks", FEAT_FX, false }, { PAGE_FX, L"Rewind", FEAT_FX, false } } },
     { PAGE_FX, L"Tune", FEAT_FX, { { PAGE_FX, L"Vocoder", FEAT_FX, false }, { PAGE_FX, L"Vocode to song", FEAT_FX, false }, { PAGE_FX, L"Synth plugin", FEAT_FX, true },
         { PAGE_FX, L"Harmonizer", FEAT_FX, false } } },
-    { PAGE_SPEECH, L"TTS & Morse", FEAT_SOUND | FEAT_SPEECH, { { PAGE_SOUND, L"Text to speech", FEAT_SOUND, false }, { PAGE_MIC, L"Talk for me", 0, false } } },
+    { PAGE_SPEECH, L"TTS & Morse", FEAT_SPEECH, { { PAGE_SOUND, L"Text to speech", FEAT_SOUND, false }, { PAGE_MIC, L"Talk for me", 0, false } } },
     { PAGE_SPEECH, L"Bleep", FEAT_SPEECH, { { PAGE_MIC, L"Bleep", 0, false }, { -1, L"Live bleep", 0, false } } },
     { PAGE_SPEECH, L"Captions", FEAT_CAPTIONS, { { PAGE_SETTINGS, L"Live captions", 0, false } } },
     { PAGE_SPEECH, L"Voice commands", FEAT_SPEECH, { { PAGE_MIC, L"Voice commands", 0, false } } },
     { PAGE_SPEECH, L"Model", FEAT_SPEECH, { { -1, L"Speech model", FEAT_SPEECH, false } } },
     { PAGE_SOUND, L"Clips", FEAT_CLIPS, { { PAGE_CLIPS, L"Instant replay", FEAT_CLIPS, false }, { PAGE_CLIPS, L"Clips", FEAT_CLIPS, false } } },
     { PAGE_SOUND, L"Pads", FEAT_SOUND, { { PAGE_SOUND, L"Pads", FEAT_SOUND, false }, { PAGE_SOUND, L"Playback", FEAT_SOUND, false } } },
-    { PAGE_SOUND, L"Music", 0, { { PAGE_MIC, L"Music", 0, false }, { -1, L"Mixer channel", 0, false } } },
+    { PAGE_SOUND, L"Music", 0, { { PAGE_MIC, L"Music", 0, false } } },
+    { PAGE_SOUND, L"Text to speech", FEAT_SOUND, { } },   // (1.92.1) typed TTS lands here while Speech is off (TtsSecPlace)
     { PAGE_SOUND, L"Looper", FEAT_SOUND, { { PAGE_SOUND, L"Looper", FEAT_SOUND, false }, { PAGE_SOUND, L"Looper settings", FEAT_SOUND, false } } },
     { PAGE_SOUND, L"Beatbox", FEAT_SOUND, { { PAGE_SOUND, L"Beatbox to drums", FEAT_SOUND, false }, { PAGE_SOUND, L"Teach it your sounds", FEAT_SOUND, false } } },
     { PAGE_SETTINGS, L"Controls", 0, { { -1, L"Controls", 0, false }, { PAGE_SETTINGS, L"Remote control (Streamer.bot)", 0, false }, { PAGE_SETTINGS, L"Command builder (Streamer.bot)", 0, false } } },
     { PAGE_SETTINGS, L"Features", 0, { { PAGE_SETTINGS, L"Features", 0, false } } },
-    { PAGE_SETTINGS, L"General", 0, { { PAGE_SETTINGS, L"Profiles", 0, false }, { PAGE_SETTINGS, L"Latency", 0, false }, { PAGE_SETTINGS, L"App", 0, false },
-        { PAGE_SETTINGS, L"Screen share", 0, false }, { PAGE_SETTINGS, L"Shortcuts & window", 0, false } } },
+    { PAGE_SETTINGS, L"General", 0, { { PAGE_SETTINGS, L"Profiles", 0, false }, { -1, L"Starting up", 0, false }, { -1, L"Window", 0, false },
+        { -1, L"Hotkeys and audio", 0, false }, { -1, L"Backups and help", 0, false } } },   // (1.92.1: regrouped by job, the user's pick A)
     { PAGE_SETTINGS, L"Avatar", FEAT_AVATAR, { { PAGE_SETTINGS, L"Avatar (PNGtuber)", 0, false } } },
     { PAGE_SETTINGS, L"Look", 0, { { PAGE_SETTINGS, L"Theme", 0, false }, { PAGE_SETTINGS, L"Your colours", 0, false }, { PAGE_SETTINGS, L"Layout", 0, false } } },
     { PAGE_SETTINGS, L"Pictures", 0, { { PAGE_SETTINGS, L"Background picture", 0, false }, { PAGE_SETTINGS, L"Pictures on top", 0, false }, { PAGE_SETTINGS, L"GIFs", 0, false } } },
@@ -18399,6 +18390,7 @@ static const wchar_t* NewSubName(int page, int sub)
 static bool NSubOn(int page, int sub)           // its feature is on
 {
     if (page < 0 || page >= TAB_COUNT || sub < 0 || sub >= gNSubN[page]) return false;
+    if (page == PAGE_SOUND && gFeatSpeech && !lstrcmpW(NEW_SUBS_T[gNSubDef[page][sub]].name, L"Text to speech")) return false;   // (1.92.1: it's in Speech then)
     const int f = NEW_SUBS_T[gNSubDef[page][sub]].feat;
     return !f || FeatOn(f);
 }
@@ -18409,6 +18401,25 @@ static void NSubFix(int page)                   // the sub-tab showing must exis
     if (NSubOn(page, v)) return;
     for (int k = 0; k < gNSubN[page]; k++) if (NSubOn(page, gNSubOrd[page][k])) { v = gNSubOrd[page][k]; return; }
     v = 0;
+}
+static int NSubByName(int page, const wchar_t* name)   // (New) a page's sub-tab by its name (-1: none)
+{
+    for (int s = 0; s < gNSubN[page]; s++) if (!lstrcmpW(NEW_SUBS_T[gNSubDef[page][s]].name, name)) return s;
+    return -1;
+}
+static int gTtsSec = -1;                        // (1.92.1) the typed "Text to speech" box
+static void TtsSecPlace()                       // in Speech > TTS & Morse while Speech is on, else Sounds > Text to speech (same height on both)
+{
+    if (!gLayoutNew || gTtsSec < 0) return;
+    const int pg = gFeatSpeech ? PAGE_SPEECH : PAGE_SOUND, sb = NSubByName(pg, gFeatSpeech ? L"TTS & Morse" : L"Text to speech");
+    Section& S = gSections[gTtsSec];
+    if (sb < 0 || (S.page == pg && S.sub == sb)) return;
+    S.page = pg; S.sub = sb;
+    for (int i = 0; i < gDesignN; i++) {
+        if (gDesign[i].sec != gTtsSec) continue;
+        gDesign[i].page = pg; gDesign[i].sub = sb;
+        for (int q = 0; q < gPagedN; q++) if (gPaged[q].h == gDesign[i].h) { gPaged[q].page = pg; gPaged[q].sub = sb; }
+    }
 }
 static void NSubPlace(int page)                 // side by side, left to right, leaving out ones whose feature is off
 {
@@ -18639,20 +18650,22 @@ static void NSubPick(int page, int sub)         // (New) show another sub-tab
     SubShownHooks();
 }
 
-static void HomePack(); static bool HomeTogOn(int t);
+static void HomePack(); static bool HomeTogOn(int t); static void MsCompute(); static bool MsStripCtl(int cid, int c);
 static void Layout()
 {
     // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
     const bool freeze = IsWindowVisible(gWnd) != FALSE;
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0);
-    if (gLayoutNew) { NSubFix(gPage); NSubPlace(gPage); HomePack(); }   // (1.90.0) a sub-tab whose feature went off: the first one there is (1.91.0: Home's switches)
+    if (gLayoutNew) { TtsSecPlace(); NSubFix(gPage); NSubPlace(gPage); HomePack(); }   // (1.90.0) a sub-tab whose feature went off: the first one there is (1.91.0: Home's switches)
     ScrollCompute();                            // (New) which boxes are scrolled into view
+    MsCompute();                                // (1.92.1) the music's strip on Sounds > Music
     for (int i = 0; i < gPagedN; i++) {
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
         const int gdi = gPaged[i].di;           // (1.91.0) a starred box's control, on Home
         const bool guest = gdi >= 0 && gDesign[gdi].sec >= 0 && gSecGuest[gDesign[gdi].sec];
-        bool vis = (guest || (gPaged[i].page == gPage && (gPaged[i].sub < 0 || gPaged[i].sub == CurSub(gPaged[i].page))))
+        const bool msStrip = gMsCh >= 0 && MsStripCtl(GetDlgCtrlID(gPaged[i].h), gMsCh);   // (1.92.1) the music's strip, on Sounds > Music
+        bool vis = (guest || msStrip || (gPaged[i].page == gPage && (gPaged[i].sub < 0 || gPaged[i].sub == CurSub(gPaged[i].page))))
                 && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat));
         vis = vis && CondOn(gPaged[i].cond);
         if (vis && gScrollN) { const int di = gPaged[i].di; if (di >= 0 && gDesign[di].sec >= 0 && gSecHid[gDesign[di].sec]) vis = false; }
@@ -18670,11 +18683,8 @@ static void Layout()
             static const int fullIds[] = { IDC_CHSOLO0, IDC_CHDUCK0, IDC_CHPAN0 };   // (not on a compact strip)
             for (int base : fullIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanFull(cid - base);
             if (cid >= IDC_HTOG0 && cid < IDC_HTOG0 + HOME_TOGS) vis = vis && HomeTogOn(cid - IDC_HTOG0);   // (1.91.0) Home > What's on
-            if (cid >= IDC_MCVOL && cid <= IDC_MCLAST) {   // (1.90.2) Sounds > Music > Mixer channel: its controls, or "make it one"
-                const bool has = MusChanIdx() >= 0;
-                vis = vis && (cid == IDC_MCNONE || cid == IDC_MCADD ? !has : has);
-                if (cid >= IDC_MCRT0) vis = vis && cid - IDC_MCRT0 < gRows;
-            }
+            if (cid == IDC_MCADD) vis = vis && MusChanIdx() < 0;
+            if (gLayoutNew && cid >= IDC_NSUB0 && cid < IDC_NSUB0 + TAB_COUNT * 10) vis = vis && NSubOn((cid - IDC_NSUB0) / 10, (cid - IDC_NSUB0) % 10);   // (1.92.1: e.g. Sounds > Text to speech only while Speech is off)   // (1.92.1) Sounds > Music: "put it in the Mixer" until it's there
             if (cid == IDC_CBTGT || cid == IDC_CBLBLTGT) vis = vis && (gCbShow & 1);   // (1.66.1) the builder: only the lists this action uses
             if (cid == IDC_CBOPT || cid == IDC_CBLBLOPT) vis = vis && (gCbShow & 2);
             if (cid == IDC_CBVAL || cid == IDC_CBLBLVAL) vis = vis && (gCbShow & 4);
@@ -18701,12 +18711,13 @@ static void Layout()
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
                 cid == IDC_ODEV0 + k || cid == IDC_ODB0 + k || cid == IDC_OLIM0 + k || cid == IDC_OTEST0 + k || cid == IDC_OFX0 + k || cid == IDC_OEQ0 + k) vis = false;
+        if (cid == IDC_STATUS && gLayoutNew) vis = false;   // (1.92.1, New) the title bar says it (running, delay); the compact window still shows it
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
     }
 
-    int by = ROW_Y0 + ROW_H * gRows + 6;
+    int by = ROW_Y0 + HomeDy() + ROW_H * gRows + 6;
     FillHearList();
     MixerOutNames();
     EnableWindow(GetDlgItem(gWnd, IDC_ADDOUT), gRows < MAX_OUT);
@@ -27948,78 +27959,45 @@ static void HomeTick()                          // (~60 a second, with the meter
     if (on != sOn) { sOn = on; for (int t = 0; t < HOME_TOGS; t++) InvalidateRect(GetDlgItem(gWnd, IDC_HTOG0 + t), nullptr, FALSE); }
 }
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d);
-// ---- (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's volume, pan, M / S / Duck, outputs and level ----
-static int gMcCh = -2;                          // the channel shown (-1 none; -2 not looked yet)
-static bool McShowing()
+// ---- (1.92.1, New) Sounds > Music: the music's own Mixer strip on the right of the Music box (the real strip's controls,
+// placed there while the box shows), or a "put it in the Mixer" button in its place ----
+static int gMcCh = -2;                          // the music's channel when last looked (-1 none; -2 not looked yet)
+static int gMusSec = -1;                        // the Music box (New)
+static bool McShowing() { return gMsCh >= 0; }
+static void MsCompute()                         // (Layout, after ScrollCompute) is the Music box showing, and is the music a channel?
 {
-    if (!gLayoutNew || !gWnd) return false;
-    HWND a = GetDlgItem(gWnd, IDC_MCGO), b = GetDlgItem(gWnd, IDC_MCADD);
-    return (a && IsWindowVisible(a)) || (b && IsWindowVisible(b));
+    gMsCh = -1;
+    if (!gLayoutNew || !gWnd || gCompact || gMusSec < 0 || gPage == PAGE_MIXER) return;
+    if (!SectionShown(gSections[gMusSec])) return;
+    gMsCh = MusChanIdx();
 }
-static void McTick()                            // (with the Mixer's meters, ~60 a second) follow changes made anywhere else
+static bool MsStripCtl(int cid, int c)          // one of channel c's strip controls
 {
-    if (!gLayoutNew || !gWnd || !GetDlgItem(gWnd, IDC_MCVOL)) return;
+    static const int ids[] = { IDC_CHSRC0, IDC_CHDB0, IDC_CHPAN0, IDC_CHVOL0, IDC_CHMETER0, IDC_CHMUTE0, IDC_CHSOLO0, IDC_CHDUCK0 };
+    for (int b : ids) if (cid == b + c) return true;
+    return cid >= IDC_CHRT0 + c * MAX_OUT && cid < IDC_CHRT0 + (c + 1) * MAX_OUT;
+}
+static void MsPlace()                           // (end of MixerPlace) the strip at the right of the Music box, as tall as the box allows
+{
+    if (gMsCh < 0 || gMusSec < 0) return;
+    const RECT b = SectionRect(gSections[gMusSec]);
+    const int w = Imin(SC(ChW(gMsCh)), SC(76));   // (the box's other things end at 450)
+    StripPlace(gMsCh, b.right - SC(16) - w, b.top + SC(30), w, (b.bottom - SC(12)) - (b.top + SC(30)));
+}
+static void McTick()                            // (with the Mixer's meters, ~60 a second) the music became / stopped being a channel
+{
+    if (!gLayoutNew || !gWnd || gMusSec < 0) return;
     const int mc = MusChanIdx();
-    if ((mc >= 0) != (gMcCh >= 0) && gMcCh != -2) { gMcCh = mc; Layout(); }   // (it became / stopped being a channel)
+    if (mc != gMcCh && gMcCh != -2) { gMcCh = mc; Layout(); InvalidateRect(gWnd, nullptr, FALSE); }
     gMcCh = mc;
-    if (mc < 0 || !McShowing()) return;
-    static int sDb = INT_MIN, sPan = INT_MIN, sFl = -1, sCh = -1;
-    const ChanSet& g = gCh[mc];
-    const int bc = ChanInBus(mc);
-    const int fl = (g.mute ? 1 : 0) | (g.solo ? 2 : 0) | (g.duck ? 4 : 0) | (ChanQuiet(mc) ? 8 : 0) | ((int)(g.routes & 31) << 4)
-                 | (bc >= 0 ? (1 << 9) | ((int)(gCh[bc].routes & 31) << 10) : 0) | (gRows << 16);
-    if (mc != sCh) { sCh = mc; sDb = sPan = INT_MIN; sFl = -1; }
-    wchar_t t[24];
-    if (g.db10 != sDb) { sDb = g.db10; DbText(sDb, t); SetTextIfChanged(gWnd, IDC_MCDB, t); InvalidateRect(GetDlgItem(gWnd, IDC_MCVOL), nullptr, FALSE); }
-    if (g.pan != sPan) { sPan = g.pan; PanText(sPan, t); SetTextIfChanged(gWnd, IDC_MCPANT, t); InvalidateRect(GetDlgItem(gWnd, IDC_MCPAN), nullptr, FALSE); }
-    if (fl != sFl) {
-        sFl = fl;
-        for (int id = IDC_MCMUTE; id <= IDC_MCDUCK; id++) InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
-        for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_MCRT0 + k), nullptr, FALSE);
-    }
-}
-static bool McDraw(int w, DRAWITEMSTRUCT* d)
-{
-    const int mc = MusChanIdx();
-    if (mc < 0) { FillRect(d->hDC, &d->rcItem, BgBrush()); return true; }
-    if (w == IDC_MCMUTE) { DrawToggle(d, gCh[mc].mute, true); return true; }
-    if (w == IDC_MCSOLO) { DrawToggleC(d, gCh[mc].solo, SOLO_C, RGB(27, 27, 27)); return true; }
-    if (w == IDC_MCDUCK) { DrawToggleC(d, gCh[mc].duck, ACCENT, RGB(255, 255, 255)); return true; }
-    if (w >= IDC_MCRT0 && w < IDC_MCRT0 + MAX_OUT) return DrawItemDispatch((WPARAM)(IDC_CHRT0 + mc * MAX_OUT + (w - IDC_MCRT0)), d);   // (as its strip's)
-    if (w == IDC_MCMETER) {                     // left and right, -60 .. 0 dB, after its fader
-        HDC dc = d->hDC; RECT rc = d->rcItem;
-        FillRect(dc, &rc, BgBrush());
-        const int gap = 2, bh = Imax(2, (rc.bottom - rc.top - gap) / 2);
-        const float v[2] = { gChShownL[mc], gChShownR[mc] };
-        for (int s2 = 0; s2 < 2; s2++) {
-            RECT b = { rc.left, rc.top + s2 * (bh + gap), rc.right, rc.top + s2 * (bh + gap) + bh };
-            HBRUSH tr = CreateSolidBrush(gDark ? DK_SECTION : LT_BORDER); FillRect(dc, &b, tr); DeleteObject(tr);
-            if (!gChA[mc].live || v[s2] <= 0.001f) continue;
-            const float db = 20.0f * log10f(v[s2]), f = Min(1.0f, Max(0.0f, (db + 60.0f) / 60.0f));
-            RECT fr = b; fr.right = b.left + (int)((b.right - b.left) * f);
-            HBRUSH fb = CreateSolidBrush(db > -3.0f ? RGB(225, 70, 60) : db > -12.0f ? RGB(225, 180, 40) : METER_C); FillRect(dc, &fr, fb); DeleteObject(fb);
-        }
-        return true;
-    }
-    return false;
 }
 static void McClick(int id)
 {
-    const int mc = MusChanIdx();
-    if (id == IDC_MCADD) {                      // (as "Plays on" > Put it in the Mixer, staying here)
-        if (mc >= 0) return;
-        int e = -1; for (int k = 0; k < CH_MAX; k++) if (gCh[k].type == CH_NONE) { e = k; break; }
-        if (e < 0) { MessageBoxW(gWnd, L"All 8 Mixer channels are in use. Clear one (its name > Clear this channel), then try again.", L"Lag Effect - Music", MB_ICONINFORMATION); return; }
-        ChanSetSource(e, CH_MUS, L"music"); SaveSettings();
-        McTick(); Layout();
-        return;
-    }
-    if (mc < 0) return;
-    if (id == IDC_MCGO) { GoTo(PAGE_MIXER, -1, GetDlgItem(gWnd, IDC_CHVOL0 + mc), L"Music", L""); return; }
-    int to = id == IDC_MCMUTE ? IDC_CHMUTE0 + mc : id == IDC_MCSOLO ? IDC_CHSOLO0 + mc : id == IDC_MCDUCK ? IDC_CHDUCK0 + mc
-           : id >= IDC_MCRT0 && id < IDC_MCRT0 + MAX_OUT ? IDC_CHRT0 + mc * MAX_OUT + (id - IDC_MCRT0) : 0;
-    if (to) SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(to, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, to));   // (the strip's own button does it)
-    InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
+    if (id != IDC_MCADD || MusChanIdx() >= 0) return;   // (as "Plays on" > Put it in the Mixer, staying here)
+    int e = -1; for (int k = 0; k < CH_MAX; k++) if (gCh[k].type == CH_NONE) { e = k; break; }
+    if (e < 0) { MessageBoxW(gWnd, L"All 8 Mixer channels are in use. Clear one (its name > Clear this channel), then try again.", L"Lag Effect - Music", MB_ICONINFORMATION); return; }
+    ChanSetSource(e, CH_MUS, L"music"); SaveSettings();
+    McTick(); Layout(); InvalidateRect(gWnd, nullptr, FALSE);
 }
 static void MusUi()                             // buttons and the list's ▶
 {
@@ -29373,9 +29351,9 @@ static void NewLayoutApply()
     { const int ids[] = { IDC_MICSUB0, IDC_MICSUB1, IDC_MICSUB2, IDC_MICSUB3, IDC_MICSUB4, IDC_MICSUB5, IDC_SBSUB0, IDC_SBSUB1, IDC_SBSUB2,
                           IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2, IDC_SETSUB3, IDC_SETSUB4 };
       for (int id : ids) hideDi(NDi(GetDlgItem(gWnd, id))); }
-    {   // Home: the status and Start... buttons move up where the stutter's boxes were (they still follow the output list)
-        const int ids[] = { IDC_STATUS, IDC_START, IDC_MUTEBTN, IDC_TRAY, IDC_HELPBTN };
-        for (int id : ids) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) NMove(di, PAGE_MAIN, -1, gDesign[di].rx, gDesign[di].ry - 266, -1, 0, true); }
+    {   // Home: the Start... buttons move up where the stutter's boxes were (they still follow the output list); the status line goes
+        const int ids[] = { IDC_STATUS, IDC_START, IDC_MUTEBTN, IDC_TRAY, IDC_HELPBTN };   // (1.92.1: under the Audio box, now 70 lower; no status line)
+        for (int id : ids) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) NMove(di, PAGE_MAIN, -1, gDesign[di].rx, gDesign[di].ry - 266 + HomeDy() - 42, -1, 0, true); }
     }
     {   // Effects: the Voice effects switch, small, at the end of the sub-tab row
         const int di = NDi(GetDlgItem(gWnd, IDC_FXON));
@@ -29384,8 +29362,9 @@ static void NewLayoutApply()
     }
     { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) gNDone[di] = true; }   // (Mic: the meter stays on top of every sub-tab)
     {   // (1.91.0) Home, under the buttons: your mic's level, What's on, then the boxes you star (a hint until you do)
-        gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = true;
-        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);
+        gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = false;
+        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);   // (1.92.1: at the top)
+        gRecordShift = true;
         AddSection(14, HOME_TOP, 532, 128, L"What's on");
         for (int t = 0; t < HOME_TOGS; t++)
             Ctl(L"BUTTON", HomeTogName(t), BS_OWNERDRAW | WS_TABSTOP | (t ? 0 : WS_GROUP), 30 + (t % 3) * 168, HOME_TOP + 20 + (t / 3) * 34, 164, 28, IDC_HTOG0 + t);
@@ -29409,15 +29388,27 @@ static void NewLayoutApply()
             { const int di = NDi(GetDlgItem(gWnd, IDC_PADBANKKEY)); if (di >= 0) gDesign[di].sec = kp; }
         }
     }
-    {   // (1.90.2) Music: say which hotkey button is which
+    {   // (1.90.2) Music: say which hotkey button is which; (1.92.1) everything 450 wide: the music's Mixer strip goes on the right
         const int km = secOf(PAGE_MIC, L"Music");
+        gMusSec = km;
         if (km >= 0) {
             gBuildPage = PAGE_MIC; gBuildSub = 5; gBuildFeat = 0;
             Ctl(L"STATIC", L"Play / pause:", 0, 30, 512, 84, 18, -1); gDesign[gDesignN - 1].sec = km;
-            Ctl(L"STATIC", L"Next song:", 0, 284, 512, 70, 18, -1); gDesign[gDesignN - 1].sec = km;
-            NMoveId(IDC_MUSKEYPLAY, PAGE_MIC, 5, 116, 506, 156);
-            NMoveId(IDC_MUSKEYNEXT, PAGE_MIC, 5, 356, 506, 174);
-            for (int id : { IDC_MUSKEYPLAY, IDC_MUSKEYNEXT }) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) gDesign[di].sec = km; }
+            Ctl(L"STATIC", L"Next song:", 0, 264, 512, 70, 18, -1); gDesign[gDesignN - 1].sec = km;
+            Ctl(L"BUTTON", L"+\nPut it in the Mixer", BS_MULTILINE | WS_TABSTOP, 462, 182, 68, 350, IDC_MCADD); gDesign[gDesignN - 1].sec = km;
+            const struct { int id, x, y, w; } mv[] = {
+                { IDC_MUSVIEW, 30, 180, 420 }, { IDC_MUSPREV, 30, 236, 40 }, { IDC_MUSPLAY, 76, 236, 90 }, { IDC_MUSNEXT, 172, 236, 40 },
+                { IDC_MUSSTOP, 218, 236, 40 }, { IDC_MUSSHUF, 266, 241, 70 }, { IDC_MUSREP, 342, 236, 108 }, { IDC_MUSOUTS, 30, 276, 270 },
+                { IDC_MUSVOL, 386, 278, 64 }, { IDC_MUSLIST, 30, 314, 420 }, { IDC_MUSADD, 30, 472, 96 }, { IDC_MUSFOLDER, 132, 472, 100 },
+                { IDC_MUSDEL, 238, 472, 80 }, { IDC_MUSCLEAR, 324, 472, 70 }, { IDC_MUSKEYPLAY, 116, 506, 140 }, { IDC_MUSKEYNEXT, 336, 506, 114 } };
+            for (const auto& m : mv) {
+                const int di = NDi(GetDlgItem(gWnd, m.id)); if (di < 0) continue;
+                NMove(di, PAGE_MIC, 5, m.x, m.y, m.w); gDesign[di].sec = km;
+                RECT r; GetWindowRect(gDesign[di].h, &r);
+                SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(m.w), r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            const int vl = NFindAt(PAGE_MIC, 384, 281);   // (its "Volume" label)
+            if (vl >= 0) { NMove(vl, PAGE_MIC, 5, 332, 281, 52); gDesign[vl].sec = km; }
         }
     }
     {   // Mic > Cleanup: "Push-to-talk & live bleep" is just push-to-talk (the live bleep key goes to Speech > Bleep)
@@ -29452,33 +29443,51 @@ static void NewLayoutApply()
         Ctl(L"STATIC", L"Whisper turns your speech into words on this PC (nothing you say goes online). Fast 31 MB, Good 57 MB, Best 181 MB: "
                        L"bigger is more accurate but slower. Its menu downloads or deletes them.", 0, 190, y + 18, 340, 52, IDC_HDR);
     }
+    {   // (1.92.1) Settings > General, regrouped (the user found it cluttered): one box per job, Classic's controls moved in
+        auto mv = [](int di, int x, int y, int w) { if (di >= 0) NMove(di, PAGE_STAGE, 0, x, y, w); };
+        auto mvId = [&](int id, int x, int y, int w) { mv(NDi(GetDlgItem(gWnd, id)), x, y, w); };
+        auto lbl = [](int rx, int ry) { return NFindAt(PAGE_SETTINGS, rx, ry); };
+        const int lBuf = lbl(30, 231), lUpd = lbl(30, 329), lMute = lbl(30, 503), lNote = lbl(30, 442);
+        int y = NBox(L"Starting up", 104);
+        mvId(IDC_STARTWIN, 30, y + 22, 260);
+        mvId(IDC_AUTO, 30, y + 46, 300);
+        mvId(IDC_UPDSTART, 30, y + 74, 230); SetDlgItemTextW(gWnd, IDC_UPDSTART, L"Check for updates at start");
+        mvId(IDC_REPO, 268, y + 70, 158);
+        mvId(IDC_CHECKUPD, 432, y + 69, 98);
+        if (lUpd >= 0) hideDi(lUpd);
+        y = NBox(L"Window", 100);
+        mvId(IDC_TOPMOST, 30, y + 22, 200);
+        mvId(IDC_OVERLAY, 262, y + 22, 268);
+        mvId(IDC_HIDESHARE, 30, y + 46, 220);
+        mvId(IDC_COMPACT, 30, y + 68, 220);
+        if (lNote >= 0) hideDi(lNote);           // (the checkbox's tooltip says it)
+        y = NBox(L"Hotkeys and audio", 90);
+        mv(lMute, 30, y + 26, 90);
+        mvId(IDC_MUTEKEY, 122, y + 22, 124);
+        mvId(IDC_OSD, 262, y + 26, 140);
+        mvId(IDC_BEEPS, 408, y + 26, 122);
+        mv(lBuf, 30, y + 58, 90);
+        mvId(IDC_BUFFER, 122, y + 54, 168);
+        mvId(IDC_EXCL, 310, y + 57, 220);
+        y = NBox(L"Backups and help", 92);
+        mvId(IDC_EXPORT, 30, y + 22, 118);
+        mvId(IDC_IMPORT, 154, y + 22, 118);
+        mvId(IDC_BACKUPS, 278, y + 22, 118);
+        mvId(IDC_OPENSET, 402, y + 22, 128);
+        mvId(IDC_VERSION, 30, y + 60, 150);
+        mvId(IDC_BUGINFO, 190, y + 56, 180);
+    }
     {   int y = NBox(L"Controls", 126);        // Settings > Controls: the windows for every way to trigger things
         Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP | WS_GROUP, 30, y + 22, 120, 28, IDC_NCKEYS);
         Ctl(L"BUTTON", L"Macros...", WS_TABSTOP, 156, y + 22, 110, 28, IDC_NCMACROS);
         Ctl(L"BUTTON", L"Recorder...", WS_TABSTOP, 272, y + 22, 110, 28, IDC_NCRCD);
         Ctl(L"BUTTON", L"Sound triggers...", WS_TABSTOP, 388, y + 22, 142, 28, IDC_NCTRIG);
         Ctl(L"BUTTON", L"MIDI controller...", WS_TABSTOP, 30, y + 56, 150, 28, IDC_NCMIDI);
-        Ctl(L"STATIC", L"Your phone and Streamer.bot: just below.", 0, 190, y + 62, 340, 18, IDC_HDR);
+        NMoveId(IDC_PHONEBTN, PAGE_STAGE, 0, 186, y + 56, 140);   // (1.92.1: here, not in the Streamer.bot box)
+        { const int di = NDi(GetDlgItem(gWnd, IDC_PHONEBTN)); if (di >= 0) SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(140), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
+        Ctl(L"STATIC", L"Streamer.bot: just below.", 0, 336, y + 62, 194, 18, IDC_HDR);
         Ctl(L"BUTTON", L"The mouse wheel changes the setting under it", BS_AUTOCHECKBOX | WS_TABSTOP, 30, y + 94, 330, 20, IDC_NCWHEEL);
         CheckDlgButton(gWnd, IDC_NCWHEEL, gWheelAdj ? BST_CHECKED : BST_UNCHECKED);
-    }
-    {   int y = NBox(L"Mixer channel", 124);   // (1.90.2) Sounds > Music: the Mixer's Music channel, for quick changes
-        Ctl(L"STATIC", L"Volume", 0, 30, y + 23, 52, 18, IDC_MCLBL0);
-        Ctl(L"LagChatMix", L"", WS_TABSTOP, 86, y + 23, 214, 20, IDC_MCVOL);
-        Ctl(L"STATIC", L"", SS_NOPREFIX, 306, y + 23, 66, 18, IDC_MCDB);
-        Ctl(L"BUTTON", L"M", BS_OWNERDRAW | WS_TABSTOP, 378, y + 19, 34, 26, IDC_MCMUTE);
-        Ctl(L"BUTTON", L"S", BS_OWNERDRAW | WS_TABSTOP, 416, y + 19, 34, 26, IDC_MCSOLO);
-        Ctl(L"BUTTON", L"Duck", BS_OWNERDRAW | WS_TABSTOP, 454, y + 19, 76, 26, IDC_MCDUCK);
-        Ctl(L"STATIC", L"Pan", 0, 30, y + 55, 52, 18, IDC_MCLBL0 + 1);
-        Ctl(L"LagChatMix", L"", WS_TABSTOP, 86, y + 55, 214, 20, IDC_MCPAN);
-        Ctl(L"STATIC", L"", SS_NOPREFIX, 306, y + 55, 66, 18, IDC_MCPANT);
-        for (int k = 0; k < MAX_OUT; k++) { wchar_t n[4]; wsprintfW(n, L"%d", k + 1); Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, 378 + k * 31, y + 51, 28, 26, IDC_MCRT0 + k); }
-        Ctl(L"STATIC", L"Level", 0, 30, y + 87, 52, 18, IDC_MCLBL0 + 2);
-        Ctl(L"STATIC", L"", SS_OWNERDRAW, 86, y + 90, 286, 12, IDC_MCMETER);
-        Ctl(L"BUTTON", L"Open in the Mixer", WS_TABSTOP, 378, y + 83, 152, 28, IDC_MCGO);
-        Ctl(L"STATIC", L"The music isn't a Mixer channel yet. Make it one to get its volume, mute, solo, duck, pan and outputs here "
-                       L"(and its EQ, plugins and the rest in the Mixer).", 0, 30, y + 22, 336, 54, IDC_MCNONE);
-        Ctl(L"BUTTON", L"Make it a Mixer channel", WS_TABSTOP, 378, y + 22, 152, 28, IDC_MCADD);
     }
     gBuildPage = -1; gBuildSub = -1; gBuildFeat = 0;
     for (int i = classicDesigns; i < gDesignN; i++) { gOrigPage[i] = -1; gOrigSub[i] = -1; gNDone[i] = true; }   // (made here: no Classic place)
@@ -29584,7 +29593,7 @@ static void NewLayoutApply()
         struct { int id; const wchar_t* t; } feat[] = {
             { IDC_FEATLAG, L"Hold a hotkey to stutter your voice. Its settings are in Effects > Stutter." },
             { IDC_FEATFX, L"Effects for your live voice, characters and Vocode to song (the Effects tab)." },
-            { IDC_FEATSOUND, L"Pads on hotkeys, a looper and beatbox drums (Sounds), and text to speech (Speech)." },
+            { IDC_FEATSOUND, L"Pads on hotkeys, a looper and beatbox drums (Sounds), and text to speech (Speech; Sounds while Speech is off)." },
             { IDC_FEATCLIPS, L"Keeps the last few seconds so you can save them as a clip (Sounds > Clips)." },
             { IDC_FEATSPEECH, L"Voice commands, bleeping words, talking through a TTS voice or Morse code (the Speech tab). Downloads a speech model once." },
             { IDC_FEATAVATAR, L"Your pictures that talk when you talk, in a window for OBS (Settings > Avatar)." },
@@ -29609,7 +29618,28 @@ static void NewLayoutApply()
         if (d.sub < 0) for (int si = 0; si <= NEW_SUBS; si++) gNewHas[d.page][si][op] |= bit;
         else gNewHas[d.page][Imin(d.sub + 1, NEW_SUBS)][op] |= bit;
     }
+    {   // (1.92.1) Home: the Audio box and everything in it 70 lower, under the mic level
+        const int dk = gDevSectionIdx;
+        for (int i = 0; i < gDesignN; i++) {
+            Design& d = gDesign[i];
+            if (d.sec != dk || d.page != PAGE_MAIN) continue;
+            d.ry += HomeDy(); d.y = SC(d.ry);
+        }
+        gSections[dk].y += HomeDy();
+    }
     AssignSections();
+    for (int k = 0; k < gSectionN; k++)         // (1.92.1) typed TTS: its box, which moves to Sounds while Speech is off
+        if (gSections[k].page == PAGE_SPEECH && gSections[k].title && !lstrcmpW(gSections[k].title, L"Text to speech")) gTtsSec = k;
+    if (gTtsSec >= 0) {                         // (its refresh hooks count it as showing on either sub-tab)
+        const int sa = NSubByName(PAGE_SPEECH, L"TTS & Morse"), sb = NSubByName(PAGE_SOUND, L"Text to speech");
+        for (int i = 0; i < gDesignN; i++) {
+            const int op = gOrigPage[i];
+            if (gDesign[i].sec != gTtsSec || op < 0 || op >= TAB_COUNT || sa < 0 || sb < 0) continue;
+            const unsigned bit = 1u << (gOrigSub[i] + 1);
+            gNewHas[PAGE_SPEECH][Imin(sa + 1, NEW_SUBS)][op] |= bit; gNewHas[PAGE_SOUND][Imin(sb + 1, NEW_SUBS)][op] |= bit;
+        }
+    }
+    TtsSecPlace();
     StarsLoad();                                // (1.91.0) the boxes you pinned to Home (their New places are final now)
 }
 
@@ -32125,10 +32155,8 @@ static void OnCommand(int id, int code)
 
 // Owner-drawn controls are drawn off-screen and copied in one go, so nothing flickers when the picture behind
 // them changes (e.g. a GIF background). The meter buffers itself; dropdown items aren't on the window background.
-static bool McDraw(int w, DRAWITEMSTRUCT* d);
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
 {
-    if (w >= IDC_MCVOL && w <= IDC_MCLAST && McDraw((int)w, d)) return true;   // (1.90.2) Sounds > Music > Mixer channel
     if (w == IDC_HMETER) { DrawMeter(d); return true; }   // (1.91.0) Home: your mic's level (as on the Mic tab)
     if (w >= IDC_CLIPWAVE && w < IDC_CLIPWAVE + CLIPS) { ClipWaveDraw(d); return true; }   // (1.92.0) a clip's waveform
     if (w >= IDC_HTOG0 && w < IDC_HTOG0 + HOME_TOGS) { DrawToggleC(d, HomeTogState((int)w - IDC_HTOG0), ACCENT, RGB(255, 255, 255)); return true; }
