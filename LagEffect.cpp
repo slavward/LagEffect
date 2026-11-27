@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.92.0"
+#define APP_VERSION L"1.92.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -8715,6 +8715,7 @@ static int TabBotH()  { return gLayoutNew && !gCompact && gTabPos == 3 ? 40 : 0;
 static int BaseH() { return BASE_H + (gLayoutNew ? 50 : 0) + TabBotH(); }   // (1.90.0) New: 50 px taller (fewer pages need scrolling)
 #define COMPACT_H 84                           // compact mode: status + a few buttons
 #define ROW_Y0    134
+static int HomeDy() { return gLayoutNew ? 70 : 0; }   // (1.92.1, New) Home's Audio box sits this much lower (the mic level is above it)
 #define ROW_H     30
 #define TAB_COUNT 8                             // (1.90.0: + Speech, the New layout's)
 #define TAB_SLOTS 7                             // tabs on show in either layout
@@ -8736,8 +8737,8 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_HMETER    4990                      // (1.91.0, New) Home: your mic's level
 #define IDC_HTOG0     4991                      // .. + HOME_TOGS - 1: Home > What's on switches
 #define HOME_TOGS     9
-#define HOME_METER_Y  320                       // (design px, moved down with the output list like the buttons above)
-#define HOME_TOP      398                       // Home: where What's on starts (and the part that scrolls)
+#define HOME_METER_Y  52                        // (design px) at the top, above the Audio box (1.92.1; was under the buttons)
+#define HOME_TOP      348                       // Home: where What's on starts (and the part that scrolls), moved with the output list
 #define IDC_MCVOL     4960                      // (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's quick controls
 #define IDC_MCDB      4961
 #define IDC_MCMUTE    4962
@@ -9133,7 +9134,7 @@ static void AssignSections()                    // which section each control si
             // the Outputs box grows with the list: all its rows belong to it (the "+ Add output" row too)
             const bool dev = k == gDevSectionIdx;
             if (!dev && d.shifted != s.shifts) continue;
-            const int bottom = dev && !d.shifted ? ROW_Y0 + ROW_H * MAX_OUT + 6 : s.y + s.h;
+            const int bottom = dev && !d.shifted ? ROW_Y0 + HomeDy() + ROW_H * MAX_OUT + 6 : s.y + s.h;
             if (d.rx >= s.x && d.rx < s.x + s.w && d.ry >= s.y - 10 && d.ry < bottom) { d.sec = k; break; }
         }
     }
@@ -18701,12 +18702,13 @@ static void Layout()
         for (int k = gRows; k < MAX_OUT; k++)
             if (cid == IDC_OLBL0 + k || cid == IDC_OMUTE0 + k || cid == IDC_OVOL0 + k || cid == IDC_OMETER0 + k ||
                 cid == IDC_ODEV0 + k || cid == IDC_ODB0 + k || cid == IDC_OLIM0 + k || cid == IDC_OTEST0 + k || cid == IDC_OFX0 + k || cid == IDC_OEQ0 + k) vis = false;
+        if (cid == IDC_STATUS && gLayoutNew) vis = false;   // (1.92.1, New) the title bar says it (running, delay); the compact window still shows it
         if (gCompact && (cid == IDC_STATUS || cid == IDC_START || cid == IDC_MUTEBTN)) vis = true;
         else if (gCompact) vis = false;
         ShowWindow(gPaged[i].h, vis ? SW_SHOWNA : SW_HIDE);
     }
 
-    int by = ROW_Y0 + ROW_H * gRows + 6;
+    int by = ROW_Y0 + HomeDy() + ROW_H * gRows + 6;
     FillHearList();
     MixerOutNames();
     EnableWindow(GetDlgItem(gWnd, IDC_ADDOUT), gRows < MAX_OUT);
@@ -29373,9 +29375,9 @@ static void NewLayoutApply()
     { const int ids[] = { IDC_MICSUB0, IDC_MICSUB1, IDC_MICSUB2, IDC_MICSUB3, IDC_MICSUB4, IDC_MICSUB5, IDC_SBSUB0, IDC_SBSUB1, IDC_SBSUB2,
                           IDC_SETSUB0, IDC_SETSUB1, IDC_SETSUB2, IDC_SETSUB3, IDC_SETSUB4 };
       for (int id : ids) hideDi(NDi(GetDlgItem(gWnd, id))); }
-    {   // Home: the status and Start... buttons move up where the stutter's boxes were (they still follow the output list)
-        const int ids[] = { IDC_STATUS, IDC_START, IDC_MUTEBTN, IDC_TRAY, IDC_HELPBTN };
-        for (int id : ids) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) NMove(di, PAGE_MAIN, -1, gDesign[di].rx, gDesign[di].ry - 266, -1, 0, true); }
+    {   // Home: the Start... buttons move up where the stutter's boxes were (they still follow the output list); the status line goes
+        const int ids[] = { IDC_STATUS, IDC_START, IDC_MUTEBTN, IDC_TRAY, IDC_HELPBTN };   // (1.92.1: under the Audio box, now 70 lower; no status line)
+        for (int id : ids) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) NMove(di, PAGE_MAIN, -1, gDesign[di].rx, gDesign[di].ry - 266 + HomeDy() - 42, -1, 0, true); }
     }
     {   // Effects: the Voice effects switch, small, at the end of the sub-tab row
         const int di = NDi(GetDlgItem(gWnd, IDC_FXON));
@@ -29384,8 +29386,9 @@ static void NewLayoutApply()
     }
     { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) gNDone[di] = true; }   // (Mic: the meter stays on top of every sub-tab)
     {   // (1.91.0) Home, under the buttons: your mic's level, What's on, then the boxes you star (a hint until you do)
-        gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = true;
-        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);
+        gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = false;
+        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);   // (1.92.1: at the top)
+        gRecordShift = true;
         AddSection(14, HOME_TOP, 532, 128, L"What's on");
         for (int t = 0; t < HOME_TOGS; t++)
             Ctl(L"BUTTON", HomeTogName(t), BS_OWNERDRAW | WS_TABSTOP | (t ? 0 : WS_GROUP), 30 + (t % 3) * 168, HOME_TOP + 20 + (t / 3) * 34, 164, 28, IDC_HTOG0 + t);
@@ -29608,6 +29611,15 @@ static void NewLayoutApply()
         const unsigned short bit = (unsigned short)(1u << (Iclamp(os, -1, 14) + 1));
         if (d.sub < 0) for (int si = 0; si <= NEW_SUBS; si++) gNewHas[d.page][si][op] |= bit;
         else gNewHas[d.page][Imin(d.sub + 1, NEW_SUBS)][op] |= bit;
+    }
+    {   // (1.92.1) Home: the Audio box and everything in it 70 lower, under the mic level
+        const int dk = gDevSectionIdx;
+        for (int i = 0; i < gDesignN; i++) {
+            Design& d = gDesign[i];
+            if (d.sec != dk || d.page != PAGE_MAIN) continue;
+            d.ry += HomeDy(); d.y = SC(d.ry);
+        }
+        gSections[dk].y += HomeDy();
     }
     AssignSections();
     StarsLoad();                                // (1.91.0) the boxes you pinned to Home (their New places are final now)
