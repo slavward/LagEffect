@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.90.2"
+#define APP_VERSION L"1.91.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1408,12 +1408,15 @@ static inline int PadSlot(int row) { return gPadBank * PADS + row; }
 
 struct PShift;
 static float PadPitch(int i, float x, double ratio);   // per-pad pitch shifter (defined with the DSP)
+static unsigned char gPadAct[SB_N];             // (1.91.0, audio thread) the slots doing something this block, in order
+static int gPadActN = 0;                        // (the rest would add nothing: same sound, without looking at all 97 every sample)
 static inline float PadsMix(float& viaFx, int& padsPlaying)   // audio thread: one output sample of all playing pads
 {                                               // (viaFx gets the ones that go through the voice effects)
     viaFx = 0; padsPlaying = 0;
     float sum = 0;
     const float padMaster = gPadMaster / 100.0f, clipMaster = gClipMaster / 100.0f;
-    for (int i = 0; i < SB_N; i++) {
+    for (int a = 0; a < gPadActN; a++) {
+        const int i = gPadAct[a];
         Pad& p = gPads[i];
         const bool  isClip = i >= CLIP0 && i < CLIP0 + CLIP_N;
         const float master = isClip ? clipMaster : padMaster;
@@ -5281,7 +5284,8 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     float outPk[MAX_OUT] = {};
 
     bool padsIdle = true;                       // nothing playing / starting / stopping: skip the soundboard mixer this block
-    for (int i = 0; i < SB_N && padsIdle; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) padsIdle = false; }
+    gPadActN = 0;                               // (1.91.0) and which ones are (a start pressed mid-block begins with the next block)
+    for (int i = 0; i < SB_N; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) { padsIdle = false; gPadAct[gPadActN++] = (unsigned char)i; } }
     {                                           // (1.69.0) sound triggers: only while they're on (they just listen)
         static TrigCore tg;
         if (gTrigOn.load(std::memory_order_relaxed) && in) TrigBlock(tg, in, frames, inCh, inSide, boost, gTrigSens.load(std::memory_order_relaxed));
@@ -8717,6 +8721,11 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_NCTRIG    4894
 #define IDC_NCMIDI    4895
 #define IDC_NCWHEEL   4896                      // (1.90.2, New) Settings > Controls: the mouse wheel changes settings
+#define IDC_HMETER    4990                      // (1.91.0, New) Home: your mic's level
+#define IDC_HTOG0     4991                      // .. + HOME_TOGS - 1: Home > What's on switches
+#define HOME_TOGS     9
+#define HOME_METER_Y  320                       // (design px, moved down with the output list like the buttons above)
+#define HOME_TOP      398                       // Home: where What's on starts (and the part that scrolls)
 #define IDC_MCVOL     4960                      // (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's quick controls
 #define IDC_MCDB      4961
 #define IDC_MCMUTE    4962
@@ -8793,25 +8802,31 @@ static int CurSub(int page) { return SubVar(page); }
 #define NEW_SUBS 8                              // (New) most sub-tabs on a page
 static unsigned short gNewHas[TAB_COUNT][NEW_SUBS + 1][TAB_COUNT];   // (New) [page][sub + 1][Classic page]: bit (Classic sub + 1) = some of it is there
 static short gOrigPage[MAX_DESIGN], gOrigSub[MAX_DESIGN];            // (New) each control's Classic page / sub
+static bool gSecGuest[MAX_SECTIONS];            // (1.91.0, New) a starred box showing on Home (only while Home shows)
+static unsigned short gGuestHas[TAB_COUNT];     // (1.91.0) Classic page -> bits (Classic sub + 1) of what shows on Home as a guest
 // Is something from this Classic page / sub (-1: any) showing now? (Classic: that page and sub; New: wherever it went.)
 static bool ShowingOld(int op, int os)
 {
     if (!gLayoutNew) return gPage == op && (os < 0 || CurSub(op) == os);
     if (gPage < 0 || gPage >= TAB_COUNT || op < 0 || op >= TAB_COUNT) return false;
     const int s = CurSub(gPage), si = s < 0 ? 0 : s + 1 > NEW_SUBS ? NEW_SUBS : s + 1;
-    const unsigned bits = gNewHas[gPage][si][op] | gNewHas[gPage][0][op];
+    const unsigned bits = gNewHas[gPage][si][op] | gNewHas[gPage][0][op] | (gPage == PAGE_MAIN ? gGuestHas[op] : 0u);   // (1.91.0: + starred on Home)
     return os < 0 ? bits != 0 : ((bits >> (os + 1)) & 1) != 0;
 }
 static bool CtlShowing(int id)                  // is this control's page / sub-tab the one showing? (not whether it's scrolled into view)
 {
     HWND h = GetDlgItem(gWnd, id); if (!h) return false;
     for (int i = 0; i < gDesignN; i++)
-        if (gDesign[i].h == h) return gDesign[i].page == gPage && (gDesign[i].sub < 0 || gDesign[i].sub == CurSub(gPage));
+        if (gDesign[i].h == h) return (gDesign[i].page == gPage && (gDesign[i].sub < 0 || gDesign[i].sub == CurSub(gPage)))
+                                   || (gDesign[i].sec >= 0 && gSecGuest[gDesign[i].sec]);   // (1.91.0: or starred on Home)
     return false;
 }
 // (New) pages scroll a box at a time when they're taller than the window: a box is either all there or not at all
 // (controls are children of the window itself, so they can't be cut off half-way).
 static int  gSecScroll[MAX_SECTIONS];           // how far up each box is moved (design px)
+static int  gScrollVy[MAX_SECTIONS];            // (1.91.0) where each listed box sits in the page's scrolling list (design px)
+#define STAR_MAX 24
+static int  gStarSec[STAR_MAX], gStarN = 0;     // (1.91.0) boxes pinned to Home, in the order you starred them
 static bool gSecHid[MAX_SECTIONS];              // scrolled out of view
 static int  gScrollFirst[TAB_COUNT][NEW_SUBS + 1];   // the first box showing, per page / sub
 static int  gScrollList[MAX_SECTIONS], gScrollN = 0, gScrollAt = 0, gScrollMax = 0, gScrollTop = 0, gScrollBot = 0;
@@ -9078,7 +9093,7 @@ static void PlaceAll()
     for (int i = 0; i < gDesignN; i++) {
         Design& d = gDesign[i];
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
-        if (d.page >= 0 && d.page != gPage) continue;   // other pages are placed when you switch to them
+        if (d.page >= 0 && d.page != gPage && !(d.sec >= 0 && gSecGuest[d.sec])) continue;   // other pages are placed when you switch to them (1.91.0: a starred box on Home is placed there)
         if (d.free) continue;
         int x = gOrgX + d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d)) - (d.sec >= 0 ? SC(gSecScroll[d.sec]) : 0);
         RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
@@ -14212,10 +14227,11 @@ static void MeterHold(float v, float& hold, DWORD& t, DWORD now)
     else if (now - t > 1500) hold *= 0.97f;     // (after 1.5 s it slides down: ~16 dB a second at 60 frames a second)
 }
 static DWORD gLimShowT[MAX_OUT];
-static bool McShowing(); static void McTick();
+static bool McShowing(); static void McTick(); static void HomeTick();
 static void MixerMeterTick()                    // (~60 times a second) meters and limit lights on the Mixer page
 {
     McTick();                                   // (1.90.2) Sounds > Music's Mixer channel box
+    HomeTick();                                 // (1.91.0) Home > What's on
     if ((gPage != PAGE_MIXER && !McShowing()) || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
     static LARGE_INTEGER qf = {}, last = {};
     if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
@@ -15513,9 +15529,10 @@ static bool EdIsSubTab(HWND h)
     return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || MicSubOf(id) >= 0 ||
            SetSubOf(id) >= 0 || (id >= IDC_NSUB0 && id < IDC_NSUB0 + 80);
 }
-static bool CondOn(int c) { return c == 0 || (c == 2) == (gVocStyle == VOC_PLUGIN); }
+static bool CondOn(int c) { return c == 0 || (c == 3 ? gStarN == 0 : (c == 2) == (gVocStyle == VOC_PLUGIN)); }   // (3: Home's "nothing starred yet")
 static bool SectionShown(const Section& s)
 {
+    if (!gCompact && gSecGuest[&s - gSections]) return !(gScrollN && gSecHid[&s - gSections]);   // (1.91.0) starred, on Home
     if (gCompact || (s.page >= 0 && s.page != gPage) || !CondOn(s.cond)) return false;
     if (gScrollN && gSecHid[&s - gSections]) return false;   // (New: scrolled out of view)
     return s.sub < 0 || s.sub == CurSub(s.page);
@@ -16095,7 +16112,7 @@ static void AddTips()
     SendMessageW(gTip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
 
     // Tabs
-    TipId(TabId(PAGE_MAIN),     gLayoutNew ? L"Home: your mic, your outputs and what each one plays, Start / Stop. (Ctrl+Tab switches tabs, Ctrl+Shift+Tab goes back.)"
+    TipId(TabId(PAGE_MAIN),     gLayoutNew ? L"Home: your outputs, Start / Stop, your mic's level, what's on, and any box you star (the star after a box's name). (Ctrl+Tab switches tabs, Ctrl+Shift+Tab goes back.)"
                                            : L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
     TipId(TabId(PAGE_MIC),      gLayoutNew ? L"Your mic's own sound: noise gate, noise suppression, push-to-talk, tone, volume and mic plugins."
                                            : L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
@@ -16457,6 +16474,15 @@ static void AddTips()
         TipId(IDC_NCTRIG,   L"Sound triggers: a clap, snap, whistle or tongue click runs any action (Settings > Features turns them on).");
         TipId(IDC_NCMIDI,   L"A MIDI controller's buttons, knobs and faders control Lag Effect (Settings > Features turns it on).");
         TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
+        TipId(IDC_HMETER,  L"Your mic's level (as on the Mic tab): green while the gate lets you through. Click: the Mic tab.");
+        {   static const wchar_t* T[HOME_TOGS] = {
+                L"Voice effects on / off (the switch on the Effects tab).", L"AI noise suppression on / off (Mic > Cleanup).",
+                L"The noise gate on / off (Mic > Cleanup; it comes back with the mode it had).", L"Mute your mic (as the Mute mic button).",
+                L"Play / pause the music (Sounds > Music).", L"Bleep words from your list on / off (Speech > Bleep).",
+                L"Morse voice on / off: what you say plays as Morse code (Speech > TTS & Morse).",
+                L"TTS voice on / off: what you say is spoken by the TTS voice (Speech > TTS & Morse).",
+                L"Live captions on / off (Speech > Captions)." };
+            for (int t = 0; t < HOME_TOGS; t++) TipId(IDC_HTOG0 + t, T[t]); }
         TipId(IDC_MCVOL,   L"The Music channel's volume (its Mixer fader). Drag; double-click: 0 dB; right / left arrow keys: 1 dB.");
         TipId(IDC_MCPAN,   L"The Music channel's pan: drag left or right. Double-click: the middle.");
         TipId(IDC_MCMUTE,  L"Mute the music (its Mixer channel).");
@@ -17282,9 +17308,10 @@ static void UpdateMeter()                       // every 50 ms: fast rise, smoot
     gMeterVadShow = v < 0 ? -1.0f : (v > gMeterVadShow ? v : gMeterVadShow * 0.8f + v * 0.2f);
     static int lastDb = -999, lastVad = -999, lastGate = -1;
     const int nowDb = (int)(gMeterShowDb * 2), nowVad = (int)(gMeterVadShow * 50), nowGate = gMeterGateOpen ? 1 : 0;
-    if (gPage == PAGE_MIC && (nowDb != lastDb || nowVad != lastVad || nowGate != lastGate)) {
+    const bool homeM = gLayoutNew && gPage == PAGE_MAIN && !gCompact;   // (1.91.0) Home has it too
+    if ((gPage == PAGE_MIC || homeM) && (nowDb != lastDb || nowVad != lastVad || nowGate != lastGate)) {
         lastDb = nowDb; lastVad = nowVad; lastGate = nowGate;
-        InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+        InvalidateRect(GetDlgItem(gWnd, homeM ? IDC_HMETER : IDC_METER), nullptr, FALSE);
     }
     if (gHdrMeter && !gCompact) {               // (1.65.0) the bar under the tabs: only when it would look different
         static HWND hm = nullptr; if (!hm) hm = GetDlgItem(gWnd, IDC_HDRMETER);
@@ -17656,6 +17683,7 @@ static void MicHintTick()                       // every 50 ms: the line under t
     if (kind != gMicHintKind || lstrcmpW(h, gMicHint)) {
         gMicHintKind = kind; lstrcpynW(gMicHint, h, 160);
         if (gPage == PAGE_MIC) InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+        else if (gLayoutNew && gPage == PAGE_MAIN) InvalidateRect(GetDlgItem(gWnd, IDC_HMETER), nullptr, FALSE);
     }
 }
 
@@ -18249,13 +18277,58 @@ static void NSubPlace(int page)                 // side by side, left to right, 
         x += gNSubW[page][s] + 3;
     }
 }
-static bool ScrollsHere(int page) { return gLayoutNew && page != PAGE_MAIN && page != PAGE_MIXER && page >= 0 && page < TAB_COUNT; }
+static bool ScrollsHere(int page) { return gLayoutNew && page != PAGE_MIXER && page >= 0 && page < TAB_COUNT; }
+static int ScrollSi() { const int sub = CurSub(gPage); return gPage == PAGE_MAIN || sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS); }   // (gScrollFirst's slot)
+static bool StarOk(int k);
+static void GuestCompute()                      // (1.91.0) which starred boxes show on Home now
+{
+    memset(gSecGuest, 0, sizeof(gSecGuest)); memset(gGuestHas, 0, sizeof(gGuestHas));
+    if (!gLayoutNew || gPage != PAGE_MAIN || gCompact) return;
+    bool any = false;
+    for (int j = 0; j < gStarN; j++) { const int k = gStarSec[j]; if (StarOk(k)) { gSecGuest[k] = true; any = true; } }
+    if (!any) return;
+    for (int i = 0; i < gDesignN; i++) {
+        const int k = gDesign[i].sec;
+        if (k >= 0 && gSecGuest[k] && gOrigPage[i] >= 0 && gOrigPage[i] < TAB_COUNT) gGuestHas[gOrigPage[i]] |= (unsigned short)(1u << (gOrigSub[i] + 1));
+    }
+}
 static void ScrollCompute()                     // which boxes show on this page / sub-tab, scrolled to gScrollFirst
 {
     for (int k = 0; k < gSectionN; k++) { gSecScroll[k] = 0; gSecHid[k] = false; }
     gScrollN = 0; gScrollMax = 0; gScrollAt = 0;
+    GuestCompute();
     if (!gWnd || gCompact || !ScrollsHere(gPage)) return;
-    const int sub = CurSub(gPage), top = NewTop(gPage), si = sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS);
+    if (gPage == PAGE_MAIN) {                   // (1.91.0) Home: under the buttons, What's on, then the boxes you starred
+        const int R = RowsDelta(), top = HOME_TOP + R;
+        RECT c; GetClientRect(gWnd, &c);
+        const int ch = IsWindowVisible(gWnd) && !IsIconic(gWnd) ? UNSC(c.bottom) : BaseH() + R;
+        const int bot = Imax(top + 120, ch - STRIP_H - 4);
+        int n = 0, y = top;
+        for (int k = 0; k < gSectionN; k++) {  // Home's own boxes there (top to bottom; they're built in that order)
+            const Section& s = gSections[k];
+            if (s.page != PAGE_MAIN || s.y < HOME_TOP - 10 || (s.feat && !FeatOn(s.feat)) || !CondOn(s.cond)) continue;
+            gScrollList[n++] = k; gScrollVy[k] = s.y + (s.shifts ? R : 0); y = gScrollVy[k] + s.h + 12;
+        }
+        for (int j = 0; j < gStarN; j++) {    // then the starred ones, in the order you starred them
+            const int k = gStarSec[j]; if (!gSecGuest[k]) continue;
+            gScrollList[n++] = k; gScrollVy[k] = y; y += gSections[k].h + 12;
+        }
+        if (!n) return;
+        const int lk = gScrollList[n - 1], lastBot = gScrollVy[lk] + gSections[lk].h;
+        int maxFirst = 0;
+        while (maxFirst < n - 1 && lastBot - gScrollVy[gScrollList[maxFirst]] > bot - top) maxFirst++;
+        const int first = Iclamp(gScrollFirst[gPage][0], 0, maxFirst);
+        gScrollFirst[gPage][0] = first;
+        const int off = gScrollVy[gScrollList[first]] - top;
+        for (int j = 0; j < n; j++) {
+            const int k = gScrollList[j]; const Section& s = gSections[k];
+            gSecScroll[k] = s.y + (s.shifts ? R : 0) - gScrollVy[k] + off;
+            gSecHid[k] = j < first || (j > first && gScrollVy[k] + s.h - off > bot);
+        }
+        gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot;
+        return;
+    }
+    const int sub = CurSub(gPage), top = NewTop(gPage), si = ScrollSi();
     RECT c; GetClientRect(gWnd, &c);
     const int ch = IsWindowVisible(gWnd) && !IsIconic(gWnd) ? UNSC(c.bottom) : BaseH() + RowsDelta();
     const int bot = Imax(top + 120, ch - STRIP_H - 4);
@@ -18268,6 +18341,7 @@ static void ScrollCompute()                     // which boxes show on this page
         gScrollList[j] = k;
     }
     if (!n) return;
+    for (int j = 0; j < n; j++) gScrollVy[gScrollList[j]] = gSections[gScrollList[j]].y;
     const Section& last = gSections[gScrollList[n - 1]];
     int maxFirst = 0;                           // the first box from which everything to the end fits
     while (maxFirst < n - 1 && last.y + last.h - gSections[gScrollList[maxFirst]].y > bot - top) maxFirst++;
@@ -18286,14 +18360,14 @@ static void ScrollPaint(HDC dc)
 {
     SetRectEmpty(&gScrollTrack); SetRectEmpty(&gScrollThumb);
     if (!gScrollN || gScrollMax <= 0) return;
-    const Section& f = gSections[gScrollList[0]]; const Section& l = gSections[gScrollList[gScrollN - 1]];
-    const int total = Imax(1, l.y + l.h - f.y);
-    int vTop = gSections[gScrollList[gScrollAt]].y, vBot = vTop;
-    for (int j = gScrollAt; j < gScrollN; j++) { const int k = gScrollList[j]; if (!gSecHid[k]) vBot = gSections[k].y + gSections[k].h; }
+    const int fk = gScrollList[0], lk = gScrollList[gScrollN - 1], fy = gScrollVy[fk];
+    const int total = Imax(1, gScrollVy[lk] + gSections[lk].h - fy);
+    int vTop = gScrollVy[gScrollList[gScrollAt]], vBot = vTop;
+    for (int j = gScrollAt; j < gScrollN; j++) { const int k = gScrollList[j]; if (!gSecHid[k]) vBot = gScrollVy[k] + gSections[k].h; }
     const int x = gOrgX + SC(CLIENT_W - 10), y0 = SC(gScrollTop - 6), y1 = SC(gScrollBot);
     gScrollTrack = { x, y0, x + Imax(3, SC(4)), y1 };
     const int th = y1 - y0;
-    gScrollThumb = { x, y0 + MulDiv(th, vTop - f.y, total), x + Imax(3, SC(4)), y0 + MulDiv(th, vBot - f.y, total) };
+    gScrollThumb = { x, y0 + MulDiv(th, vTop - fy, total), x + Imax(3, SC(4)), y0 + MulDiv(th, vBot - fy, total) };
     if (gScrollThumb.bottom - gScrollThumb.top < SC(18)) gScrollThumb.bottom = Imin(y1, (int)gScrollThumb.top + SC(18));
     HBRUSH tb = CreateSolidBrush(gDark ? DK_SECTION : LT_BORDER); FillRect(dc, &gScrollTrack, tb); DeleteObject(tb);
     HBRUSH hb = CreateSolidBrush(ACCENT); FillRect(dc, &gScrollThumb, hb); DeleteObject(hb);
@@ -18301,10 +18375,9 @@ static void ScrollPaint(HDC dc)
 static void ScrollBy(int n)                     // a box at a time
 {
     if (!gScrollN || !n) return;
-    const int sub = CurSub(gPage), si = sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS);
     const int want = Iclamp(gScrollAt + n, 0, gScrollMax);
     if (want == gScrollAt) return;
-    gScrollFirst[gPage][si] = want;
+    gScrollFirst[gPage][ScrollSi()] = want;
     Layout();
 }
 static bool WheelAdjusts() { return !gLayoutNew || gWheelAdj; }   // (1.90.2) Classic: as it always was
@@ -18326,7 +18399,7 @@ static bool ScrollClick(int x, int y)           // a click on the bar: on the th
     RECT r = gScrollTrack; InflateRect(&r, SC(6), 0);
     POINT p = { x, y }; if (!PtInRect(&r, p)) return false;
     if (y >= gScrollThumb.top && y < gScrollThumb.bottom && gScrollN) {
-        gScrollDrag = true; gScrollDragY0 = y; gScrollDragTop0 = gSections[gScrollList[gScrollAt]].y;
+        gScrollDrag = true; gScrollDragY0 = y; gScrollDragTop0 = gScrollVy[gScrollList[gScrollAt]];
         SetCapture(gWnd);
         return true;
     }
@@ -18336,11 +18409,11 @@ static bool ScrollClick(int x, int y)           // a click on the bar: on the th
 static void ScrollDragTo(int y)                 // (while dragging) the box nearest where the thumb is now goes to the top
 {
     if (!gScrollDrag || !gScrollN || IsRectEmpty(&gScrollTrack)) return;
-    const Section& f = gSections[gScrollList[0]]; const Section& l = gSections[gScrollList[gScrollN - 1]];
-    const int total = Imax(1, l.y + l.h - f.y), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
+    const int fk = gScrollList[0], lk = gScrollList[gScrollN - 1];
+    const int total = Imax(1, gScrollVy[lk] + gSections[lk].h - gScrollVy[fk]), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
     const int want = gScrollDragTop0 + MulDiv(y - gScrollDragY0, total, th);
     int j = 0, best = INT_MAX;
-    for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gSections[gScrollList[k]].y - want); if (d < best) { best = d; j = k; } }
+    for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gScrollVy[gScrollList[k]] - want); if (d < best) { best = d; j = k; } }
     if (j != gScrollAt) ScrollBy(j - gScrollAt);
 }
 static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the box it's in shows
@@ -18352,8 +18425,7 @@ static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the 
     const int k = gDesign[di].sec;
     if (!gScrollN || !gSecHid[k]) return;
     for (int j = 0; j < gScrollN; j++) if (gScrollList[j] == k) {
-        const int sub = CurSub(gPage), si = sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS);
-        gScrollFirst[gPage][si] = Imin(j, gScrollMax);
+        gScrollFirst[gPage][ScrollSi()] = Imin(j, gScrollMax);
         Layout();
         return;
     }
@@ -18423,18 +18495,21 @@ static void NSubPick(int page, int sub)         // (New) show another sub-tab
     SubShownHooks();
 }
 
+static void HomePack(); static bool HomeTogOn(int t);
 static void Layout()
 {
     // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
     const bool freeze = IsWindowVisible(gWnd) != FALSE;
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0);
-    if (gLayoutNew) { NSubFix(gPage); NSubPlace(gPage); }   // (1.90.0) a sub-tab whose feature went off: the first one there is
+    if (gLayoutNew) { NSubFix(gPage); NSubPlace(gPage); HomePack(); }   // (1.90.0) a sub-tab whose feature went off: the first one there is (1.91.0: Home's switches)
     ScrollCompute();                            // (New) which boxes are scrolled into view
     for (int i = 0; i < gPagedN; i++) {
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
-        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat))
-                && (gPaged[i].sub < 0 || gPaged[i].sub == CurSub(gPaged[i].page));
+        const int gdi = gPaged[i].di;           // (1.91.0) a starred box's control, on Home
+        const bool guest = gdi >= 0 && gDesign[gdi].sec >= 0 && gSecGuest[gDesign[gdi].sec];
+        bool vis = (guest || (gPaged[i].page == gPage && (gPaged[i].sub < 0 || gPaged[i].sub == CurSub(gPaged[i].page))))
+                && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat));
         vis = vis && CondOn(gPaged[i].cond);
         if (vis && gScrollN) { const int di = gPaged[i].di; if (di >= 0 && gDesign[di].sec >= 0 && gSecHid[gDesign[di].sec]) vis = false; }
         int  cid = GetDlgCtrlID(gPaged[i].h);
@@ -18450,6 +18525,7 @@ static void Layout()
             for (int base : chIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanShown(cid - base);
             static const int fullIds[] = { IDC_CHSOLO0, IDC_CHDUCK0, IDC_CHPAN0 };   // (not on a compact strip)
             for (int base : fullIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanFull(cid - base);
+            if (cid >= IDC_HTOG0 && cid < IDC_HTOG0 + HOME_TOGS) vis = vis && HomeTogOn(cid - IDC_HTOG0);   // (1.91.0) Home > What's on
             if (cid >= IDC_MCVOL && cid <= IDC_MCLAST) {   // (1.90.2) Sounds > Music > Mixer channel: its controls, or "make it one"
                 const bool has = MusChanIdx() >= 0;
                 vis = vis && (cid == IDC_MCNONE || cid == IDC_MCADD ? !has : has);
@@ -22850,6 +22926,73 @@ static float DelayProcMs(float* gate, float* lim, float* plug)   // what the set
 }
 // ---- (1.65.0) a "?" on each box's title: just that part's help, in a window you can scroll and keep open
 static RECT gSecHelpRc[MAX_SECTIONS];           // (where each box's "?" was painted; empty = not showing)
+static RECT gSecStarRc[MAX_SECTIONS];           // (1.91.0) ... and its star
+static int StarIdx(int k) { for (int j = 0; j < gStarN; j++) if (gStarSec[j] == k) return j; return -1; }
+static bool StarCan(int k)                      // a box that can be pinned to Home: any New box outside Home and the Mixer
+{
+    if (!gLayoutNew || k < 0 || k >= gSectionN) return false;
+    const Section& s = gSections[k];
+    return s.title && s.title[0] && s.page >= 0 && s.page < TAB_COUNT && s.page != PAGE_MAIN && s.page != PAGE_MIXER;
+}
+static void StarPaint(HDC dc, const RECT& r, bool on)   // a five-pointed star, filled when it's pinned
+{
+    POINT pt[10]; const double cx = (r.left + r.right) / 2.0, cy = (r.top + r.bottom) / 2.0 + 0.5, ro = (r.right - r.left) / 2.0, ri = ro * 0.45;
+    for (int i = 0; i < 10; i++) { const double a = -1.5707963 + i * 0.6283185, rr = i & 1 ? ri : ro; pt[i] = { (LONG)lround(cx + rr * cos(a)), (LONG)lround(cy + rr * sin(a)) }; }
+    const COLORREF c = on ? ACCENT : (gDark ? DK_DIM : gLtDim);
+    HPEN pn = CreatePen(PS_SOLID, 1, c); HBRUSH br = on ? CreateSolidBrush(c) : nullptr;
+    HGDIOBJ op = SelectObject(dc, pn), ob = SelectObject(dc, br ? (HGDIOBJ)br : GetStockObject(NULL_BRUSH));
+    Polygon(dc, pt, 10);
+    SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(pn); if (br) DeleteObject(br);
+}
+static int SectionStarAt(int x, int y)
+{
+    POINT p = { x, y };
+    for (int i = 0; i < gSectionN; i++) if (gSecStarRc[i].right > gSecStarRc[i].left) {
+        RECT r = gSecStarRc[i]; InflateRect(&r, SC(3), SC(3));
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
+}
+static void StarsSave()                         // INI home_stars: "page:sub:title|..." (New places)
+{
+    if (!gLayoutNew) return;
+    wchar_t buf[4096] = L""; int at = 0;
+    for (int j = 0; j < gStarN; j++) {
+        const Section& s = gSections[gStarSec[j]];
+        at += swprintf(buf + at, 4096 - at, L"%ls%d:%d:%ls", j ? L"|" : L"", s.page, s.sub, s.title);
+        if (at >= 4000) break;
+    }
+    WritePrivateProfileStringW(L"settings", L"home_stars", buf, gIni);
+}
+static void StarsLoad()                         // (after the New layout is built: the boxes' New places)
+{
+    gStarN = 0;
+    wchar_t buf[4096]; GetPrivateProfileStringW(L"settings", L"home_stars", L"", buf, 4096, gIni);
+    for (wchar_t* tok = buf; tok && *tok && gStarN < STAR_MAX; ) {
+        wchar_t* bar = wcschr(tok, L'|'); if (bar) *bar = 0;
+        int pg = -1, sb = -1, n = 0;
+        if (swscanf(tok, L"%d:%d:%n", &pg, &sb, &n) >= 2 && n > 0)
+            for (int k = 0; k < gSectionN; k++)
+                if (gSections[k].page == pg && gSections[k].sub == sb && gSections[k].title && !lstrcmpW(gSections[k].title, tok + n) && StarCan(k) && StarIdx(k) < 0) { gStarSec[gStarN++] = k; break; }
+        tok = bar ? bar + 1 : nullptr;
+    }
+}
+static void StarToggle(int k)                   // the star on a box: pin it to Home / take it off
+{
+    if (!StarCan(k)) return;
+    const int j = StarIdx(k);
+    if (j >= 0) { for (int i = j; i < gStarN - 1; i++) gStarSec[i] = gStarSec[i + 1]; gStarN--; ShowOsd(L"Removed from Home", false); }
+    else if (gStarN >= STAR_MAX) { ShowOsd(L"Home is full: unpin something first", false); return; }
+    else { gStarSec[gStarN++] = k; ShowOsd(L"Pinned to Home", true); }
+    StarsSave();
+    Layout();
+}
+static bool StarOk(int k)                       // a starred box that can show now (its feature and sub-tab are on)
+{
+    if (!StarCan(k)) return false;
+    const Section& s = gSections[k];
+    return (!s.feat || FeatOn(s.feat)) && CondOn(s.cond) && PageOn(s.page) && (s.sub < 0 || NSubOn(s.page, s.sub));
+}
 static HWND gHelpWnd = nullptr;
 static const wchar_t* TipTextOf(HWND h) { for (int i = 0; i < gTipRecN; i++) if (gTipRec[i].h == h) return gTipRec[i].text; return nullptr; }
 struct SecIntro { const wchar_t* title; const wchar_t* text; };
@@ -27514,6 +27657,74 @@ static void MusOutsMenu()
         GoTo(PAGE_MIXER, -1, nullptr, nullptr, L"");
     }
 }
+// ---- (1.91.0, New) Home > What's on: one click turns the big things on or off (each does what its own switch does)
+static const wchar_t* HomeTogName(int t)
+{
+    static const wchar_t* N[HOME_TOGS] = { L"Voice effects", L"Noise suppression", L"Noise gate", L"Mute mic", L"Music playing",
+                                           L"Bleep", L"Morse voice", L"TTS voice", L"Live captions" };
+    return t >= 0 && t < HOME_TOGS ? N[t] : L"";
+}
+static bool HomeTogOn(int t)                    // shown (its feature is on)
+{
+    switch (t) {
+    case 0: return gFeatFx;
+    case 5: case 6: case 7: return gFeatSpeech;
+    case 8: return gFeatCaptions;
+    }
+    return t >= 0 && t < HOME_TOGS;
+}
+static bool HomeTogState(int t)
+{
+    switch (t) {
+    case 0: return gFxOn;            case 1: return gNsOn;           case 2: return gGateMode != GATE_OFF;
+    case 3: return gMicMuted;        case 4: return gMusPlay.load() && MusActive();
+    case 5: return gBlOn.load();     case 6: return gMoOn.load();    case 7: return gSpTts;
+    case 8: return gCapOn;
+    }
+    return false;
+}
+static void HomeTogClick(int t)
+{
+    auto chk = [&](int id) {                    // a checkbox elsewhere: tick it the other way and let it do its job
+        CheckDlgButton(gWnd, id, HomeTogState(t) ? BST_UNCHECKED : BST_CHECKED);
+        SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, id));
+    };
+    switch (t) {
+    case 0: SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(IDC_FXON, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, IDC_FXON)); break;
+    case 1: chk(IDC_NSON); SaveSettings(); break;
+    case 2: SetGateMode(gGateMode != GATE_OFF ? GATE_OFF : gGateLastMode); SaveSettings(); break;
+    case 3: SetMute(!gMicMuted); break;
+    case 4: MusToggle(); break;
+    case 5: chk(IDC_BLON); break;
+    case 6: chk(IDC_MORSEON); break;
+    case 7: chk(IDC_SPTTS); break;
+    case 8: chk(IDC_CAPON); break;
+    }
+    for (int k = 0; k < HOME_TOGS; k++) InvalidateRect(GetDlgItem(gWnd, IDC_HTOG0 + k), nullptr, FALSE);
+}
+static void HomePack()                          // (Layout) the switches that show, packed 3 to a row; What's on fits them
+{
+    if (!gLayoutNew || !gWnd) return;
+    int n = 0;
+    for (int t = 0; t < HOME_TOGS; t++) {
+        const int di = DesignOf(GetDlgItem(gWnd, IDC_HTOG0 + t));
+        if (di < 0 || !HomeTogOn(t)) continue;
+        Design& d = gDesign[di];
+        d.rx = 30 + (n % 3) * 168; d.ry = HOME_TOP + 20 + (n / 3) * 34; d.x = SC(d.rx); d.y = SC(d.ry);
+        n++;
+    }
+    for (int k = 0; k < gSectionN; k++)
+        if (gSections[k].page == PAGE_MAIN && gSections[k].y == HOME_TOP) { gSections[k].h = 26 + Imax(1, (n + 2) / 3) * 34; break; }
+}
+static void HomeTick()                          // (~60 a second, with the meters) follow changes made anywhere else
+{
+    if (!gLayoutNew || !gWnd || gPage != PAGE_MAIN || gCompact) return;
+    static int sOn = -1, sVis = -1;
+    int on = 0, vis = 0;
+    for (int t = 0; t < HOME_TOGS; t++) { if (HomeTogOn(t)) vis |= 1 << t; if (HomeTogState(t)) on |= 1 << t; }
+    if (vis != sVis) { const bool first = sVis < 0; sVis = vis; if (!first) Layout(); }
+    if (on != sOn) { sOn = on; for (int t = 0; t < HOME_TOGS; t++) InvalidateRect(GetDlgItem(gWnd, IDC_HTOG0 + t), nullptr, FALSE); }
+}
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d);
 // ---- (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's volume, pan, M / S / Duck, outputs and level ----
 static int gMcCh = -2;                          // the channel shown (-1 none; -2 not looked yet)
@@ -28950,6 +29161,18 @@ static void NewLayoutApply()
         if (di >= 0) { gDesign[di].ht = SC(28); SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(156), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
     }
     { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) gNDone[di] = true; }   // (Mic: the meter stays on top of every sub-tab)
+    {   // (1.91.0) Home, under the buttons: your mic's level, What's on, then the boxes you star (a hint until you do)
+        gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = true;
+        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);
+        AddSection(14, HOME_TOP, 532, 128, L"What's on");
+        for (int t = 0; t < HOME_TOGS; t++)
+            Ctl(L"BUTTON", HomeTogName(t), BS_OWNERDRAW | WS_TABSTOP | (t ? 0 : WS_GROUP), 30 + (t % 3) * 168, HOME_TOP + 20 + (t / 3) * 34, 164, 28, IDC_HTOG0 + t);
+        gBuildCond = 3;                         // (only while nothing is starred)
+        AddSection(14, HOME_TOP + 140, 532, 58, L"Starred");
+        Ctl(L"STATIC", L"Nothing starred yet. Click the star after any box's name (on any tab) to pin that box here, so it's "
+                       L"one click away.", 0, 30, HOME_TOP + 158, 500, 34, IDC_HDR);
+        gBuildCond = 0; gRecordShift = false; gBuildPage = -1;
+    }
     {   // Pads: the page buttons (A-D) and its key go inside the box, on a row of their own
         const int kp = secOf(PAGE_SOUND, L"Pads");
         if (kp >= 0) {
@@ -29165,6 +29388,7 @@ static void NewLayoutApply()
         else gNewHas[d.page][Imin(d.sub + 1, NEW_SUBS)][op] |= bit;
     }
     AssignSections();
+    StarsLoad();                                // (1.91.0) the boxes you pinned to Home (their New places are final now)
 }
 
 // ======================= window =======================
@@ -30490,11 +30714,13 @@ static void PaintWindow(HDC dc)
         DeleteObject(sep);
     }
 
-    memset(gSecHelpRc, 0, sizeof(gSecHelpRc));
+    memset(gSecHelpRc, 0, sizeof(gSecHelpRc)); memset(gSecStarRc, 0, sizeof(gSecStarRc));
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
-        if (s.page >= 0 && s.page != gPage) continue;
-        if (s.sub >= 0 && s.sub != CurSub(s.page)) continue;
+        if (!gSecGuest[i]) {                    // (1.91.0: a starred box shows on Home too)
+            if (s.page >= 0 && s.page != gPage) continue;
+            if (s.sub >= 0 && s.sub != CurSub(s.page)) continue;
+        }
         if (gCompact) continue;
         if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
         if (!CondOn(s.cond)) continue;          // (Synth plugin / Vocode to song: one or the other in the same place)
@@ -30504,7 +30730,9 @@ static void PaintWindow(HDC dc)
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         const int q = Imax(SC(13), sz.cy * 3 / 4);  // (1.65.0) the "?" after the title: its help
         RECT qr = { sx + 18 + sz.cx, y - q / 2, sx + 18 + sz.cx + q, y - q / 2 + q };
-        RECT tr = { sx + 10, y - sz.cy / 2, qr.right + 5, y + sz.cy / 2 + 1 };
+        const bool canStar = StarCan(i);        // (1.91.0) the star after the "?": pin this box to Home
+        RECT sr = { qr.right + SC(5), qr.top - 1, qr.right + SC(5) + q + 2, qr.bottom + 1 };
+        RECT tr = { sx + 10, y - sz.cy / 2, (canStar ? sr.right : qr.right) + 5, y + sz.cy / 2 + 1 };
         FillRect(dc, &tr, BgBrush());
         SetBkColor(dc, BgColor());
         SetTextColor(dc, TITLE_C);
@@ -30519,6 +30747,7 @@ static void PaintWindow(HDC dc)
             SetBkMode(dc, bk); SelectObject(dc, of);
             gSecHelpRc[i] = qr;
         }
+        if (canStar) { StarPaint(dc, sr, StarIdx(i) >= 0); gSecStarRc[i] = sr; }
     }
     MixerPaintStrips(dc);
     ScrollPaint(dc);                            // (1.90.0, New) the scroll bar, when the page is taller than the window
@@ -30601,6 +30830,8 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_MCVOL && id <= IDC_MCLAST) { if (code == BN_CLICKED) McClick(id); return; }   // (1.90.2) Sounds > Music > Mixer channel
+    if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { if (code == BN_CLICKED) HomeTogClick(id - IDC_HTOG0); return; }   // (1.91.0) Home > What's on
+    if (id == IDC_HMETER) { if (code == STN_CLICKED) SetPage(PAGE_MIC); return; }   // (Home's mic level: the Mic tab)
     if (id == IDC_NCWHEEL) {                    // (1.90.2) the wheel on knobs / number boxes / faders / lists
         if (code == BN_CLICKED) { gWheelAdj = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings(); }
         return;
@@ -31649,6 +31880,8 @@ static bool McDraw(int w, DRAWITEMSTRUCT* d);
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
 {
     if (w >= IDC_MCVOL && w <= IDC_MCLAST && McDraw((int)w, d)) return true;   // (1.90.2) Sounds > Music > Mixer channel
+    if (w == IDC_HMETER) { DrawMeter(d); return true; }   // (1.91.0) Home: your mic's level (as on the Mic tab)
+    if (w >= IDC_HTOG0 && w < IDC_HTOG0 + HOME_TOGS) { DrawToggleC(d, HomeTogState((int)w - IDC_HTOG0), ACCENT, RGB(255, 255, 255)); return true; }
     if (w >= IDC_CHMUTE0 && w < IDC_CHMUTE0 + CH_MAX) { DrawToggle(d, gCh[w - IDC_CHMUTE0].mute, true); return true; }
     if (w >= IDC_CHSOLO0 && w < IDC_CHSOLO0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHSOLO0].solo, SOLO_C, RGB(27, 27, 27)); return true; }
     if (w >= IDC_CHDUCK0 && w < IDC_CHDUCK0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHDUCK0].duck, ACCENT, RGB(255, 255, 255)); return true; }
@@ -32054,7 +32287,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
         const RECT rc = d->rcItem; const int bw = rc.right - rc.left, bh = rc.bottom - rc.top;
-        const bool buffer = w != IDC_METER && d->CtlType != ODT_COMBOBOX && d->CtlType != ODT_LISTBOX && bw > 0 && bh > 0;
+        const bool buffer = w != IDC_METER && w != IDC_HMETER && d->CtlType != ODT_COMBOBOX && d->CtlType != ODT_LISTBOX && bw > 0 && bh > 0;
         HDC real = d->hDC, mem = nullptr;
         OffScreen* os = buffer ? new OffScreen(real, bw, bh) : nullptr;
         if (os && os->dc) { mem = os->dc; SetViewportOrgEx(mem, -rc.left, -rc.top, nullptr); d->hDC = mem; }
@@ -32075,7 +32308,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if ((HWND)w == h && LOWORD(l) == HTCLIENT) {
             POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
             if (gEdgeDrag >= 0 || MixerEdgeAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE; }
-            if (SectionHelpAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+            if (SectionHelpAt(p.x, p.y) >= 0 || SectionStarAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
         }
         break;
     case WM_LBUTTONDOWN: {                      // click on empty space: leave the text/number box you were in
@@ -32083,6 +32316,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         const int x = (short)LOWORD(l), y = (short)HIWORD(l), e = MixerEdgeAt(x, y);
         if (ScrollClick(x, y)) return 0;        // (1.90.0, New) the scroll bar
         if (e < 0) { const int hs = SectionHelpAt(x, y); if (hs >= 0) { SectionHelp(hs); return 0; } }   // (1.65.0) a box's "?"
+        if (e < 0) { const int ss = SectionStarAt(x, y); if (ss >= 0) { StarToggle(ss); return 0; } }    // (1.91.0) its star
         if (e >= 0) {
             if (e == gEdgeLast && GetTickCount() - gEdgeLastT < GetDoubleClickTime()) {   // double-click: normal width
                 gEdgeLast = -1; MixerEdgeSet(e, 0); return 0;
