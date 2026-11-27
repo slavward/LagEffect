@@ -18364,8 +18364,8 @@ static const NSubDef NEW_SUBS_T[] = {
     { PAGE_SOUND, L"Beatbox", FEAT_SOUND, { { PAGE_SOUND, L"Beatbox to drums", FEAT_SOUND, false }, { PAGE_SOUND, L"Teach it your sounds", FEAT_SOUND, false } } },
     { PAGE_SETTINGS, L"Controls", 0, { { -1, L"Controls", 0, false }, { PAGE_SETTINGS, L"Remote control (Streamer.bot)", 0, false }, { PAGE_SETTINGS, L"Command builder (Streamer.bot)", 0, false } } },
     { PAGE_SETTINGS, L"Features", 0, { { PAGE_SETTINGS, L"Features", 0, false } } },
-    { PAGE_SETTINGS, L"General", 0, { { PAGE_SETTINGS, L"Profiles", 0, false }, { PAGE_SETTINGS, L"Latency", 0, false }, { PAGE_SETTINGS, L"App", 0, false },
-        { PAGE_SETTINGS, L"Screen share", 0, false }, { PAGE_SETTINGS, L"Shortcuts & window", 0, false } } },
+    { PAGE_SETTINGS, L"General", 0, { { PAGE_SETTINGS, L"Profiles", 0, false }, { -1, L"Starting up", 0, false }, { -1, L"Window", 0, false },
+        { -1, L"Hotkeys and audio", 0, false }, { -1, L"Backups and help", 0, false } } },   // (1.92.1: regrouped by job, the user's pick A)
     { PAGE_SETTINGS, L"Avatar", FEAT_AVATAR, { { PAGE_SETTINGS, L"Avatar (PNGtuber)", 0, false } } },
     { PAGE_SETTINGS, L"Look", 0, { { PAGE_SETTINGS, L"Theme", 0, false }, { PAGE_SETTINGS, L"Your colours", 0, false }, { PAGE_SETTINGS, L"Layout", 0, false } } },
     { PAGE_SETTINGS, L"Pictures", 0, { { PAGE_SETTINGS, L"Background picture", 0, false }, { PAGE_SETTINGS, L"Pictures on top", 0, false }, { PAGE_SETTINGS, L"GIFs", 0, false } } },
@@ -29442,6 +29442,40 @@ static void NewLayoutApply()
         NMoveId(IDC_SPMODEL, PAGE_STAGE, 0, 30, y + 22, 150);
         Ctl(L"STATIC", L"Whisper turns your speech into words on this PC (nothing you say goes online). Fast 31 MB, Good 57 MB, Best 181 MB: "
                        L"bigger is more accurate but slower. Its menu downloads or deletes them.", 0, 190, y + 18, 340, 52, IDC_HDR);
+    }
+    {   // (1.92.1) Settings > General, regrouped (the user found it cluttered): one box per job, Classic's controls moved in
+        auto mv = [](int di, int x, int y, int w) { if (di >= 0) NMove(di, PAGE_STAGE, 0, x, y, w); };
+        auto mvId = [&](int id, int x, int y, int w) { mv(NDi(GetDlgItem(gWnd, id)), x, y, w); };
+        auto lbl = [](int rx, int ry) { return NFindAt(PAGE_SETTINGS, rx, ry); };
+        const int lBuf = lbl(30, 231), lUpd = lbl(30, 329), lMute = lbl(30, 503), lNote = lbl(30, 442);
+        int y = NBox(L"Starting up", 104);
+        mvId(IDC_STARTWIN, 30, y + 22, 260);
+        mvId(IDC_AUTO, 30, y + 46, 300);
+        mvId(IDC_UPDSTART, 30, y + 74, 230); SetDlgItemTextW(gWnd, IDC_UPDSTART, L"Check for updates at start");
+        mvId(IDC_REPO, 268, y + 70, 158);
+        mvId(IDC_CHECKUPD, 432, y + 69, 98);
+        if (lUpd >= 0) hideDi(lUpd);
+        y = NBox(L"Window", 100);
+        mvId(IDC_TOPMOST, 30, y + 22, 200);
+        mvId(IDC_OVERLAY, 262, y + 22, 268);
+        mvId(IDC_HIDESHARE, 30, y + 46, 220);
+        mvId(IDC_COMPACT, 30, y + 68, 220);
+        if (lNote >= 0) hideDi(lNote);           // (the checkbox's tooltip says it)
+        y = NBox(L"Hotkeys and audio", 90);
+        mv(lMute, 30, y + 26, 90);
+        mvId(IDC_MUTEKEY, 122, y + 22, 124);
+        mvId(IDC_OSD, 262, y + 26, 140);
+        mvId(IDC_BEEPS, 408, y + 26, 122);
+        mv(lBuf, 30, y + 58, 90);
+        mvId(IDC_BUFFER, 122, y + 54, 168);
+        mvId(IDC_EXCL, 310, y + 57, 220);
+        y = NBox(L"Backups and help", 92);
+        mvId(IDC_EXPORT, 30, y + 22, 118);
+        mvId(IDC_IMPORT, 154, y + 22, 118);
+        mvId(IDC_BACKUPS, 278, y + 22, 118);
+        mvId(IDC_OPENSET, 402, y + 22, 128);
+        mvId(IDC_VERSION, 30, y + 60, 150);
+        mvId(IDC_BUGINFO, 190, y + 56, 180);
     }
     {   int y = NBox(L"Controls", 126);        // Settings > Controls: the windows for every way to trigger things
         Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP | WS_GROUP, 30, y + 22, 120, 28, IDC_NCKEYS);
