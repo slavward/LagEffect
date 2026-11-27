@@ -8761,7 +8761,7 @@ static bool PageOn(int page)                    // Voice FX, Soundboard and Clip
     if (gLayoutNew) {                           // (New: Clips is on Sounds; Effects has the stutter too; Sounds has Music)
         if (page < 0 || page >= TAB_COUNT || page == PAGE_CLIPS) return false;
         if (page == PAGE_FX) return gFeatFx || gFeatLag;
-        if (page == PAGE_SPEECH) return gFeatSpeech || gFeatSound || gFeatCaptions;
+        if (page == PAGE_SPEECH) return gFeatSpeech || gFeatCaptions;   // (1.92.1: with Speech off, typed TTS is on Sounds instead)
         return true;
     }
     if (page == PAGE_SPEECH) return false;
@@ -18351,7 +18351,7 @@ static const NSubDef NEW_SUBS_T[] = {
     { PAGE_FX, L"Stutter", FEAT_LAG | FEAT_FX, { { PAGE_MAIN, L"Effect", 0, false }, { PAGE_MAIN, L"Lag extras", 0, false }, { PAGE_FX, L"Hotkey tricks", FEAT_FX, false }, { PAGE_FX, L"Rewind", FEAT_FX, false } } },
     { PAGE_FX, L"Tune", FEAT_FX, { { PAGE_FX, L"Vocoder", FEAT_FX, false }, { PAGE_FX, L"Vocode to song", FEAT_FX, false }, { PAGE_FX, L"Synth plugin", FEAT_FX, true },
         { PAGE_FX, L"Harmonizer", FEAT_FX, false } } },
-    { PAGE_SPEECH, L"TTS & Morse", FEAT_SOUND | FEAT_SPEECH, { { PAGE_SOUND, L"Text to speech", FEAT_SOUND, false }, { PAGE_MIC, L"Talk for me", 0, false } } },
+    { PAGE_SPEECH, L"TTS & Morse", FEAT_SPEECH, { { PAGE_SOUND, L"Text to speech", FEAT_SOUND, false }, { PAGE_MIC, L"Talk for me", 0, false } } },
     { PAGE_SPEECH, L"Bleep", FEAT_SPEECH, { { PAGE_MIC, L"Bleep", 0, false }, { -1, L"Live bleep", 0, false } } },
     { PAGE_SPEECH, L"Captions", FEAT_CAPTIONS, { { PAGE_SETTINGS, L"Live captions", 0, false } } },
     { PAGE_SPEECH, L"Voice commands", FEAT_SPEECH, { { PAGE_MIC, L"Voice commands", 0, false } } },
@@ -18359,6 +18359,7 @@ static const NSubDef NEW_SUBS_T[] = {
     { PAGE_SOUND, L"Clips", FEAT_CLIPS, { { PAGE_CLIPS, L"Instant replay", FEAT_CLIPS, false }, { PAGE_CLIPS, L"Clips", FEAT_CLIPS, false } } },
     { PAGE_SOUND, L"Pads", FEAT_SOUND, { { PAGE_SOUND, L"Pads", FEAT_SOUND, false }, { PAGE_SOUND, L"Playback", FEAT_SOUND, false } } },
     { PAGE_SOUND, L"Music", 0, { { PAGE_MIC, L"Music", 0, false } } },
+    { PAGE_SOUND, L"Text to speech", FEAT_SOUND, { } },   // (1.92.1) typed TTS lands here while Speech is off (TtsSecPlace)
     { PAGE_SOUND, L"Looper", FEAT_SOUND, { { PAGE_SOUND, L"Looper", FEAT_SOUND, false }, { PAGE_SOUND, L"Looper settings", FEAT_SOUND, false } } },
     { PAGE_SOUND, L"Beatbox", FEAT_SOUND, { { PAGE_SOUND, L"Beatbox to drums", FEAT_SOUND, false }, { PAGE_SOUND, L"Teach it your sounds", FEAT_SOUND, false } } },
     { PAGE_SETTINGS, L"Controls", 0, { { -1, L"Controls", 0, false }, { PAGE_SETTINGS, L"Remote control (Streamer.bot)", 0, false }, { PAGE_SETTINGS, L"Command builder (Streamer.bot)", 0, false } } },
@@ -18389,6 +18390,7 @@ static const wchar_t* NewSubName(int page, int sub)
 static bool NSubOn(int page, int sub)           // its feature is on
 {
     if (page < 0 || page >= TAB_COUNT || sub < 0 || sub >= gNSubN[page]) return false;
+    if (page == PAGE_SOUND && gFeatSpeech && !lstrcmpW(NEW_SUBS_T[gNSubDef[page][sub]].name, L"Text to speech")) return false;   // (1.92.1: it's in Speech then)
     const int f = NEW_SUBS_T[gNSubDef[page][sub]].feat;
     return !f || FeatOn(f);
 }
@@ -18399,6 +18401,25 @@ static void NSubFix(int page)                   // the sub-tab showing must exis
     if (NSubOn(page, v)) return;
     for (int k = 0; k < gNSubN[page]; k++) if (NSubOn(page, gNSubOrd[page][k])) { v = gNSubOrd[page][k]; return; }
     v = 0;
+}
+static int NSubByName(int page, const wchar_t* name)   // (New) a page's sub-tab by its name (-1: none)
+{
+    for (int s = 0; s < gNSubN[page]; s++) if (!lstrcmpW(NEW_SUBS_T[gNSubDef[page][s]].name, name)) return s;
+    return -1;
+}
+static int gTtsSec = -1;                        // (1.92.1) the typed "Text to speech" box
+static void TtsSecPlace()                       // in Speech > TTS & Morse while Speech is on, else Sounds > Text to speech (same height on both)
+{
+    if (!gLayoutNew || gTtsSec < 0) return;
+    const int pg = gFeatSpeech ? PAGE_SPEECH : PAGE_SOUND, sb = NSubByName(pg, gFeatSpeech ? L"TTS & Morse" : L"Text to speech");
+    Section& S = gSections[gTtsSec];
+    if (sb < 0 || (S.page == pg && S.sub == sb)) return;
+    S.page = pg; S.sub = sb;
+    for (int i = 0; i < gDesignN; i++) {
+        if (gDesign[i].sec != gTtsSec) continue;
+        gDesign[i].page = pg; gDesign[i].sub = sb;
+        for (int q = 0; q < gPagedN; q++) if (gPaged[q].h == gDesign[i].h) { gPaged[q].page = pg; gPaged[q].sub = sb; }
+    }
 }
 static void NSubPlace(int page)                 // side by side, left to right, leaving out ones whose feature is off
 {
@@ -18635,7 +18656,7 @@ static void Layout()
     // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
     const bool freeze = IsWindowVisible(gWnd) != FALSE;
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0);
-    if (gLayoutNew) { NSubFix(gPage); NSubPlace(gPage); HomePack(); }   // (1.90.0) a sub-tab whose feature went off: the first one there is (1.91.0: Home's switches)
+    if (gLayoutNew) { TtsSecPlace(); NSubFix(gPage); NSubPlace(gPage); HomePack(); }   // (1.90.0) a sub-tab whose feature went off: the first one there is (1.91.0: Home's switches)
     ScrollCompute();                            // (New) which boxes are scrolled into view
     MsCompute();                                // (1.92.1) the music's strip on Sounds > Music
     for (int i = 0; i < gPagedN; i++) {
@@ -18662,7 +18683,8 @@ static void Layout()
             static const int fullIds[] = { IDC_CHSOLO0, IDC_CHDUCK0, IDC_CHPAN0 };   // (not on a compact strip)
             for (int base : fullIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanFull(cid - base);
             if (cid >= IDC_HTOG0 && cid < IDC_HTOG0 + HOME_TOGS) vis = vis && HomeTogOn(cid - IDC_HTOG0);   // (1.91.0) Home > What's on
-            if (cid == IDC_MCADD) vis = vis && MusChanIdx() < 0;   // (1.92.1) Sounds > Music: "put it in the Mixer" until it's there
+            if (cid == IDC_MCADD) vis = vis && MusChanIdx() < 0;
+            if (gLayoutNew && cid >= IDC_NSUB0 && cid < IDC_NSUB0 + TAB_COUNT * 10) vis = vis && NSubOn((cid - IDC_NSUB0) / 10, (cid - IDC_NSUB0) % 10);   // (1.92.1: e.g. Sounds > Text to speech only while Speech is off)   // (1.92.1) Sounds > Music: "put it in the Mixer" until it's there
             if (cid == IDC_CBTGT || cid == IDC_CBLBLTGT) vis = vis && (gCbShow & 1);   // (1.66.1) the builder: only the lists this action uses
             if (cid == IDC_CBOPT || cid == IDC_CBLBLOPT) vis = vis && (gCbShow & 2);
             if (cid == IDC_CBVAL || cid == IDC_CBLBLVAL) vis = vis && (gCbShow & 4);
@@ -29427,7 +29449,9 @@ static void NewLayoutApply()
         Ctl(L"BUTTON", L"Recorder...", WS_TABSTOP, 272, y + 22, 110, 28, IDC_NCRCD);
         Ctl(L"BUTTON", L"Sound triggers...", WS_TABSTOP, 388, y + 22, 142, 28, IDC_NCTRIG);
         Ctl(L"BUTTON", L"MIDI controller...", WS_TABSTOP, 30, y + 56, 150, 28, IDC_NCMIDI);
-        Ctl(L"STATIC", L"Your phone and Streamer.bot: just below.", 0, 190, y + 62, 340, 18, IDC_HDR);
+        NMoveId(IDC_PHONEBTN, PAGE_STAGE, 0, 186, y + 56, 140);   // (1.92.1: here, not in the Streamer.bot box)
+        { const int di = NDi(GetDlgItem(gWnd, IDC_PHONEBTN)); if (di >= 0) SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(140), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
+        Ctl(L"STATIC", L"Streamer.bot: just below.", 0, 336, y + 62, 194, 18, IDC_HDR);
         Ctl(L"BUTTON", L"The mouse wheel changes the setting under it", BS_AUTOCHECKBOX | WS_TABSTOP, 30, y + 94, 330, 20, IDC_NCWHEEL);
         CheckDlgButton(gWnd, IDC_NCWHEEL, gWheelAdj ? BST_CHECKED : BST_UNCHECKED);
     }
@@ -29535,7 +29559,7 @@ static void NewLayoutApply()
         struct { int id; const wchar_t* t; } feat[] = {
             { IDC_FEATLAG, L"Hold a hotkey to stutter your voice. Its settings are in Effects > Stutter." },
             { IDC_FEATFX, L"Effects for your live voice, characters and Vocode to song (the Effects tab)." },
-            { IDC_FEATSOUND, L"Pads on hotkeys, a looper and beatbox drums (Sounds), and text to speech (Speech)." },
+            { IDC_FEATSOUND, L"Pads on hotkeys, a looper and beatbox drums (Sounds), and text to speech (Speech; Sounds while Speech is off)." },
             { IDC_FEATCLIPS, L"Keeps the last few seconds so you can save them as a clip (Sounds > Clips)." },
             { IDC_FEATSPEECH, L"Voice commands, bleeping words, talking through a TTS voice or Morse code (the Speech tab). Downloads a speech model once." },
             { IDC_FEATAVATAR, L"Your pictures that talk when you talk, in a window for OBS (Settings > Avatar)." },
@@ -29570,6 +29594,18 @@ static void NewLayoutApply()
         gSections[dk].y += HomeDy();
     }
     AssignSections();
+    for (int k = 0; k < gSectionN; k++)         // (1.92.1) typed TTS: its box, which moves to Sounds while Speech is off
+        if (gSections[k].page == PAGE_SPEECH && gSections[k].title && !lstrcmpW(gSections[k].title, L"Text to speech")) gTtsSec = k;
+    if (gTtsSec >= 0) {                         // (its refresh hooks count it as showing on either sub-tab)
+        const int sa = NSubByName(PAGE_SPEECH, L"TTS & Morse"), sb = NSubByName(PAGE_SOUND, L"Text to speech");
+        for (int i = 0; i < gDesignN; i++) {
+            const int op = gOrigPage[i];
+            if (gDesign[i].sec != gTtsSec || op < 0 || op >= TAB_COUNT || sa < 0 || sb < 0) continue;
+            const unsigned bit = 1u << (gOrigSub[i] + 1);
+            gNewHas[PAGE_SPEECH][Imin(sa + 1, NEW_SUBS)][op] |= bit; gNewHas[PAGE_SOUND][Imin(sb + 1, NEW_SUBS)][op] |= bit;
+        }
+    }
+    TtsSecPlace();
     StarsLoad();                                // (1.91.0) the boxes you pinned to Home (their New places are final now)
 }
 
