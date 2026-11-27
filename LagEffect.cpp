@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.91.0"
+#define APP_VERSION L"1.92.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1286,6 +1286,7 @@ static DWORD gOutNextTry[MAX_OUT], gOutWait[MAX_OUT];       // (extra outputs th
 static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
 static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
 static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;
+static int gTabPos = 0;                         // (1.92.0, New) where the tabs are: 0 top, 1 left side, 2 right side, 3 bottom (INI tab_position)
 static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }
 static inline int UNSC(int v) { return gUiScale == 100 ? v : MulDiv(v, 100, gUiScale); }   // screen px -> design px   // UI size   // gCmdLine: hidden (right-click the version text)
 static int  gOverlayX = INT_MIN, gOverlayY = INT_MIN;
@@ -7270,6 +7271,12 @@ struct Clip {
     TrimState redo[TRIM_HIST]; int nRedo;
 };
 static Clip    gClips[CLIP_N];
+#define IDC_CLIPWAVE  4950                      // (1.92.0, New) .. + CLIPS - 1: each clip row's waveform + length (click: hear it on Ears)
+static void ClipRowRedraw(int row)              // a clip row's name button (1.92.0: and its waveform)
+{
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + row), nullptr, FALSE);
+    if (gLayoutNew) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + row), nullptr, FALSE);
+}
 static int     gClipBank = 0;                    // clip page on screen
 #define IDC_CLIPBANK4 4897                      // (1.90.2, New) clip pages E-H (.. 4900)
 static inline int ClipBanks() { return gLayoutNew ? CLIP_BANKS : 4; }   // (1.90.2) pages this layout shows (Classic: A-D, as it was)
@@ -7407,6 +7414,7 @@ static void LoadSettings()
     gVolStyle     = Iclamp(INI_INT(L"volume_control_style", 0), 0, 1);
     gHdrMeter     = INI_INT(L"header_mic_meter", 1) != 0;
     gWheelAdj     = INI_INT(L"wheel_changes_settings", 0) != 0;
+    gTabPos       = Iclamp(INI_INT(L"tab_position", 0), 0, 3);
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
     gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
@@ -8378,6 +8386,7 @@ static void SaveSettings()
     SaveInt(L"volume_control_style", gVolStyle);
     SaveInt(L"header_mic_meter", gHdrMeter);
     SaveInt(L"wheel_changes_settings", gWheelAdj);
+    SaveInt(L"tab_position", gTabPos);
     SaveInt(L"layout_new", gLayoutWant ? 1 : 0);   // (1.90.0)
     if (gLayoutNew) { SaveInt(L"layout_new_runs", gNewRuns); SaveNewSubs(); }
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
@@ -8701,7 +8710,9 @@ static void StopAudio()
 #define CLIENT_W  560
 #define STRIP_H   30                           // the bar along the bottom: search, Hotkeys, what's on (1.51.0)
 #define BASE_H    (592 + STRIP_H)              // window height with one output
-static int BaseH() { return BASE_H + (gLayoutNew ? 50 : 0); }   // (1.90.0) New: 50 px taller (fewer pages need scrolling)
+static int TabSideW() { return gLayoutNew && !gCompact && (gTabPos == 1 || gTabPos == 2) ? 104 : 0; }   // (design px) the side column
+static int TabBotH()  { return gLayoutNew && !gCompact && gTabPos == 3 ? 40 : 0; }                    // ... the row above the bottom bar
+static int BaseH() { return BASE_H + (gLayoutNew ? 50 : 0) + TabBotH(); }   // (1.90.0) New: 50 px taller (fewer pages need scrolling)
 #define COMPACT_H 84                           // compact mode: status + a few buttons
 #define ROW_Y0    134
 #define ROW_H     30
@@ -8714,6 +8725,7 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
        PAGE_HIDE = 98, PAGE_STAGE = 99 };      // (New: a Classic control it doesn't use; a new box being built)
 #define IDC_TAB7      4800                      // (1.90.0) the Speech tab (IDC_TAB0 + 7 is taken)
 #define IDC_NSUB0     4810                      // .. + page * 10 + sub: the New layout's sub-tabs
+#define IDC_TABPOS    4958                      // (1.92.0, New) Settings > Look > Layout > Tabs: where they are
 #define IDC_LAYOUTSEL 4890                      // Settings > Look > Layout: New / Classic
 #define IDC_NCKEYS    4891                      // (New) Settings > Controls: Hotkeys..., Macros..., Recorder..., Sound triggers..., MIDI...
 #define IDC_NCMACROS  4892
@@ -9089,7 +9101,8 @@ static void PlaceAll()
     if (!gWnd) return;
     const int rows = RowsDelta();
     HWND keep[3] = { GetDlgItem(gWnd, IDC_STATUS), GetDlgItem(gWnd, IDC_START), GetDlgItem(gWnd, IDC_MUTEBTN) };
-    { RECT c; GetClientRect(gWnd, &c); gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - SC(CLIENT_W)) / 2); }
+    { RECT c; GetClientRect(gWnd, &c); const int sw = SC(TabSideW());   // (1.92.0: tabs on a side: the pages sit beside them)
+      gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - sw - SC(CLIENT_W)) / 2) + (gTabPos == 1 ? sw : 0); }
     for (int i = 0; i < gDesignN; i++) {
         Design& d = gDesign[i];
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
@@ -10387,6 +10400,7 @@ static void ClipMenu(int c, HWND anchor);
 static void ClipHistory(HWND anchor);
 static void SetClipBank(int b);
 static void DrawClipBank(DRAWITEMSTRUCT* d);
+static void ClipWaveTick();
 static void PadTick()                           // every 50 ms: redraw pads that are playing or just stopped
 {
     static bool was[SB_N];
@@ -10407,6 +10421,7 @@ static void PadTick()                           // every 50 ms: redraw pads that
         lastBankDraw = GetTickCount();
         for (int b = 0; b < PAD_BANKS; b++) InvalidateRect(GetDlgItem(gWnd, IDC_PADBANK0 + b), nullptr, FALSE);
     }
+    ClipWaveTick();                             // (1.92.0) a clip being heard on Ears: its progress
     ClipTick();
     MicTestTick();
     LoopTick();
@@ -10500,7 +10515,7 @@ static void ClipApply(int c)                    // play the trimmed part (after 
     p.len = 0; p.data = nullptr;
     Sleep(30);                                  // the audio thread has let go of the old range
     if (k.base && k.te > k.ts) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
 static void ClipSetBase(int c, short* data, unsigned len)   // a new recording for a slot (or none)
@@ -10520,7 +10535,7 @@ static void ClipSetBase(int c, short* data, unsigned len)   // a new recording f
     k.pendTs = k.pendTe = 0;
     k.nUndo = k.nRedo = 0;
     if (data) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
 static bool InClipFolder(const wchar_t* path)
@@ -10873,8 +10888,9 @@ static void PrevStop()
     if (gTrimWnd) { SetDlgItemTextW(gTrimWnd, IDT_PLAY, L"\x25B6  Listen"); InvalidateRect(GetDlgItem(gTrimWnd, IDT_WAVE), nullptr, FALSE); }
 }
 
-static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain)   // play on your default speakers only
-{
+static int ComboIndex(int id);
+static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain, int row = -1)   // play on your default speakers only
+{                                               // (1.92.0: or on that output's device, e.g. Ears; the default if it can't open)
     PrevStop();
     if (!gCtxOk || !d || to <= from) return false;
     gPrevData = d; gPrevPos = from; gPrevEnd = to; gPrevGain = gain;
@@ -10883,6 +10899,15 @@ static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain)   /
     cfg.playback.channels = 2;
     cfg.sampleRate        = RATE;
     cfg.dataCallback      = PrevCallback;
+    const int di = row >= 0 && row < gRows ? ComboIndex(IDC_ROWDEV + row) : -1;
+    if (di >= 0 && di < (int)gPlayCount) {
+        cfg.playback.pDeviceID = &gPlayDevs[di].id;
+        if (ma_device_init(&gCtx, &cfg, &gPrevDev) == MA_SUCCESS) {
+            if (ma_device_start(&gPrevDev) == MA_SUCCESS) { gPrevRunning = true; return true; }
+            ma_device_uninit(&gPrevDev);
+        }
+        cfg.playback.pDeviceID = nullptr;
+    }
     if (ma_device_init(&gCtx, &cfg, &gPrevDev) != MA_SUCCESS) return false;
     if (ma_device_start(&gPrevDev) != MA_SUCCESS) { ma_device_uninit(&gPrevDev); return false; }
     gPrevRunning = true;
@@ -11008,7 +11033,7 @@ static void TrimRename()                        // the Name box renames the clip
     lstrcatW(np, dot && dot > slash ? dot : L".wav");
     if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES || MoveFileW(old, np)) lstrcpynW(old, np, MAX_PATH);
     else MessageBoxW(gTrimWnd, L"Couldn't rename the clip (is that name already taken?).", L"Lag Effect - Clips", MB_ICONWARNING);
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + gTrimClip % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(gTrimClip % CLIPS);
 }
 
 static void TrimClose()
@@ -11022,7 +11047,7 @@ static void TrimClose()
     gTrimWnd = nullptr;
     DestroyWindow(w);
     SetForegroundWindow(gWnd);
-    SetFocus(GetDlgItem(gWnd, IDC_CLIPTRIM + gTrimClip % CLIPS));
+    SetFocus(GetDlgItem(gWnd, (gLayoutNew ? IDC_CLIPWAVE : IDC_CLIPTRIM) + gTrimClip % CLIPS));   // (1.92.0, New: no Trim button; its waveform)
     gTrimClip = -1;
 }
 
@@ -13937,6 +13962,53 @@ static void PlaceFree(HWND c, int x, int y, int w, int h)
 }
 static void PlaceTabs()                         // the tabs whose feature is on, side by side (wider when there are fewer)
 {
+    if (gLayoutNew && TabSideW()) {             // (1.92.0) tabs down the left or right side, with their names; the mic level across the top
+        RECT c; GetClientRect(gWnd, &c);
+        const int tx = gTabPos == 1 ? SC(8) : c.right - SC(8) - SC(TabSideW() - 12);
+        int y = 10;
+        for (int i = 0; i < TAB_SLOTS; i++) {
+            const int pg = TabAt(i);
+            HWND t = GetDlgItem(gWnd, TabId(pg));
+            if (!t) continue;
+            if (!PageOn(pg)) { ShowWindow(t, SW_HIDE); continue; }
+            PlaceFree(t, tx, SC(y), SC(TabSideW() - 12), SC(34));
+            ShowWindow(t, SW_SHOWNA);
+            y += 36;
+        }
+        for (int pg = 0; pg < TAB_COUNT; pg++) {
+            bool shown = false; for (int i = 0; i < TAB_SLOTS; i++) if (TabAt(i) == pg) shown = true;
+            if (!shown) ShowWindow(GetDlgItem(gWnd, TabId(pg)), SW_HIDE);
+        }
+        HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
+        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(532), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
+        return;
+    }
+    if (gLayoutNew && TabBotH()) {              // (1.92.0) tabs in a row just above the bottom bar; the mic level across the top
+        RECT c; GetClientRect(gWnd, &c);
+        const int ICON_W = 40;
+        int words = 0, icons = 0;
+        for (int i = 0; i < TAB_SLOTS; i++) { const int pg = TabAt(i); if (!PageOn(pg)) continue; if (pg == PAGE_MAIN || pg == PAGE_SETTINGS) icons++; else words++; }
+        const int nt = words + icons, ww = Imin(110, (532 - icons * ICON_W - (nt - 1) * 2) / Imax(1, words));
+        const int y = c.bottom - SC(STRIP_H) - SC(38);
+        int x = 14;
+        for (int i = 0; i < TAB_SLOTS; i++) {
+            const int pg = TabAt(i);
+            HWND t = GetDlgItem(gWnd, TabId(pg));
+            if (!t) continue;
+            if (!PageOn(pg)) { ShowWindow(t, SW_HIDE); continue; }
+            const int w = pg == PAGE_MAIN || pg == PAGE_SETTINGS ? ICON_W : ww;
+            PlaceFree(t, gOrgX + SC(x), y, SC(w), SC(32));
+            ShowWindow(t, SW_SHOWNA);
+            x += w + 2;
+        }
+        for (int pg = 0; pg < TAB_COUNT; pg++) {
+            bool shown = false; for (int i = 0; i < TAB_SLOTS; i++) if (TabAt(i) == pg) shown = true;
+            if (!shown) ShowWindow(GetDlgItem(gWnd, TabId(pg)), SW_HIDE);
+        }
+        HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
+        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(532), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
+        return;
+    }
     if (gLayoutNew) {                           // (1.90.0) Home and Settings are icons, the mic level sits at the end of the row
         const int ICON_W = 40, MET_W = gHdrMeter ? 84 : 0;
         int words = 0, icons = 0;
@@ -13987,9 +14059,9 @@ static void MixerPlace()                        // the Mixer fills the window: s
 {
     if (!gWnd || gSecChan < 0 || gSecOut < 0 || gCompact) return;
     RECT cr; GetClientRect(gWnd, &cr);
-    const int W = Imax((int)cr.right, MixerNeedW()), H = cr.bottom;
+    const int sw = SC(TabSideW()), W = Imax((int)cr.right - sw, MixerNeedW()), H = cr.bottom;   // (1.92.0: beside side tabs)
     const int extraH = Imax(0, H - SC(DesignH()));
-    const int cx0 = SC(14), cw = W - SC(28);
+    const int cx0 = SC(14) + (gTabPos == 1 ? sw : 0), cw = W - SC(28);
     const int chTop = SC(54), chH = SC(354) + extraH * 2 / 3;
     const int oTop = chTop + chH + SC(16), oH = SC(160) + (extraH - extraH * 2 / 3);
     Section& sc = gSections[gSecChan]; sc.x = UNSC(cx0); sc.y = UNSC(chTop); sc.w = UNSC(cw); sc.h = UNSC(chH); sc.ox = sc.oy = 0;
@@ -14024,7 +14096,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
 
     // channel strips
     const int sy = chTop + SC(72), sh = chH - SC(88);
-    int x = SC(21);
+    int x = cx0 + SC(7);
     const int n = Imax(1, Imin(gRows, MAX_OUT));
     for (int c = 0; c < CH_MAX; c++) {
         if (!ChanShown(c)) { gStripRc[c] = { 0, 0, 0, 0 }; continue; }   // (empty: no strip, "+ Add channel" fills it; or hidden)
@@ -14057,7 +14129,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
     }
     // output strips
     const int oy = oTop + SC(14), oh = oH - SC(22);
-    x = SC(21);
+    x = cx0 + SC(7);
     for (int k = 0; k < MAX_OUT; k++) {
         const int w = SC(OutW(k));
         gStripRc[CH_MAX + k] = { x, oy, x + w, oy + oh };
@@ -14479,7 +14551,7 @@ static void SetClipBank(int b)
     gClipBank = Iclamp(b, 0, ClipBanks() - 1);
     for (int r = 0; r < CLIPS; r++) {
         MiniSet(IDC_CLIPVOL + r, gPads[CLIP0 + ClipSlot(r)].vol);
-        InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + r), nullptr, FALSE);
+        ClipRowRedraw(r);
     }
     for (int k = 0; k < ClipBanks(); k++) InvalidateRect(GetDlgItem(gWnd, ClipBankId(k)), nullptr, FALSE);
 }
@@ -14613,7 +14685,7 @@ static void ClipRename(int c)
     wchar_t np[MAX_PATH]; wsprintfW(np, L"%s\\%s.wav", gClipDir, name);
     if (MoveFileW(old, np)) lstrcpynW(old, np, MAX_PATH);
     else MessageBoxW(gWnd, L"Couldn't rename the clip (is that name already taken?).", L"Lag Effect - Clips", MB_ICONWARNING);
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
 static void OpenTrim(int c);
@@ -14640,9 +14712,77 @@ static void ClipMenu(int c, HWND anchor)
     else if (cmd == 5) gClipPinned[c] = !gClipPinned[c];
     else if (cmd == 6) OpenTrim(c);
     else if (cmd == 7) { ClipClear(c); gClipPinned[c] = false; ClipShiftUp(c); }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
+static void CalloutShow(HWND target, const wchar_t* title, const wchar_t* body, int act, int arg, const wchar_t* btn);
+// ---- (1.92.0, New) clip rows: the clip's waveform + length; click = hear it on your "Always hear sounds on" output (Ears) only
+static int gPrevClip = -1;                      // the clip being heard that way (-1: none)
+static struct { const short* p; unsigned n; int cols; unsigned char h[160]; } gClipWv[CLIP_N];   // its bars, made once per clip / width
+static void ClipWaveClick(int row)
+{
+    const int c = ClipSlot(row); const Clip& k = gClips[c];
+    if (gPrevRunning && gPrevClip == c && gPrevData == k.base) { PrevStop(); gPrevClip = -1; InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + row), nullptr, FALSE); return; }
+    if (!k.base || k.te <= k.ts) { CalloutShow(GetDlgItem(gWnd, IDC_CLIPWAVE + row), L"Empty", L"Nothing in this slot yet: press Clip it (or its hotkey) to save the last few seconds.", 0, 0, nullptr); return; }
+    if (gTrimWnd) return;                       // (the trim editor has the preview)
+    const int row2 = gHearOut >= 1 && gHearOut <= gRows ? gHearOut - 1 : -1;
+    if (PrevPlay(k.base, k.ts, k.te, gPads[CLIP0 + c].vol / 100.0f, row2)) gPrevClip = c;
+    for (int r = 0; r < CLIPS; r++) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + r), nullptr, FALSE);
+}
+static void ClipWaveTick()                      // (every 50 ms) the bar over the waveform while it's heard; stop marks when it ends
+{
+    if (!gLayoutNew || gPrevClip < 0) return;
+    const int c = gPrevClip;
+    if (!gPrevRunning || gPrevData != gClips[c].base) gPrevClip = -1;
+    if (c / CLIPS == gClipBank) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + c % CLIPS), nullptr, FALSE);
+}
+static void ClipWaveDraw(DRAWITEMSTRUCT* d)
+{
+    const int row = (int)d->CtlID - IDC_CLIPWAVE, c = ClipSlot(row);
+    const Clip& k = gClips[c];
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    const bool has = k.base && k.te > k.ts, hearing = has && gPrevRunning && gPrevClip == c && gPrevData == k.base;
+    const COLORREF field = gDark ? RGB(28, 28, 28) : RGB(250, 250, 250), dim = gDark ? DK_DIM : gLtDim;
+    HBRUSH fb = CreateSolidBrush(field); HPEN bp = CreatePen(PS_SOLID, 1, hearing || (d->itemState & ODS_FOCUS) ? ACCENT : (gDark ? DK_BORDER : LT_BORDER));
+    HGDIOBJ ob = SelectObject(dc, fb), op = SelectObject(dc, bp);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, SC(6), SC(6));
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(fb); DeleteObject(bp);
+    if (!has) {                                 // empty: a flat line
+        HPEN lp = CreatePen(PS_DOT, 1, dim); HGDIOBJ o2 = SelectObject(dc, lp);
+        const int my = (rc.top + rc.bottom) / 2; MoveToEx(dc, rc.left + SC(6), my, nullptr); LineTo(dc, rc.right - SC(6), my);
+        SelectObject(dc, o2); DeleteObject(lp);
+        return;
+    }
+    const unsigned n = k.te - k.ts, secs = (n + RATE / 2) / RATE;
+    wchar_t len[16]; wsprintfW(len, L"%u:%02u", secs / 60, secs % 60);
+    HGDIOBJ of = SelectObject(dc, gFont); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, dim);
+    SIZE ts; GetTextExtentPoint32W(dc, len, lstrlenW(len), &ts);
+    RECT lr = { rc.right - SC(6) - ts.cx, rc.top, rc.right - SC(6), rc.bottom };
+    DrawTextW(dc, len, -1, &lr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+    SelectObject(dc, of);
+    const int x0 = rc.left + SC(6), x1 = lr.left - SC(5), step = Imax(3, SC(3)), bw = Imax(2, step * 2 / 3);
+    const int cols = Imin(160, Imax(1, (x1 - x0) / step));
+    auto& wv = gClipWv[c];
+    const short* src = k.base + k.ts;
+    if (wv.p != src || wv.n != n || wv.cols != cols) {   // (once per clip / trim / size: the loudest part of each slice)
+        wv.p = src; wv.n = n; wv.cols = cols;
+        for (int i = 0; i < cols; i++) {
+            const unsigned a = (unsigned)((unsigned long long)n * i / cols), b = Imax((int)a + 1, (int)((unsigned long long)n * (i + 1) / cols));
+            int pk = 0; for (unsigned j = a; j < b && j < n; j += 4) { const int v = abs((int)src[j]); if (v > pk) pk = v; }
+            wv.h[i] = (unsigned char)Imin(255, (int)(sqrtf(pk / 32768.0f) * 255.0f + 0.5f));
+        }
+    }
+    const int done = hearing && gPrevEnd > k.ts ? (int)((unsigned long long)cols * (Imin((int)gPrevPos, (int)gPrevEnd) - (int)k.ts) / (gPrevEnd - k.ts)) : -1;
+    const int mid = (rc.top + rc.bottom) / 2, half = (rc.bottom - rc.top) / 2 - SC(5);
+    HBRUSH on = CreateSolidBrush(ACCENT), off = CreateSolidBrush(gDark ? RGB(150, 150, 150) : RGB(120, 120, 120));
+    for (int i = 0; i < cols; i++) {
+        const int hh = Imax(1, half * wv.h[i] / 255);
+        RECT b = { x0 + i * step, mid - hh, x0 + i * step + bw, mid + hh + 1 };
+        FillRect(dc, &b, i < done ? on : off);
+    }
+    DeleteObject(on); DeleteObject(off);
+}
 static void ClipHistory(HWND anchor)            // every clip ever saved: load one back onto the board
 {
     ClipFolder();
@@ -16458,8 +16598,10 @@ static void AddTips()
     TipId(IDC_TRAY,    L"Hide the window. Lag Effect keeps running in the system tray; click the tray icon to bring it back. "
                        L"Right-click the tray icon for quick on/off switches.");
     TipId(IDC_HELPBTN, L"How everything works, plus setup steps for Discord and OBS.");
-    TipId(IDC_SEARCH,   L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
-                        L"its tab opens and it flashes.");
+    TipId(IDC_SEARCH,   gLayoutNew ? L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
+                                 L"its tab opens and it flashes. A switch has Turn on / Turn off right in the list (or Ctrl+Enter)."
+                               : L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
+                                 L"its tab opens and it flashes.");
     TipId(IDC_KEYSLIST, L"Every hotkey you've set, in one list: what each does, where its button is, and keys set for more than one thing.");
     TipId(IDC_ONSTRIP,  L"What's on right now. Click one to go to its settings.");
     TipId(IDC_HDRMETER, L"Your mic's level, on every tab (dim while the gate is shut, red when it's close to too loud). Click: the Mic tab. Turn it off in Settings > Look.");
@@ -16474,6 +16616,8 @@ static void AddTips()
         TipId(IDC_NCTRIG,   L"Sound triggers: a clap, snap, whistle or tongue click runs any action (Settings > Features turns them on).");
         TipId(IDC_NCMIDI,   L"A MIDI controller's buttons, knobs and faders control Lag Effect (Settings > Features turns it on).");
         TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
+        for (int i = 0; i < CLIPS; i++) TipId(IDC_CLIPWAVE + i, L"The clip and how long it is. Click to hear it on your \"Always hear sounds on\" output (Home), only you; click again to stop. (Trim, rename, MP3: the ... button.)");
+        TipId(IDC_TABPOS,  L"Where the tabs are: along the top (usual), down the left or right side (with their names; the window gets wider), or along the bottom just above the search bar. The mic level then sits across the top.");
         TipId(IDC_HMETER,  L"Your mic's level (as on the Mic tab): green while the gate lets you through. Click: the Mic tab.");
         {   static const wchar_t* T[HOME_TOGS] = {
                 L"Voice effects on / off (the switch on the Effects tab).", L"AI noise suppression on / off (Mic > Cleanup).",
@@ -18302,7 +18446,7 @@ static void ScrollCompute()                     // which boxes show on this page
         const int R = RowsDelta(), top = HOME_TOP + R;
         RECT c; GetClientRect(gWnd, &c);
         const int ch = IsWindowVisible(gWnd) && !IsIconic(gWnd) ? UNSC(c.bottom) : BaseH() + R;
-        const int bot = Imax(top + 120, ch - STRIP_H - 4);
+        const int bot = Imax(top + 120, ch - STRIP_H - 4 - TabBotH());   // (1.92.0: above tabs at the bottom)
         int n = 0, y = top;
         for (int k = 0; k < gSectionN; k++) {  // Home's own boxes there (top to bottom; they're built in that order)
             const Section& s = gSections[k];
@@ -18331,7 +18475,7 @@ static void ScrollCompute()                     // which boxes show on this page
     const int sub = CurSub(gPage), top = NewTop(gPage), si = ScrollSi();
     RECT c; GetClientRect(gWnd, &c);
     const int ch = IsWindowVisible(gWnd) && !IsIconic(gWnd) ? UNSC(c.bottom) : BaseH() + RowsDelta();
-    const int bot = Imax(top + 120, ch - STRIP_H - 4);
+    const int bot = Imax(top + 120, ch - STRIP_H - 4 - TabBotH());   // (1.92.0: above tabs at the bottom)
     int n = 0;
     for (int k = 0; k < gSectionN; k++) {      // this sub-tab's boxes, top to bottom
         const Section& s = gSections[k];
@@ -18574,7 +18718,7 @@ static void Layout()
     DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
     // every page shares the window size, so switching never jumps; plus however much bigger you made it
     RECT r = gCompact ? RECT{ 0, 0, SC(CLIENT_W), SC(COMPACT_H) }
-                      : RECT{ 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + gExtraW, SC(BaseH() + d) + gExtraH };
+                      : RECT{ 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + SC(TabSideW()) + gExtraW, SC(BaseH() + d) + gExtraH };
     AdjustWindowRect(&r, style, FALSE);
     if (!IsZoomed(gWnd)) {
         gOwnSize = true;
@@ -23776,13 +23920,72 @@ static void SearchPick(int r)
     }
     if (it.kind == SK_SUB || it.kind == SK_TAB) SetFocus(GetDlgItem(gWnd, TabId(it.page)));
 }
+// (1.92.0, New) a result that's a switch gets "Turn on" / "Turn off": it switches it right there, without going to it
+static bool HomeTogState(int t); static void HomeTogClick(int t);
+static int SrchSwitch(const SrchItem& it, HWND* out)   // 0: not a switch; 1: a checkbox; 2: a Home switch; 3: the Voice effects switch
+{
+    if (!gLayoutNew || (it.feat && !FeatOn(it.feat))) return 0;
+    auto isChk = [](HWND c) {
+        wchar_t cls[16]; GetClassNameW(c, cls, 16);
+        const LONG t = GetWindowLongW(c, GWL_STYLE) & BS_TYPEMASK;
+        return !lstrcmpiW(cls, L"Button") && (t == BS_AUTOCHECKBOX || t == BS_CHECKBOX) && IsWindowEnabled(c);
+    };
+    HWND c = it.h;
+    if (it.kind == SK_SEC) {                    // a box with an "On" switch (each voice effect): that one
+        c = nullptr;
+        for (int i = 0; i < gDesignN && !c; i++) {
+            if (gDesign[i].sec != it.sec || !isChk(gDesign[i].h)) continue;
+            wchar_t t[8]; GetWindowTextW(gDesign[i].h, t, 8); if (!lstrcmpiW(t, L"On")) c = gDesign[i].h;
+        }
+        if (!c) return 0;
+        *out = c; return 1;
+    }
+    if (it.kind != SK_CTL || !c) return 0;
+    const int id = GetDlgCtrlID(c);
+    if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { *out = c; return 2; }
+    if (id == IDC_FXON) { *out = c; return 3; }
+    if (isChk(c)) { *out = c; return 1; }
+    return 0;
+}
+static bool SrchSwitchState(int kind, HWND c)
+{
+    return kind == 1 ? IsDlgButtonChecked(gWnd, GetDlgCtrlID(c)) == BST_CHECKED : kind == 2 ? HomeTogState(GetDlgCtrlID(c) - IDC_HTOG0) : kind == 3 ? (bool)gFxOn : false;
+}
+static void SrchSwitchFlip(int r)               // the result's switch, the other way (as clicking it would)
+{
+    if (r < 0 || r >= gSrchResN) return;
+    const SrchItem& it = gSrch[gSrchRes[r]];
+    HWND c = nullptr; const int kind = SrchSwitch(it, &c); if (!kind) return;
+    const int id = GetDlgCtrlID(c);
+    if (kind == 2) HomeTogClick(id - IDC_HTOG0);
+    else {
+        if (kind == 1) CheckDlgButton(gWnd, id, IsDlgButtonChecked(gWnd, id) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED);
+        SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)c);
+    }
+    wchar_t t[120]; wsprintfW(t, L"%s: %s", it.name, SrchSwitchState(kind, c) ? L"on" : L"off");
+    ShowOsd(t, SrchSwitchState(kind, c));
+    if (gSearchPop) InvalidateRect(gSearchPop, nullptr, FALSE);
+}
+static RECT SrchPillRect(int r, int cw)        // where a result's "Turn on / off" sits (popup px)
+{
+    const int rh = SC(26);
+    return RECT{ cw - SC(84), r * rh + SC(3), cw - SC(8), (r + 1) * rh - SC(3) };
+}
 static LRESULT CALLBACK SearchPopProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     const int rh = SC(26);
     switch (m) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;  // (the search box keeps the keyboard)
     case WM_MOUSEMOVE: { const int r = (short)HIWORD(l) / rh; if (r != gSrchSel && r >= 0 && r < gSrchResN) { gSrchSel = r; InvalidateRect(h, nullptr, FALSE); } return 0; }
-    case WM_LBUTTONDOWN: SearchPick((short)HIWORD(l) / rh); return 0;
+    case WM_LBUTTONDOWN: {
+        const int r = (short)HIWORD(l) / rh;
+        if (r >= 0 && r < gSrchResN) {          // (1.92.0) on its Turn on / off: just that
+            RECT rc; GetClientRect(h, &rc); RECT pr = SrchPillRect(r, rc.right); POINT p = { (short)LOWORD(l), (short)HIWORD(l) };
+            HWND c = nullptr;
+            if (PtInRect(&pr, p) && SrchSwitch(gSrch[gSrchRes[r]], &c)) { SrchSwitchFlip(r); return 0; }
+        }
+        SearchPick(r); return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC wdc = BeginPaint(h, &ps);
@@ -23807,8 +24010,20 @@ static LRESULT CALLBACK SearchPopProc(HWND h, UINT m, WPARAM w, LPARAM l)
             SelectObject(dc, gFont);
             SetTextColor(dc, r == gSrchSel ? RGB(235, 235, 235) : gDark ? DK_DIM : gLtDim);
             wchar_t loc[140]; wsprintfW(loc, off ? L"%s  (off)" : L"%s", it.loc);
-            tr.left = rc.right / 2; tr.right = rc.right - SC(8);
+            HWND sc = nullptr; const int sk = SrchSwitch(it, &sc);
+            tr.left = rc.right / 2; tr.right = rc.right - SC(sk ? 90 : 8);
             DrawTextW(dc, loc, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (sk) {                           // (1.92.0) Turn on / Turn off, lit while it's on
+                const bool st = SrchSwitchState(sk, sc);
+                RECT pr = SrchPillRect(r, rc.right);
+                const COLORREF fill = st ? (r == gSrchSel ? RGB(255, 255, 255) : ACCENT) : (gDark ? RGB(45, 45, 45) : RGB(235, 235, 235));
+                HBRUSH pb = CreateSolidBrush(fill); HPEN pp = CreatePen(PS_SOLID, 1, r == gSrchSel ? RGB(255, 255, 255) : st ? ACCENT : (gDark ? DK_BORDER : LT_BORDER));
+                HGDIOBJ o1 = SelectObject(dc, pb), o2 = SelectObject(dc, pp);
+                RoundRect(dc, pr.left, pr.top, pr.right, pr.bottom, pr.bottom - pr.top, pr.bottom - pr.top);
+                SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(pb); DeleteObject(pp);
+                SetTextColor(dc, st ? (r == gSrchSel ? ACCENT : RGB(255, 255, 255)) : TXT_C);
+                DrawTextW(dc, st ? L"Turn off" : L"Turn on", -1, &pr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            }
         }
         HPEN pn = CreatePen(PS_SOLID, 1, ACCENT); HGDIOBJ op = SelectObject(dc, pn); HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
         Rectangle(dc, 0, 0, rc.right, rc.bottom);
@@ -23867,7 +24082,14 @@ static LRESULT CALLBACK SearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
             if (gSrchResN) { gSrchSel = (gSrchSel + (w == VK_DOWN ? 1 : gSrchResN - 1)) % gSrchResN; if (gSearchPop) InvalidateRect(gSearchPop, nullptr, FALSE); }
             return 0;
         }
-        if (w == VK_RETURN) { if (gSearchPop && IsWindowVisible(gSearchPop)) SearchPick(gSrchSel); return 0; }
+        if (w == VK_RETURN) {
+            if (gSearchPop && IsWindowVisible(gSearchPop)) {
+                HWND c = nullptr;                // (1.92.0) Ctrl+Enter: switch it on / off without going there
+                if ((GetKeyState(VK_CONTROL) & 0x8000) && gSrchSel < gSrchResN && SrchSwitch(gSrch[gSrchRes[gSrchSel]], &c)) SrchSwitchFlip(gSrchSel);
+                else SearchPick(gSrchSel);
+            }
+            return 0;
+        }
         if (w == VK_ESCAPE) { SetWindowTextW(h, L""); SearchHide(); SetFocus(GetDlgItem(gWnd, TabId(gPage))); return 0; }
         break;
     case WM_CHAR: if (w == VK_RETURN || w == VK_ESCAPE) return 0; break;   // (no beep)
@@ -30148,7 +30370,17 @@ static void CreateUI()
             Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 342 + b2 * 47, 264, 43, 24, ClipBankId(b2));
     }
     if (gClipBank >= ClipBanks()) gClipBank = 0;
-    for (int i = 0; i < CLIPS; i++) {
+    for (int i = 0; i < CLIPS && gLayoutNew; i++) {   // (1.92.0, New) name, volume, waveform + length, key, ..., ×  (Trim is in the ... menu)
+        int y = 292 + i * 36;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
+        MiniVol(IDC_CLIPVOL + i, 210, y + 3, 56, gPads[CLIP0 + ClipSlot(i)].vol);
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 272, y + 1, 104, 28, IDC_CLIPWAVE + i);
+        wchar_t kn[120]; FxKeyButtonText(SLOT_CLIP0 + i, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 382, y + 1, 88, 28, IDC_CLIPKEY + i);
+        Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 476, y + 1, 26, 28, IDC_CLIPMORE + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 506, y + 1, 24, 28, IDC_CLIPCLR + i);
+    }
+    for (int i = 0; i < CLIPS && !gLayoutNew; i++) {
         int y = 292 + i * 36;
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
         MiniVol(IDC_CLIPVOL + i, 212, y + 3, 64, gPads[CLIP0 + ClipSlot(i)].vol);
@@ -30401,7 +30633,7 @@ static void CreateUI()
     Ctl(L"STATIC", L"Click: change it. Right-click: theme's colour.", 0, 30, 350, 390, 18, IDC_HDR);
     Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 346, 100, 26, IDC_COLRESET);
 
-    AddSection(14, 392, 532, 84, L"Layout");
+    AddSection(14, 392, 532, gLayoutNew ? 116 : 84, L"Layout");
     Ctl(L"BUTTON", L"Move things around...", WS_TABSTOP | WS_GROUP, 30, 414, 180, 28, IDC_LAYEDIT);
     Ctl(L"BUTTON", L"Put everything back", WS_TABSTOP, 218, 414, 160, 28, IDC_LAYRESET);
     {                                           // (1.90.0) New (by job) / Classic: restarts in the other
@@ -30410,6 +30642,12 @@ static void CreateUI()
         SendMessageW(ls, CB_SETCURSEL, gLayoutNew ? 0 : 1, 0);
     }
     Ctl(L"STATIC", L"Saved per profile: each one can have its own layout.", 0, 30, 450, 500, 18, IDC_HDR);
+    if (gLayoutNew) {                           // (1.92.0) where the tabs are
+        Ctl(L"STATIC", L"Tabs:", 0, 30, 480, 46, 18, -1);
+        HWND tp = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 80, 476, 160, 200, IDC_TABPOS);
+        for (const wchar_t* t : { L"At the top", L"Down the left side", L"Down the right side", L"At the bottom" }) SendMessageW(tp, CB_ADDSTRING, 0, (LPARAM)t);
+        SendMessageW(tp, CB_SETCURSEL, gTabPos, 0);
+    }
     gBuildSub = -1;
 
     // ---- Pictures ----
@@ -30652,7 +30890,8 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     FillRect(dc, &rc, BgBrush());
     wchar_t text[32]; GetWindowTextW(d->hwndItem, text, 32);
     static HFONT icons = nullptr;               // (1.90.0, New) Home and Settings: Windows' own house and gear
-    if (gLayoutNew && (idx == PAGE_MAIN || idx == PAGE_SETTINGS)) {
+    if (gLayoutNew && TabSideW() && (idx == PAGE_MAIN || idx == PAGE_SETTINGS)) lstrcpynW(text, PAGE_NAMES_N[idx], 32);   // (1.92.0: side tabs have names)
+    if (gLayoutNew && !TabSideW() && (idx == PAGE_MAIN || idx == PAGE_SETTINGS)) {
         static int iconPx = 0;
         if (!icons || iconPx != SC(16)) {
             if (icons) DeleteObject(icons);
@@ -30683,11 +30922,13 @@ static void DrawTab(DRAWITEMSTRUCT* d)
         if (sz.cx <= tr.right - tr.left - 6) break;
         SelectObject(dc, FitFont(lvl));
     }
-    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    if (gLayoutNew && TabSideW()) { tr = rc; tr.left += SC(14); }   // (side tabs: left-aligned)
+    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | (gLayoutNew && TabSideW() ? DT_LEFT : DT_CENTER) | DT_VCENTER);
     SelectObject(dc, of);
     if (active) {
         HBRUSH ab = CreateSolidBrush(TAB_C);
         RECT bar = { rc.left + 14, rc.bottom - 3, rc.right - 14, rc.bottom };
+        if (gLayoutNew && TabSideW()) bar = { rc.left + SC(3), rc.top + SC(8), rc.left + SC(6), rc.bottom - SC(8) };   // (a bar at the side)
         FillRect(dc, &bar, ab);
         DeleteObject(ab);
     }
@@ -30822,6 +31063,13 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) NSubPick((id - IDC_NSUB0) / 10, (id - IDC_NSUB0) % 10);
         return;
     }
+    if (id == IDC_TABPOS) {                     // (1.92.0) Settings > Look > Layout > Tabs: top / left / right / bottom
+        if (code == CBN_SELCHANGE && gUiReady) {
+            const int v = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3);
+            if (v != gTabPos) { gTabPos = v; SaveSettings(); Layout(); InvalidateRect(gWnd, nullptr, TRUE); }
+        }
+        return;
+    }
     if (id == IDC_LAYOUTSEL) {                  // Settings > Look > Layout: New / Classic (restarts)
         if (code == CBN_SELCHANGE && gUiReady) {
             const bool want = SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) == 0;
@@ -30831,6 +31079,7 @@ static void OnCommand(int id, int code)
     }
     if (id >= IDC_MCVOL && id <= IDC_MCLAST) { if (code == BN_CLICKED) McClick(id); return; }   // (1.90.2) Sounds > Music > Mixer channel
     if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { if (code == BN_CLICKED) HomeTogClick(id - IDC_HTOG0); return; }   // (1.91.0) Home > What's on
+    if (id >= IDC_CLIPWAVE && id < IDC_CLIPWAVE + CLIPS) { if (code == BN_CLICKED) ClipWaveClick(id - IDC_CLIPWAVE); return; }   // (1.92.0) hear a clip on Ears
     if (id == IDC_HMETER) { if (code == STN_CLICKED) SetPage(PAGE_MIC); return; }   // (Home's mic level: the Mic tab)
     if (id == IDC_NCWHEEL) {                    // (1.90.2) the wheel on knobs / number boxes / faders / lists
         if (code == BN_CLICKED) { gWheelAdj = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings(); }
@@ -31881,6 +32130,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
 {
     if (w >= IDC_MCVOL && w <= IDC_MCLAST && McDraw((int)w, d)) return true;   // (1.90.2) Sounds > Music > Mixer channel
     if (w == IDC_HMETER) { DrawMeter(d); return true; }   // (1.91.0) Home: your mic's level (as on the Mic tab)
+    if (w >= IDC_CLIPWAVE && w < IDC_CLIPWAVE + CLIPS) { ClipWaveDraw(d); return true; }   // (1.92.0) a clip's waveform
     if (w >= IDC_HTOG0 && w < IDC_HTOG0 + HOME_TOGS) { DrawToggleC(d, HomeTogState((int)w - IDC_HTOG0), ACCENT, RGB(255, 255, 255)); return true; }
     if (w >= IDC_CHMUTE0 && w < IDC_CHMUTE0 + CH_MAX) { DrawToggle(d, gCh[w - IDC_CHMUTE0].mute, true); return true; }
     if (w >= IDC_CHSOLO0 && w < IDC_CHSOLO0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHSOLO0].solo, SOLO_C, RGB(27, 27, 27)); return true; }
@@ -32180,7 +32430,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
                 busy = true;
                 if (!gOwnSize && !IsZoomed(h) && !gCompact) {   // remember how much bigger than needed you made it
                     RECT c; GetClientRect(h, &c);
-                    gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()));
+                    gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()) - SC(TabSideW()));
                     gExtraH = Imax(0, (int)c.bottom - SC(DesignH()));
                 }
                 PlaceAll(); MixerPlace(); PlaceTabs(); PlaceStrip();
@@ -32199,7 +32449,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_EXITSIZEMOVE:  gMoving = false; break;
     case WM_GETMINMAXINFO: {                    // never smaller than the layout needs
         MINMAXINFO* mm = (MINMAXINFO*)l;
-        RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()), SC(gWnd ? DesignH() : BaseH()) };
+        RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + SC(TabSideW()), SC(gWnd ? DesignH() : BaseH()) };
         AdjustWindowRect(&r, (DWORD)GetWindowLongW(h, GWL_STYLE), FALSE);
         mm->ptMinTrackSize.x = r.right - r.left; mm->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
