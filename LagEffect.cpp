@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.90.0"
+#define APP_VERSION L"1.90.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -18247,13 +18247,30 @@ static void ScrollBy(int n)                     // a box at a time
     gScrollFirst[gPage][si] = want;
     Layout();
 }
-static bool ScrollClick(int x, int y)           // a click on the bar: a box up or down
+static bool gScrollDrag = false;                // dragging the bar's thumb
+static int  gScrollDragY0 = 0, gScrollDragTop0 = 0;
+static bool ScrollClick(int x, int y)           // a click on the bar: on the thumb drags it, above / below it moves a box
 {
     if (IsRectEmpty(&gScrollTrack)) return false;
     RECT r = gScrollTrack; InflateRect(&r, SC(6), 0);
     POINT p = { x, y }; if (!PtInRect(&r, p)) return false;
-    ScrollBy(y < gScrollThumb.top ? -1 : y >= gScrollThumb.bottom ? 1 : 0);
+    if (y >= gScrollThumb.top && y < gScrollThumb.bottom && gScrollN) {
+        gScrollDrag = true; gScrollDragY0 = y; gScrollDragTop0 = gSections[gScrollList[gScrollAt]].y;
+        SetCapture(gWnd);
+        return true;
+    }
+    ScrollBy(y < gScrollThumb.top ? -1 : 1);
     return true;
+}
+static void ScrollDragTo(int y)                 // (while dragging) the box nearest where the thumb is now goes to the top
+{
+    if (!gScrollDrag || !gScrollN || IsRectEmpty(&gScrollTrack)) return;
+    const Section& f = gSections[gScrollList[0]]; const Section& l = gSections[gScrollList[gScrollN - 1]];
+    const int total = Imax(1, l.y + l.h - f.y), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
+    const int want = gScrollDragTop0 + MulDiv(y - gScrollDragY0, total, th);
+    int j = 0, best = INT_MAX;
+    for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gSections[gScrollList[k]].y - want); if (d < best) { best = d; j = k; } }
+    if (j != gScrollAt) ScrollBy(j - gScrollAt);
 }
 static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the box it's in shows
 {
@@ -28761,7 +28778,7 @@ static void NewLayoutApply()
     const int classicDesigns = gDesignN;
     for (int i = 0; i < gDesignN; i++) { gOrigPage[i] = (short)gDesign[i].page; gOrigSub[i] = (short)gDesign[i].sub; gNDone[i] = false; }
     short secOrigPage[MAX_SECTIONS], secOrigSub[MAX_SECTIONS]; bool secDone[MAX_SECTIONS];
-    for (int k = 0; k < gSectionN; k++) { secOrigPage[k] = (short)gSections[k].page; secOrigSub[k] = (short)gSections[k].sub; secDone[k] = false; }
+    for (int k = 0; k < MAX_SECTIONS; k++) { secOrigPage[k] = k < gSectionN ? (short)gSections[k].page : -1; secOrigSub[k] = k < gSectionN ? (short)gSections[k].sub : -1; secDone[k] = false; }
     const int classicSecs = gSectionN;
     gNewRuns++;
     auto secOf = [&](int page, const wchar_t* title) { for (int k = 0; k < classicSecs; k++) if (secOrigPage[k] == page && gSections[k].title && !lstrcmpW(gSections[k].title, title)) return k; return -1; };
@@ -28778,8 +28795,8 @@ static void NewLayoutApply()
     }
     {   // Effects: the Voice effects switch, small, at the end of the sub-tab row
         const int di = NDi(GetDlgItem(gWnd, IDC_FXON));
-        NMove(di, PAGE_FX, -1, 418, NSubRowY(PAGE_FX), 128, FEAT_FX);
-        if (di >= 0) { gDesign[di].ht = SC(28); SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(128), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
+        NMove(di, PAGE_FX, -1, 390, NSubRowY(PAGE_FX), 156, FEAT_FX);
+        if (di >= 0) { gDesign[di].ht = SC(28); SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(156), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
     }
     { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) gNDone[di] = true; }   // (Mic: the meter stays on top of every sub-tab)
     {   // Pads: the page buttons (A-D) and its key go inside the box, on a row of their own
@@ -28790,8 +28807,10 @@ static void NewLayoutApply()
             s.h += 36;
             gBuildPage = PAGE_SOUND; gBuildSub = 0; gBuildFeat = 0;
             Ctl(L"STATIC", L"Page:", 0, 30, s.y + 20, 40, 18, -1);
-            for (int b = 0; b < PAD_BANKS; b++) NMoveId(IDC_PADBANK0 + b, PAGE_SOUND, 0, 72 + b * 33, s.y + 14);
+            gDesign[gDesignN - 1].sec = kp;     // (in the box: moves with it)
+            for (int b = 0; b < PAD_BANKS; b++) { NMoveId(IDC_PADBANK0 + b, PAGE_SOUND, 0, 72 + b * 33, s.y + 14); const int di = NDi(GetDlgItem(gWnd, IDC_PADBANK0 + b)); if (di >= 0) gDesign[di].sec = kp; }
             NMoveId(IDC_PADBANKKEY, PAGE_SOUND, 0, 214, s.y + 14, 150);
+            { const int di = NDi(GetDlgItem(gWnd, IDC_PADBANKKEY)); if (di >= 0) gDesign[di].sec = kp; }
         }
     }
     {   // Mic > Cleanup: "Push-to-talk & live bleep" is just push-to-talk (the live bleep key goes to Speech > Bleep)
@@ -28836,7 +28855,15 @@ static void NewLayoutApply()
     }
     gBuildPage = -1; gBuildSub = -1; gBuildFeat = 0;
     for (int i = classicDesigns; i < gDesignN; i++) { gOrigPage[i] = -1; gOrigSub[i] = -1; gNDone[i] = true; }   // (made here: no Classic place)
-    AssignSections();
+    for (int i = 0; i < gDesignN; i++) {        // what's in each new box (only those: the Classic boxes keep what they had, as Classic laid it out)
+        Design& d = gDesign[i];
+        if (d.page != PAGE_STAGE) continue;
+        d.sec = -1;
+        for (int k = classicSecs; k < gSectionN; k++) {
+            const Section& bx = gSections[k];
+            if (bx.page == PAGE_STAGE && d.rx >= bx.x && d.rx < bx.x + bx.w && d.ry >= bx.y - 10 && d.ry < bx.y + bx.h) { d.sec = k; break; }
+        }
+    }
 
     // ---- 3. stack each sub-tab's boxes ----
     memset(gNSubN, 0, sizeof(gNSubN));
@@ -28905,7 +28932,7 @@ static void NewLayoutApply()
                 gNSubW[p][s] = Imax(46, UNSC(z.cx) + 18 + (p == PAGE_FX ? 12 : 0));   // (Effects: room for "2", the effects on)
                 sum += gNSubW[p][s] + 3;
             }
-            const int avail = p == PAGE_FX ? 400 : 532;
+            const int avail = p == PAGE_FX ? 372 : 532;   // (Effects: the Voice effects switch at 390)
             if (sum > avail) for (int s = 0; s < gNSubN[p]; s++) gNSubW[p][s] = gNSubW[p][s] * avail / sum;
             gBuildPage = p; gBuildSub = -1;
             int x = 14;
@@ -31871,13 +31898,15 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         return 0;
     }
     case WM_MOUSEMOVE:
+        if (gScrollDrag && GetCapture() == h) { ScrollDragTo((short)HIWORD(l)); return 0; }   // (1.90.0) the scroll bar's thumb
         if (gEdgeDrag >= 0 && GetCapture() == h) MixerEdgeSet(gEdgeDrag, gEdgeW0 + UNSC((short)LOWORD(l) - gEdgeX0));
         break;
     case WM_LBUTTONUP:
+        if (gScrollDrag) { gScrollDrag = false; ReleaseCapture(); return 0; }
         if (gEdgeDrag >= 0) { gEdgeDrag = -1; ReleaseCapture(); }
         break;
     case WM_CAPTURECHANGED:
-        gEdgeDrag = -1;
+        gEdgeDrag = -1; gScrollDrag = false;
         break;
     case WM_CONTEXTMENU: {                      // right-click a Voice FX hotkey button to clear it
         int id = GetDlgCtrlID((HWND)w);
@@ -32189,6 +32218,10 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
               const int dir = (GetKeyState(VK_SHIFT) & 0x8000) ? TAB_SLOTS - 1 : 1;
               for (int n = 1; n < TAB_SLOTS; n++) { const int pg = TabAt((slot + n * dir) % TAB_SLOTS); if (PageOn(pg)) { SetPage(pg); break; } } }
             continue;
+        }
+        if (msg.message == WM_MOUSEWHEEL && gLayoutNew && gScrollN && gScrollMax > 0 && msg.hwnd != h && IsChild(h, msg.hwnd)) {
+            HWND f = GetFocus();                // (1.90.0) on a page that scrolls, the wheel scrolls it: a setting under the mouse only
+            if (f != msg.hwnd && !IsChild(msg.hwnd, f) && !IsChild(f, msg.hwnd)) msg.hwnd = h;   // takes the wheel once you've clicked it
         }
         if (msg.message == WM_KEYDOWN && msg.wParam >= '1' && msg.wParam < '1' + TAB_SLOTS &&
             (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
