@@ -16614,7 +16614,7 @@ static void AddTips()
         TipId(IDC_NCTRIG,   L"Sound triggers: a clap, snap, whistle or tongue click runs any action (Settings > Features turns them on).");
         TipId(IDC_NCMIDI,   L"A MIDI controller's buttons, knobs and faders control Lag Effect (Settings > Features turns it on).");
         TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
-        for (int i = 0; i < CLIPS; i++) TipId(IDC_CLIPWAVE + i, L"The clip and how long it is. Click to hear it on your \"Always hear sounds on\" output (Home), only you; click again to stop. (Trim, rename, MP3: the ... button.)");
+        for (int i = 0; i < CLIPS; i++) TipId(IDC_CLIPWAVE + i, L"The clip and how long it is. Click to hear it on your \"Always hear sounds on\" output (Home), only you; click again to stop. Right-click: trim it. (Rename, MP3: the ... button.)");
         TipId(IDC_TABPOS,  L"Where the tabs are: along the top (usual), down the left or right side (with their names; the window gets wider), or along the bottom just above the search bar. The mic level then sits across the top.");
         TipId(IDC_HMETER,  L"Your mic's level (as on the Mic tab): green while the gate lets you through. Click: the Mic tab.");
         {   static const wchar_t* T[HOME_TOGS] = {
@@ -32652,6 +32652,11 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_CONTEXTMENU: {                      // right-click a Voice FX hotkey button to clear it
         int id = GetDlgCtrlID((HWND)w);
         if (id == IDC_FXKEY_MASTER) { ClearFxKey(0); return 0; }
+        if (id >= IDC_CLIPWAVE && id < IDC_CLIPWAVE + CLIPS) {   // (1.92.2) right-click a clip's waveform: trim it (empty: pick a file)
+            if (gPrevRunning && gPrevClip >= 0) { PrevStop(); gPrevClip = -1; }
+            const int c = ClipSlot(id - IDC_CLIPWAVE); if (gClips[c].base) OpenTrim(c); else ClipBrowse(c);
+            return 0;
+        }
         if (id >= IDC_FXGRP_KEY && id < IDC_FXGRP_KEY + FX_GROUPS) { ClearFxKey(1 + id - IDC_FXGRP_KEY); return 0; }
         if (id == IDC_MUTEKEY) { ClearFxKey(SLOT_MUTE); return 0; }
         if (id >= IDC_PADKEY && id < IDC_PADKEY + PADS) { ClearFxKey(SLOT_PAD0 + id - IDC_PADKEY); return 0; }
