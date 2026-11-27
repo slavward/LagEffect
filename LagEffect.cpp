@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.92.2"
+#define APP_VERSION L"1.93.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -6309,6 +6309,7 @@ static const wchar_t* FX_SUB_NAMES[FX_SUBS] = { L"Voice", L"Tune", L"Monster", L
 // only go in New). Both build the same controls; New moves them to their new tabs once the window is built (NewLayoutApply).
 // Switching restarts the app. In New the sub-tab variables below hold the New layout's sub-tabs (see NEW_SUBS_T).
 static bool gLayoutNew = false;                 // INI layout_new; a fresh install starts in New, an existing one in Classic
+static bool gFirstRunLoad = false;              // (1.93.0) no settings when it started: a fresh install (the guide)
 static bool gLayoutWant = false;                // the layout to start in next time (Settings > Look > Layout; switching restarts)
 static int  gSpSub = 0;                         // (New) the Speech tab's sub-tab
 static int  gNewRuns = 0;                       // (New) how many times it has started in New (the "moved here" dots: the first 5)
@@ -7320,7 +7321,7 @@ static void LoadSettings()
     #define INI_INT(k, d) (int)GetPrivateProfileIntW(L"settings", k, d, gIni)
     {                                           // (1.90.0) the layout: a fresh install (no settings yet) starts in New
         const int ln = INI_INT(L"layout_new", -1);
-        if (ln < 0) { wchar_t keys[64] = L""; GetPrivateProfileStringW(L"settings", nullptr, L"", keys, 64, gIni); gLayoutNew = keys[0] == 0; }
+        if (ln < 0) { wchar_t keys[64] = L""; GetPrivateProfileStringW(L"settings", nullptr, L"", keys, 64, gIni); gLayoutNew = keys[0] == 0; gFirstRunLoad = keys[0] == 0; }
         else gLayoutNew = ln != 0;
         gLayoutWant = gLayoutNew;
         gNewRuns = Iclamp(INI_INT(L"layout_new_runs", 0), 0, 1000);
@@ -8726,6 +8727,7 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
        PAGE_HIDE = 98, PAGE_STAGE = 99 };      // (New: a Classic control it doesn't use; a new box being built)
 #define IDC_TAB7      4800                      // (1.90.0) the Speech tab (IDC_TAB0 + 7 is taken)
 #define IDC_NSUB0     4810                      // .. + page * 10 + sub: the New layout's sub-tabs
+#define IDC_GUIDE     4959                      // (1.93.0, New) Settings > General: the first-start guide again
 #define IDC_TABPOS    4958                      // (1.92.0, New) Settings > Look > Layout > Tabs: where they are
 #define IDC_LAYOUTSEL 4890                      // Settings > Look > Layout: New / Classic
 #define IDC_NCKEYS    4891                      // (New) Settings > Controls: Hotkeys..., Macros..., Recorder..., Sound triggers..., MIDI...
@@ -8886,11 +8888,16 @@ static MiniD* MiniOf(HWND h) { return h ? (MiniD*)GetWindowLongPtrW(h, GWLP_USER
 static int  MiniGetH(HWND h) { MiniD* m = MiniOf(h); return m ? m->v : 0; }
 static int  MiniGet(int id)  { return MiniGetH(GetDlgItem(gWnd, id)); }
 static int  MiniClamp(const MiniD* m, int v) { return v < m->lo ? m->lo : v > m->hi ? m->hi : v; }
+static void DiffTitleRedraw(HWND h);
+static void MiniFlip(HWND h, const MiniD* m, int old)   // (1.93.0) its box's Reset, when it leaves / comes back to its usual value
+{
+    if (m->def != INT_MIN && (old != m->def) != (m->v != m->def)) DiffTitleRedraw(h);
+}
 static void MiniSetH(HWND h, int v)
 {
     MiniD* m = MiniOf(h); if (!m) return;
     v = MiniClamp(m, v);
-    if (m->v != v) { m->v = v; InvalidateRect(h, nullptr, FALSE); }
+    if (m->v != v) { const int o = m->v; m->v = v; InvalidateRect(h, nullptr, FALSE); MiniFlip(h, m, o); }
 }
 static void MiniSet(int id, int v) { MiniSetH(GetDlgItem(gWnd, id), v); }   // (no WM_COMMAND: for the code putting a saved value back)
 static void MiniChange(HWND h, int v)           // by the user: tell the window
@@ -8898,7 +8905,8 @@ static void MiniChange(HWND h, int v)           // by the user: tell the window
     MiniD* m = MiniOf(h); if (!m) return;
     v = MiniClamp(m, v);
     if (m->v == v) return;
-    m->v = v; InvalidateRect(h, nullptr, FALSE); UpdateWindow(h);
+    const int o = m->v;
+    m->v = v; InvalidateRect(h, nullptr, FALSE); UpdateWindow(h); MiniFlip(h, m, o);
     SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(h), EN_CHANGE), (LPARAM)h);
 }
 static int MiniStep(const MiniD* m)            // wheel / arrow step: 5 on a 0-200 volume, 1 on small or very large ranges
@@ -8952,7 +8960,14 @@ static void PaintMini(HWND h, HDC dc)
     if (GetParent(h) == gWnd) FillRect(dc, &rc, BgBrush());
     else { HBRUSH pb = CreateSolidBrush(gDark ? DK_BG : gLtBg); FillRect(dc, &rc, pb); DeleteObject(pb); }   // (a dialog: its plain colour)
     MiniD* m = MiniOf(h); if (!m) return;
-    if (gVolStyle == 1 && m->vol) { PaintMiniKnob(h, dc); return; }
+    auto dot = [&]() {                          // (1.93.0, New) not its usual value: a dot in the corner
+        if (!gLayoutNew || m->def == INT_MIN || m->v == m->def || GetParent(h) != gWnd) return;
+        const int r2 = Imax(2, SC(2));
+        HBRUSH db = CreateSolidBrush(ACCENT); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, rc.right - SC(4) - 2 * r2, SC(3), rc.right - SC(4) + 1, SC(3) + 2 * r2 + 1);
+        SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(db);
+    };
+    if (gVolStyle == 1 && m->vol) { PaintMiniKnob(h, dc); dot(); return; }
     const int v = m->v; const bool on = IsWindowEnabled(h) != FALSE;
     const bool focus = GetFocus() == h, hot = on && (gMiniHot == h || GetCapture() == h);
     const COLORREF field = gDark ? DK_CTL : GetSysColor(COLOR_WINDOW);
@@ -8966,6 +8981,7 @@ static void PaintMini(HWND h, HDC dc)
     SetTextColor(dc, on ? TXT_C : (gDark ? DK_DIM : RGB(150, 150, 150)));
     DrawTextW(dc, t, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
     SelectObject(dc, of);
+    dot();
 }
 static LRESULT CALLBACK MiniProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -9050,7 +9066,7 @@ static LRESULT CALLBACK MiniProc(HWND h, UINT m, WPARAM w, LPARAM l)
         const wchar_t* p = (const wchar_t*)l; while (*p == L' ') p++;
         if (!*p) return TRUE;
         const int v = MiniClamp(md, _wtoi(p));
-        if (md->v != v) { md->v = v; InvalidateRect(h, nullptr, FALSE); }
+        if (md->v != v) { const int o = md->v; md->v = v; InvalidateRect(h, nullptr, FALSE); MiniFlip(h, md, o); }
         SendMessageW(GetParent(h), WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(h), EN_CHANGE), (LPARAM)h);
         return TRUE;
     }
@@ -9422,7 +9438,11 @@ static void SetKnobValue(HWND h, int i, int v)
 {
     Knob& k = gKnobs[i];
     v = Iclamp(v, k.lo, k.hi);
-    if (v != *k.var) { *k.var = v; InvalidateRect(h, nullptr, FALSE); }
+    if (v != *k.var) {
+        const bool was = *k.var != k.def;
+        *k.var = v; InvalidateRect(h, nullptr, FALSE);
+        if (was != (v != k.def)) DiffTitleRedraw(h);   // (1.93.0: its box's Reset)
+    }
     // Auto volume and the leveler would fight: turning one on turns the other off.
     if (v > 0 && (k.var == &gAgcMaxDb || k.var == &gLevelerPct)) {
         volatile int* other = k.var == &gAgcMaxDb ? &gLevelerPct : &gAgcMaxDb;
@@ -9534,6 +9554,12 @@ static void PaintKnob(HWND h, HDC dc)
     RECT vr = { 0, cy + 29, rc.right, rc.bottom };
     DrawTextW(dc, txt, -1, &vr, DT_SINGLELINE | DT_CENTER | DT_TOP);
     SelectObject(dc, of);
+    if (gLayoutNew && *k.var != k.def) {        // (1.93.0) not its usual value: a dot by the dial (double-click puts it back)
+        HBRUSH db = CreateSolidBrush(ACCENT); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        const int dx = Imin(cx + r + 2, (int)rc.right - 8);
+        Ellipse(dc, dx, cy - r - 1, dx + 7, cy - r + 6);
+        SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(db);
+    }
 }
 
 static LRESULT CALLBACK KnobProc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -16619,6 +16645,7 @@ static void AddTips()
         TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
         for (int i = 0; i < CLIPS; i++) TipId(IDC_CLIPWAVE + i, L"The clip and how long it is. Click to hear it on your \"Always hear sounds on\" output (Home), only you; click again to stop. Right-click: trim it. (Rename, MP3: the ... button.)");
         TipId(IDC_TABPOS,  L"Where the tabs are: along the top (usual), down the left or right side (with their names; the window gets wider), or along the bottom just above the search bar. The mic level then sits across the top.");
+        TipId(IDC_GUIDE,   L"The four steps a new install starts with: your mic, where your voice goes (VB-Cable), what you'll use, and Set up my mic.");
         TipId(IDC_HMETER,  L"Your mic's level (as on the Mic tab): green while the gate lets you through. Click: the Mic tab.");
         {   static const wchar_t* T[HOME_TOGS] = {
                 L"Voice effects on / off (the switch on the Effects tab).", L"AI noise suppression on / off (Mic > Cleanup).",
@@ -22619,6 +22646,34 @@ static void TrayMenu()
 // It sits under every tab (not in the compact window): a search box, a "Hotkeys" button and the "what's on" chips.
 static void RcdShow(); static void RcdWindowSync(); static void RcdTick();
 static int DesignOf(HWND h) { if (h) for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == h) return i; return -1; }
+// ---- (1.93.0, New) U6: a dot on a knob / number that isn't at its usual value, and "Reset" in its box's title ----
+static int  gDiffDi[1024], gDiffN = -1, gDiffBuiltFor = -1;   // the knobs and number boxes (design indices), made once
+static void DiffBuild()
+{
+    if (gDiffBuiltFor == gDesignN) return;
+    gDiffN = 0; gDiffBuiltFor = gDesignN;
+    for (int i = 0; i < gDesignN && gDiffN < 1024; i++) {
+        wchar_t cls[16]; GetClassNameW(gDesign[i].h, cls, 16);
+        if (!lstrcmpW(cls, L"LagKnob") || !lstrcmpW(cls, L"LagMini")) gDiffDi[gDiffN++] = i;
+    }
+}
+static bool CtlDiff(HWND h)                     // not at its usual value (knobs; number boxes that have one)
+{
+    if (!h) return false;
+    const int id = GetDlgCtrlID(h);
+    if (GetParent(h) == gWnd && id >= IDC_KNOB && id < IDC_KNOB + KNOB_N) { const Knob& k = gKnobs[id - IDC_KNOB]; return *k.var != k.def; }
+    MiniD* m = nullptr; wchar_t cls[16]; GetClassNameW(h, cls, 16);
+    if (!lstrcmpW(cls, L"LagMini")) m = MiniOf(h);
+    return m && m->def != INT_MIN && m->v != m->def;
+}
+static RECT SectionRect(const Section& s);
+static void DiffTitleRedraw(HWND h)             // its box's title line (where "Reset" shows)
+{
+    if (!gLayoutNew || GetParent(h) != gWnd) return;
+    const int di = DesignOf(h); if (di < 0 || gDesign[di].sec < 0) return;
+    RECT r = SectionRect(gSections[gDesign[di].sec]); r.bottom = r.top + SC(22);
+    InvalidateRect(gWnd, &r, FALSE);
+}
 static int PagedFeatOf(HWND h) { if (h) for (int i = 0; i < gPagedN; i++) if (gPaged[i].h == h) return gPaged[i].feat; return 0; }
 static const wchar_t* SubName(int page, int sub)
 {
@@ -23096,6 +23151,34 @@ static float DelayProcMs(float* gate, float* lim, float* plug)   // what the set
 // ---- (1.65.0) a "?" on each box's title: just that part's help, in a window you can scroll and keep open
 static RECT gSecHelpRc[MAX_SECTIONS];           // (where each box's "?" was painted; empty = not showing)
 static RECT gSecStarRc[MAX_SECTIONS];           // (1.91.0) ... and its star
+static RECT gSecResetRc[MAX_SECTIONS];          // (1.93.0) ... and its "Reset" (only when something in it isn't at its usual value)
+static int SectionResetAt(int x, int y)
+{
+    POINT p = { x, y };
+    for (int i = 0; i < gSectionN; i++) if (gSecResetRc[i].right > gSecResetRc[i].left) {
+        RECT r = gSecResetRc[i]; InflateRect(&r, SC(3), SC(3));
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
+}
+static void SectionReset(int k)                 // its knobs / numbers back to their usual values (asks first)
+{
+    if (k < 0 || k >= gSectionN) return;
+    DiffBuild();
+    HWND hs[64]; int n = 0;
+    for (int j = 0; j < gDiffN && n < 64; j++) { const Design& d = gDesign[gDiffDi[j]]; if (d.sec == k && CtlDiff(d.h)) hs[n++] = d.h; }
+    if (!n) return;
+    wchar_t q[200]; _snwprintf(q, 199, L"Put %d %s in \"%s\" back to the usual value%s?\n\n(Switches and lists stay as they are.)",
+                               n, n == 1 ? L"setting" : L"settings", gSections[k].title, n == 1 ? L"" : L"s"); q[199] = 0;
+    if (MessageBoxW(gWnd, q, L"Lag Effect - Reset", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    for (int j = 0; j < n; j++) {
+        const int id = GetDlgCtrlID(hs[j]);
+        if (id >= IDC_KNOB && id < IDC_KNOB + KNOB_N) SetKnobValue(hs[j], id - IDC_KNOB, gKnobs[id - IDC_KNOB].def);
+        else { MiniD* m = MiniOf(hs[j]); if (m) MiniChange(hs[j], m->def); }
+    }
+    RedrawKnobs();
+    InvalidateRect(gWnd, nullptr, FALSE);
+}
 static int StarIdx(int k) { for (int j = 0; j < gStarN; j++) if (gStarSec[j] == k) return j; return -1; }
 static bool StarCan(int k)                      // a box that can be pinned to Home: any New box outside Home and the Mixer
 {
@@ -23327,6 +23410,169 @@ static void HelpWindow(const wchar_t* title, const wchar_t* text, const POINT* a
     { RECT c; GetClientRect(w, &c); SendMessageW(w, WM_SIZE, 0, MAKELPARAM(c.right, c.bottom)); }
     gHelpWnd = w;
     ShowWindow(w, SW_SHOW); SetFocus(e); SendMessageW(e, EM_SETSEL, 0, 0);
+}
+// ---- (1.93.0, New) U10: the first-start guide: your mic, where your voice goes, what you'll use, Set up my mic ----
+// Each step drives the main window's own controls (the same lists, buttons and checkboxes), so nothing works differently.
+static HWND gGuideWnd = nullptr;
+static int  gGuideStep = 0;
+static bool gFirstRun = false;                  // (no settings yet when it started)
+enum { GD_TITLE = 100, GD_BODY, GD_MIC = 110, GD_LEVEL, GD_LEVELTXT, GD_VBSTAT = 120, GD_VB, GD_OUTLBL, GD_OUT,
+       GD_F0 = 130, GD_SETUP = 140, GD_SKIP = 190, GD_BACK, GD_NEXT, GD_STEPTXT };
+static const int GD_FEAT[] = { IDC_FEATLAG, IDC_FEATFX, IDC_FEATSOUND, IDC_FEATCLIPS, IDC_FEATSPEECH, IDC_FEATVST };
+static const wchar_t* GD_FEATTXT[] = { L"Lag effect: stutter your voice on a hotkey", L"Voice effects: pitch, robot, reverb, characters and more",
+                                       L"Soundboard: pads on hotkeys, a looper, beatbox drums, text to speech", L"Clips: save the last few seconds",
+                                       L"Speech: voice commands, bleeping words, Morse (downloads a model once)", L"Plugins: VST3 and CLAP effects" };
+static void GuideCopyCombo(HWND to, int fromId)  // the main window's list, as it is now
+{
+    HWND f = GetDlgItem(gWnd, fromId);
+    SendMessageW(to, CB_RESETCONTENT, 0, 0);
+    const int n = (int)SendMessageW(f, CB_GETCOUNT, 0, 0);
+    for (int i = 0; i < n; i++) { wchar_t t[300]; t[0] = 0; if (SendMessageW(f, CB_GETLBTEXTLEN, i, 0) < 299) SendMessageW(f, CB_GETLBTEXT, i, (LPARAM)t); SendMessageW(to, CB_ADDSTRING, 0, (LPARAM)t); }
+    SendMessageW(to, CB_SETCURSEL, SendMessageW(f, CB_GETCURSEL, 0, 0), 0);
+}
+static void GuidePick(int mainId, HWND from)    // a pick in the guide = the same pick in the main window
+{
+    const int sel = (int)SendMessageW(from, CB_GETCURSEL, 0, 0);
+    HWND f = GetDlgItem(gWnd, mainId);
+    if (sel < 0 || sel == (int)SendMessageW(f, CB_GETCURSEL, 0, 0)) return;
+    SendMessageW(f, CB_SETCURSEL, sel, 0);
+    SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(mainId, CBN_SELCHANGE), (LPARAM)f);
+}
+static void GuideShowStep(HWND h)
+{
+    static const wchar_t* T[4] = { L"Your microphone", L"Where your voice goes", L"What you'll use", L"Make your mic sound right" };
+    static const wchar_t* B[4] = {
+        L"Pick the microphone you talk into. Lag Effect cleans it up and adds your effects, then sends it on.",
+        L"Discord, OBS and games hear you through VB-Cable, a free virtual cable. Click Use VB-Cable (it offers to install it "
+        L"if it's missing), or pick where your voice should go.",
+        L"Tick what you want. Anything off is hidden and doesn't run, so it costs nothing. You can change this any time in Settings > Features.",
+        L"Set up my mic listens to your room for 3 seconds and to your voice for 4, then suggests the noise gate, cleanup and "
+        L"volume. Or finish now and do it later (Mic > Cleanup > Set up)." };
+    const int st = gGuideStep;
+    SetDlgItemTextW(h, GD_TITLE, T[st]); SetDlgItemTextW(h, GD_BODY, B[st]);
+    wchar_t t[32]; wsprintfW(t, L"Step %d of 4", st + 1); SetDlgItemTextW(h, GD_STEPTXT, t);
+    auto show = [&](int id, bool on) { ShowWindow(GetDlgItem(h, id), on ? SW_SHOW : SW_HIDE); };
+    show(GD_MIC, st == 0); show(GD_LEVEL, st == 0); show(GD_LEVELTXT, st == 0 && !gRunning);
+    show(GD_VBSTAT, st == 1); show(GD_VB, st == 1); show(GD_OUTLBL, st == 1); show(GD_OUT, st == 1);
+    for (int i = 0; i < 6; i++) show(GD_F0 + i, st == 2);
+    show(GD_SETUP, st == 3);
+    show(GD_BACK, st > 0);
+    SetDlgItemTextW(h, GD_NEXT, st == 3 ? L"Finish" : L"Next");
+    if (st == 0) GuideCopyCombo(GetDlgItem(h, GD_MIC), IDC_MIC);
+    if (st == 1) {
+        GuideCopyCombo(GetDlgItem(h, GD_OUT), IDC_ROWDEV);
+        int vi; SetDlgItemTextW(h, GD_VBSTAT, VbCableFound(&vi) ? L"VB-Cable is installed." : L"VB-Cable isn't installed yet.");
+    }
+    if (st == 2) for (int i = 0; i < 6; i++) CheckDlgButton(h, GD_F0 + i, IsDlgButtonChecked(gWnd, GD_FEAT[i]));
+}
+static void GuideApplyFeatures(HWND h)
+{
+    for (int i = 0; i < 6; i++) {
+        const UINT want = IsDlgButtonChecked(h, GD_F0 + i);
+        if (want == IsDlgButtonChecked(gWnd, GD_FEAT[i])) continue;
+        CheckDlgButton(gWnd, GD_FEAT[i], want);
+        SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(GD_FEAT[i], BN_CLICKED), (LPARAM)GetDlgItem(gWnd, GD_FEAT[i]));
+    }
+}
+static void GuideFinish(HWND h, bool setUp)
+{
+    WritePrivateProfileStringW(L"settings", L"guide_done", L"1", gIni);
+    DestroyWindow(h);
+    if (!gWantRunning) SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(IDC_START, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, IDC_START));
+    if (setUp) {
+        GoTo(PAGE_MIC, NSubByName(PAGE_MIC, L"Cleanup"), GetDlgItem(gWnd, IDC_MICSETUP), nullptr, L"");
+        if (gRunning) SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(IDC_MICSETUP, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, IDC_MICSETUP));
+    }
+}
+static LRESULT CALLBACK GuideProc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    switch (m) {
+    case WM_COMMAND: {
+        const int id = LOWORD(w), code = HIWORD(w);
+        if (id == GD_MIC && code == CBN_SELCHANGE) { GuidePick(IDC_MIC, (HWND)l); ShowWindow(GetDlgItem(h, GD_LEVELTXT), gRunning ? SW_HIDE : SW_SHOW); }
+        if (id == GD_OUT && code == CBN_SELCHANGE) GuidePick(IDC_ROWDEV, (HWND)l);
+        if (id == GD_VB && code == BN_CLICKED) { SetupVbCable(); GuideShowStep(h); }
+        if (id == GD_SETUP && code == BN_CLICKED) { GuideApplyFeatures(h); GuideFinish(h, true); }
+        if (id == GD_SKIP && code == BN_CLICKED) { WritePrivateProfileStringW(L"settings", L"guide_done", L"1", gIni); DestroyWindow(h); }
+        if (id == GD_BACK && code == BN_CLICKED && gGuideStep > 0) { if (gGuideStep == 2) GuideApplyFeatures(h); gGuideStep--; GuideShowStep(h); }
+        if (id == GD_NEXT && code == BN_CLICKED) {
+            if (gGuideStep == 2) GuideApplyFeatures(h);
+            if (gGuideStep == 3) GuideFinish(h, false);
+            else { gGuideStep++; GuideShowStep(h); }
+        }
+        return 0;
+    }
+    case WM_TIMER: if (gGuideStep == 0) InvalidateRect(GetDlgItem(h, GD_LEVEL), nullptr, FALSE); return 0;
+    case WM_DRAWITEM: {                         // the level bar: the same one as beside the tabs
+        DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
+        if (d->CtlID == GD_LEVEL) {             // your mic's level, -60 .. 0 dB (green while the gate lets you through)
+            HDC dc = d->hDC; RECT rc = d->rcItem;
+            HBRUSH bb = CreateSolidBrush(gDark ? DK_BG : gLtBg); FillRect(dc, &rc, bb); DeleteObject(bb);
+            RECT tr = { rc.left, rc.top + (rc.bottom - rc.top) / 2 - SC(4), rc.right, rc.top + (rc.bottom - rc.top) / 2 + SC(4) };
+            HBRUSH kb = CreateSolidBrush(gDark ? DK_TRACK : LT_TRACK); FillRect(dc, &tr, kb); DeleteObject(kb);
+            if (gRunning) {
+                const float f = Min(1.0f, Max(0.0f, (gMeterShowDb + 60.0f) / 60.0f));
+                RECT fr = tr; fr.right = tr.left + (int)((tr.right - tr.left) * f);
+                const COLORREF on = gMeterShowDb > -3.0f ? RGB(225, 70, 60) : gMeterShowDb > -12.0f ? RGB(225, 180, 40) : METER_C;
+                HBRUSH fb = CreateSolidBrush(gMeterGateOpen ? on : (gDark ? DK_DIM : gLtDim)); FillRect(dc, &fr, fb); DeleteObject(fb);
+            }
+        }
+        return TRUE;
+    }
+    case WM_CTLCOLORSTATIC: case WM_CTLCOLORBTN: case WM_CTLCOLOREDIT: case WM_CTLCOLORLISTBOX: return CtlColor(h, m, w, l);
+    case WM_ERASEBKGND: { RECT rc; GetClientRect(h, &rc); FillRect((HDC)w, &rc, BgSolid()); return 1; }
+    case WM_NOTIFY: {
+        NMHDR* nh = (NMHDR*)l;
+        if (gDark && nh->code == NM_CUSTOMDRAW) { wchar_t cls[16]; GetClassNameW(nh->hwndFrom, cls, 16); if (!lstrcmpiW(cls, L"Button")) return DrawDarkCheck((NMCUSTOMDRAW*)l); }
+        break;
+    }
+    case WM_CLOSE: WritePrivateProfileStringW(L"settings", L"guide_done", L"1", gIni); DestroyWindow(h); return 0;
+    case WM_DESTROY: KillTimer(h, 1); if (gGuideWnd == h) gGuideWnd = nullptr; return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+static void GuideShow()                         // (Settings > General > First-start guide..., or a fresh install's first start)
+{
+    if (gGuideWnd) { SetForegroundWindow(gGuideWnd); return; }
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = GuideProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagGuide"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU;
+    RECT r = { 0, 0, SC(500), SC(340) }; AdjustWindowRect(&r, style, FALSE);
+    RECT mr; GetWindowRect(gWnd, &mr);
+    const int ww = r.right - r.left, wh = r.bottom - r.top;
+    HWND h = CreateWindowExW(WS_EX_DLGMODALFRAME, L"LagGuide", L"Lag Effect - Getting started", style,
+                             (mr.left + mr.right - ww) / 2, mr.top + SC(60), ww, wh, gWnd, nullptr, gInst, nullptr);
+    if (!h) return;
+    auto C = [&](const wchar_t* cls, const wchar_t* t, DWORD st, int x, int y, int cw, int ch, int id) {
+        HWND c = CreateWindowExW(0, cls, t, WS_CHILD | st, SC(x), SC(y), SC(cw), SC(ch), h, (HMENU)(INT_PTR)id, gInst, nullptr);
+        SendMessageW(c, WM_SETFONT, (WPARAM)gFont, TRUE); return c;
+    };
+    HWND tt = C(L"STATIC", L"", WS_VISIBLE | SS_NOPREFIX, 24, 18, 452, 26, GD_TITLE); SendMessageW(tt, WM_SETFONT, (WPARAM)gFontBold, TRUE);
+    C(L"STATIC", L"", WS_VISIBLE | SS_NOPREFIX, 24, 50, 452, 70, GD_BODY);
+    C(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 24, 130, 452, 300, GD_MIC);
+    C(L"STATIC", L"", SS_OWNERDRAW, 24, 172, 452, 24, GD_LEVEL);
+    C(L"STATIC", L"(Your level shows here once the audio is running: Finish starts it.)", SS_NOPREFIX, 24, 202, 452, 20, GD_LEVELTXT);
+    C(L"STATIC", L"", SS_NOPREFIX, 24, 132, 260, 20, GD_VBSTAT);
+    C(L"BUTTON", L"Use VB-Cable", WS_TABSTOP, 326, 126, 150, 30, GD_VB);
+    C(L"STATIC", L"Or send your voice to:", SS_NOPREFIX, 24, 180, 452, 20, GD_OUTLBL);
+    C(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, 24, 204, 452, 300, GD_OUT);
+    for (int i = 0; i < 6; i++) C(L"BUTTON", GD_FEATTXT[i], BS_AUTOCHECKBOX | WS_TABSTOP, 24, 124 + i * 28, 452, 24, GD_F0 + i);
+    C(L"BUTTON", L"Set up my mic now", WS_TABSTOP, 24, 136, 200, 32, GD_SETUP);
+    C(L"BUTTON", L"Skip", WS_VISIBLE | WS_TABSTOP, 24, 296, 90, 30, GD_SKIP);
+    C(L"STATIC", L"", WS_VISIBLE | SS_NOPREFIX | SS_CENTER, 140, 302, 120, 20, GD_STEPTXT);
+    C(L"BUTTON", L"Back", WS_TABSTOP, 280, 296, 90, 30, GD_BACK);
+    C(L"BUTTON", L"Next", WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 386, 296, 90, 30, GD_NEXT);
+    ThemeTitleBar(h); EnumChildWindows(h, ThemeChild, 0);
+    gGuideWnd = h; gGuideStep = 0;
+    GuideShowStep(h);
+    SetTimer(h, 1, 60, nullptr);
+    ShowWindow(h, SW_SHOW);
+}
+static void GuideOffer()                        // a fresh install's first start (New layout): the guide, once
+{
+    if (!gFirstRun || !gLayoutNew || gSafe || GetPrivateProfileIntW(L"settings", L"guide_done", 0, gIni)) return;
+    GuideShow();
 }
 static int SectionHelpAt(int x, int y)          // (main window px) which box's "?" that is, or -1
 {
@@ -29503,6 +29749,7 @@ static void NewLayoutApply()
         mvId(IDC_OPENSET, 402, y + 22, 128);
         mvId(IDC_VERSION, 30, y + 60, 150);
         mvId(IDC_BUGINFO, 190, y + 56, 180);
+        Ctl(L"BUTTON", L"First-start guide...", WS_TABSTOP, 376, y + 56, 154, 28, IDC_GUIDE);   // (1.93.0)
     }
     {   int y = NBox(L"Controls", 126);        // Settings > Controls: the windows for every way to trigger things
         Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP | WS_GROUP, 30, y + 22, 120, 28, IDC_NCKEYS);
@@ -31032,7 +31279,10 @@ static void PaintWindow(HDC dc)
         DeleteObject(sep);
     }
 
-    memset(gSecHelpRc, 0, sizeof(gSecHelpRc)); memset(gSecStarRc, 0, sizeof(gSecStarRc));
+    memset(gSecHelpRc, 0, sizeof(gSecHelpRc)); memset(gSecStarRc, 0, sizeof(gSecStarRc)); memset(gSecResetRc, 0, sizeof(gSecResetRc));
+    static bool secDiff[MAX_SECTIONS];          // (1.93.0, New) a box with a knob / number not at its usual value: "Reset" in its title
+    memset(secDiff, 0, sizeof(secDiff));
+    if (gLayoutNew) { DiffBuild(); for (int j = 0; j < gDiffN; j++) { const Design& dd = gDesign[gDiffDi[j]]; if (dd.sec >= 0 && dd.sec < MAX_SECTIONS && !secDiff[dd.sec] && CtlDiff(dd.h)) secDiff[dd.sec] = true; } }
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
         if (!gSecGuest[i]) {                    // (1.91.0: a starred box shows on Home too)
@@ -31050,7 +31300,13 @@ static void PaintWindow(HDC dc)
         RECT qr = { sx + 18 + sz.cx, y - q / 2, sx + 18 + sz.cx + q, y - q / 2 + q };
         const bool canStar = StarCan(i);        // (1.91.0) the star after the "?": pin this box to Home
         RECT sr = { qr.right + SC(5), qr.top - 1, qr.right + SC(5) + q + 2, qr.bottom + 1 };
-        RECT tr = { sx + 10, y - sz.cy / 2, (canStar ? sr.right : qr.right) + 5, y + sz.cy / 2 + 1 };
+        RECT rr = { 0, 0, 0, 0 };               // (1.93.0) "Reset" after them
+        if (secDiff[i] && i != gSecChan && i != gSecOut && i != gSecKeys) {
+            HGDIOBJ of2 = SelectObject(dc, gFont); SIZE rz; GetTextExtentPoint32W(dc, L"Reset", 5, &rz); SelectObject(dc, of2);
+            const int rx0 = (canStar ? sr.right : qr.right) + SC(8);
+            rr = { rx0, y - sz.cy / 2, rx0 + rz.cx, y + sz.cy / 2 + 1 };
+        }
+        RECT tr = { sx + 10, y - sz.cy / 2, (rr.right ? rr.right : canStar ? sr.right : qr.right) + 5, y + sz.cy / 2 + 1 };
         FillRect(dc, &tr, BgBrush());
         SetBkColor(dc, BgColor());
         SetTextColor(dc, TITLE_C);
@@ -31066,6 +31322,12 @@ static void PaintWindow(HDC dc)
             gSecHelpRc[i] = qr;
         }
         if (canStar) { StarPaint(dc, sr, StarIdx(i) >= 0); gSecStarRc[i] = sr; }
+        if (rr.right) {
+            HGDIOBJ of2 = SelectObject(dc, gFont); const int bk = SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, ACCENT); DrawTextW(dc, L"Reset", 5, &rr, DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
+            SetBkMode(dc, bk); SelectObject(dc, of2);
+            gSecResetRc[i] = rr;
+        }
     }
     MixerPaintStrips(dc);
     ScrollPaint(dc);                            // (1.90.0, New) the scroll bar, when the page is taller than the window
@@ -31140,6 +31402,7 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) NSubPick((id - IDC_NSUB0) / 10, (id - IDC_NSUB0) % 10);
         return;
     }
+    if (id == IDC_GUIDE) { if (code == BN_CLICKED) GuideShow(); return; }   // (1.93.0)
     if (id == IDC_TABPOS) {                     // (1.92.0) Settings > Look > Layout > Tabs: top / left / right / bottom
         if (code == CBN_SELCHANGE && gUiReady) {
             const int v = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3);
@@ -32633,7 +32896,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if ((HWND)w == h && LOWORD(l) == HTCLIENT) {
             POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
             if (gEdgeDrag >= 0 || MixerEdgeAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE; }
-            if (SectionHelpAt(p.x, p.y) >= 0 || SectionStarAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+            if (SectionHelpAt(p.x, p.y) >= 0 || SectionStarAt(p.x, p.y) >= 0 || SectionResetAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
         }
         break;
     case WM_LBUTTONDOWN: {                      // click on empty space: leave the text/number box you were in
@@ -32642,6 +32905,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if (ScrollClick(x, y)) return 0;        // (1.90.0, New) the scroll bar
         if (e < 0) { const int hs = SectionHelpAt(x, y); if (hs >= 0) { SectionHelp(hs); return 0; } }   // (1.65.0) a box's "?"
         if (e < 0) { const int ss = SectionStarAt(x, y); if (ss >= 0) { StarToggle(ss); return 0; } }    // (1.91.0) its star
+        if (e < 0) { const int rs = SectionResetAt(x, y); if (rs >= 0) { SectionReset(rs); return 0; } }   // (1.93.0) its Reset
         if (e >= 0) {
             if (e == gEdgeLast && GetTickCount() - gEdgeLastT < GetDoubleClickTime()) {   // double-click: normal width
                 gEdgeLast = -1; MixerEdgeSet(e, 0); return 0;
@@ -32951,6 +33215,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
     else if (gUpdateOnStart && gUpdateRepo[0])
         StartUpdateCheck(false);
     LayoutOffer();                              // (1.90.0) once: try the New layout?
+    gFirstRun = gFirstRunLoad; GuideOffer();    // (1.93.0) a fresh install: the first-start guide
 
     MSG msg;
     SendMessageW(h, WM_CHANGEUISTATE, MAKEWPARAM(UIS_SET, UISF_HIDEFOCUS), 0);   // (no focus boxes until you use the keyboard)
