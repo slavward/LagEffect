@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.93.0"
+#define APP_VERSION L"1.93.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -9554,10 +9554,11 @@ static void PaintKnob(HWND h, HDC dc)
     RECT vr = { 0, cy + 29, rc.right, rc.bottom };
     DrawTextW(dc, txt, -1, &vr, DT_SINGLELINE | DT_CENTER | DT_TOP);
     SelectObject(dc, of);
-    if (gLayoutNew && *k.var != k.def) {        // (1.93.0) not its usual value: a dot by the dial (double-click puts it back)
-        HBRUSH db = CreateSolidBrush(ACCENT); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
-        const int dx = Imin(cx + r + 2, (int)rc.right - 8);
-        Ellipse(dc, dx, cy - r - 1, dx + 7, cy - r + 6);
+    if (gLayoutNew && *k.var != k.def) {        // (1.93.0) not its usual value: a dot just inside the ring, where the usual value is
+        const double dang = 225.0 - 270.0 * (double)(k.def - k.lo) / (double)(k.hi - k.lo);   // (1.93.1: it was always top right)
+        int dx, dy; KnobPoint(cx, cy, r - 5, dang, &dx, &dy);   // (between the ring and the knob; double-click puts it back there)
+        HBRUSH db = CreateSolidBrush(TXT_C); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, dx - 2, dy - 2, dx + 3, dy + 3);
         SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(db);
     }
 }
