@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.90.1"
+#define APP_VERSION L"1.90.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1375,7 +1375,7 @@ static int gPadRecSlot = -1;                    // pad being recorded from the m
 #define PAD_BANKS 4                             // pages A-D
 #define PAD_N (PADS * PAD_BANKS)                // every pad
 #define CLIPS 8                                 // instant-replay clips on screen (one page)
-#define CLIP_BANKS 4                            // clip pages A-D
+#define CLIP_BANKS 8                            // clip pages A-H (1.90.2; Classic shows A-D: ClipBanks())
 #define CLIP_N (CLIPS * CLIP_BANKS)             // every clip slot
 #define CLIP0 PAD_N                             // where clips start in gPads
 #define TTS_SLOT (CLIP0 + CLIP_N)               // text-to-speech plays in this slot
@@ -6700,6 +6700,7 @@ static HBRUSH   gBrPicture = nullptr;            // the picture, sized to the wi
 static wchar_t  gFontName[40] = L"Segoe UI";
 static int      gOpacity = 100;
 static int      gCbShow = 7;                    // (1.66.1) the command builder's lists that matter now: 1 "Which one", 2 "How", 4 the value
+static int      gWheelAdj = 0;                  // (1.90.2, New) the mouse wheel changes the setting under it (off: it only scrolls)
 static int      gHdrMeter = 1;                  // (1.65.0) a thin mic level bar under the tabs, on every tab (Settings > Look)
 static int      gVolStyle = 0;                  // volume boxes (pads, clips, music, TTS): 0 a number you drag, 1 a small knob (1.63.0)
 static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
@@ -7266,6 +7267,11 @@ struct Clip {
 };
 static Clip    gClips[CLIP_N];
 static int     gClipBank = 0;                    // clip page on screen
+#define IDC_CLIPBANK4 4897                      // (1.90.2, New) clip pages E-H (.. 4900)
+static inline int ClipBanks() { return gLayoutNew ? CLIP_BANKS : 4; }   // (1.90.2) pages this layout shows (Classic: A-D, as it was)
+static inline int ClipN() { return ClipBanks() * CLIPS; }             // clip slots this layout uses
+static inline int ClipBankId(int b) { return b < 4 ? IDC_CLIPBANK0 + b : IDC_CLIPBANK4 + b - 4; }   // (E-H: their own ids)
+static inline int ClipBankOf(int id) { return id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + 4 ? id - IDC_CLIPBANK0 : id >= IDC_CLIPBANK4 && id < IDC_CLIPBANK4 + CLIP_BANKS - 4 ? id - IDC_CLIPBANK4 + 4 : -1; }
 static inline int ClipSlot(int row) { return gClipBank * CLIPS + row; }
 static bool    gClipPinned[CLIP_N];              // never replaced when the board is full
 static unsigned gClipStamp[CLIP_N], gClipStampNext = 1;   // capture order (oldest gets replaced)
@@ -7396,6 +7402,7 @@ static void LoadSettings()
     gOpacity      = Iclamp(INI_INT(L"window_opacity", 100), 40, 100);
     gVolStyle     = Iclamp(INI_INT(L"volume_control_style", 0), 0, 1);
     gHdrMeter     = INI_INT(L"header_mic_meter", 1) != 0;
+    gWheelAdj     = INI_INT(L"wheel_changes_settings", 0) != 0;
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
     gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
@@ -8366,6 +8373,7 @@ static void SaveSettings()
     SaveInt(L"window_opacity", gOpacity);
     SaveInt(L"volume_control_style", gVolStyle);
     SaveInt(L"header_mic_meter", gHdrMeter);
+    SaveInt(L"wheel_changes_settings", gWheelAdj);
     SaveInt(L"layout_new", gLayoutWant ? 1 : 0);   // (1.90.0)
     if (gLayoutNew) { SaveInt(L"layout_new_runs", gNewRuns); SaveNewSubs(); }
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
@@ -8708,6 +8716,22 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_NCRCD     4893
 #define IDC_NCTRIG    4894
 #define IDC_NCMIDI    4895
+#define IDC_NCWHEEL   4896                      // (1.90.2, New) Settings > Controls: the mouse wheel changes settings
+#define IDC_MCVOL     4960                      // (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's quick controls
+#define IDC_MCDB      4961
+#define IDC_MCMUTE    4962
+#define IDC_MCSOLO    4963
+#define IDC_MCDUCK    4964
+#define IDC_MCPAN     4965
+#define IDC_MCPANT    4966
+#define IDC_MCMETER   4967
+#define IDC_MCGO      4968
+#define IDC_MCNONE    4969
+#define IDC_MCADD     4970
+#define IDC_MCLBL0    4971                      // .. +2: Volume, Pan, Level
+#define IDC_MCRT0     4975                      // .. + MAX_OUT - 1: its outputs
+#define IDC_MCLAST    (IDC_MCRT0 + MAX_OUT - 1)
+static int MusChanIdx();
 static int TabId(int page) { return page >= 0 && page < 7 ? IDC_TAB0 + page : page == 7 ? IDC_TAB7 : 0; }
 static int TabPage(int id) { return id >= IDC_TAB0 && id <= IDC_TAB6 ? id - IDC_TAB0 : id == IDC_TAB7 ? 7 : -1; }
 static bool PageOn(int page)                    // Voice FX, Soundboard and Clips only exist while their feature is on
@@ -10593,7 +10617,7 @@ static void ClipNow()                           // save the last N seconds as a 
     SYSTEMTIME t; GetLocalTime(&t);
     wchar_t path[MAX_PATH];
     wsprintfW(path, L"%s\\Clip %02d-%02d %02d.%02d.%02d.wav", gClipDir, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
-    for (int n = 2; GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES && n < 100; n++)
+    for (int n = 2; GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES && n < 10000; n++)   // (a new file every time: never over an old clip)
         wsprintfW(path, L"%s\\Clip %02d-%02d %02d.%02d.%02d (%d).wav", gClipDir, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, n);
     bool saved = WriteWav(path, out, len);
 
@@ -10610,13 +10634,13 @@ static void ClipNow()                           // save the last N seconds as a 
         }
     }
     int slot = -1;
-    for (int k = 0; k < CLIP_N && slot < 0; k++) {   // first empty slot, starting on the page you're looking at
-        int c = (gClipBank * CLIPS + k) % CLIP_N;
+    for (int k = 0; k < ClipN() && slot < 0; k++) {   // first empty slot, starting on the page you're looking at
+        int c = (gClipBank * CLIPS + k) % ClipN();
         if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c;
     }
     if (slot < 0 && gClipReplace) {             // full: replace the oldest clip that isn't pinned
         unsigned oldest = 0xFFFFFFFF;
-        for (int c = 0; c < CLIP_N; c++) if (!gClipPinned[c] && gClipStamp[c] < oldest) { oldest = gClipStamp[c]; slot = c; }
+        for (int c = 0; c < ClipN(); c++) if (!gClipPinned[c] && gClipStamp[c] < oldest) { oldest = gClipStamp[c]; slot = c; }
         if (slot >= 0) {
             ClipSetBase(slot, nullptr, 0);      // its file stays in the Clips folder (see History)
             gPadFile[CLIP0 + slot][0] = 0;
@@ -12864,7 +12888,7 @@ static void SliderRange(HWND h, int* lo, int* hi, int* step)
         else if (id == CFX_GRANGE) { *lo = 10; *hi = 80; *step = 5; }      // (dB; 80 = silent)
         else if (id >= CFX_SEND0) { *lo = -400; *hi = 60; *step = 10; }   // (tenths of a dB)
         else { *lo = -120; *hi = 120; *step = 5; }
-    }
+    } else if (id == IDC_MCVOL) { *lo = -600; *hi = 60; *step = 10; }   // (1.90.2) Sounds > Music: the Music channel (tenths of a dB)
 }
 static void CfxValText(int id, wchar_t* t)
 {
@@ -12880,6 +12904,9 @@ static void ChanFxBadge(int c);
 static int  SliderGet(HWND h)
 {
     if (gCfxWnd && GetParent(h) == gCfxWnd) { volatile int* v = CfxVar(GetDlgCtrlID(h)); return v ? *v : 0; }
+    {   const int id = GetDlgCtrlID(h), mc = id == IDC_MCVOL || id == IDC_MCPAN ? MusChanIdx() : -1;   // (1.90.2) the Music channel
+        if (id == IDC_MCVOL) return mc >= 0 ? Imax(-600, (int)gCh[mc].db10) : 0;
+        if (id == IDC_MCPAN) return mc >= 0 ? (int)gCh[mc].pan : 0; }
     int c; return SliderIsPan(h, &c) ? (int)gCh[c].pan : (int)gChatMix;
 }
 static void FaderLabel(int id);
@@ -12896,6 +12923,16 @@ static void SliderSet(HWND h, int v)
         wchar_t t[24]; CfxValText(id, t); SetDlgItemTextW(gCfxWnd, CFX_VAL + id, t);
         ChanFxBadge(gCfxCh);
         return;
+    }
+    {   const int id = GetDlgCtrlID(h);        // (1.90.2) Sounds > Music: the Music channel's volume / pan
+        if (id == IDC_MCVOL || id == IDC_MCPAN) {
+            const int mc = MusChanIdx(); if (mc < 0) return;
+            wchar_t t[24];
+            if (id == IDC_MCVOL) { FaderSet(IDC_CHVOL0 + mc, v); DbText(gCh[mc].db10, t); SetDlgItemTextW(gWnd, IDC_MCDB, t); }
+            else { PanSet(mc, v); PanText(gCh[mc].pan, t); SetDlgItemTextW(gWnd, IDC_MCPANT, t); }
+            InvalidateRect(h, nullptr, FALSE);
+            return;
+        }
     }
     int c;
     if (!SliderIsPan(h, &c)) { ChatMixSet(v); return; }
@@ -14175,9 +14212,11 @@ static void MeterHold(float v, float& hold, DWORD& t, DWORD now)
     else if (now - t > 1500) hold *= 0.97f;     // (after 1.5 s it slides down: ~16 dB a second at 60 frames a second)
 }
 static DWORD gLimShowT[MAX_OUT];
+static bool McShowing(); static void McTick();
 static void MixerMeterTick()                    // (~60 times a second) meters and limit lights on the Mixer page
 {
-    if (gPage != PAGE_MIXER || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
+    McTick();                                   // (1.90.2) Sounds > Music's Mixer channel box
+    if ((gPage != PAGE_MIXER && !McShowing()) || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
     static LARGE_INTEGER qf = {}, last = {};
     if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
@@ -14208,7 +14247,8 @@ static void MixerMeterTick()                    // (~60 times a second) meters a
         static long long lastC[CH_MAX] = { -999, -999, -999, -999, -999, -999, -999, -999 };
         const long long v = (long long)(q(gChShownL[c]) + 300) + (q(gChShownR[c]) + 300) * 1000LL + (q(gChHoldL[c]) + 300) * 1000000LL
                           + (q(gChHoldR[c]) + 300) * 1000000000LL + (tn - gChClipT[c] < 2000 ? 1LL << 50 : 0);
-        if (v != lastC[c]) { lastC[c] = v; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE); }
+        if (v != lastC[c]) { lastC[c] = v; InvalidateRect(GetDlgItem(gWnd, IDC_CHMETER0 + c), nullptr, FALSE);
+                             if (gLayoutNew && gCh[c].type == CH_MUS) InvalidateRect(GetDlgItem(gWnd, IDC_MCMETER), nullptr, FALSE); }
     }
     for (int k = 0; k < MAX_OUT && k < gRows; k++) {
         const float pk = gOutPeakMix[k]; gOutPeakMix[k] = 0;   // (its own copy: the Main tab's meter reads the other)
@@ -14420,12 +14460,12 @@ static void PadMenu(int i, HWND anchor)          // the "..." menu on a pad row
 // ======================= clips: pages, copy, MP3, history =======================
 static void SetClipBank(int b)
 {
-    gClipBank = Iclamp(b, 0, CLIP_BANKS - 1);
+    gClipBank = Iclamp(b, 0, ClipBanks() - 1);
     for (int r = 0; r < CLIPS; r++) {
         MiniSet(IDC_CLIPVOL + r, gPads[CLIP0 + ClipSlot(r)].vol);
         InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + r), nullptr, FALSE);
     }
-    for (int k = 0; k < CLIP_BANKS; k++) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPBANK0 + k), nullptr, FALSE);
+    for (int k = 0; k < ClipBanks(); k++) InvalidateRect(GetDlgItem(gWnd, ClipBankId(k)), nullptr, FALSE);
 }
 
 static bool ClipTrimmedFile(int c, wchar_t* out)  // the clip as you hear it (trimmed): the file itself, or a temp copy
@@ -14590,13 +14630,14 @@ static void ClipMenu(int c, HWND anchor)
 static void ClipHistory(HWND anchor)            // every clip ever saved: load one back onto the board
 {
     ClipFolder();
-    struct Item { wchar_t name[MAX_PATH]; FILETIME t; } items[24]; int n = 0;
+    const int HN = 40;                          // (1.90.2: the 40 newest, was 24)
+    struct Item { wchar_t name[MAX_PATH]; FILETIME t; } items[HN]; int n = 0;
     wchar_t pat[MAX_PATH]; wsprintfW(pat, L"%s\\*.wav", gClipDir);
     WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW(pat, &fd);
     if (f != INVALID_HANDLE_VALUE) {
-        do {                                    // keep the 24 newest
-            int at = n < 24 ? n++ : 23;
-            if (at == 23 && n == 24 && CompareFileTime(&fd.ftLastWriteTime, &items[23].t) <= 0) continue;
+        do {                                    // keep the newest
+            int at = n < HN ? n++ : HN - 1;
+            if (at == HN - 1 && n == HN && CompareFileTime(&fd.ftLastWriteTime, &items[HN - 1].t) <= 0) continue;
             lstrcpynW(items[at].name, fd.cFileName, MAX_PATH); items[at].t = fd.ftLastWriteTime;
             for (int k = at; k > 0 && CompareFileTime(&items[k].t, &items[k - 1].t) > 0; k--) { Item tmp = items[k]; items[k] = items[k - 1]; items[k - 1] = tmp; }
         } while (FindNextFileW(f, &fd));
@@ -14616,7 +14657,7 @@ static void ClipHistory(HWND anchor)            // every clip ever saved: load o
     if (cmd == 100) { ShellExecuteW(nullptr, L"open", gClipDir, nullptr, nullptr, SW_SHOWNORMAL); return; }
     if (cmd < 1 || cmd > n) return;
     int slot = -1;
-    for (int k = 0; k < CLIP_N && slot < 0; k++) { int c = (gClipBank * CLIPS + k) % CLIP_N; if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c; }
+    for (int k = 0; k < ClipN() && slot < 0; k++) { int c = (gClipBank * CLIPS + k) % ClipN(); if (!gClips[c].base && !gPadFile[CLIP0 + c][0]) slot = c; }
     if (slot < 0) { MessageBoxW(gWnd, L"All clip slots are full. Remove one first.", L"Lag Effect - Clips", MB_ICONINFORMATION); return; }
     wchar_t full[MAX_PATH]; wsprintfW(full, L"%s\\%s", gClipDir, items[cmd - 1].name);
     gClips[slot].pendTs = gClips[slot].pendTe = 0;
@@ -14628,7 +14669,8 @@ static void ClipHistory(HWND anchor)            // every clip ever saved: load o
 
 static void DrawClipBank(DRAWITEMSTRUCT* d)     // clip page button (same look as the pad pages)
 {
-    int b = (int)d->CtlID - IDC_CLIPBANK0;
+    int b = ClipBankOf((int)d->CtlID);
+    if (b < 0) return;
     HDC dc = d->hDC; RECT rc = d->rcItem;
     FillRect(dc, &rc, BgBrush());
     bool active = b == gClipBank, any = false;
@@ -14638,7 +14680,13 @@ static void DrawClipBank(DRAWITEMSTRUCT* d)     // clip page button (same look a
     HGDIOBJ ob = SelectObject(dc, br), op = SelectObject(dc, pn);
     RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
     SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(br); DeleteObject(pn);
-    wchar_t t[8]; wsprintfW(t, any ? L"%c \x2022" : L"%c", L'A' + b);
+    const bool narrow = rc.right - rc.left < SC(34);   // (New: 8 small pages) the dot goes in the corner
+    wchar_t t[8]; wsprintfW(t, any && !narrow ? L"%c \x2022" : L"%c", L'A' + b);
+    if (any && narrow) {
+        HBRUSH db = CreateSolidBrush(active ? RGB(255, 255, 255) : ACCENT); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        const int r2 = Imax(2, SC(2)); Ellipse(dc, rc.right - SC(6) - r2, rc.top + SC(6) - r2, rc.right - SC(6) + r2 + 1, rc.top + SC(6) + r2 + 1);
+        SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(db);
+    }
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, active ? RGB(255, 255, 255) : TXT_C);
     HGDIOBJ of = SelectObject(dc, active ? gFontBold : gFont);
@@ -16112,8 +16160,10 @@ static void AddTips()
     TipId(IDC_CLIPSTOP,   L"Stop every clip that's playing.");
     for (int i = 0; i < PADS; i++) TipId(IDC_PADMORE + i, L"Options for this pad: play mode (one-shot, loop, hold, toggle), "
                                                      L"speed, pitch, fades, name, colour, record from your mic.");
-    for (int i = 0; i < CLIP_BANKS; i++) TipId(IDC_CLIPBANK0 + i, L"Clip pages: 8 clips each (32 in all). Clip hotkeys play the clip in "
-                                                                 L"that spot on the page showing. New clips fill this page first.");
+    for (int i = 0; i < ClipBanks(); i++) TipId(ClipBankId(i), ClipBanks() > 4 ? L"Clip pages: 8 clips each (64 in all; a dot = it has clips). Clip hotkeys play the clip in "
+                                                                                  L"that spot on the page showing. New clips fill this page first."
+                                                                                : L"Clip pages: 8 clips each (32 in all). Clip hotkeys play the clip in "
+                                                                                  L"that spot on the page showing. New clips fill this page first.");
     TipId(IDC_CLIPHIST,  L"Every clip you've saved, newest first: pick one to put it back on the board. Also opens the Clips folder.");
     TipId(IDC_CLIPSEP,   L"With a mix (your voice + PC or Discord), also save each part as its own WAV, for editing later.");
     TipId(IDC_CLIPREPLACE, L"When every slot is taken, a new clip replaces the oldest one that isn't pinned (its file is kept; see History).");
@@ -16406,6 +16456,16 @@ static void AddTips()
         TipId(IDC_NCRCD,    L"The Recorder: record an output, or every source on its own track, to WAV.");
         TipId(IDC_NCTRIG,   L"Sound triggers: a clap, snap, whistle or tongue click runs any action (Settings > Features turns them on).");
         TipId(IDC_NCMIDI,   L"A MIDI controller's buttons, knobs and faders control Lag Effect (Settings > Features turns it on).");
+        TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
+        TipId(IDC_MCVOL,   L"The Music channel's volume (its Mixer fader). Drag; double-click: 0 dB; right / left arrow keys: 1 dB.");
+        TipId(IDC_MCPAN,   L"The Music channel's pan: drag left or right. Double-click: the middle.");
+        TipId(IDC_MCMUTE,  L"Mute the music (its Mixer channel).");
+        TipId(IDC_MCSOLO,  L"Solo: hear only the music on your listening output.");
+        TipId(IDC_MCDUCK,  L"Duck: the music gets quieter while you talk, then comes back up.");
+        for (int k = 0; k < MAX_OUT; k++) TipId(IDC_MCRT0 + k, L"Send the music to that output (lit = on), as on its Mixer strip.");
+        TipId(IDC_MCMETER, L"How loud the music is right now, after its volume (left and right).");
+        TipId(IDC_MCGO,    L"The Music channel's strip in the Mixer: EQ, compressor, plugins, links, hotkeys.");
+        TipId(IDC_MCADD,   L"Put the music player in the Mixer as a channel, so it gets a fader, mute, solo, duck, pan, EQ and plugins.");
         NSubTips();                             // (each sub-tab: what's in it)
     }
     TipId(IDC_PHONEBTN, L"Control Lag Effect from your phone's browser, on the same Wi-Fi: pads, voice effects, the Mixer, scenes, "
@@ -18136,7 +18196,7 @@ static const NSubDef NEW_SUBS_T[] = {
     { PAGE_SPEECH, L"Model", FEAT_SPEECH, { { -1, L"Speech model", FEAT_SPEECH, false } } },
     { PAGE_SOUND, L"Clips", FEAT_CLIPS, { { PAGE_CLIPS, L"Instant replay", FEAT_CLIPS, false }, { PAGE_CLIPS, L"Clips", FEAT_CLIPS, false } } },
     { PAGE_SOUND, L"Pads", FEAT_SOUND, { { PAGE_SOUND, L"Pads", FEAT_SOUND, false }, { PAGE_SOUND, L"Playback", FEAT_SOUND, false } } },
-    { PAGE_SOUND, L"Music", 0, { { PAGE_MIC, L"Music", 0, false } } },
+    { PAGE_SOUND, L"Music", 0, { { PAGE_MIC, L"Music", 0, false }, { -1, L"Mixer channel", 0, false } } },
     { PAGE_SOUND, L"Looper", FEAT_SOUND, { { PAGE_SOUND, L"Looper", FEAT_SOUND, false }, { PAGE_SOUND, L"Looper settings", FEAT_SOUND, false } } },
     { PAGE_SOUND, L"Beatbox", FEAT_SOUND, { { PAGE_SOUND, L"Beatbox to drums", FEAT_SOUND, false }, { PAGE_SOUND, L"Teach it your sounds", FEAT_SOUND, false } } },
     { PAGE_SETTINGS, L"Controls", 0, { { -1, L"Controls", 0, false }, { PAGE_SETTINGS, L"Remote control (Streamer.bot)", 0, false }, { PAGE_SETTINGS, L"Command builder (Streamer.bot)", 0, false } } },
@@ -18246,6 +18306,17 @@ static void ScrollBy(int n)                     // a box at a time
     if (want == gScrollAt) return;
     gScrollFirst[gPage][si] = want;
     Layout();
+}
+static bool WheelAdjusts() { return !gLayoutNew || gWheelAdj; }   // (1.90.2) Classic: as it always was
+static bool WheelIsSetting(HWND t)              // a control the wheel would change (not a list or text that just scrolls)
+{
+    for (int i = 0; i < 2 && t; i++, t = GetParent(t)) {   // (a combo box's edit part: the combo box)
+        wchar_t cls[32]; GetClassNameW(t, cls, 32);
+        if (!lstrcmpiW(cls, L"LagKnob") || !lstrcmpiW(cls, L"LagMini") || !lstrcmpiW(cls, L"LagFader") || !lstrcmpiW(cls, L"LagChatMix") ||
+            !lstrcmpiW(cls, L"ComboBox") || !lstrcmpiW(cls, L"msctls_trackbar32") || !lstrcmpiW(cls, L"msctls_updown32")) return true;
+        if (!lstrcmpiW(cls, L"LagEffectWnd")) return false;
+    }
+    return false;
 }
 static bool gScrollDrag = false;                // dragging the bar's thumb
 static int  gScrollDragY0 = 0, gScrollDragTop0 = 0;
@@ -18379,6 +18450,11 @@ static void Layout()
             for (int base : chIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanShown(cid - base);
             static const int fullIds[] = { IDC_CHSOLO0, IDC_CHDUCK0, IDC_CHPAN0 };   // (not on a compact strip)
             for (int base : fullIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanFull(cid - base);
+            if (cid >= IDC_MCVOL && cid <= IDC_MCLAST) {   // (1.90.2) Sounds > Music > Mixer channel: its controls, or "make it one"
+                const bool has = MusChanIdx() >= 0;
+                vis = vis && (cid == IDC_MCNONE || cid == IDC_MCADD ? !has : has);
+                if (cid >= IDC_MCRT0) vis = vis && cid - IDC_MCRT0 < gRows;
+            }
             if (cid == IDC_CBTGT || cid == IDC_CBLBLTGT) vis = vis && (gCbShow & 1);   // (1.66.1) the builder: only the lists this action uses
             if (cid == IDC_CBOPT || cid == IDC_CBLBLOPT) vis = vis && (gCbShow & 2);
             if (cid == IDC_CBVAL || cid == IDC_CBLBLVAL) vis = vis && (gCbShow & 4);
@@ -20864,7 +20940,8 @@ static void ShowHelp()
         L"CLIPS (INSTANT REPLAY)\n"
         L"Lag Effect keeps the last few seconds of your voice, PC sound or just Discord (pick in Record) in memory. Press Clip it (or its hotkey) "
         L"to save them as a clip. Trim lets you listen back privately, cut the start and end, and undo. "
-        L"Clips are saved as WAV files in %APPDATA%\\LagEffect\\Clips.\n\n"
+        L"Clips are saved as WAV files in %APPDATA%\\LagEffect\\Clips. A new clip never writes over an old file: a clip replaced on the board keeps its "
+        L"file (see History); only Remove (\x00D7) deletes it, to the Recycle Bin.\n\n"
         L"SHORTCUTS\n"
         L"Ctrl+1-6 jumps to a tab. Right-click the tray icon for quick switches (mute, voice effects, vocode to song, "
         L"noise suppression, gate). Settings has a Mute hotkey, hotkey pop-ups, Always on top and Start with Windows.\n\n"
@@ -27437,6 +27514,80 @@ static void MusOutsMenu()
         GoTo(PAGE_MIXER, -1, nullptr, nullptr, L"");
     }
 }
+static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d);
+// ---- (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's volume, pan, M / S / Duck, outputs and level ----
+static int gMcCh = -2;                          // the channel shown (-1 none; -2 not looked yet)
+static bool McShowing()
+{
+    if (!gLayoutNew || !gWnd) return false;
+    HWND a = GetDlgItem(gWnd, IDC_MCGO), b = GetDlgItem(gWnd, IDC_MCADD);
+    return (a && IsWindowVisible(a)) || (b && IsWindowVisible(b));
+}
+static void McTick()                            // (with the Mixer's meters, ~60 a second) follow changes made anywhere else
+{
+    if (!gLayoutNew || !gWnd || !GetDlgItem(gWnd, IDC_MCVOL)) return;
+    const int mc = MusChanIdx();
+    if ((mc >= 0) != (gMcCh >= 0) && gMcCh != -2) { gMcCh = mc; Layout(); }   // (it became / stopped being a channel)
+    gMcCh = mc;
+    if (mc < 0 || !McShowing()) return;
+    static int sDb = INT_MIN, sPan = INT_MIN, sFl = -1, sCh = -1;
+    const ChanSet& g = gCh[mc];
+    const int bc = ChanInBus(mc);
+    const int fl = (g.mute ? 1 : 0) | (g.solo ? 2 : 0) | (g.duck ? 4 : 0) | (ChanQuiet(mc) ? 8 : 0) | ((int)(g.routes & 31) << 4)
+                 | (bc >= 0 ? (1 << 9) | ((int)(gCh[bc].routes & 31) << 10) : 0) | (gRows << 16);
+    if (mc != sCh) { sCh = mc; sDb = sPan = INT_MIN; sFl = -1; }
+    wchar_t t[24];
+    if (g.db10 != sDb) { sDb = g.db10; DbText(sDb, t); SetTextIfChanged(gWnd, IDC_MCDB, t); InvalidateRect(GetDlgItem(gWnd, IDC_MCVOL), nullptr, FALSE); }
+    if (g.pan != sPan) { sPan = g.pan; PanText(sPan, t); SetTextIfChanged(gWnd, IDC_MCPANT, t); InvalidateRect(GetDlgItem(gWnd, IDC_MCPAN), nullptr, FALSE); }
+    if (fl != sFl) {
+        sFl = fl;
+        for (int id = IDC_MCMUTE; id <= IDC_MCDUCK; id++) InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
+        for (int k = 0; k < MAX_OUT; k++) InvalidateRect(GetDlgItem(gWnd, IDC_MCRT0 + k), nullptr, FALSE);
+    }
+}
+static bool McDraw(int w, DRAWITEMSTRUCT* d)
+{
+    const int mc = MusChanIdx();
+    if (mc < 0) { FillRect(d->hDC, &d->rcItem, BgBrush()); return true; }
+    if (w == IDC_MCMUTE) { DrawToggle(d, gCh[mc].mute, true); return true; }
+    if (w == IDC_MCSOLO) { DrawToggleC(d, gCh[mc].solo, SOLO_C, RGB(27, 27, 27)); return true; }
+    if (w == IDC_MCDUCK) { DrawToggleC(d, gCh[mc].duck, ACCENT, RGB(255, 255, 255)); return true; }
+    if (w >= IDC_MCRT0 && w < IDC_MCRT0 + MAX_OUT) return DrawItemDispatch((WPARAM)(IDC_CHRT0 + mc * MAX_OUT + (w - IDC_MCRT0)), d);   // (as its strip's)
+    if (w == IDC_MCMETER) {                     // left and right, -60 .. 0 dB, after its fader
+        HDC dc = d->hDC; RECT rc = d->rcItem;
+        FillRect(dc, &rc, BgBrush());
+        const int gap = 2, bh = Imax(2, (rc.bottom - rc.top - gap) / 2);
+        const float v[2] = { gChShownL[mc], gChShownR[mc] };
+        for (int s2 = 0; s2 < 2; s2++) {
+            RECT b = { rc.left, rc.top + s2 * (bh + gap), rc.right, rc.top + s2 * (bh + gap) + bh };
+            HBRUSH tr = CreateSolidBrush(gDark ? DK_SECTION : LT_BORDER); FillRect(dc, &b, tr); DeleteObject(tr);
+            if (!gChA[mc].live || v[s2] <= 0.001f) continue;
+            const float db = 20.0f * log10f(v[s2]), f = Min(1.0f, Max(0.0f, (db + 60.0f) / 60.0f));
+            RECT fr = b; fr.right = b.left + (int)((b.right - b.left) * f);
+            HBRUSH fb = CreateSolidBrush(db > -3.0f ? RGB(225, 70, 60) : db > -12.0f ? RGB(225, 180, 40) : METER_C); FillRect(dc, &fr, fb); DeleteObject(fb);
+        }
+        return true;
+    }
+    return false;
+}
+static void McClick(int id)
+{
+    const int mc = MusChanIdx();
+    if (id == IDC_MCADD) {                      // (as "Plays on" > Put it in the Mixer, staying here)
+        if (mc >= 0) return;
+        int e = -1; for (int k = 0; k < CH_MAX; k++) if (gCh[k].type == CH_NONE) { e = k; break; }
+        if (e < 0) { MessageBoxW(gWnd, L"All 8 Mixer channels are in use. Clear one (its name > Clear this channel), then try again.", L"Lag Effect - Music", MB_ICONINFORMATION); return; }
+        ChanSetSource(e, CH_MUS, L"music"); SaveSettings();
+        McTick(); Layout();
+        return;
+    }
+    if (mc < 0) return;
+    if (id == IDC_MCGO) { GoTo(PAGE_MIXER, -1, GetDlgItem(gWnd, IDC_CHVOL0 + mc), L"Music", L""); return; }
+    int to = id == IDC_MCMUTE ? IDC_CHMUTE0 + mc : id == IDC_MCSOLO ? IDC_CHSOLO0 + mc : id == IDC_MCDUCK ? IDC_CHDUCK0 + mc
+           : id >= IDC_MCRT0 && id < IDC_MCRT0 + MAX_OUT ? IDC_CHRT0 + mc * MAX_OUT + (id - IDC_MCRT0) : 0;
+    if (to) SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(to, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, to));   // (the strip's own button does it)
+    InvalidateRect(GetDlgItem(gWnd, id), nullptr, FALSE);
+}
 static void MusUi()                             // buttons and the list's ▶
 {
     if (!gWnd || !GetDlgItem(gWnd, IDC_MUSPLAY)) return;
@@ -28813,6 +28964,17 @@ static void NewLayoutApply()
             { const int di = NDi(GetDlgItem(gWnd, IDC_PADBANKKEY)); if (di >= 0) gDesign[di].sec = kp; }
         }
     }
+    {   // (1.90.2) Music: say which hotkey button is which
+        const int km = secOf(PAGE_MIC, L"Music");
+        if (km >= 0) {
+            gBuildPage = PAGE_MIC; gBuildSub = 5; gBuildFeat = 0;
+            Ctl(L"STATIC", L"Play / pause:", 0, 30, 512, 84, 18, -1); gDesign[gDesignN - 1].sec = km;
+            Ctl(L"STATIC", L"Next song:", 0, 284, 512, 70, 18, -1); gDesign[gDesignN - 1].sec = km;
+            NMoveId(IDC_MUSKEYPLAY, PAGE_MIC, 5, 116, 506, 156);
+            NMoveId(IDC_MUSKEYNEXT, PAGE_MIC, 5, 356, 506, 174);
+            for (int id : { IDC_MUSKEYPLAY, IDC_MUSKEYNEXT }) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) gDesign[di].sec = km; }
+        }
+    }
     {   // Mic > Cleanup: "Push-to-talk & live bleep" is just push-to-talk (the live bleep key goes to Speech > Bleep)
         const int k = secOf(PAGE_MIC, L"Push-to-talk & live bleep");
         if (k >= 0) {
@@ -28845,13 +29007,33 @@ static void NewLayoutApply()
         Ctl(L"STATIC", L"Whisper turns your speech into words on this PC (nothing you say goes online). Fast 31 MB, Good 57 MB, Best 181 MB: "
                        L"bigger is more accurate but slower. Its menu downloads or deletes them.", 0, 190, y + 18, 340, 52, IDC_HDR);
     }
-    {   int y = NBox(L"Controls", 100);        // Settings > Controls: the windows for every way to trigger things
+    {   int y = NBox(L"Controls", 126);        // Settings > Controls: the windows for every way to trigger things
         Ctl(L"BUTTON", L"Hotkeys...", WS_TABSTOP | WS_GROUP, 30, y + 22, 120, 28, IDC_NCKEYS);
         Ctl(L"BUTTON", L"Macros...", WS_TABSTOP, 156, y + 22, 110, 28, IDC_NCMACROS);
         Ctl(L"BUTTON", L"Recorder...", WS_TABSTOP, 272, y + 22, 110, 28, IDC_NCRCD);
         Ctl(L"BUTTON", L"Sound triggers...", WS_TABSTOP, 388, y + 22, 142, 28, IDC_NCTRIG);
         Ctl(L"BUTTON", L"MIDI controller...", WS_TABSTOP, 30, y + 56, 150, 28, IDC_NCMIDI);
         Ctl(L"STATIC", L"Your phone and Streamer.bot: just below.", 0, 190, y + 62, 340, 18, IDC_HDR);
+        Ctl(L"BUTTON", L"The mouse wheel changes the setting under it", BS_AUTOCHECKBOX | WS_TABSTOP, 30, y + 94, 330, 20, IDC_NCWHEEL);
+        CheckDlgButton(gWnd, IDC_NCWHEEL, gWheelAdj ? BST_CHECKED : BST_UNCHECKED);
+    }
+    {   int y = NBox(L"Mixer channel", 124);   // (1.90.2) Sounds > Music: the Mixer's Music channel, for quick changes
+        Ctl(L"STATIC", L"Volume", 0, 30, y + 23, 52, 18, IDC_MCLBL0);
+        Ctl(L"LagChatMix", L"", WS_TABSTOP, 86, y + 23, 214, 20, IDC_MCVOL);
+        Ctl(L"STATIC", L"", SS_NOPREFIX, 306, y + 23, 66, 18, IDC_MCDB);
+        Ctl(L"BUTTON", L"M", BS_OWNERDRAW | WS_TABSTOP, 378, y + 19, 34, 26, IDC_MCMUTE);
+        Ctl(L"BUTTON", L"S", BS_OWNERDRAW | WS_TABSTOP, 416, y + 19, 34, 26, IDC_MCSOLO);
+        Ctl(L"BUTTON", L"Duck", BS_OWNERDRAW | WS_TABSTOP, 454, y + 19, 76, 26, IDC_MCDUCK);
+        Ctl(L"STATIC", L"Pan", 0, 30, y + 55, 52, 18, IDC_MCLBL0 + 1);
+        Ctl(L"LagChatMix", L"", WS_TABSTOP, 86, y + 55, 214, 20, IDC_MCPAN);
+        Ctl(L"STATIC", L"", SS_NOPREFIX, 306, y + 55, 66, 18, IDC_MCPANT);
+        for (int k = 0; k < MAX_OUT; k++) { wchar_t n[4]; wsprintfW(n, L"%d", k + 1); Ctl(L"BUTTON", n, BS_OWNERDRAW | WS_TABSTOP, 378 + k * 31, y + 51, 28, 26, IDC_MCRT0 + k); }
+        Ctl(L"STATIC", L"Level", 0, 30, y + 87, 52, 18, IDC_MCLBL0 + 2);
+        Ctl(L"STATIC", L"", SS_OWNERDRAW, 86, y + 90, 286, 12, IDC_MCMETER);
+        Ctl(L"BUTTON", L"Open in the Mixer", WS_TABSTOP, 378, y + 83, 152, 28, IDC_MCGO);
+        Ctl(L"STATIC", L"The music isn't a Mixer channel yet. Make it one to get its volume, mute, solo, duck, pan and outputs here "
+                       L"(and its EQ, plugins and the rest in the Mixer).", 0, 30, y + 22, 336, 54, IDC_MCNONE);
+        Ctl(L"BUTTON", L"Make it a Mixer channel", WS_TABSTOP, 378, y + 22, 152, 28, IDC_MCADD);
     }
     gBuildPage = -1; gBuildSub = -1; gBuildFeat = 0;
     for (int i = classicDesigns; i < gDesignN; i++) { gOrigPage[i] = -1; gOrigSub[i] = -1; gNDone[i] = true; }   // (made here: no Classic place)
@@ -29732,9 +29914,16 @@ static void CreateUI()
     AddSection(14, 254, 532, 330, L"Clips");
     Ctl(L"STATIC", L"Clip", 0, 30, 270, 120, 16, IDC_HDR);
     Ctl(L"STATIC", L"Volume", 0, 212, 270, 70, 16, IDC_HDR);
-    Ctl(L"STATIC", L"Page:", 0, 300, 270, 40, 16, IDC_HDR);
-    for (int b2 = 0; b2 < CLIP_BANKS; b2++)
-        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 342 + b2 * 47, 264, 43, 24, IDC_CLIPBANK0 + b2);
+    if (gLayoutNew) {                           // (1.90.2, New) 8 pages, smaller
+        Ctl(L"STATIC", L"Page:", 0, 290, 270, 36, 16, IDC_HDR);
+        for (int b2 = 0; b2 < ClipBanks(); b2++)
+            Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 328 + b2 * 25, 264, 23, 24, ClipBankId(b2));
+    } else {
+        Ctl(L"STATIC", L"Page:", 0, 300, 270, 40, 16, IDC_HDR);
+        for (int b2 = 0; b2 < ClipBanks(); b2++)
+            Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 342 + b2 * 47, 264, 43, 24, ClipBankId(b2));
+    }
+    if (gClipBank >= ClipBanks()) gClipBank = 0;
     for (int i = 0; i < CLIPS; i++) {
         int y = 292 + i * 36;
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
@@ -30411,6 +30600,11 @@ static void OnCommand(int id, int code)
         }
         return;
     }
+    if (id >= IDC_MCVOL && id <= IDC_MCLAST) { if (code == BN_CLICKED) McClick(id); return; }   // (1.90.2) Sounds > Music > Mixer channel
+    if (id == IDC_NCWHEEL) {                    // (1.90.2) the wheel on knobs / number boxes / faders / lists
+        if (code == BN_CLICKED) { gWheelAdj = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings(); }
+        return;
+    }
     if (id >= IDC_NCKEYS && id <= IDC_NCMIDI) {    // (New) Settings > Controls: the windows these live in
         if (code == BN_CLICKED) {
             const int to = id == IDC_NCKEYS ? IDC_KEYSLIST : id == IDC_NCMACROS ? IDC_MACROBTN : id == IDC_NCRCD ? IDC_RCDBTN : id == IDC_NCTRIG ? IDC_TRIGSET : IDC_MIDISET;
@@ -30836,7 +31030,7 @@ static void OnCommand(int id, int code)
     if (id >= IDC_CLIPCLR && id < IDC_CLIPCLR + CLIPS) { if (code == BN_CLICKED) { int c = ClipSlot(id - IDC_CLIPCLR); ClipClear(c); gClipPinned[c] = false; ClipShiftUp(c); } return; }
     if (id >= IDC_CLIPMORE && id < IDC_CLIPMORE + CLIPS) { if (code == BN_CLICKED) ClipMenu(ClipSlot(id - IDC_CLIPMORE), GetDlgItem(gWnd, id)); return; }
     if (id >= IDC_PADMORE && id < IDC_PADMORE + PADS)    { if (code == BN_CLICKED) PadMenu(PadSlot(id - IDC_PADMORE), GetDlgItem(gWnd, id)); return; }
-    if (id >= IDC_CLIPBANK0 && id < IDC_CLIPBANK0 + CLIP_BANKS) { if (code == BN_CLICKED) SetClipBank(id - IDC_CLIPBANK0); return; }
+    if (ClipBankOf(id) >= 0) { if (code == BN_CLICKED) SetClipBank(ClipBankOf(id)); return; }
     if (id == IDC_CLIPHIST)    { if (code == BN_CLICKED) ClipHistory(GetDlgItem(gWnd, id)); return; }
     if (id == IDC_PADFOLDER)   { if (code == BN_CLICKED) PadLoadFolder(); return; }
     if (SbSubOf(id) >= 0) {                     // Soundboard: Pads / Looper / Beatbox / Music
@@ -31451,8 +31645,10 @@ static void OnCommand(int id, int code)
 
 // Owner-drawn controls are drawn off-screen and copied in one go, so nothing flickers when the picture behind
 // them changes (e.g. a GIF background). The meter buffers itself; dropdown items aren't on the window background.
+static bool McDraw(int w, DRAWITEMSTRUCT* d);
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
 {
+    if (w >= IDC_MCVOL && w <= IDC_MCLAST && McDraw((int)w, d)) return true;   // (1.90.2) Sounds > Music > Mixer channel
     if (w >= IDC_CHMUTE0 && w < IDC_CHMUTE0 + CH_MAX) { DrawToggle(d, gCh[w - IDC_CHMUTE0].mute, true); return true; }
     if (w >= IDC_CHSOLO0 && w < IDC_CHSOLO0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHSOLO0].solo, SOLO_C, RGB(27, 27, 27)); return true; }
     if (w >= IDC_CHDUCK0 && w < IDC_CHDUCK0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHDUCK0].duck, ACCENT, RGB(255, 255, 255)); return true; }
@@ -31524,7 +31720,7 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
     if (w == IDC_BBVIEW) { DrawBbView(d); return true; }
     if (w >= IDC_COLSW0 && w < IDC_COLSW0 + USERCOL_N) { DrawSwatch(d); return true; }
     if (w >= IDC_PADBANK0 && w < IDC_PADBANK0 + PAD_BANKS) { DrawPadBank(d); return true; }
-    if (w >= IDC_CLIPBANK0 && w < IDC_CLIPBANK0 + CLIP_BANKS) { DrawClipBank(d); return true; }
+    if (ClipBankOf((int)w) >= 0) { DrawClipBank(d); return true; }
     if (w >= IDC_ROWLBL && w < IDC_ROWLBL + MAX_OUT) { DrawOutLabel(d); return true; }
     if ((w >= IDC_PADPLAY && w < IDC_PADPLAY + PADS) || (w >= IDC_CLIPPLAY && w < IDC_CLIPPLAY + CLIPS)) {
         DrawPadButton(d); return true;
@@ -31780,7 +31976,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         HWND t = WindowFromPoint(pt);
         if (t && t != h && IsChild(h, t)) {
             wchar_t cls[16]; GetClassNameW(t, cls, 16);
-            if (!lstrcmpW(cls, L"LagFader")) return SendMessageW(t, m, w, l);
+            if (!lstrcmpW(cls, L"LagFader") && WheelAdjusts()) return SendMessageW(t, m, w, l);
         }
         if (gScrollN && gScrollMax > 0) {       // (1.90.0, New) a page taller than the window: a box at a time
             static int acc = 0;
@@ -32219,9 +32415,12 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE, LPSTR, int show)
               for (int n = 1; n < TAB_SLOTS; n++) { const int pg = TabAt((slot + n * dir) % TAB_SLOTS); if (PageOn(pg)) { SetPage(pg); break; } } }
             continue;
         }
-        if (msg.message == WM_MOUSEWHEEL && gLayoutNew && gScrollN && gScrollMax > 0 && msg.hwnd != h && IsChild(h, msg.hwnd)) {
-            HWND f = GetFocus();                // (1.90.0) on a page that scrolls, the wheel scrolls it: a setting under the mouse only
-            if (f != msg.hwnd && !IsChild(msg.hwnd, f) && !IsChild(f, msg.hwnd)) msg.hwnd = h;   // takes the wheel once you've clicked it
+        if (msg.message == WM_MOUSEWHEEL && msg.hwnd != h && IsChild(h, msg.hwnd)) {
+            if (!WheelAdjusts() && WheelIsSetting(msg.hwnd)) msg.hwnd = h;   // (1.90.2) a setting never takes the wheel (Settings > Controls)
+            else if (gLayoutNew && gScrollN && gScrollMax > 0) {
+                HWND f = GetFocus();            // (1.90.0) on a page that scrolls, the wheel scrolls it: a list under the mouse only
+                if (f != msg.hwnd && !IsChild(msg.hwnd, f) && !IsChild(f, msg.hwnd)) msg.hwnd = h;   // takes the wheel once you've clicked it
+            }
         }
         if (msg.message == WM_KEYDOWN && msg.wParam >= '1' && msg.wParam < '1' + TAB_SLOTS &&
             (GetKeyState(VK_CONTROL) & 0x8000) && (msg.hwnd == h || IsChild(h, msg.hwnd))) {
