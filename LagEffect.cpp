@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.92.1"
+#define APP_VERSION L"1.92.2"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -21034,9 +21034,10 @@ static int VstCheckMain(const wchar_t* mode, const wchar_t* path, const wchar_t*
     return 0;
 }
 
-static void ShowHelp()
+static void HelpWindow(const wchar_t* title, const wchar_t* text, const POINT* at, int w, int h);
+static void ShowHelp()                          // (1.92.2) in the help window (scrolls, resizes, stays open); it was a message box too tall for the screen
 {
-    MessageBoxW(gWnd,
+    static const wchar_t* HELP_TEXT =
         L"HELP FOR ONE PART\n"
         L"Every box has a ? after its title: click it for just that part's help, in a window you can keep open.\n\n"
         L"HOW IT WORKS\n"
@@ -21178,8 +21179,17 @@ static void ShowHelp()
         L"noise suppression, gate). Settings has a Mute hotkey, hotkey pop-ups, Always on top and Start with Windows.\n\n"
         L"TIPS\n"
         L"Use headphones. If a game runs as administrator, run Lag Effect as administrator too, "
-        L"or the hotkey won't work while that game is focused.",
-        L"Lag Effect " APP_VERSION L" - Help", MB_ICONINFORMATION);
+        L"or the hotkey won't work while that game is focused.";
+    wchar_t* fixed = PlaceFixDup(HELP_TEXT);    // (the New layout's place names)
+    const wchar_t* src = fixed ? fixed : HELP_TEXT;
+    const int n = lstrlenW(src);
+    wchar_t* t = (wchar_t*)malloc((n * 2 + 1) * sizeof(wchar_t));   // (the edit box wants \r\n)
+    if (t) {
+        int o = 0; for (int i = 0; i < n; i++) { if (src[i] == L'\n' && (i == 0 || src[i - 1] != L'\r')) t[o++] = L'\r'; t[o++] = src[i]; } t[o] = 0;
+        HelpWindow(L"Lag Effect " APP_VERSION L" - Help", t, nullptr, 720, 620);
+        free(t);
+    }
+    if (fixed) free(fixed);
 }
 
 // ======================= hotkey picker =======================
@@ -23277,16 +23287,28 @@ static void SectionHelp(int k)
                 wc.hIcon = gIcon; wc.lpszClassName = L"LagHelp"; RegisterClassW(&wc); reg = true; }
     static wchar_t text[24000]; SectionHelpText(k, text, 24000);
     wchar_t title[96]; _snwprintf(title, 95, L"Help - %s", gSections[k].title); title[95] = 0;
-    if (gHelpWnd) {                             // (one at a time: it shows the box you clicked last)
+    POINT at = { gSecHelpRc[k].right, gSecHelpRc[k].bottom }; ClientToScreen(gWnd, &at);
+    HelpWindow(title, text, &at, 440, 380);
+}
+static void HelpWindow(const wchar_t* title, const wchar_t* text, const POINT* at, int cw, int chh)   // the help window: by a point, or over the main window
+{
+    static bool reg = false;
+    if (!reg) { WNDCLASSW wc = {}; wc.lpfnWndProc = HelpProc; wc.hInstance = gInst; wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+                wc.hIcon = gIcon; wc.lpszClassName = L"LagHelp"; RegisterClassW(&wc); reg = true; }
+    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME;
+    RECT r = { 0, 0, SC(cw), SC(chh) }; AdjustWindowRect(&r, style, FALSE);
+    POINT p = { 0, 0 };
+    if (at) p = { at->x + SC(8), at->y };
+    else { RECT mr; GetWindowRect(gWnd, &mr); p = { (mr.left + mr.right - (r.right - r.left)) / 2, mr.top + SC(30) }; }
+    HMONITOR mon = MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
+    const int ww = Imin(r.right - r.left, (int)(mi.rcWork.right - mi.rcWork.left)), wh = Imin(r.bottom - r.top, (int)(mi.rcWork.bottom - mi.rcWork.top));
+    const int x = Iclamp(p.x, (int)mi.rcWork.left, (int)mi.rcWork.right - ww), y = Iclamp(p.y, (int)mi.rcWork.top, (int)mi.rcWork.bottom - wh);
+    if (gHelpWnd) {                             // (one at a time: it shows what you asked for last)
         SetWindowTextW(gHelpWnd, title); SetDlgItemTextW(gHelpWnd, 101, text);
+        if (!at) SetWindowPos(gHelpWnd, nullptr, x, y, ww, wh, SWP_NOZORDER | SWP_NOACTIVATE);   // (the whole help: big)
+        SendDlgItemMessageW(gHelpWnd, 101, EM_SETSEL, 0, 0); SendDlgItemMessageW(gHelpWnd, 101, EM_SCROLLCARET, 0, 0);
         SetForegroundWindow(gHelpWnd); return;
     }
-    const DWORD style = WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME;
-    RECT r = { 0, 0, SC(440), SC(380) }; AdjustWindowRect(&r, style, FALSE);
-    POINT at = { gSecHelpRc[k].right, gSecHelpRc[k].bottom }; ClientToScreen(gWnd, &at);
-    HMONITOR mon = MonitorFromPoint(at, MONITOR_DEFAULTTONEAREST); MONITORINFO mi = { sizeof(mi) }; GetMonitorInfoW(mon, &mi);
-    const int ww = r.right - r.left, wh = r.bottom - r.top;
-    const int x = Iclamp(at.x + SC(8), (int)mi.rcWork.left, (int)mi.rcWork.right - ww), y = Iclamp(at.y, (int)mi.rcWork.top, (int)mi.rcWork.bottom - wh);
     HWND w = CreateWindowExW(WS_EX_TOOLWINDOW, L"LagHelp", title, style, x, y, ww, wh, gWnd, nullptr, gInst, nullptr);
     if (!w) return;
     HWND e = CreateWindowExW(0, L"EDIT", text, WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_TABSTOP,
@@ -29598,11 +29620,22 @@ static void NewLayoutApply()
             { IDC_FEATSPEECH, L"Voice commands, bleeping words, talking through a TTS voice or Morse code (the Speech tab). Downloads a speech model once." },
             { IDC_FEATAVATAR, L"Your pictures that talk when you talk, in a window for OBS (Settings > Avatar)." },
             { IDC_FEATCAPS, L"What you say as text, in a window or a text file for OBS (Speech > Captions). Uses Speech." },
+            { IDC_FEATTRIG, L"A clap, snap, whistle or click runs any action." },          // (1.92.2: short, to end before Set up...)
+            { IDC_FEATMIDI, L"A USB MIDI controller's knobs, faders and pads, with lights." },
         };
         for (auto& f : feat) {                  // (each description sits just under its checkbox)
             const int di = NDi(GetDlgItem(gWnd, f.id)); if (di < 0) continue;
             for (int i = 0; i < gDesignN; i++)
-                if (gDesign[i].page == gDesign[di].page && abs(gDesign[i].rx - 50) <= 1 && abs(gDesign[i].ry - gDesign[di].ry - 20) <= 1) { SetWindowTextW(gDesign[i].h, f.t); break; }
+                if (gDesign[i].page == gDesign[di].page && abs(gDesign[i].rx - 50) <= 1 && abs(gDesign[i].ry - gDesign[di].ry - 20) <= 1) {
+                    SetWindowTextW(gDesign[i].h, f.t);
+                    if (f.id == IDC_FEATTRIG || f.id == IDC_FEATMIDI) NMove(i, gDesign[i].page, gDesign[i].sub, gDesign[i].rx, gDesign[i].ry, 370);   // (Set up... to its right)
+                    break;
+                }
+        }
+        for (int id : { IDC_TRIGSET, IDC_MIDISET }) {   // (1.92.2) Set up...: in the middle of its row, clear of the lines above and below
+            const int di = NDi(GetDlgItem(gWnd, id)), ci = NDi(GetDlgItem(gWnd, id == IDC_TRIGSET ? IDC_FEATTRIG : IDC_FEATMIDI));
+            if (di < 0 || ci < 0) continue;
+            NMove(di, gDesign[di].page, gDesign[di].sub, 436, gDesign[ci].ry + 6, 94);
         }
         SetDlgItemTextW(gWnd, IDC_HDRMETERON, L"Mic level beside the tabs");
         for (int i = 0; i < gDesignN; i++) {    // anything else naming a Classic place
