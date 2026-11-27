@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.90.2"
+#define APP_VERSION L"1.92.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -1286,6 +1286,7 @@ static DWORD gOutNextTry[MAX_OUT], gOutWait[MAX_OUT];       // (extra outputs th
 static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
 static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
 static bool gOverlayOn = false, gBeeps = false, gCmdLine = false, gCompact = false;
+static int gTabPos = 0;                         // (1.92.0, New) where the tabs are: 0 top, 1 left side, 2 right side, 3 bottom (INI tab_position)
 static inline int SC(int v) { return gUiScale == 100 ? v : MulDiv(v, gUiScale, 100); }
 static inline int UNSC(int v) { return gUiScale == 100 ? v : MulDiv(v, 100, gUiScale); }   // screen px -> design px   // UI size   // gCmdLine: hidden (right-click the version text)
 static int  gOverlayX = INT_MIN, gOverlayY = INT_MIN;
@@ -1408,12 +1409,15 @@ static inline int PadSlot(int row) { return gPadBank * PADS + row; }
 
 struct PShift;
 static float PadPitch(int i, float x, double ratio);   // per-pad pitch shifter (defined with the DSP)
+static unsigned char gPadAct[SB_N];             // (1.91.0, audio thread) the slots doing something this block, in order
+static int gPadActN = 0;                        // (the rest would add nothing: same sound, without looking at all 97 every sample)
 static inline float PadsMix(float& viaFx, int& padsPlaying)   // audio thread: one output sample of all playing pads
 {                                               // (viaFx gets the ones that go through the voice effects)
     viaFx = 0; padsPlaying = 0;
     float sum = 0;
     const float padMaster = gPadMaster / 100.0f, clipMaster = gClipMaster / 100.0f;
-    for (int i = 0; i < SB_N; i++) {
+    for (int a = 0; a < gPadActN; a++) {
+        const int i = gPadAct[a];
         Pad& p = gPads[i];
         const bool  isClip = i >= CLIP0 && i < CLIP0 + CLIP_N;
         const float master = isClip ? clipMaster : padMaster;
@@ -5281,7 +5285,8 @@ static void AudioCallback(ma_device* dev, void* output, const void* input, ma_ui
     float outPk[MAX_OUT] = {};
 
     bool padsIdle = true;                       // nothing playing / starting / stopping: skip the soundboard mixer this block
-    for (int i = 0; i < SB_N && padsIdle; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) padsIdle = false; }
+    gPadActN = 0;                               // (1.91.0) and which ones are (a start pressed mid-block begins with the next block)
+    for (int i = 0; i < SB_N; i++) { const Pad& p = gPads[i]; if (p.playing || p.trigger || p.stop || p.fade > 0) { padsIdle = false; gPadAct[gPadActN++] = (unsigned char)i; } }
     {                                           // (1.69.0) sound triggers: only while they're on (they just listen)
         static TrigCore tg;
         if (gTrigOn.load(std::memory_order_relaxed) && in) TrigBlock(tg, in, frames, inCh, inSide, boost, gTrigSens.load(std::memory_order_relaxed));
@@ -7266,6 +7271,12 @@ struct Clip {
     TrimState redo[TRIM_HIST]; int nRedo;
 };
 static Clip    gClips[CLIP_N];
+#define IDC_CLIPWAVE  4950                      // (1.92.0, New) .. + CLIPS - 1: each clip row's waveform + length (click: hear it on Ears)
+static void ClipRowRedraw(int row)              // a clip row's name button (1.92.0: and its waveform)
+{
+    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + row), nullptr, FALSE);
+    if (gLayoutNew) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + row), nullptr, FALSE);
+}
 static int     gClipBank = 0;                    // clip page on screen
 #define IDC_CLIPBANK4 4897                      // (1.90.2, New) clip pages E-H (.. 4900)
 static inline int ClipBanks() { return gLayoutNew ? CLIP_BANKS : 4; }   // (1.90.2) pages this layout shows (Classic: A-D, as it was)
@@ -7403,6 +7414,7 @@ static void LoadSettings()
     gVolStyle     = Iclamp(INI_INT(L"volume_control_style", 0), 0, 1);
     gHdrMeter     = INI_INT(L"header_mic_meter", 1) != 0;
     gWheelAdj     = INI_INT(L"wheel_changes_settings", 0) != 0;
+    gTabPos       = Iclamp(INI_INT(L"tab_position", 0), 0, 3);
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
     gPadsFx       = INI_INT(L"pads_through_fx", 0) != 0;
@@ -8374,6 +8386,7 @@ static void SaveSettings()
     SaveInt(L"volume_control_style", gVolStyle);
     SaveInt(L"header_mic_meter", gHdrMeter);
     SaveInt(L"wheel_changes_settings", gWheelAdj);
+    SaveInt(L"tab_position", gTabPos);
     SaveInt(L"layout_new", gLayoutWant ? 1 : 0);   // (1.90.0)
     if (gLayoutNew) { SaveInt(L"layout_new_runs", gNewRuns); SaveNewSubs(); }
     SaveInt(L"fx_hotkey_hold", gFxHold[0]);
@@ -8697,7 +8710,9 @@ static void StopAudio()
 #define CLIENT_W  560
 #define STRIP_H   30                           // the bar along the bottom: search, Hotkeys, what's on (1.51.0)
 #define BASE_H    (592 + STRIP_H)              // window height with one output
-static int BaseH() { return BASE_H + (gLayoutNew ? 50 : 0); }   // (1.90.0) New: 50 px taller (fewer pages need scrolling)
+static int TabSideW() { return gLayoutNew && !gCompact && (gTabPos == 1 || gTabPos == 2) ? 104 : 0; }   // (design px) the side column
+static int TabBotH()  { return gLayoutNew && !gCompact && gTabPos == 3 ? 40 : 0; }                    // ... the row above the bottom bar
+static int BaseH() { return BASE_H + (gLayoutNew ? 50 : 0) + TabBotH(); }   // (1.90.0) New: 50 px taller (fewer pages need scrolling)
 #define COMPACT_H 84                           // compact mode: status + a few buttons
 #define ROW_Y0    134
 #define ROW_H     30
@@ -8710,6 +8725,7 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
        PAGE_HIDE = 98, PAGE_STAGE = 99 };      // (New: a Classic control it doesn't use; a new box being built)
 #define IDC_TAB7      4800                      // (1.90.0) the Speech tab (IDC_TAB0 + 7 is taken)
 #define IDC_NSUB0     4810                      // .. + page * 10 + sub: the New layout's sub-tabs
+#define IDC_TABPOS    4958                      // (1.92.0, New) Settings > Look > Layout > Tabs: where they are
 #define IDC_LAYOUTSEL 4890                      // Settings > Look > Layout: New / Classic
 #define IDC_NCKEYS    4891                      // (New) Settings > Controls: Hotkeys..., Macros..., Recorder..., Sound triggers..., MIDI...
 #define IDC_NCMACROS  4892
@@ -8717,6 +8733,11 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_NCTRIG    4894
 #define IDC_NCMIDI    4895
 #define IDC_NCWHEEL   4896                      // (1.90.2, New) Settings > Controls: the mouse wheel changes settings
+#define IDC_HMETER    4990                      // (1.91.0, New) Home: your mic's level
+#define IDC_HTOG0     4991                      // .. + HOME_TOGS - 1: Home > What's on switches
+#define HOME_TOGS     9
+#define HOME_METER_Y  320                       // (design px, moved down with the output list like the buttons above)
+#define HOME_TOP      398                       // Home: where What's on starts (and the part that scrolls)
 #define IDC_MCVOL     4960                      // (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's quick controls
 #define IDC_MCDB      4961
 #define IDC_MCMUTE    4962
@@ -8793,25 +8814,31 @@ static int CurSub(int page) { return SubVar(page); }
 #define NEW_SUBS 8                              // (New) most sub-tabs on a page
 static unsigned short gNewHas[TAB_COUNT][NEW_SUBS + 1][TAB_COUNT];   // (New) [page][sub + 1][Classic page]: bit (Classic sub + 1) = some of it is there
 static short gOrigPage[MAX_DESIGN], gOrigSub[MAX_DESIGN];            // (New) each control's Classic page / sub
+static bool gSecGuest[MAX_SECTIONS];            // (1.91.0, New) a starred box showing on Home (only while Home shows)
+static unsigned short gGuestHas[TAB_COUNT];     // (1.91.0) Classic page -> bits (Classic sub + 1) of what shows on Home as a guest
 // Is something from this Classic page / sub (-1: any) showing now? (Classic: that page and sub; New: wherever it went.)
 static bool ShowingOld(int op, int os)
 {
     if (!gLayoutNew) return gPage == op && (os < 0 || CurSub(op) == os);
     if (gPage < 0 || gPage >= TAB_COUNT || op < 0 || op >= TAB_COUNT) return false;
     const int s = CurSub(gPage), si = s < 0 ? 0 : s + 1 > NEW_SUBS ? NEW_SUBS : s + 1;
-    const unsigned bits = gNewHas[gPage][si][op] | gNewHas[gPage][0][op];
+    const unsigned bits = gNewHas[gPage][si][op] | gNewHas[gPage][0][op] | (gPage == PAGE_MAIN ? gGuestHas[op] : 0u);   // (1.91.0: + starred on Home)
     return os < 0 ? bits != 0 : ((bits >> (os + 1)) & 1) != 0;
 }
 static bool CtlShowing(int id)                  // is this control's page / sub-tab the one showing? (not whether it's scrolled into view)
 {
     HWND h = GetDlgItem(gWnd, id); if (!h) return false;
     for (int i = 0; i < gDesignN; i++)
-        if (gDesign[i].h == h) return gDesign[i].page == gPage && (gDesign[i].sub < 0 || gDesign[i].sub == CurSub(gPage));
+        if (gDesign[i].h == h) return (gDesign[i].page == gPage && (gDesign[i].sub < 0 || gDesign[i].sub == CurSub(gPage)))
+                                   || (gDesign[i].sec >= 0 && gSecGuest[gDesign[i].sec]);   // (1.91.0: or starred on Home)
     return false;
 }
 // (New) pages scroll a box at a time when they're taller than the window: a box is either all there or not at all
 // (controls are children of the window itself, so they can't be cut off half-way).
 static int  gSecScroll[MAX_SECTIONS];           // how far up each box is moved (design px)
+static int  gScrollVy[MAX_SECTIONS];            // (1.91.0) where each listed box sits in the page's scrolling list (design px)
+#define STAR_MAX 24
+static int  gStarSec[STAR_MAX], gStarN = 0;     // (1.91.0) boxes pinned to Home, in the order you starred them
 static bool gSecHid[MAX_SECTIONS];              // scrolled out of view
 static int  gScrollFirst[TAB_COUNT][NEW_SUBS + 1];   // the first box showing, per page / sub
 static int  gScrollList[MAX_SECTIONS], gScrollN = 0, gScrollAt = 0, gScrollMax = 0, gScrollTop = 0, gScrollBot = 0;
@@ -9074,11 +9101,12 @@ static void PlaceAll()
     if (!gWnd) return;
     const int rows = RowsDelta();
     HWND keep[3] = { GetDlgItem(gWnd, IDC_STATUS), GetDlgItem(gWnd, IDC_START), GetDlgItem(gWnd, IDC_MUTEBTN) };
-    { RECT c; GetClientRect(gWnd, &c); gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - SC(CLIENT_W)) / 2); }
+    { RECT c; GetClientRect(gWnd, &c); const int sw = SC(TabSideW());   // (1.92.0: tabs on a side: the pages sit beside them)
+      gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - sw - SC(CLIENT_W)) / 2) + (gTabPos == 1 ? sw : 0); }
     for (int i = 0; i < gDesignN; i++) {
         Design& d = gDesign[i];
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
-        if (d.page >= 0 && d.page != gPage) continue;   // other pages are placed when you switch to them
+        if (d.page >= 0 && d.page != gPage && !(d.sec >= 0 && gSecGuest[d.sec])) continue;   // other pages are placed when you switch to them (1.91.0: a starred box on Home is placed there)
         if (d.free) continue;
         int x = gOrgX + d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d)) - (d.sec >= 0 ? SC(gSecScroll[d.sec]) : 0);
         RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
@@ -10372,6 +10400,7 @@ static void ClipMenu(int c, HWND anchor);
 static void ClipHistory(HWND anchor);
 static void SetClipBank(int b);
 static void DrawClipBank(DRAWITEMSTRUCT* d);
+static void ClipWaveTick();
 static void PadTick()                           // every 50 ms: redraw pads that are playing or just stopped
 {
     static bool was[SB_N];
@@ -10392,6 +10421,7 @@ static void PadTick()                           // every 50 ms: redraw pads that
         lastBankDraw = GetTickCount();
         for (int b = 0; b < PAD_BANKS; b++) InvalidateRect(GetDlgItem(gWnd, IDC_PADBANK0 + b), nullptr, FALSE);
     }
+    ClipWaveTick();                             // (1.92.0) a clip being heard on Ears: its progress
     ClipTick();
     MicTestTick();
     LoopTick();
@@ -10485,7 +10515,7 @@ static void ClipApply(int c)                    // play the trimmed part (after 
     p.len = 0; p.data = nullptr;
     Sleep(30);                                  // the audio thread has let go of the old range
     if (k.base && k.te > k.ts) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
 static void ClipSetBase(int c, short* data, unsigned len)   // a new recording for a slot (or none)
@@ -10505,7 +10535,7 @@ static void ClipSetBase(int c, short* data, unsigned len)   // a new recording f
     k.pendTs = k.pendTe = 0;
     k.nUndo = k.nRedo = 0;
     if (data) { p.len = k.te - k.ts; p.data = k.base + k.ts; }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
 static bool InClipFolder(const wchar_t* path)
@@ -10858,8 +10888,9 @@ static void PrevStop()
     if (gTrimWnd) { SetDlgItemTextW(gTrimWnd, IDT_PLAY, L"\x25B6  Listen"); InvalidateRect(GetDlgItem(gTrimWnd, IDT_WAVE), nullptr, FALSE); }
 }
 
-static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain)   // play on your default speakers only
-{
+static int ComboIndex(int id);
+static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain, int row = -1)   // play on your default speakers only
+{                                               // (1.92.0: or on that output's device, e.g. Ears; the default if it can't open)
     PrevStop();
     if (!gCtxOk || !d || to <= from) return false;
     gPrevData = d; gPrevPos = from; gPrevEnd = to; gPrevGain = gain;
@@ -10868,6 +10899,15 @@ static bool PrevPlay(const short* d, unsigned from, unsigned to, float gain)   /
     cfg.playback.channels = 2;
     cfg.sampleRate        = RATE;
     cfg.dataCallback      = PrevCallback;
+    const int di = row >= 0 && row < gRows ? ComboIndex(IDC_ROWDEV + row) : -1;
+    if (di >= 0 && di < (int)gPlayCount) {
+        cfg.playback.pDeviceID = &gPlayDevs[di].id;
+        if (ma_device_init(&gCtx, &cfg, &gPrevDev) == MA_SUCCESS) {
+            if (ma_device_start(&gPrevDev) == MA_SUCCESS) { gPrevRunning = true; return true; }
+            ma_device_uninit(&gPrevDev);
+        }
+        cfg.playback.pDeviceID = nullptr;
+    }
     if (ma_device_init(&gCtx, &cfg, &gPrevDev) != MA_SUCCESS) return false;
     if (ma_device_start(&gPrevDev) != MA_SUCCESS) { ma_device_uninit(&gPrevDev); return false; }
     gPrevRunning = true;
@@ -10993,7 +11033,7 @@ static void TrimRename()                        // the Name box renames the clip
     lstrcatW(np, dot && dot > slash ? dot : L".wav");
     if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES || MoveFileW(old, np)) lstrcpynW(old, np, MAX_PATH);
     else MessageBoxW(gTrimWnd, L"Couldn't rename the clip (is that name already taken?).", L"Lag Effect - Clips", MB_ICONWARNING);
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + gTrimClip % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(gTrimClip % CLIPS);
 }
 
 static void TrimClose()
@@ -11007,7 +11047,7 @@ static void TrimClose()
     gTrimWnd = nullptr;
     DestroyWindow(w);
     SetForegroundWindow(gWnd);
-    SetFocus(GetDlgItem(gWnd, IDC_CLIPTRIM + gTrimClip % CLIPS));
+    SetFocus(GetDlgItem(gWnd, (gLayoutNew ? IDC_CLIPWAVE : IDC_CLIPTRIM) + gTrimClip % CLIPS));   // (1.92.0, New: no Trim button; its waveform)
     gTrimClip = -1;
 }
 
@@ -13922,6 +13962,53 @@ static void PlaceFree(HWND c, int x, int y, int w, int h)
 }
 static void PlaceTabs()                         // the tabs whose feature is on, side by side (wider when there are fewer)
 {
+    if (gLayoutNew && TabSideW()) {             // (1.92.0) tabs down the left or right side, with their names; the mic level across the top
+        RECT c; GetClientRect(gWnd, &c);
+        const int tx = gTabPos == 1 ? SC(8) : c.right - SC(8) - SC(TabSideW() - 12);
+        int y = 10;
+        for (int i = 0; i < TAB_SLOTS; i++) {
+            const int pg = TabAt(i);
+            HWND t = GetDlgItem(gWnd, TabId(pg));
+            if (!t) continue;
+            if (!PageOn(pg)) { ShowWindow(t, SW_HIDE); continue; }
+            PlaceFree(t, tx, SC(y), SC(TabSideW() - 12), SC(34));
+            ShowWindow(t, SW_SHOWNA);
+            y += 36;
+        }
+        for (int pg = 0; pg < TAB_COUNT; pg++) {
+            bool shown = false; for (int i = 0; i < TAB_SLOTS; i++) if (TabAt(i) == pg) shown = true;
+            if (!shown) ShowWindow(GetDlgItem(gWnd, TabId(pg)), SW_HIDE);
+        }
+        HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
+        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(532), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
+        return;
+    }
+    if (gLayoutNew && TabBotH()) {              // (1.92.0) tabs in a row just above the bottom bar; the mic level across the top
+        RECT c; GetClientRect(gWnd, &c);
+        const int ICON_W = 40;
+        int words = 0, icons = 0;
+        for (int i = 0; i < TAB_SLOTS; i++) { const int pg = TabAt(i); if (!PageOn(pg)) continue; if (pg == PAGE_MAIN || pg == PAGE_SETTINGS) icons++; else words++; }
+        const int nt = words + icons, ww = Imin(110, (532 - icons * ICON_W - (nt - 1) * 2) / Imax(1, words));
+        const int y = c.bottom - SC(STRIP_H) - SC(38);
+        int x = 14;
+        for (int i = 0; i < TAB_SLOTS; i++) {
+            const int pg = TabAt(i);
+            HWND t = GetDlgItem(gWnd, TabId(pg));
+            if (!t) continue;
+            if (!PageOn(pg)) { ShowWindow(t, SW_HIDE); continue; }
+            const int w = pg == PAGE_MAIN || pg == PAGE_SETTINGS ? ICON_W : ww;
+            PlaceFree(t, gOrgX + SC(x), y, SC(w), SC(32));
+            ShowWindow(t, SW_SHOWNA);
+            x += w + 2;
+        }
+        for (int pg = 0; pg < TAB_COUNT; pg++) {
+            bool shown = false; for (int i = 0; i < TAB_SLOTS; i++) if (TabAt(i) == pg) shown = true;
+            if (!shown) ShowWindow(GetDlgItem(gWnd, TabId(pg)), SW_HIDE);
+        }
+        HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
+        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(532), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
+        return;
+    }
     if (gLayoutNew) {                           // (1.90.0) Home and Settings are icons, the mic level sits at the end of the row
         const int ICON_W = 40, MET_W = gHdrMeter ? 84 : 0;
         int words = 0, icons = 0;
@@ -13972,9 +14059,9 @@ static void MixerPlace()                        // the Mixer fills the window: s
 {
     if (!gWnd || gSecChan < 0 || gSecOut < 0 || gCompact) return;
     RECT cr; GetClientRect(gWnd, &cr);
-    const int W = Imax((int)cr.right, MixerNeedW()), H = cr.bottom;
+    const int sw = SC(TabSideW()), W = Imax((int)cr.right - sw, MixerNeedW()), H = cr.bottom;   // (1.92.0: beside side tabs)
     const int extraH = Imax(0, H - SC(DesignH()));
-    const int cx0 = SC(14), cw = W - SC(28);
+    const int cx0 = SC(14) + (gTabPos == 1 ? sw : 0), cw = W - SC(28);
     const int chTop = SC(54), chH = SC(354) + extraH * 2 / 3;
     const int oTop = chTop + chH + SC(16), oH = SC(160) + (extraH - extraH * 2 / 3);
     Section& sc = gSections[gSecChan]; sc.x = UNSC(cx0); sc.y = UNSC(chTop); sc.w = UNSC(cw); sc.h = UNSC(chH); sc.ox = sc.oy = 0;
@@ -14009,7 +14096,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
 
     // channel strips
     const int sy = chTop + SC(72), sh = chH - SC(88);
-    int x = SC(21);
+    int x = cx0 + SC(7);
     const int n = Imax(1, Imin(gRows, MAX_OUT));
     for (int c = 0; c < CH_MAX; c++) {
         if (!ChanShown(c)) { gStripRc[c] = { 0, 0, 0, 0 }; continue; }   // (empty: no strip, "+ Add channel" fills it; or hidden)
@@ -14042,7 +14129,7 @@ static void MixerPlace()                        // the Mixer fills the window: s
     }
     // output strips
     const int oy = oTop + SC(14), oh = oH - SC(22);
-    x = SC(21);
+    x = cx0 + SC(7);
     for (int k = 0; k < MAX_OUT; k++) {
         const int w = SC(OutW(k));
         gStripRc[CH_MAX + k] = { x, oy, x + w, oy + oh };
@@ -14212,10 +14299,11 @@ static void MeterHold(float v, float& hold, DWORD& t, DWORD now)
     else if (now - t > 1500) hold *= 0.97f;     // (after 1.5 s it slides down: ~16 dB a second at 60 frames a second)
 }
 static DWORD gLimShowT[MAX_OUT];
-static bool McShowing(); static void McTick();
+static bool McShowing(); static void McTick(); static void HomeTick();
 static void MixerMeterTick()                    // (~60 times a second) meters and limit lights on the Mixer page
 {
     McTick();                                   // (1.90.2) Sounds > Music's Mixer channel box
+    HomeTick();                                 // (1.91.0) Home > What's on
     if ((gPage != PAGE_MIXER && !McShowing()) || !IsWindowVisible(gWnd) || IsIconic(gWnd)) return;
     static LARGE_INTEGER qf = {}, last = {};
     if (!qf.QuadPart) QueryPerformanceFrequency(&qf);
@@ -14463,7 +14551,7 @@ static void SetClipBank(int b)
     gClipBank = Iclamp(b, 0, ClipBanks() - 1);
     for (int r = 0; r < CLIPS; r++) {
         MiniSet(IDC_CLIPVOL + r, gPads[CLIP0 + ClipSlot(r)].vol);
-        InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + r), nullptr, FALSE);
+        ClipRowRedraw(r);
     }
     for (int k = 0; k < ClipBanks(); k++) InvalidateRect(GetDlgItem(gWnd, ClipBankId(k)), nullptr, FALSE);
 }
@@ -14597,7 +14685,7 @@ static void ClipRename(int c)
     wchar_t np[MAX_PATH]; wsprintfW(np, L"%s\\%s.wav", gClipDir, name);
     if (MoveFileW(old, np)) lstrcpynW(old, np, MAX_PATH);
     else MessageBoxW(gWnd, L"Couldn't rename the clip (is that name already taken?).", L"Lag Effect - Clips", MB_ICONWARNING);
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
 static void OpenTrim(int c);
@@ -14624,9 +14712,77 @@ static void ClipMenu(int c, HWND anchor)
     else if (cmd == 5) gClipPinned[c] = !gClipPinned[c];
     else if (cmd == 6) OpenTrim(c);
     else if (cmd == 7) { ClipClear(c); gClipPinned[c] = false; ClipShiftUp(c); }
-    InvalidateRect(GetDlgItem(gWnd, IDC_CLIPPLAY + c % CLIPS), nullptr, FALSE);
+    ClipRowRedraw(c % CLIPS);
 }
 
+static void CalloutShow(HWND target, const wchar_t* title, const wchar_t* body, int act, int arg, const wchar_t* btn);
+// ---- (1.92.0, New) clip rows: the clip's waveform + length; click = hear it on your "Always hear sounds on" output (Ears) only
+static int gPrevClip = -1;                      // the clip being heard that way (-1: none)
+static struct { const short* p; unsigned n; int cols; unsigned char h[160]; } gClipWv[CLIP_N];   // its bars, made once per clip / width
+static void ClipWaveClick(int row)
+{
+    const int c = ClipSlot(row); const Clip& k = gClips[c];
+    if (gPrevRunning && gPrevClip == c && gPrevData == k.base) { PrevStop(); gPrevClip = -1; InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + row), nullptr, FALSE); return; }
+    if (!k.base || k.te <= k.ts) { CalloutShow(GetDlgItem(gWnd, IDC_CLIPWAVE + row), L"Empty", L"Nothing in this slot yet: press Clip it (or its hotkey) to save the last few seconds.", 0, 0, nullptr); return; }
+    if (gTrimWnd) return;                       // (the trim editor has the preview)
+    const int row2 = gHearOut >= 1 && gHearOut <= gRows ? gHearOut - 1 : -1;
+    if (PrevPlay(k.base, k.ts, k.te, gPads[CLIP0 + c].vol / 100.0f, row2)) gPrevClip = c;
+    for (int r = 0; r < CLIPS; r++) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + r), nullptr, FALSE);
+}
+static void ClipWaveTick()                      // (every 50 ms) the bar over the waveform while it's heard; stop marks when it ends
+{
+    if (!gLayoutNew || gPrevClip < 0) return;
+    const int c = gPrevClip;
+    if (!gPrevRunning || gPrevData != gClips[c].base) gPrevClip = -1;
+    if (c / CLIPS == gClipBank) InvalidateRect(GetDlgItem(gWnd, IDC_CLIPWAVE + c % CLIPS), nullptr, FALSE);
+}
+static void ClipWaveDraw(DRAWITEMSTRUCT* d)
+{
+    const int row = (int)d->CtlID - IDC_CLIPWAVE, c = ClipSlot(row);
+    const Clip& k = gClips[c];
+    HDC dc = d->hDC; RECT rc = d->rcItem;
+    FillRect(dc, &rc, BgBrush());
+    const bool has = k.base && k.te > k.ts, hearing = has && gPrevRunning && gPrevClip == c && gPrevData == k.base;
+    const COLORREF field = gDark ? RGB(28, 28, 28) : RGB(250, 250, 250), dim = gDark ? DK_DIM : gLtDim;
+    HBRUSH fb = CreateSolidBrush(field); HPEN bp = CreatePen(PS_SOLID, 1, hearing || (d->itemState & ODS_FOCUS) ? ACCENT : (gDark ? DK_BORDER : LT_BORDER));
+    HGDIOBJ ob = SelectObject(dc, fb), op = SelectObject(dc, bp);
+    RoundRect(dc, rc.left, rc.top, rc.right, rc.bottom, SC(6), SC(6));
+    SelectObject(dc, ob); SelectObject(dc, op); DeleteObject(fb); DeleteObject(bp);
+    if (!has) {                                 // empty: a flat line
+        HPEN lp = CreatePen(PS_DOT, 1, dim); HGDIOBJ o2 = SelectObject(dc, lp);
+        const int my = (rc.top + rc.bottom) / 2; MoveToEx(dc, rc.left + SC(6), my, nullptr); LineTo(dc, rc.right - SC(6), my);
+        SelectObject(dc, o2); DeleteObject(lp);
+        return;
+    }
+    const unsigned n = k.te - k.ts, secs = (n + RATE / 2) / RATE;
+    wchar_t len[16]; wsprintfW(len, L"%u:%02u", secs / 60, secs % 60);
+    HGDIOBJ of = SelectObject(dc, gFont); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, dim);
+    SIZE ts; GetTextExtentPoint32W(dc, len, lstrlenW(len), &ts);
+    RECT lr = { rc.right - SC(6) - ts.cx, rc.top, rc.right - SC(6), rc.bottom };
+    DrawTextW(dc, len, -1, &lr, DT_SINGLELINE | DT_VCENTER | DT_RIGHT | DT_NOPREFIX);
+    SelectObject(dc, of);
+    const int x0 = rc.left + SC(6), x1 = lr.left - SC(5), step = Imax(3, SC(3)), bw = Imax(2, step * 2 / 3);
+    const int cols = Imin(160, Imax(1, (x1 - x0) / step));
+    auto& wv = gClipWv[c];
+    const short* src = k.base + k.ts;
+    if (wv.p != src || wv.n != n || wv.cols != cols) {   // (once per clip / trim / size: the loudest part of each slice)
+        wv.p = src; wv.n = n; wv.cols = cols;
+        for (int i = 0; i < cols; i++) {
+            const unsigned a = (unsigned)((unsigned long long)n * i / cols), b = Imax((int)a + 1, (int)((unsigned long long)n * (i + 1) / cols));
+            int pk = 0; for (unsigned j = a; j < b && j < n; j += 4) { const int v = abs((int)src[j]); if (v > pk) pk = v; }
+            wv.h[i] = (unsigned char)Imin(255, (int)(sqrtf(pk / 32768.0f) * 255.0f + 0.5f));
+        }
+    }
+    const int done = hearing && gPrevEnd > k.ts ? (int)((unsigned long long)cols * (Imin((int)gPrevPos, (int)gPrevEnd) - (int)k.ts) / (gPrevEnd - k.ts)) : -1;
+    const int mid = (rc.top + rc.bottom) / 2, half = (rc.bottom - rc.top) / 2 - SC(5);
+    HBRUSH on = CreateSolidBrush(ACCENT), off = CreateSolidBrush(gDark ? RGB(150, 150, 150) : RGB(120, 120, 120));
+    for (int i = 0; i < cols; i++) {
+        const int hh = Imax(1, half * wv.h[i] / 255);
+        RECT b = { x0 + i * step, mid - hh, x0 + i * step + bw, mid + hh + 1 };
+        FillRect(dc, &b, i < done ? on : off);
+    }
+    DeleteObject(on); DeleteObject(off);
+}
 static void ClipHistory(HWND anchor)            // every clip ever saved: load one back onto the board
 {
     ClipFolder();
@@ -15513,9 +15669,10 @@ static bool EdIsSubTab(HWND h)
     return (id >= IDC_FXSUB0 && id < IDC_FXSUB0 + FX_SUBS) || MicSubOf(id) >= 0 ||
            SetSubOf(id) >= 0 || (id >= IDC_NSUB0 && id < IDC_NSUB0 + 80);
 }
-static bool CondOn(int c) { return c == 0 || (c == 2) == (gVocStyle == VOC_PLUGIN); }
+static bool CondOn(int c) { return c == 0 || (c == 3 ? gStarN == 0 : (c == 2) == (gVocStyle == VOC_PLUGIN)); }   // (3: Home's "nothing starred yet")
 static bool SectionShown(const Section& s)
 {
+    if (!gCompact && gSecGuest[&s - gSections]) return !(gScrollN && gSecHid[&s - gSections]);   // (1.91.0) starred, on Home
     if (gCompact || (s.page >= 0 && s.page != gPage) || !CondOn(s.cond)) return false;
     if (gScrollN && gSecHid[&s - gSections]) return false;   // (New: scrolled out of view)
     return s.sub < 0 || s.sub == CurSub(s.page);
@@ -16095,7 +16252,7 @@ static void AddTips()
     SendMessageW(gTip, TTM_SETDELAYTIME, TTDT_AUTOPOP, 20000);
 
     // Tabs
-    TipId(TabId(PAGE_MAIN),     gLayoutNew ? L"Home: your mic, your outputs and what each one plays, Start / Stop. (Ctrl+Tab switches tabs, Ctrl+Shift+Tab goes back.)"
+    TipId(TabId(PAGE_MAIN),     gLayoutNew ? L"Home: your outputs, Start / Stop, your mic's level, what's on, and any box you star (the star after a box's name). (Ctrl+Tab switches tabs, Ctrl+Shift+Tab goes back.)"
                                            : L"Outputs, the stutter effect and its hotkey. (Ctrl+Tab switches tabs.)");
     TipId(TabId(PAGE_MIC),      gLayoutNew ? L"Your mic's own sound: noise gate, noise suppression, push-to-talk, tone, volume and mic plugins."
                                            : L"Clean up your microphone: AI noise suppression, noise gate and voice quality.");
@@ -16441,8 +16598,10 @@ static void AddTips()
     TipId(IDC_TRAY,    L"Hide the window. Lag Effect keeps running in the system tray; click the tray icon to bring it back. "
                        L"Right-click the tray icon for quick on/off switches.");
     TipId(IDC_HELPBTN, L"How everything works, plus setup steps for Discord and OBS.");
-    TipId(IDC_SEARCH,   L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
-                        L"its tab opens and it flashes.");
+    TipId(IDC_SEARCH,   gLayoutNew ? L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
+                                 L"its tab opens and it flashes. A switch has Turn on / Turn off right in the list (or Ctrl+Enter)."
+                               : L"Find any setting by name (Ctrl+F). Type a word or two, then pick a result (or use the arrow keys and Enter): "
+                                 L"its tab opens and it flashes.");
     TipId(IDC_KEYSLIST, L"Every hotkey you've set, in one list: what each does, where its button is, and keys set for more than one thing.");
     TipId(IDC_ONSTRIP,  L"What's on right now. Click one to go to its settings.");
     TipId(IDC_HDRMETER, L"Your mic's level, on every tab (dim while the gate is shut, red when it's close to too loud). Click: the Mic tab. Turn it off in Settings > Look.");
@@ -16457,6 +16616,17 @@ static void AddTips()
         TipId(IDC_NCTRIG,   L"Sound triggers: a clap, snap, whistle or tongue click runs any action (Settings > Features turns them on).");
         TipId(IDC_NCMIDI,   L"A MIDI controller's buttons, knobs and faders control Lag Effect (Settings > Features turns it on).");
         TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
+        for (int i = 0; i < CLIPS; i++) TipId(IDC_CLIPWAVE + i, L"The clip and how long it is. Click to hear it on your \"Always hear sounds on\" output (Home), only you; click again to stop. (Trim, rename, MP3: the ... button.)");
+        TipId(IDC_TABPOS,  L"Where the tabs are: along the top (usual), down the left or right side (with their names; the window gets wider), or along the bottom just above the search bar. The mic level then sits across the top.");
+        TipId(IDC_HMETER,  L"Your mic's level (as on the Mic tab): green while the gate lets you through. Click: the Mic tab.");
+        {   static const wchar_t* T[HOME_TOGS] = {
+                L"Voice effects on / off (the switch on the Effects tab).", L"AI noise suppression on / off (Mic > Cleanup).",
+                L"The noise gate on / off (Mic > Cleanup; it comes back with the mode it had).", L"Mute your mic (as the Mute mic button).",
+                L"Play / pause the music (Sounds > Music).", L"Bleep words from your list on / off (Speech > Bleep).",
+                L"Morse voice on / off: what you say plays as Morse code (Speech > TTS & Morse).",
+                L"TTS voice on / off: what you say is spoken by the TTS voice (Speech > TTS & Morse).",
+                L"Live captions on / off (Speech > Captions)." };
+            for (int t = 0; t < HOME_TOGS; t++) TipId(IDC_HTOG0 + t, T[t]); }
         TipId(IDC_MCVOL,   L"The Music channel's volume (its Mixer fader). Drag; double-click: 0 dB; right / left arrow keys: 1 dB.");
         TipId(IDC_MCPAN,   L"The Music channel's pan: drag left or right. Double-click: the middle.");
         TipId(IDC_MCMUTE,  L"Mute the music (its Mixer channel).");
@@ -17282,9 +17452,10 @@ static void UpdateMeter()                       // every 50 ms: fast rise, smoot
     gMeterVadShow = v < 0 ? -1.0f : (v > gMeterVadShow ? v : gMeterVadShow * 0.8f + v * 0.2f);
     static int lastDb = -999, lastVad = -999, lastGate = -1;
     const int nowDb = (int)(gMeterShowDb * 2), nowVad = (int)(gMeterVadShow * 50), nowGate = gMeterGateOpen ? 1 : 0;
-    if (gPage == PAGE_MIC && (nowDb != lastDb || nowVad != lastVad || nowGate != lastGate)) {
+    const bool homeM = gLayoutNew && gPage == PAGE_MAIN && !gCompact;   // (1.91.0) Home has it too
+    if ((gPage == PAGE_MIC || homeM) && (nowDb != lastDb || nowVad != lastVad || nowGate != lastGate)) {
         lastDb = nowDb; lastVad = nowVad; lastGate = nowGate;
-        InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+        InvalidateRect(GetDlgItem(gWnd, homeM ? IDC_HMETER : IDC_METER), nullptr, FALSE);
     }
     if (gHdrMeter && !gCompact) {               // (1.65.0) the bar under the tabs: only when it would look different
         static HWND hm = nullptr; if (!hm) hm = GetDlgItem(gWnd, IDC_HDRMETER);
@@ -17656,6 +17827,7 @@ static void MicHintTick()                       // every 50 ms: the line under t
     if (kind != gMicHintKind || lstrcmpW(h, gMicHint)) {
         gMicHintKind = kind; lstrcpynW(gMicHint, h, 160);
         if (gPage == PAGE_MIC) InvalidateRect(GetDlgItem(gWnd, IDC_METER), nullptr, FALSE);
+        else if (gLayoutNew && gPage == PAGE_MAIN) InvalidateRect(GetDlgItem(gWnd, IDC_HMETER), nullptr, FALSE);
     }
 }
 
@@ -18249,16 +18421,61 @@ static void NSubPlace(int page)                 // side by side, left to right, 
         x += gNSubW[page][s] + 3;
     }
 }
-static bool ScrollsHere(int page) { return gLayoutNew && page != PAGE_MAIN && page != PAGE_MIXER && page >= 0 && page < TAB_COUNT; }
+static bool ScrollsHere(int page) { return gLayoutNew && page != PAGE_MIXER && page >= 0 && page < TAB_COUNT; }
+static int ScrollSi() { const int sub = CurSub(gPage); return gPage == PAGE_MAIN || sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS); }   // (gScrollFirst's slot)
+static bool StarOk(int k);
+static void GuestCompute()                      // (1.91.0) which starred boxes show on Home now
+{
+    memset(gSecGuest, 0, sizeof(gSecGuest)); memset(gGuestHas, 0, sizeof(gGuestHas));
+    if (!gLayoutNew || gPage != PAGE_MAIN || gCompact) return;
+    bool any = false;
+    for (int j = 0; j < gStarN; j++) { const int k = gStarSec[j]; if (StarOk(k)) { gSecGuest[k] = true; any = true; } }
+    if (!any) return;
+    for (int i = 0; i < gDesignN; i++) {
+        const int k = gDesign[i].sec;
+        if (k >= 0 && gSecGuest[k] && gOrigPage[i] >= 0 && gOrigPage[i] < TAB_COUNT) gGuestHas[gOrigPage[i]] |= (unsigned short)(1u << (gOrigSub[i] + 1));
+    }
+}
 static void ScrollCompute()                     // which boxes show on this page / sub-tab, scrolled to gScrollFirst
 {
     for (int k = 0; k < gSectionN; k++) { gSecScroll[k] = 0; gSecHid[k] = false; }
     gScrollN = 0; gScrollMax = 0; gScrollAt = 0;
+    GuestCompute();
     if (!gWnd || gCompact || !ScrollsHere(gPage)) return;
-    const int sub = CurSub(gPage), top = NewTop(gPage), si = sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS);
+    if (gPage == PAGE_MAIN) {                   // (1.91.0) Home: under the buttons, What's on, then the boxes you starred
+        const int R = RowsDelta(), top = HOME_TOP + R;
+        RECT c; GetClientRect(gWnd, &c);
+        const int ch = IsWindowVisible(gWnd) && !IsIconic(gWnd) ? UNSC(c.bottom) : BaseH() + R;
+        const int bot = Imax(top + 120, ch - STRIP_H - 4 - TabBotH());   // (1.92.0: above tabs at the bottom)
+        int n = 0, y = top;
+        for (int k = 0; k < gSectionN; k++) {  // Home's own boxes there (top to bottom; they're built in that order)
+            const Section& s = gSections[k];
+            if (s.page != PAGE_MAIN || s.y < HOME_TOP - 10 || (s.feat && !FeatOn(s.feat)) || !CondOn(s.cond)) continue;
+            gScrollList[n++] = k; gScrollVy[k] = s.y + (s.shifts ? R : 0); y = gScrollVy[k] + s.h + 12;
+        }
+        for (int j = 0; j < gStarN; j++) {    // then the starred ones, in the order you starred them
+            const int k = gStarSec[j]; if (!gSecGuest[k]) continue;
+            gScrollList[n++] = k; gScrollVy[k] = y; y += gSections[k].h + 12;
+        }
+        if (!n) return;
+        const int lk = gScrollList[n - 1], lastBot = gScrollVy[lk] + gSections[lk].h;
+        int maxFirst = 0;
+        while (maxFirst < n - 1 && lastBot - gScrollVy[gScrollList[maxFirst]] > bot - top) maxFirst++;
+        const int first = Iclamp(gScrollFirst[gPage][0], 0, maxFirst);
+        gScrollFirst[gPage][0] = first;
+        const int off = gScrollVy[gScrollList[first]] - top;
+        for (int j = 0; j < n; j++) {
+            const int k = gScrollList[j]; const Section& s = gSections[k];
+            gSecScroll[k] = s.y + (s.shifts ? R : 0) - gScrollVy[k] + off;
+            gSecHid[k] = j < first || (j > first && gScrollVy[k] + s.h - off > bot);
+        }
+        gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot;
+        return;
+    }
+    const int sub = CurSub(gPage), top = NewTop(gPage), si = ScrollSi();
     RECT c; GetClientRect(gWnd, &c);
     const int ch = IsWindowVisible(gWnd) && !IsIconic(gWnd) ? UNSC(c.bottom) : BaseH() + RowsDelta();
-    const int bot = Imax(top + 120, ch - STRIP_H - 4);
+    const int bot = Imax(top + 120, ch - STRIP_H - 4 - TabBotH());   // (1.92.0: above tabs at the bottom)
     int n = 0;
     for (int k = 0; k < gSectionN; k++) {      // this sub-tab's boxes, top to bottom
         const Section& s = gSections[k];
@@ -18268,6 +18485,7 @@ static void ScrollCompute()                     // which boxes show on this page
         gScrollList[j] = k;
     }
     if (!n) return;
+    for (int j = 0; j < n; j++) gScrollVy[gScrollList[j]] = gSections[gScrollList[j]].y;
     const Section& last = gSections[gScrollList[n - 1]];
     int maxFirst = 0;                           // the first box from which everything to the end fits
     while (maxFirst < n - 1 && last.y + last.h - gSections[gScrollList[maxFirst]].y > bot - top) maxFirst++;
@@ -18286,14 +18504,14 @@ static void ScrollPaint(HDC dc)
 {
     SetRectEmpty(&gScrollTrack); SetRectEmpty(&gScrollThumb);
     if (!gScrollN || gScrollMax <= 0) return;
-    const Section& f = gSections[gScrollList[0]]; const Section& l = gSections[gScrollList[gScrollN - 1]];
-    const int total = Imax(1, l.y + l.h - f.y);
-    int vTop = gSections[gScrollList[gScrollAt]].y, vBot = vTop;
-    for (int j = gScrollAt; j < gScrollN; j++) { const int k = gScrollList[j]; if (!gSecHid[k]) vBot = gSections[k].y + gSections[k].h; }
+    const int fk = gScrollList[0], lk = gScrollList[gScrollN - 1], fy = gScrollVy[fk];
+    const int total = Imax(1, gScrollVy[lk] + gSections[lk].h - fy);
+    int vTop = gScrollVy[gScrollList[gScrollAt]], vBot = vTop;
+    for (int j = gScrollAt; j < gScrollN; j++) { const int k = gScrollList[j]; if (!gSecHid[k]) vBot = gScrollVy[k] + gSections[k].h; }
     const int x = gOrgX + SC(CLIENT_W - 10), y0 = SC(gScrollTop - 6), y1 = SC(gScrollBot);
     gScrollTrack = { x, y0, x + Imax(3, SC(4)), y1 };
     const int th = y1 - y0;
-    gScrollThumb = { x, y0 + MulDiv(th, vTop - f.y, total), x + Imax(3, SC(4)), y0 + MulDiv(th, vBot - f.y, total) };
+    gScrollThumb = { x, y0 + MulDiv(th, vTop - fy, total), x + Imax(3, SC(4)), y0 + MulDiv(th, vBot - fy, total) };
     if (gScrollThumb.bottom - gScrollThumb.top < SC(18)) gScrollThumb.bottom = Imin(y1, (int)gScrollThumb.top + SC(18));
     HBRUSH tb = CreateSolidBrush(gDark ? DK_SECTION : LT_BORDER); FillRect(dc, &gScrollTrack, tb); DeleteObject(tb);
     HBRUSH hb = CreateSolidBrush(ACCENT); FillRect(dc, &gScrollThumb, hb); DeleteObject(hb);
@@ -18301,10 +18519,9 @@ static void ScrollPaint(HDC dc)
 static void ScrollBy(int n)                     // a box at a time
 {
     if (!gScrollN || !n) return;
-    const int sub = CurSub(gPage), si = sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS);
     const int want = Iclamp(gScrollAt + n, 0, gScrollMax);
     if (want == gScrollAt) return;
-    gScrollFirst[gPage][si] = want;
+    gScrollFirst[gPage][ScrollSi()] = want;
     Layout();
 }
 static bool WheelAdjusts() { return !gLayoutNew || gWheelAdj; }   // (1.90.2) Classic: as it always was
@@ -18326,7 +18543,7 @@ static bool ScrollClick(int x, int y)           // a click on the bar: on the th
     RECT r = gScrollTrack; InflateRect(&r, SC(6), 0);
     POINT p = { x, y }; if (!PtInRect(&r, p)) return false;
     if (y >= gScrollThumb.top && y < gScrollThumb.bottom && gScrollN) {
-        gScrollDrag = true; gScrollDragY0 = y; gScrollDragTop0 = gSections[gScrollList[gScrollAt]].y;
+        gScrollDrag = true; gScrollDragY0 = y; gScrollDragTop0 = gScrollVy[gScrollList[gScrollAt]];
         SetCapture(gWnd);
         return true;
     }
@@ -18336,11 +18553,11 @@ static bool ScrollClick(int x, int y)           // a click on the bar: on the th
 static void ScrollDragTo(int y)                 // (while dragging) the box nearest where the thumb is now goes to the top
 {
     if (!gScrollDrag || !gScrollN || IsRectEmpty(&gScrollTrack)) return;
-    const Section& f = gSections[gScrollList[0]]; const Section& l = gSections[gScrollList[gScrollN - 1]];
-    const int total = Imax(1, l.y + l.h - f.y), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
+    const int fk = gScrollList[0], lk = gScrollList[gScrollN - 1];
+    const int total = Imax(1, gScrollVy[lk] + gSections[lk].h - gScrollVy[fk]), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
     const int want = gScrollDragTop0 + MulDiv(y - gScrollDragY0, total, th);
     int j = 0, best = INT_MAX;
-    for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gSections[gScrollList[k]].y - want); if (d < best) { best = d; j = k; } }
+    for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gScrollVy[gScrollList[k]] - want); if (d < best) { best = d; j = k; } }
     if (j != gScrollAt) ScrollBy(j - gScrollAt);
 }
 static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the box it's in shows
@@ -18352,8 +18569,7 @@ static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the 
     const int k = gDesign[di].sec;
     if (!gScrollN || !gSecHid[k]) return;
     for (int j = 0; j < gScrollN; j++) if (gScrollList[j] == k) {
-        const int sub = CurSub(gPage), si = sub < 0 ? 0 : Imin(sub + 1, NEW_SUBS);
-        gScrollFirst[gPage][si] = Imin(j, gScrollMax);
+        gScrollFirst[gPage][ScrollSi()] = Imin(j, gScrollMax);
         Layout();
         return;
     }
@@ -18423,18 +18639,21 @@ static void NSubPick(int page, int sub)         // (New) show another sub-tab
     SubShownHooks();
 }
 
+static void HomePack(); static bool HomeTogOn(int t);
 static void Layout()
 {
     // Showing / hiding dozens of controls one by one flickers: freeze drawing, then paint once at the end.
     const bool freeze = IsWindowVisible(gWnd) != FALSE;
     if (freeze) SendMessageW(gWnd, WM_SETREDRAW, FALSE, 0);
-    if (gLayoutNew) { NSubFix(gPage); NSubPlace(gPage); }   // (1.90.0) a sub-tab whose feature went off: the first one there is
+    if (gLayoutNew) { NSubFix(gPage); NSubPlace(gPage); HomePack(); }   // (1.90.0) a sub-tab whose feature went off: the first one there is (1.91.0: Home's switches)
     ScrollCompute();                            // (New) which boxes are scrolled into view
     for (int i = 0; i < gPagedN; i++) {
         bool del;
         int k = RowOfId(GetDlgCtrlID(gPaged[i].h), &del);
-        bool vis = gPaged[i].page == gPage && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat))
-                && (gPaged[i].sub < 0 || gPaged[i].sub == CurSub(gPaged[i].page));
+        const int gdi = gPaged[i].di;           // (1.91.0) a starred box's control, on Home
+        const bool guest = gdi >= 0 && gDesign[gdi].sec >= 0 && gSecGuest[gDesign[gdi].sec];
+        bool vis = (guest || (gPaged[i].page == gPage && (gPaged[i].sub < 0 || gPaged[i].sub == CurSub(gPaged[i].page))))
+                && (k < 0 || (k < gRows && !(del && k == 0))) && (!gPaged[i].feat || FeatOn(gPaged[i].feat));
         vis = vis && CondOn(gPaged[i].cond);
         if (vis && gScrollN) { const int di = gPaged[i].di; if (di >= 0 && gDesign[di].sec >= 0 && gSecHid[gDesign[di].sec]) vis = false; }
         int  cid = GetDlgCtrlID(gPaged[i].h);
@@ -18450,6 +18669,7 @@ static void Layout()
             for (int base : chIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanShown(cid - base);
             static const int fullIds[] = { IDC_CHSOLO0, IDC_CHDUCK0, IDC_CHPAN0 };   // (not on a compact strip)
             for (int base : fullIds) if (cid >= base && cid < base + CH_MAX) vis = vis && ChanFull(cid - base);
+            if (cid >= IDC_HTOG0 && cid < IDC_HTOG0 + HOME_TOGS) vis = vis && HomeTogOn(cid - IDC_HTOG0);   // (1.91.0) Home > What's on
             if (cid >= IDC_MCVOL && cid <= IDC_MCLAST) {   // (1.90.2) Sounds > Music > Mixer channel: its controls, or "make it one"
                 const bool has = MusChanIdx() >= 0;
                 vis = vis && (cid == IDC_MCNONE || cid == IDC_MCADD ? !has : has);
@@ -18498,7 +18718,7 @@ static void Layout()
     DWORD style = (DWORD)GetWindowLongW(gWnd, GWL_STYLE);
     // every page shares the window size, so switching never jumps; plus however much bigger you made it
     RECT r = gCompact ? RECT{ 0, 0, SC(CLIENT_W), SC(COMPACT_H) }
-                      : RECT{ 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + gExtraW, SC(BaseH() + d) + gExtraH };
+                      : RECT{ 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + SC(TabSideW()) + gExtraW, SC(BaseH() + d) + gExtraH };
     AdjustWindowRect(&r, style, FALSE);
     if (!IsZoomed(gWnd)) {
         gOwnSize = true;
@@ -22850,6 +23070,73 @@ static float DelayProcMs(float* gate, float* lim, float* plug)   // what the set
 }
 // ---- (1.65.0) a "?" on each box's title: just that part's help, in a window you can scroll and keep open
 static RECT gSecHelpRc[MAX_SECTIONS];           // (where each box's "?" was painted; empty = not showing)
+static RECT gSecStarRc[MAX_SECTIONS];           // (1.91.0) ... and its star
+static int StarIdx(int k) { for (int j = 0; j < gStarN; j++) if (gStarSec[j] == k) return j; return -1; }
+static bool StarCan(int k)                      // a box that can be pinned to Home: any New box outside Home and the Mixer
+{
+    if (!gLayoutNew || k < 0 || k >= gSectionN) return false;
+    const Section& s = gSections[k];
+    return s.title && s.title[0] && s.page >= 0 && s.page < TAB_COUNT && s.page != PAGE_MAIN && s.page != PAGE_MIXER;
+}
+static void StarPaint(HDC dc, const RECT& r, bool on)   // a five-pointed star, filled when it's pinned
+{
+    POINT pt[10]; const double cx = (r.left + r.right) / 2.0, cy = (r.top + r.bottom) / 2.0 + 0.5, ro = (r.right - r.left) / 2.0, ri = ro * 0.45;
+    for (int i = 0; i < 10; i++) { const double a = -1.5707963 + i * 0.6283185, rr = i & 1 ? ri : ro; pt[i] = { (LONG)lround(cx + rr * cos(a)), (LONG)lround(cy + rr * sin(a)) }; }
+    const COLORREF c = on ? ACCENT : (gDark ? DK_DIM : gLtDim);
+    HPEN pn = CreatePen(PS_SOLID, 1, c); HBRUSH br = on ? CreateSolidBrush(c) : nullptr;
+    HGDIOBJ op = SelectObject(dc, pn), ob = SelectObject(dc, br ? (HGDIOBJ)br : GetStockObject(NULL_BRUSH));
+    Polygon(dc, pt, 10);
+    SelectObject(dc, op); SelectObject(dc, ob); DeleteObject(pn); if (br) DeleteObject(br);
+}
+static int SectionStarAt(int x, int y)
+{
+    POINT p = { x, y };
+    for (int i = 0; i < gSectionN; i++) if (gSecStarRc[i].right > gSecStarRc[i].left) {
+        RECT r = gSecStarRc[i]; InflateRect(&r, SC(3), SC(3));
+        if (PtInRect(&r, p)) return i;
+    }
+    return -1;
+}
+static void StarsSave()                         // INI home_stars: "page:sub:title|..." (New places)
+{
+    if (!gLayoutNew) return;
+    wchar_t buf[4096] = L""; int at = 0;
+    for (int j = 0; j < gStarN; j++) {
+        const Section& s = gSections[gStarSec[j]];
+        at += swprintf(buf + at, 4096 - at, L"%ls%d:%d:%ls", j ? L"|" : L"", s.page, s.sub, s.title);
+        if (at >= 4000) break;
+    }
+    WritePrivateProfileStringW(L"settings", L"home_stars", buf, gIni);
+}
+static void StarsLoad()                         // (after the New layout is built: the boxes' New places)
+{
+    gStarN = 0;
+    wchar_t buf[4096]; GetPrivateProfileStringW(L"settings", L"home_stars", L"", buf, 4096, gIni);
+    for (wchar_t* tok = buf; tok && *tok && gStarN < STAR_MAX; ) {
+        wchar_t* bar = wcschr(tok, L'|'); if (bar) *bar = 0;
+        int pg = -1, sb = -1, n = 0;
+        if (swscanf(tok, L"%d:%d:%n", &pg, &sb, &n) >= 2 && n > 0)
+            for (int k = 0; k < gSectionN; k++)
+                if (gSections[k].page == pg && gSections[k].sub == sb && gSections[k].title && !lstrcmpW(gSections[k].title, tok + n) && StarCan(k) && StarIdx(k) < 0) { gStarSec[gStarN++] = k; break; }
+        tok = bar ? bar + 1 : nullptr;
+    }
+}
+static void StarToggle(int k)                   // the star on a box: pin it to Home / take it off
+{
+    if (!StarCan(k)) return;
+    const int j = StarIdx(k);
+    if (j >= 0) { for (int i = j; i < gStarN - 1; i++) gStarSec[i] = gStarSec[i + 1]; gStarN--; ShowOsd(L"Removed from Home", false); }
+    else if (gStarN >= STAR_MAX) { ShowOsd(L"Home is full: unpin something first", false); return; }
+    else { gStarSec[gStarN++] = k; ShowOsd(L"Pinned to Home", true); }
+    StarsSave();
+    Layout();
+}
+static bool StarOk(int k)                       // a starred box that can show now (its feature and sub-tab are on)
+{
+    if (!StarCan(k)) return false;
+    const Section& s = gSections[k];
+    return (!s.feat || FeatOn(s.feat)) && CondOn(s.cond) && PageOn(s.page) && (s.sub < 0 || NSubOn(s.page, s.sub));
+}
 static HWND gHelpWnd = nullptr;
 static const wchar_t* TipTextOf(HWND h) { for (int i = 0; i < gTipRecN; i++) if (gTipRec[i].h == h) return gTipRec[i].text; return nullptr; }
 struct SecIntro { const wchar_t* title; const wchar_t* text; };
@@ -23633,13 +23920,72 @@ static void SearchPick(int r)
     }
     if (it.kind == SK_SUB || it.kind == SK_TAB) SetFocus(GetDlgItem(gWnd, TabId(it.page)));
 }
+// (1.92.0, New) a result that's a switch gets "Turn on" / "Turn off": it switches it right there, without going to it
+static bool HomeTogState(int t); static void HomeTogClick(int t);
+static int SrchSwitch(const SrchItem& it, HWND* out)   // 0: not a switch; 1: a checkbox; 2: a Home switch; 3: the Voice effects switch
+{
+    if (!gLayoutNew || (it.feat && !FeatOn(it.feat))) return 0;
+    auto isChk = [](HWND c) {
+        wchar_t cls[16]; GetClassNameW(c, cls, 16);
+        const LONG t = GetWindowLongW(c, GWL_STYLE) & BS_TYPEMASK;
+        return !lstrcmpiW(cls, L"Button") && (t == BS_AUTOCHECKBOX || t == BS_CHECKBOX) && IsWindowEnabled(c);
+    };
+    HWND c = it.h;
+    if (it.kind == SK_SEC) {                    // a box with an "On" switch (each voice effect): that one
+        c = nullptr;
+        for (int i = 0; i < gDesignN && !c; i++) {
+            if (gDesign[i].sec != it.sec || !isChk(gDesign[i].h)) continue;
+            wchar_t t[8]; GetWindowTextW(gDesign[i].h, t, 8); if (!lstrcmpiW(t, L"On")) c = gDesign[i].h;
+        }
+        if (!c) return 0;
+        *out = c; return 1;
+    }
+    if (it.kind != SK_CTL || !c) return 0;
+    const int id = GetDlgCtrlID(c);
+    if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { *out = c; return 2; }
+    if (id == IDC_FXON) { *out = c; return 3; }
+    if (isChk(c)) { *out = c; return 1; }
+    return 0;
+}
+static bool SrchSwitchState(int kind, HWND c)
+{
+    return kind == 1 ? IsDlgButtonChecked(gWnd, GetDlgCtrlID(c)) == BST_CHECKED : kind == 2 ? HomeTogState(GetDlgCtrlID(c) - IDC_HTOG0) : kind == 3 ? (bool)gFxOn : false;
+}
+static void SrchSwitchFlip(int r)               // the result's switch, the other way (as clicking it would)
+{
+    if (r < 0 || r >= gSrchResN) return;
+    const SrchItem& it = gSrch[gSrchRes[r]];
+    HWND c = nullptr; const int kind = SrchSwitch(it, &c); if (!kind) return;
+    const int id = GetDlgCtrlID(c);
+    if (kind == 2) HomeTogClick(id - IDC_HTOG0);
+    else {
+        if (kind == 1) CheckDlgButton(gWnd, id, IsDlgButtonChecked(gWnd, id) == BST_CHECKED ? BST_UNCHECKED : BST_CHECKED);
+        SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)c);
+    }
+    wchar_t t[120]; wsprintfW(t, L"%s: %s", it.name, SrchSwitchState(kind, c) ? L"on" : L"off");
+    ShowOsd(t, SrchSwitchState(kind, c));
+    if (gSearchPop) InvalidateRect(gSearchPop, nullptr, FALSE);
+}
+static RECT SrchPillRect(int r, int cw)        // where a result's "Turn on / off" sits (popup px)
+{
+    const int rh = SC(26);
+    return RECT{ cw - SC(84), r * rh + SC(3), cw - SC(8), (r + 1) * rh - SC(3) };
+}
 static LRESULT CALLBACK SearchPopProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     const int rh = SC(26);
     switch (m) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;  // (the search box keeps the keyboard)
     case WM_MOUSEMOVE: { const int r = (short)HIWORD(l) / rh; if (r != gSrchSel && r >= 0 && r < gSrchResN) { gSrchSel = r; InvalidateRect(h, nullptr, FALSE); } return 0; }
-    case WM_LBUTTONDOWN: SearchPick((short)HIWORD(l) / rh); return 0;
+    case WM_LBUTTONDOWN: {
+        const int r = (short)HIWORD(l) / rh;
+        if (r >= 0 && r < gSrchResN) {          // (1.92.0) on its Turn on / off: just that
+            RECT rc; GetClientRect(h, &rc); RECT pr = SrchPillRect(r, rc.right); POINT p = { (short)LOWORD(l), (short)HIWORD(l) };
+            HWND c = nullptr;
+            if (PtInRect(&pr, p) && SrchSwitch(gSrch[gSrchRes[r]], &c)) { SrchSwitchFlip(r); return 0; }
+        }
+        SearchPick(r); return 0;
+    }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC wdc = BeginPaint(h, &ps);
@@ -23664,8 +24010,20 @@ static LRESULT CALLBACK SearchPopProc(HWND h, UINT m, WPARAM w, LPARAM l)
             SelectObject(dc, gFont);
             SetTextColor(dc, r == gSrchSel ? RGB(235, 235, 235) : gDark ? DK_DIM : gLtDim);
             wchar_t loc[140]; wsprintfW(loc, off ? L"%s  (off)" : L"%s", it.loc);
-            tr.left = rc.right / 2; tr.right = rc.right - SC(8);
+            HWND sc = nullptr; const int sk = SrchSwitch(it, &sc);
+            tr.left = rc.right / 2; tr.right = rc.right - SC(sk ? 90 : 8);
             DrawTextW(dc, loc, -1, &tr, DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+            if (sk) {                           // (1.92.0) Turn on / Turn off, lit while it's on
+                const bool st = SrchSwitchState(sk, sc);
+                RECT pr = SrchPillRect(r, rc.right);
+                const COLORREF fill = st ? (r == gSrchSel ? RGB(255, 255, 255) : ACCENT) : (gDark ? RGB(45, 45, 45) : RGB(235, 235, 235));
+                HBRUSH pb = CreateSolidBrush(fill); HPEN pp = CreatePen(PS_SOLID, 1, r == gSrchSel ? RGB(255, 255, 255) : st ? ACCENT : (gDark ? DK_BORDER : LT_BORDER));
+                HGDIOBJ o1 = SelectObject(dc, pb), o2 = SelectObject(dc, pp);
+                RoundRect(dc, pr.left, pr.top, pr.right, pr.bottom, pr.bottom - pr.top, pr.bottom - pr.top);
+                SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(pb); DeleteObject(pp);
+                SetTextColor(dc, st ? (r == gSrchSel ? ACCENT : RGB(255, 255, 255)) : TXT_C);
+                DrawTextW(dc, st ? L"Turn off" : L"Turn on", -1, &pr, DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX);
+            }
         }
         HPEN pn = CreatePen(PS_SOLID, 1, ACCENT); HGDIOBJ op = SelectObject(dc, pn); HGDIOBJ obr = SelectObject(dc, GetStockObject(NULL_BRUSH));
         Rectangle(dc, 0, 0, rc.right, rc.bottom);
@@ -23724,7 +24082,14 @@ static LRESULT CALLBACK SearchEditProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_
             if (gSrchResN) { gSrchSel = (gSrchSel + (w == VK_DOWN ? 1 : gSrchResN - 1)) % gSrchResN; if (gSearchPop) InvalidateRect(gSearchPop, nullptr, FALSE); }
             return 0;
         }
-        if (w == VK_RETURN) { if (gSearchPop && IsWindowVisible(gSearchPop)) SearchPick(gSrchSel); return 0; }
+        if (w == VK_RETURN) {
+            if (gSearchPop && IsWindowVisible(gSearchPop)) {
+                HWND c = nullptr;                // (1.92.0) Ctrl+Enter: switch it on / off without going there
+                if ((GetKeyState(VK_CONTROL) & 0x8000) && gSrchSel < gSrchResN && SrchSwitch(gSrch[gSrchRes[gSrchSel]], &c)) SrchSwitchFlip(gSrchSel);
+                else SearchPick(gSrchSel);
+            }
+            return 0;
+        }
         if (w == VK_ESCAPE) { SetWindowTextW(h, L""); SearchHide(); SetFocus(GetDlgItem(gWnd, TabId(gPage))); return 0; }
         break;
     case WM_CHAR: if (w == VK_RETURN || w == VK_ESCAPE) return 0; break;   // (no beep)
@@ -27514,6 +27879,74 @@ static void MusOutsMenu()
         GoTo(PAGE_MIXER, -1, nullptr, nullptr, L"");
     }
 }
+// ---- (1.91.0, New) Home > What's on: one click turns the big things on or off (each does what its own switch does)
+static const wchar_t* HomeTogName(int t)
+{
+    static const wchar_t* N[HOME_TOGS] = { L"Voice effects", L"Noise suppression", L"Noise gate", L"Mute mic", L"Music playing",
+                                           L"Bleep", L"Morse voice", L"TTS voice", L"Live captions" };
+    return t >= 0 && t < HOME_TOGS ? N[t] : L"";
+}
+static bool HomeTogOn(int t)                    // shown (its feature is on)
+{
+    switch (t) {
+    case 0: return gFeatFx;
+    case 5: case 6: case 7: return gFeatSpeech;
+    case 8: return gFeatCaptions;
+    }
+    return t >= 0 && t < HOME_TOGS;
+}
+static bool HomeTogState(int t)
+{
+    switch (t) {
+    case 0: return gFxOn;            case 1: return gNsOn;           case 2: return gGateMode != GATE_OFF;
+    case 3: return gMicMuted;        case 4: return gMusPlay.load() && MusActive();
+    case 5: return gBlOn.load();     case 6: return gMoOn.load();    case 7: return gSpTts;
+    case 8: return gCapOn;
+    }
+    return false;
+}
+static void HomeTogClick(int t)
+{
+    auto chk = [&](int id) {                    // a checkbox elsewhere: tick it the other way and let it do its job
+        CheckDlgButton(gWnd, id, HomeTogState(t) ? BST_UNCHECKED : BST_CHECKED);
+        SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(id, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, id));
+    };
+    switch (t) {
+    case 0: SendMessageW(gWnd, WM_COMMAND, MAKEWPARAM(IDC_FXON, BN_CLICKED), (LPARAM)GetDlgItem(gWnd, IDC_FXON)); break;
+    case 1: chk(IDC_NSON); SaveSettings(); break;
+    case 2: SetGateMode(gGateMode != GATE_OFF ? GATE_OFF : gGateLastMode); SaveSettings(); break;
+    case 3: SetMute(!gMicMuted); break;
+    case 4: MusToggle(); break;
+    case 5: chk(IDC_BLON); break;
+    case 6: chk(IDC_MORSEON); break;
+    case 7: chk(IDC_SPTTS); break;
+    case 8: chk(IDC_CAPON); break;
+    }
+    for (int k = 0; k < HOME_TOGS; k++) InvalidateRect(GetDlgItem(gWnd, IDC_HTOG0 + k), nullptr, FALSE);
+}
+static void HomePack()                          // (Layout) the switches that show, packed 3 to a row; What's on fits them
+{
+    if (!gLayoutNew || !gWnd) return;
+    int n = 0;
+    for (int t = 0; t < HOME_TOGS; t++) {
+        const int di = DesignOf(GetDlgItem(gWnd, IDC_HTOG0 + t));
+        if (di < 0 || !HomeTogOn(t)) continue;
+        Design& d = gDesign[di];
+        d.rx = 30 + (n % 3) * 168; d.ry = HOME_TOP + 20 + (n / 3) * 34; d.x = SC(d.rx); d.y = SC(d.ry);
+        n++;
+    }
+    for (int k = 0; k < gSectionN; k++)
+        if (gSections[k].page == PAGE_MAIN && gSections[k].y == HOME_TOP) { gSections[k].h = 26 + Imax(1, (n + 2) / 3) * 34; break; }
+}
+static void HomeTick()                          // (~60 a second, with the meters) follow changes made anywhere else
+{
+    if (!gLayoutNew || !gWnd || gPage != PAGE_MAIN || gCompact) return;
+    static int sOn = -1, sVis = -1;
+    int on = 0, vis = 0;
+    for (int t = 0; t < HOME_TOGS; t++) { if (HomeTogOn(t)) vis |= 1 << t; if (HomeTogState(t)) on |= 1 << t; }
+    if (vis != sVis) { const bool first = sVis < 0; sVis = vis; if (!first) Layout(); }
+    if (on != sOn) { sOn = on; for (int t = 0; t < HOME_TOGS; t++) InvalidateRect(GetDlgItem(gWnd, IDC_HTOG0 + t), nullptr, FALSE); }
+}
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d);
 // ---- (1.90.2, New) Sounds > Music > Mixer channel: the Music channel's volume, pan, M / S / Duck, outputs and level ----
 static int gMcCh = -2;                          // the channel shown (-1 none; -2 not looked yet)
@@ -28950,6 +29383,18 @@ static void NewLayoutApply()
         if (di >= 0) { gDesign[di].ht = SC(28); SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(156), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
     }
     { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) gNDone[di] = true; }   // (Mic: the meter stays on top of every sub-tab)
+    {   // (1.91.0) Home, under the buttons: your mic's level, What's on, then the boxes you star (a hint until you do)
+        gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = true;
+        Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);
+        AddSection(14, HOME_TOP, 532, 128, L"What's on");
+        for (int t = 0; t < HOME_TOGS; t++)
+            Ctl(L"BUTTON", HomeTogName(t), BS_OWNERDRAW | WS_TABSTOP | (t ? 0 : WS_GROUP), 30 + (t % 3) * 168, HOME_TOP + 20 + (t / 3) * 34, 164, 28, IDC_HTOG0 + t);
+        gBuildCond = 3;                         // (only while nothing is starred)
+        AddSection(14, HOME_TOP + 140, 532, 58, L"Starred");
+        Ctl(L"STATIC", L"Nothing starred yet. Click the star after any box's name (on any tab) to pin that box here, so it's "
+                       L"one click away.", 0, 30, HOME_TOP + 158, 500, 34, IDC_HDR);
+        gBuildCond = 0; gRecordShift = false; gBuildPage = -1;
+    }
     {   // Pads: the page buttons (A-D) and its key go inside the box, on a row of their own
         const int kp = secOf(PAGE_SOUND, L"Pads");
         if (kp >= 0) {
@@ -29165,6 +29610,7 @@ static void NewLayoutApply()
         else gNewHas[d.page][Imin(d.sub + 1, NEW_SUBS)][op] |= bit;
     }
     AssignSections();
+    StarsLoad();                                // (1.91.0) the boxes you pinned to Home (their New places are final now)
 }
 
 // ======================= window =======================
@@ -29924,7 +30370,17 @@ static void CreateUI()
             Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | (b2 == 0 ? WS_GROUP : 0), 342 + b2 * 47, 264, 43, 24, ClipBankId(b2));
     }
     if (gClipBank >= ClipBanks()) gClipBank = 0;
-    for (int i = 0; i < CLIPS; i++) {
+    for (int i = 0; i < CLIPS && gLayoutNew; i++) {   // (1.92.0, New) name, volume, waveform + length, key, ..., ×  (Trim is in the ... menu)
+        int y = 292 + i * 36;
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
+        MiniVol(IDC_CLIPVOL + i, 210, y + 3, 56, gPads[CLIP0 + ClipSlot(i)].vol);
+        Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP, 272, y + 1, 104, 28, IDC_CLIPWAVE + i);
+        wchar_t kn[120]; FxKeyButtonText(SLOT_CLIP0 + i, kn, 120);
+        Ctl(L"BUTTON", kn, WS_TABSTOP, 382, y + 1, 88, 28, IDC_CLIPKEY + i);
+        Ctl(L"BUTTON", L"\x22EF", WS_TABSTOP, 476, y + 1, 26, 28, IDC_CLIPMORE + i);
+        Ctl(L"BUTTON", L"\x00D7", WS_TABSTOP, 506, y + 1, 24, 28, IDC_CLIPCLR + i);
+    }
+    for (int i = 0; i < CLIPS && !gLayoutNew; i++) {
         int y = 292 + i * 36;
         Ctl(L"BUTTON", L"", BS_OWNERDRAW | WS_TABSTOP | WS_GROUP, 30, y, 174, 30, IDC_CLIPPLAY + i);
         MiniVol(IDC_CLIPVOL + i, 212, y + 3, 64, gPads[CLIP0 + ClipSlot(i)].vol);
@@ -30177,7 +30633,7 @@ static void CreateUI()
     Ctl(L"STATIC", L"Click: change it. Right-click: theme's colour.", 0, 30, 350, 390, 18, IDC_HDR);
     Ctl(L"BUTTON", L"Reset all", WS_TABSTOP, 430, 346, 100, 26, IDC_COLRESET);
 
-    AddSection(14, 392, 532, 84, L"Layout");
+    AddSection(14, 392, 532, gLayoutNew ? 116 : 84, L"Layout");
     Ctl(L"BUTTON", L"Move things around...", WS_TABSTOP | WS_GROUP, 30, 414, 180, 28, IDC_LAYEDIT);
     Ctl(L"BUTTON", L"Put everything back", WS_TABSTOP, 218, 414, 160, 28, IDC_LAYRESET);
     {                                           // (1.90.0) New (by job) / Classic: restarts in the other
@@ -30186,6 +30642,12 @@ static void CreateUI()
         SendMessageW(ls, CB_SETCURSEL, gLayoutNew ? 0 : 1, 0);
     }
     Ctl(L"STATIC", L"Saved per profile: each one can have its own layout.", 0, 30, 450, 500, 18, IDC_HDR);
+    if (gLayoutNew) {                           // (1.92.0) where the tabs are
+        Ctl(L"STATIC", L"Tabs:", 0, 30, 480, 46, 18, -1);
+        HWND tp = Ctl(L"COMBOBOX", L"", COMBO | WS_GROUP, 80, 476, 160, 200, IDC_TABPOS);
+        for (const wchar_t* t : { L"At the top", L"Down the left side", L"Down the right side", L"At the bottom" }) SendMessageW(tp, CB_ADDSTRING, 0, (LPARAM)t);
+        SendMessageW(tp, CB_SETCURSEL, gTabPos, 0);
+    }
     gBuildSub = -1;
 
     // ---- Pictures ----
@@ -30428,7 +30890,8 @@ static void DrawTab(DRAWITEMSTRUCT* d)
     FillRect(dc, &rc, BgBrush());
     wchar_t text[32]; GetWindowTextW(d->hwndItem, text, 32);
     static HFONT icons = nullptr;               // (1.90.0, New) Home and Settings: Windows' own house and gear
-    if (gLayoutNew && (idx == PAGE_MAIN || idx == PAGE_SETTINGS)) {
+    if (gLayoutNew && TabSideW() && (idx == PAGE_MAIN || idx == PAGE_SETTINGS)) lstrcpynW(text, PAGE_NAMES_N[idx], 32);   // (1.92.0: side tabs have names)
+    if (gLayoutNew && !TabSideW() && (idx == PAGE_MAIN || idx == PAGE_SETTINGS)) {
         static int iconPx = 0;
         if (!icons || iconPx != SC(16)) {
             if (icons) DeleteObject(icons);
@@ -30459,11 +30922,13 @@ static void DrawTab(DRAWITEMSTRUCT* d)
         if (sz.cx <= tr.right - tr.left - 6) break;
         SelectObject(dc, FitFont(lvl));
     }
-    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+    if (gLayoutNew && TabSideW()) { tr = rc; tr.left += SC(14); }   // (side tabs: left-aligned)
+    DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | (gLayoutNew && TabSideW() ? DT_LEFT : DT_CENTER) | DT_VCENTER);
     SelectObject(dc, of);
     if (active) {
         HBRUSH ab = CreateSolidBrush(TAB_C);
         RECT bar = { rc.left + 14, rc.bottom - 3, rc.right - 14, rc.bottom };
+        if (gLayoutNew && TabSideW()) bar = { rc.left + SC(3), rc.top + SC(8), rc.left + SC(6), rc.bottom - SC(8) };   // (a bar at the side)
         FillRect(dc, &bar, ab);
         DeleteObject(ab);
     }
@@ -30490,11 +30955,13 @@ static void PaintWindow(HDC dc)
         DeleteObject(sep);
     }
 
-    memset(gSecHelpRc, 0, sizeof(gSecHelpRc));
+    memset(gSecHelpRc, 0, sizeof(gSecHelpRc)); memset(gSecStarRc, 0, sizeof(gSecStarRc));
     for (int i = 0; i < gSectionN; i++) {       // rounded section frames with their title in the top edge
         Section& s = gSections[i];
-        if (s.page >= 0 && s.page != gPage) continue;
-        if (s.sub >= 0 && s.sub != CurSub(s.page)) continue;
+        if (!gSecGuest[i]) {                    // (1.91.0: a starred box shows on Home too)
+            if (s.page >= 0 && s.page != gPage) continue;
+            if (s.sub >= 0 && s.sub != CurSub(s.page)) continue;
+        }
         if (gCompact) continue;
         if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
         if (!CondOn(s.cond)) continue;          // (Synth plugin / Vocode to song: one or the other in the same place)
@@ -30504,7 +30971,9 @@ static void PaintWindow(HDC dc)
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         const int q = Imax(SC(13), sz.cy * 3 / 4);  // (1.65.0) the "?" after the title: its help
         RECT qr = { sx + 18 + sz.cx, y - q / 2, sx + 18 + sz.cx + q, y - q / 2 + q };
-        RECT tr = { sx + 10, y - sz.cy / 2, qr.right + 5, y + sz.cy / 2 + 1 };
+        const bool canStar = StarCan(i);        // (1.91.0) the star after the "?": pin this box to Home
+        RECT sr = { qr.right + SC(5), qr.top - 1, qr.right + SC(5) + q + 2, qr.bottom + 1 };
+        RECT tr = { sx + 10, y - sz.cy / 2, (canStar ? sr.right : qr.right) + 5, y + sz.cy / 2 + 1 };
         FillRect(dc, &tr, BgBrush());
         SetBkColor(dc, BgColor());
         SetTextColor(dc, TITLE_C);
@@ -30519,6 +30988,7 @@ static void PaintWindow(HDC dc)
             SetBkMode(dc, bk); SelectObject(dc, of);
             gSecHelpRc[i] = qr;
         }
+        if (canStar) { StarPaint(dc, sr, StarIdx(i) >= 0); gSecStarRc[i] = sr; }
     }
     MixerPaintStrips(dc);
     ScrollPaint(dc);                            // (1.90.0, New) the scroll bar, when the page is taller than the window
@@ -30593,6 +31063,13 @@ static void OnCommand(int id, int code)
         if (code == BN_CLICKED) NSubPick((id - IDC_NSUB0) / 10, (id - IDC_NSUB0) % 10);
         return;
     }
+    if (id == IDC_TABPOS) {                     // (1.92.0) Settings > Look > Layout > Tabs: top / left / right / bottom
+        if (code == CBN_SELCHANGE && gUiReady) {
+            const int v = Iclamp((int)SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0), 0, 3);
+            if (v != gTabPos) { gTabPos = v; SaveSettings(); Layout(); InvalidateRect(gWnd, nullptr, TRUE); }
+        }
+        return;
+    }
     if (id == IDC_LAYOUTSEL) {                  // Settings > Look > Layout: New / Classic (restarts)
         if (code == CBN_SELCHANGE && gUiReady) {
             const bool want = SendDlgItemMessageW(gWnd, id, CB_GETCURSEL, 0, 0) == 0;
@@ -30601,6 +31078,9 @@ static void OnCommand(int id, int code)
         return;
     }
     if (id >= IDC_MCVOL && id <= IDC_MCLAST) { if (code == BN_CLICKED) McClick(id); return; }   // (1.90.2) Sounds > Music > Mixer channel
+    if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { if (code == BN_CLICKED) HomeTogClick(id - IDC_HTOG0); return; }   // (1.91.0) Home > What's on
+    if (id >= IDC_CLIPWAVE && id < IDC_CLIPWAVE + CLIPS) { if (code == BN_CLICKED) ClipWaveClick(id - IDC_CLIPWAVE); return; }   // (1.92.0) hear a clip on Ears
+    if (id == IDC_HMETER) { if (code == STN_CLICKED) SetPage(PAGE_MIC); return; }   // (Home's mic level: the Mic tab)
     if (id == IDC_NCWHEEL) {                    // (1.90.2) the wheel on knobs / number boxes / faders / lists
         if (code == BN_CLICKED) { gWheelAdj = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings(); }
         return;
@@ -31649,6 +32129,9 @@ static bool McDraw(int w, DRAWITEMSTRUCT* d);
 static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d)
 {
     if (w >= IDC_MCVOL && w <= IDC_MCLAST && McDraw((int)w, d)) return true;   // (1.90.2) Sounds > Music > Mixer channel
+    if (w == IDC_HMETER) { DrawMeter(d); return true; }   // (1.91.0) Home: your mic's level (as on the Mic tab)
+    if (w >= IDC_CLIPWAVE && w < IDC_CLIPWAVE + CLIPS) { ClipWaveDraw(d); return true; }   // (1.92.0) a clip's waveform
+    if (w >= IDC_HTOG0 && w < IDC_HTOG0 + HOME_TOGS) { DrawToggleC(d, HomeTogState((int)w - IDC_HTOG0), ACCENT, RGB(255, 255, 255)); return true; }
     if (w >= IDC_CHMUTE0 && w < IDC_CHMUTE0 + CH_MAX) { DrawToggle(d, gCh[w - IDC_CHMUTE0].mute, true); return true; }
     if (w >= IDC_CHSOLO0 && w < IDC_CHSOLO0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHSOLO0].solo, SOLO_C, RGB(27, 27, 27)); return true; }
     if (w >= IDC_CHDUCK0 && w < IDC_CHDUCK0 + CH_MAX) { DrawToggleC(d, gCh[w - IDC_CHDUCK0].duck, ACCENT, RGB(255, 255, 255)); return true; }
@@ -31947,7 +32430,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
                 busy = true;
                 if (!gOwnSize && !IsZoomed(h) && !gCompact) {   // remember how much bigger than needed you made it
                     RECT c; GetClientRect(h, &c);
-                    gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()));
+                    gExtraW = Imax(0, (int)c.right - Imax(SC(CLIENT_W), MixerNeedW()) - SC(TabSideW()));
                     gExtraH = Imax(0, (int)c.bottom - SC(DesignH()));
                 }
                 PlaceAll(); MixerPlace(); PlaceTabs(); PlaceStrip();
@@ -31966,7 +32449,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_EXITSIZEMOVE:  gMoving = false; break;
     case WM_GETMINMAXINFO: {                    // never smaller than the layout needs
         MINMAXINFO* mm = (MINMAXINFO*)l;
-        RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()), SC(gWnd ? DesignH() : BaseH()) };
+        RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + SC(TabSideW()), SC(gWnd ? DesignH() : BaseH()) };
         AdjustWindowRect(&r, (DWORD)GetWindowLongW(h, GWL_STYLE), FALSE);
         mm->ptMinTrackSize.x = r.right - r.left; mm->ptMinTrackSize.y = r.bottom - r.top;
         return 0;
@@ -32054,7 +32537,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_DRAWITEM: {
         DRAWITEMSTRUCT* d = (DRAWITEMSTRUCT*)l;
         const RECT rc = d->rcItem; const int bw = rc.right - rc.left, bh = rc.bottom - rc.top;
-        const bool buffer = w != IDC_METER && d->CtlType != ODT_COMBOBOX && d->CtlType != ODT_LISTBOX && bw > 0 && bh > 0;
+        const bool buffer = w != IDC_METER && w != IDC_HMETER && d->CtlType != ODT_COMBOBOX && d->CtlType != ODT_LISTBOX && bw > 0 && bh > 0;
         HDC real = d->hDC, mem = nullptr;
         OffScreen* os = buffer ? new OffScreen(real, bw, bh) : nullptr;
         if (os && os->dc) { mem = os->dc; SetViewportOrgEx(mem, -rc.left, -rc.top, nullptr); d->hDC = mem; }
@@ -32075,7 +32558,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         if ((HWND)w == h && LOWORD(l) == HTCLIENT) {
             POINT p; GetCursorPos(&p); ScreenToClient(h, &p);
             if (gEdgeDrag >= 0 || MixerEdgeAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_SIZEWE)); return TRUE; }
-            if (SectionHelpAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
+            if (SectionHelpAt(p.x, p.y) >= 0 || SectionStarAt(p.x, p.y) >= 0) { SetCursor(LoadCursor(nullptr, IDC_HAND)); return TRUE; }
         }
         break;
     case WM_LBUTTONDOWN: {                      // click on empty space: leave the text/number box you were in
@@ -32083,6 +32566,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         const int x = (short)LOWORD(l), y = (short)HIWORD(l), e = MixerEdgeAt(x, y);
         if (ScrollClick(x, y)) return 0;        // (1.90.0, New) the scroll bar
         if (e < 0) { const int hs = SectionHelpAt(x, y); if (hs >= 0) { SectionHelp(hs); return 0; } }   // (1.65.0) a box's "?"
+        if (e < 0) { const int ss = SectionStarAt(x, y); if (ss >= 0) { StarToggle(ss); return 0; } }    // (1.91.0) its star
         if (e >= 0) {
             if (e == gEdgeLast && GetTickCount() - gEdgeLastT < GetDoubleClickTime()) {   // double-click: normal width
                 gEdgeLast = -1; MixerEdgeSet(e, 0); return 0;
