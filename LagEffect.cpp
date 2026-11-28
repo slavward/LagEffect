@@ -1282,6 +1282,7 @@ static volatile bool gMicMuted = false;          // Mute mic: button / hotkey / 
 static int gUiScale = 100;                      // Settings > UI size
 static bool gOwnSize = false;                   // (resizing) the window is sizing itself
 static bool gMoving = false;                    // you're dragging / resizing the window
+static bool gPicStale = false;                  // (2.0.0) the picture skipped a size while you dragged the edge
 static DWORD gOutNextTry[MAX_OUT], gOutWait[MAX_OUT];       // (extra outputs that failed: when to try again)
 static int  gOrgX = 0;                          // pages sit centred when the window is wider than they are
 static int  gExtraW = 0, gExtraH = 0;           // how much bigger than it needs to be you made the window (px)
@@ -8788,6 +8789,7 @@ struct Design  {
     int  sec, ox, oy;                           // the section it's in (-1 none), your offset (design px)
     int  s0, x0, y0, w0, ht0, hh0, ww0, udx0, udy0, udw0, udh0;   // (resizing) its size at the UI size s0, kept so sizes never drift
     bool free;                                  // placed by its own code (the Mixer's strips), not from the layout
+    char wide;                                  // (2.0.0, two columns) 1: moves right / 2: gets wider, by its box's gSecWide; 3: as wide as the page (the mic levels)
 };
 #define MAX_DESIGN 3000                         // (every control the window builds; plenty of room)
 static void LayoutSave(const wchar_t* path);
@@ -8849,6 +8851,9 @@ static int  gSecScroll[MAX_SECTIONS];           // how far up each box is moved 
 static int  gScrollVy[MAX_SECTIONS];            // (1.91.0) where each listed box sits in the page's scrolling list (design px)
 #define COL2_DX 546                             // (2.0.0) the second column: this far right of the first (design px)
 static int  gSecDx[MAX_SECTIONS];               // (2.0.0) how far right each box is moved (design px): 0, or COL2_DX in the second column
+static int  gSecWide[MAX_SECTIONS];             // (2.0.0) how much wider a box is drawn (the Music box, alone on its sub-tab, fills both columns)
+static int  gMusSec = -1;                       // the Music box (New)
+static int  gViewDx = 0;                        // (2.0.0) Home > Overview in two columns: its things (not in a box) move this far right, to the middle
 static bool gTwoNow = false;                    // (2.0.0) two columns now (set by ScrollCompute; PlaceAll centres for it)
 static bool gScrollTwo = false;                 // (2.0.0) this page's boxes are in two columns
 static int  gScrollEnd = 0;                     // (2.0.0) the bottom of the last box (scrolling list, design px)
@@ -9126,6 +9131,7 @@ static void AddSection(int x, int y, int w, int h, const wchar_t* title)
 // ======================= placing controls =======================
 static int CtlOffX(const Design& d) { return d.ox + (d.sec >= 0 ? gSections[d.sec].ox : 0); }
 static int CtlOffY(const Design& d) { return d.oy + (d.sec >= 0 ? gSections[d.sec].oy : 0); }
+static int  NewTop(int page);
 static void PlaceAll()
 {
     if (!gWnd) return;
@@ -9138,9 +9144,16 @@ static void PlaceAll()
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
         if (d.page >= 0 && d.page != gPage && !(d.sec >= 0 && gSecGuest[d.sec])) continue;   // other pages are placed when you switch to them (1.91.0: a starred box on Home is placed there)
         if (d.free) continue;
-        int x = gOrgX + d.x + d.dx + SC(CtlOffX(d) + (d.sec >= 0 ? gSecDx[d.sec] : 0)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d)) - (d.sec >= 0 ? SC(gSecScroll[d.sec]) : 0);
+        int wx = d.sec >= 0 ? gSecDx[d.sec] : 0, ww = 0;   // (2.0.0, two columns)
+        if (d.sec >= 0 && gSecWide[d.sec]) { if (d.wide == 1) wx += gSecWide[d.sec]; else if (d.wide == 2) ww = gSecWide[d.sec]; }
+        if (gTwoNow && d.wide == 3) ww = PageW() - CLIENT_W;
+        if (gTwoNow && d.sec < 0 && d.wide != 3 && d.page == gPage && gPage != PAGE_MIXER && !(d.h && GetDlgCtrlID(d.h) >= IDC_NSUB0 && GetDlgCtrlID(d.h) < IDC_NSUB0 + TAB_COUNT * 10)) {
+            if (gPage == PAGE_MAIN) wx += gViewDx;                                  // (Home > Overview: to the middle)
+            else if (d.ry >= 42 && d.ry < NewTop(gPage) && d.rx >= 300) wx += COL2_DX; // (the right end of the sub-tab row: to the right end)
+        }
+        int x = gOrgX + d.x + d.dx + SC(CtlOffX(d) + wx), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d)) - (d.sec >= 0 ? SC(gSecScroll[d.sec]) : 0);
         RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
-        int w = d.ud ? r.right - r.left : d.w + d.dw;          // a number box keeps the width its arrows left it
+        int w = d.ud ? r.right - r.left : d.w + d.dw + SC(ww);   // a number box keeps the width its arrows left it
         int h = d.combo ? d.ht : r.bottom - r.top;              // a dropdown's height is its list
         if (r.left != x || r.top != y || r.right - r.left != w)
             SetWindowPos(d.h, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
@@ -14065,7 +14078,7 @@ static void PlaceTabs()                         // the tabs whose feature is on,
             if (!shown) ShowWindow(GetDlgItem(gWnd, TabId(pg)), SW_HIDE);
         }
         HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
-        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(532), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
+        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(PageW() - 28), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
         return;
     }
     if (gLayoutNew && TabBotH()) {              // (1.92.0) tabs in a row just above the bottom bar; the mic level across the top
@@ -14073,7 +14086,7 @@ static void PlaceTabs()                         // the tabs whose feature is on,
         const int ICON_W = 40;
         int words = 0, icons = 0;
         for (int i = 0; i < TAB_SLOTS; i++) { const int pg = TabAt(i); if (!PageOn(pg)) continue; if (pg == PAGE_MAIN || pg == PAGE_SETTINGS) icons++; else words++; }
-        const int nt = words + icons, ww = Imin(110, (532 - icons * ICON_W - (nt - 1) * 2) / Imax(1, words));
+        const int nt = words + icons, ww = Imin(gTwoNow ? 1000 : 110, (PageW() - 28 - icons * ICON_W - (nt - 1) * 2) / Imax(1, words));   // (2.0.0: two columns: spread across)
         const int y = c.bottom - SC(STRIP_H) - SC(38);
         int x = 14;
         for (int i = 0; i < TAB_SLOTS; i++) {
@@ -14091,7 +14104,7 @@ static void PlaceTabs()                         // the tabs whose feature is on,
             if (!shown) ShowWindow(GetDlgItem(gWnd, TabId(pg)), SW_HIDE);
         }
         HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
-        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(532), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
+        if (mt) { PlaceFree(mt, gOrgX + SC(14), SC(10), SC(PageW() - 28), SC(30)); ShowWindow(mt, gHdrMeter ? SW_SHOWNA : SW_HIDE); }
         return;
     }
     if (gLayoutNew) {                           // (1.90.0) Home and Settings are icons, the mic level sits at the end of the row
@@ -14099,7 +14112,7 @@ static void PlaceTabs()                         // the tabs whose feature is on,
         int words = 0, icons = 0;
         for (int i = 0; i < TAB_SLOTS; i++) { const int pg = TabAt(i); if (!PageOn(pg)) continue; if (pg == PAGE_MAIN || pg == PAGE_SETTINGS) icons++; else words++; }
         const int nt = words + icons;
-        const int ww = Imin(110, (532 - MET_W - icons * ICON_W - (nt - 1) * 2) / Imax(1, words));
+        const int ww = Imin(gTwoNow ? 1000 : 110, (PageW() - 28 - MET_W - icons * ICON_W - (nt - 1) * 2) / Imax(1, words));   // (2.0.0: two columns: spread across)
         int x = 14;
         for (int i = 0; i < TAB_SLOTS; i++) {
             const int pg = TabAt(i);
@@ -14117,7 +14130,7 @@ static void PlaceTabs()                         // the tabs whose feature is on,
         }
         HWND mt = GetDlgItem(gWnd, IDC_HDRMETER);
         if (mt) {
-            PlaceFree(mt, gOrgX + SC(546 - MET_W + 6), SC(10), SC(MET_W - 6), SC(32));
+            PlaceFree(mt, gOrgX + SC(PageW() - 14 - MET_W + 6), SC(10), SC(MET_W - 6), SC(32));
             ShowWindow(mt, gHdrMeter && !gCompact ? SW_SHOWNA : SW_HIDE);
         }
         return;
@@ -15775,7 +15788,7 @@ static bool SectionShown(const Section& s)
 static RECT SectionRect(const Section& s)
 {
     int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0) - gSecScroll[&s - gSections]), x = SC(s.x + s.ox + gSecDx[&s - gSections]) + ((gSecChan >= 0 && &s == &gSections[gSecChan]) || (gSecOut >= 0 && &s == &gSections[gSecOut]) || (gSecKeys >= 0 && &s == &gSections[gSecKeys]) ? 0 : gOrgX);
-    RECT r = { x, y - SC(8), x + SC(s.w), y + SC(s.h) };
+    RECT r = { x, y - SC(8), x + SC(s.w + gSecWide[&s - gSections]), y + SC(s.h) };
     return r;
 }
 static bool EdItemRect(int item, RECT* r)
@@ -18582,13 +18595,21 @@ static void ScrollTwoCol(int n, int start, int top, int bot, int* firstSlot)   /
         gSecHid[k] = gScrollVy[k] < stop || (gScrollVy[k] != stop && gScrollVy[k] + s2.h - stop > bot - top);
     }
     gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot; gScrollEnd = end; gScrollTwo = true;
+    if (n == 1) {                               // (one box: nothing for the second column) the Music box fills both; anything else goes in the middle
+        const int k = gScrollList[0];
+        if (k == gMusSec) gSecWide[k] = COL2_DX; else gSecDx[k] = COL2_DX / 2;
+    }
 }
 static void ScrollCompute()                     // which boxes show on this page / sub-tab, scrolled to gScrollFirst
 {
-    for (int k = 0; k < gSectionN; k++) { gSecScroll[k] = 0; gSecHid[k] = false; gSecDx[k] = 0; }
-    gScrollN = 0; gScrollMax = 0; gScrollAt = 0; gScrollTwo = false;
+    for (int k = 0; k < gSectionN; k++) { gSecScroll[k] = 0; gSecHid[k] = false; gSecDx[k] = 0; gSecWide[k] = 0; }
+    gScrollN = 0; gScrollMax = 0; gScrollAt = 0; gScrollTwo = false; gViewDx = 0;
     gTwoNow = TwoColWide();
     GuestCompute();
+    if (gTwoNow && gPage == PAGE_MAIN && gHomeSub != 1) {   // (2.0.0) Home > Overview is one column: in the middle
+        gViewDx = COL2_DX / 2;
+        for (int k = 0; k < gSectionN; k++) if (gSections[k].page == PAGE_MAIN && gSections[k].sub != 1) gSecDx[k] = gViewDx;
+    }
     if (!gWnd || gCompact || !ScrollsHere(gPage)) return;
     if (gPage == PAGE_MAIN) {                   // (1.92.2) Home > Starred: the boxes you starred, from the top (Overview doesn't scroll)
         if (gHomeSub != 1) return;
@@ -28357,7 +28378,6 @@ static bool DrawItemDispatch(WPARAM w, DRAWITEMSTRUCT* d);
 // ---- (1.92.1, New) Sounds > Music: the music's own Mixer strip on the right of the Music box (the real strip's controls,
 // placed there while the box shows), or a "put it in the Mixer" button in its place ----
 static int gMcCh = -2;                          // the music's channel when last looked (-1 none; -2 not looked yet)
-static int gMusSec = -1;                        // the Music box (New)
 static bool McShowing() { return gMsCh >= 0; }
 static void MsCompute()                         // (Layout, after ScrollCompute) is the Music box showing, and is the music a channel?
 {
@@ -29755,10 +29775,11 @@ static void NewLayoutApply()
         NMove(di, PAGE_FX, -1, 390, NSubRowY(PAGE_FX), 156, FEAT_FX);
         if (di >= 0) { gDesign[di].ht = SC(28); SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(156), SC(28), SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE); }
     }
-    { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) gNDone[di] = true; }   // (Mic: the meter stays on top of every sub-tab)
+    { const int di = NDi(GetDlgItem(gWnd, IDC_METER)); if (di >= 0) { gNDone[di] = true; gDesign[di].wide = 3; } }   // (2.0.0: as wide as the page)   // (Mic: the meter stays on top of every sub-tab)
     {   // (1.91.0) Home, under the buttons: your mic's level, What's on, then the boxes you star (a hint until you do)
         gBuildPage = PAGE_MAIN; gBuildSub = -1; gBuildFeat = 0; gBuildCond = 0; gRecordShift = false;
         Ctl(L"STATIC", L"", SS_OWNERDRAW | SS_NOTIFY, 14, HOME_METER_Y, 532, 62, IDC_HMETER);   // (1.92.1: at the top)
+        gDesign[gDesignN - 1].wide = 3;         // (2.0.0: as wide as the page)
         gRecordShift = true;
         AddSection(14, HOME_TOP, 532, 128, L"What's on");
         for (int t = 0; t < HOME_TOGS; t++)
@@ -29789,8 +29810,8 @@ static void NewLayoutApply()
         if (km >= 0) {
             gBuildPage = PAGE_MIC; gBuildSub = 5; gBuildFeat = 0;
             Ctl(L"STATIC", L"Play / pause:", 0, 30, 512, 84, 18, -1); gDesign[gDesignN - 1].sec = km;
-            Ctl(L"STATIC", L"Next song:", 0, 264, 512, 70, 18, -1); gDesign[gDesignN - 1].sec = km;
-            Ctl(L"BUTTON", L"+\nPut it in the Mixer", BS_MULTILINE | WS_TABSTOP, 462, 182, 68, 350, IDC_MCADD); gDesign[gDesignN - 1].sec = km;
+            Ctl(L"STATIC", L"Next song:", 0, 264, 512, 70, 18, -1); gDesign[gDesignN - 1].sec = km; gDesign[gDesignN - 1].wide = 1;
+            Ctl(L"BUTTON", L"+\nPut it in the Mixer", BS_MULTILINE | WS_TABSTOP, 462, 182, 68, 350, IDC_MCADD); gDesign[gDesignN - 1].sec = km; gDesign[gDesignN - 1].wide = 1;
             const struct { int id, x, y, w; } mv[] = {
                 { IDC_MUSVIEW, 30, 180, 420 }, { IDC_MUSPREV, 30, 236, 40 }, { IDC_MUSPLAY, 76, 236, 90 }, { IDC_MUSNEXT, 172, 236, 40 },
                 { IDC_MUSSTOP, 218, 236, 40 }, { IDC_MUSSHUF, 266, 241, 70 }, { IDC_MUSREP, 342, 236, 108 }, { IDC_MUSOUTS, 30, 276, 270 },
@@ -29803,7 +29824,12 @@ static void NewLayoutApply()
                 SetWindowPos(gDesign[di].h, nullptr, 0, 0, SC(m.w), r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
             }
             const int vl = NFindAt(PAGE_MIC, 384, 281);   // (its "Volume" label)
-            if (vl >= 0) { NMove(vl, PAGE_MIC, 5, 332, 281, 52); gDesign[vl].sec = km; }
+            if (vl >= 0) { NMove(vl, PAGE_MIC, 5, 332, 281, 52); gDesign[vl].sec = km; gDesign[vl].wide = 1; }
+            {   // (2.0.0) alone in two columns the box fills both: the view and the list get wider, the right-hand things move right
+                const int grow[] = { IDC_MUSVIEW, IDC_MUSLIST }, mv2[] = { IDC_MUSSHUF, IDC_MUSREP, IDC_MUSVOL, IDC_MUSKEYNEXT };
+                for (int id : grow) { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) gDesign[di].wide = 2; }
+                for (int id : mv2)  { const int di = NDi(GetDlgItem(gWnd, id)); if (di >= 0) gDesign[di].wide = 1; }
+            }
         }
     }
     {   // Mic > Cleanup: "Push-to-talk & live bleep" is just push-to-talk (the live bleep key goes to Speech > Bleep)
@@ -31419,7 +31445,7 @@ static void PaintWindow(HDC dc)
         if (!CondOn(s.cond)) continue;          // (Synth plugin / Vocode to song: one or the other in the same place)
         if (gScrollN && gSecHid[i]) continue;   // (1.90.0, New: scrolled out of view)
         int y = SC(s.y + s.oy + (s.shifts ? d : 0) - gSecScroll[i]), sx = SC(s.x + s.ox + gSecDx[i]) + (i == gSecChan || i == gSecOut || i == gSecKeys ? 0 : gOrgX);
-        RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
+        RoundRect(dc, sx, y, sx + SC(s.w + gSecWide[i]), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         const int q = Imax(SC(13), sz.cy * 3 / 4);  // (1.65.0) the "?" after the title: its help
         RECT qr = { sx + 18 + sz.cx, y - q / 2, sx + 18 + sz.cx + q, y - q / 2 + q };
@@ -32908,7 +32934,11 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         OnDropFiles((HDROP)w);
         return 0;
     case WM_SIZE:                               // the picture is sized to the window
-        if (PicActive() && w != SIZE_MINIMIZED) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); }
+        if (PicActive() && w != SIZE_MINIMIZED) {   // (2.0.0: while you drag the edge, at most every 100 ms: a big picture is slow to redo)
+            static DWORD lastPic = 0; const DWORD now = GetTickCount();
+            if (!gMoving || now - lastPic >= 100) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); lastPic = now; }
+            else gPicStale = true;
+        }
         EdFollow();
         if (w != SIZE_MINIMIZED && gUiReady) {  // free sizing: centre the page, the Mixer fills the width / height
             static bool busy = false;
@@ -32933,7 +32963,9 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
         }
         break;
     case WM_ENTERSIZEMOVE: gMoving = true; break;
-    case WM_EXITSIZEMOVE:  gMoving = false; break;
+    case WM_EXITSIZEMOVE:  gMoving = false;
+        if (gPicStale) { gPicStale = false; if (PicActive()) { PictureRebuild(); InvalidateRect(h, nullptr, TRUE); } }   // (2.0.0) the last size, now you've let go
+        break;
     case WM_GETMINMAXINFO: {                    // never smaller than the layout needs
         MINMAXINFO* mm = (MINMAXINFO*)l;
         RECT r = { 0, 0, Imax(SC(CLIENT_W), MixerNeedW()) + SC(TabSideW()), SC(gWnd ? DesignH() : BaseH()) };
