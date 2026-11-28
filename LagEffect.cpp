@@ -6707,6 +6707,7 @@ static wchar_t  gFontName[40] = L"Segoe UI";
 static int      gOpacity = 100;
 static int      gCbShow = 7;                    // (1.66.1) the command builder's lists that matter now: 1 "Which one", 2 "How", 4 the value
 static int      gWheelAdj = 0;                  // (1.90.2, New) the mouse wheel changes the setting under it (off: it only scrolls)
+static int      gTwoCol = 0;                    // (1.94.0, New) boxes in two columns when the window is wide enough
 static int      gHdrMeter = 1;                  // (1.65.0) a thin mic level bar under the tabs, on every tab (Settings > Look)
 static int      gVolStyle = 0;                  // volume boxes (pads, clips, music, TTS): 0 a number you drag, 1 a small knob (1.63.0)
 static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
@@ -7415,6 +7416,7 @@ static void LoadSettings()
     gVolStyle     = Iclamp(INI_INT(L"volume_control_style", 0), 0, 1);
     gHdrMeter     = INI_INT(L"header_mic_meter", 1) != 0;
     gWheelAdj     = INI_INT(L"wheel_changes_settings", 0) != 0;
+    gTwoCol       = INI_INT(L"two_columns", 0) != 0;
     gTabPos       = Iclamp(INI_INT(L"tab_position", 0), 0, 3);
     gFxHold[0]    = INI_INT(L"fx_hotkey_hold", 0) != 0;
     for (int g = 0; g < FX_GROUPS; g++) { wchar_t k[64]; wsprintfW(k, L"%s_hold", gFxGroups[g].hotkeyKey); gFxHold[1 + g] = INI_INT(k, 0) != 0; }
@@ -8387,6 +8389,7 @@ static void SaveSettings()
     SaveInt(L"volume_control_style", gVolStyle);
     SaveInt(L"header_mic_meter", gHdrMeter);
     SaveInt(L"wheel_changes_settings", gWheelAdj);
+    SaveInt(L"two_columns", gTwoCol);
     SaveInt(L"tab_position", gTabPos);
     SaveInt(L"layout_new", gLayoutWant ? 1 : 0);   // (1.90.0)
     if (gLayoutNew) { SaveInt(L"layout_new_runs", gNewRuns); SaveNewSubs(); }
@@ -8736,6 +8739,7 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_NCTRIG    4894
 #define IDC_NCMIDI    4895
 #define IDC_NCWHEEL   4896                      // (1.90.2, New) Settings > Controls: the mouse wheel changes settings
+#define IDC_TWOCOL    4985                      // (1.94.0, New) Settings > General > Window: two columns when wide
 #define IDC_HSTARHINT 4980                      // (1.92.2) Home > Starred: "nothing starred yet"
 #define IDC_HMETER    4990                      // (1.91.0, New) Home: your mic's level
 #define IDC_HTOG0     4991                      // .. + HOME_TOGS - 1: Home > What's on switches
@@ -8843,6 +8847,12 @@ static bool CtlShowing(int id)                  // is this control's page / sub-
 // (controls are children of the window itself, so they can't be cut off half-way).
 static int  gSecScroll[MAX_SECTIONS];           // how far up each box is moved (design px)
 static int  gScrollVy[MAX_SECTIONS];            // (1.91.0) where each listed box sits in the page's scrolling list (design px)
+#define COL2_DX 546                             // (1.94.0) the second column: this far right of the first (design px)
+static int  gSecDx[MAX_SECTIONS];               // (1.94.0) how far right each box is moved (design px): 0, or COL2_DX in the second column
+static bool gTwoNow = false;                    // (1.94.0) two columns now (set by ScrollCompute; PlaceAll centres for it)
+static bool gScrollTwo = false;                 // (1.94.0) this page's boxes are in two columns
+static int  gScrollEnd = 0;                     // (1.94.0) the bottom of the last box (scrolling list, design px)
+static int  PageW() { return gTwoNow ? CLIENT_W + COL2_DX : CLIENT_W; }   // (1.94.0) the width the pages are centred for
 #define STAR_MAX 24
 static int  gStarSec[STAR_MAX], gStarN = 0;     // (1.91.0) boxes pinned to Home, in the order you starred them
 static bool gSecHid[MAX_SECTIONS];              // scrolled out of view
@@ -9122,13 +9132,13 @@ static void PlaceAll()
     const int rows = RowsDelta();
     HWND keep[3] = { GetDlgItem(gWnd, IDC_STATUS), GetDlgItem(gWnd, IDC_START), GetDlgItem(gWnd, IDC_MUTEBTN) };
     { RECT c; GetClientRect(gWnd, &c); const int sw = SC(TabSideW());   // (1.92.0: tabs on a side: the pages sit beside them)
-      gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - sw - SC(CLIENT_W)) / 2) + (gTabPos == 1 ? sw : 0); }
+      gOrgX = gCompact ? 0 : Imax(0, ((int)c.right - sw - SC(PageW())) / 2) + (gTabPos == 1 ? sw : 0); }
     for (int i = 0; i < gDesignN; i++) {
         Design& d = gDesign[i];
         if (gCompact && (d.h == keep[0] || d.h == keep[1] || d.h == keep[2])) continue;   // compact mode places these
         if (d.page >= 0 && d.page != gPage && !(d.sec >= 0 && gSecGuest[d.sec])) continue;   // other pages are placed when you switch to them (1.91.0: a starred box on Home is placed there)
         if (d.free) continue;
-        int x = gOrgX + d.x + d.dx + SC(CtlOffX(d)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d)) - (d.sec >= 0 ? SC(gSecScroll[d.sec]) : 0);
+        int x = gOrgX + d.x + d.dx + SC(CtlOffX(d) + (d.sec >= 0 ? gSecDx[d.sec] : 0)), y = d.y + (d.shifted ? SC(rows) : 0) + SC(CtlOffY(d)) - (d.sec >= 0 ? SC(gSecScroll[d.sec]) : 0);
         RECT r; GetWindowRect(d.h, &r); MapWindowPoints(nullptr, gWnd, (POINT*)&r, 2);
         int w = d.ud ? r.right - r.left : d.w + d.dw;          // a number box keeps the width its arrows left it
         int h = d.combo ? d.ht : r.bottom - r.top;              // a dropdown's height is its list
@@ -15764,7 +15774,7 @@ static bool SectionShown(const Section& s)
 }
 static RECT SectionRect(const Section& s)
 {
-    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0) - gSecScroll[&s - gSections]), x = SC(s.x + s.ox) + ((gSecChan >= 0 && &s == &gSections[gSecChan]) || (gSecOut >= 0 && &s == &gSections[gSecOut]) || (gSecKeys >= 0 && &s == &gSections[gSecKeys]) ? 0 : gOrgX);
+    int y = SC(s.y + s.oy + (s.shifts ? RowsDelta() : 0) - gSecScroll[&s - gSections]), x = SC(s.x + s.ox + gSecDx[&s - gSections]) + ((gSecChan >= 0 && &s == &gSections[gSecChan]) || (gSecOut >= 0 && &s == &gSections[gSecOut]) || (gSecKeys >= 0 && &s == &gSections[gSecKeys]) ? 0 : gOrgX);
     RECT r = { x, y - SC(8), x + SC(s.w), y + SC(s.h) };
     return r;
 }
@@ -16703,6 +16713,7 @@ static void AddTips()
         TipId(IDC_NCWHEEL,  L"On: scrolling over a knob, number, slider, fader or dropdown changes it. Off (usual): the wheel only scrolls the page, so nothing changes by accident; drag, type or use the arrow keys instead.");
         for (int i = 0; i < CLIPS; i++) TipId(IDC_CLIPWAVE + i, L"The clip and how long it is. Click to hear it on your \"Always hear sounds on\" output (Home), only you; click again to stop. Right-click: trim it. (Rename, MP3: the ... button.)");
         TipId(IDC_TABPOS,  L"Where the tabs are: along the top (usual), down the left or right side (with their names; the window gets wider), or along the bottom just above the search bar. The mic level then sits across the top.");
+        TipId(IDC_TWOCOL,  L"On: when the window is wide enough, the boxes on Mic, Effects, Sounds, Speech, Settings and Home > Starred sit in two columns, so more fit without scrolling. Turning it on widens the window if your screen has room; off puts it back to its usual width.");
         TipId(IDC_GUIDE,   L"The four steps a new install starts with: your mic, where your voice goes (VB-Cable), what you'll use, and Set up my mic.");
         TipId(IDC_HMETER,  L"Your mic's level (as on the Mic tab): green while the gate lets you through. Click: the Mic tab.");
         {   static const wchar_t* T[HOME_TOGS] = {
@@ -18538,10 +18549,45 @@ static void GuestCompute()                      // (1.91.0) which starred boxes 
         if (k >= 0 && gSecGuest[k] && gOrigPage[i] >= 0 && gOrigPage[i] < TAB_COUNT) gGuestHas[gOrigPage[i]] |= (unsigned short)(1u << (gOrigSub[i] + 1));
     }
 }
+static bool TwoColWide()                         // (1.94.0) two columns: on, and the window is wide enough for them
+{
+    if (!gLayoutNew || !gTwoCol || gCompact || !gWnd) return false;
+    RECT c; GetClientRect(gWnd, &c);
+    return (int)c.right >= SC(CLIENT_W + COL2_DX) + SC(TabSideW());
+}
+static void ScrollTwoCol(int n, int start, int top, int bot, int* firstSlot)   // (1.94.0) gScrollList[0..n) (in reading order) into two columns
+{
+    int colBot[2] = { start, start };           // each box goes to the column that ends higher (left on a tie)
+    for (int j = 0; j < n; j++) {
+        const int k = gScrollList[j], c = colBot[1] < colBot[0] ? 1 : 0;
+        gScrollVy[k] = colBot[c]; gSecDx[k] = c ? COL2_DX : 0;
+        colBot[c] += gSections[k].h + 12;
+    }
+    for (int j = 1; j < n; j++) {              // top to bottom (left first): the order you scroll through them
+        const int k = gScrollList[j]; int i = j;
+        while (i > 0 && (gScrollVy[gScrollList[i - 1]] > gScrollVy[k] || (gScrollVy[gScrollList[i - 1]] == gScrollVy[k] && gSecDx[gScrollList[i - 1]] > gSecDx[k]))) { gScrollList[i] = gScrollList[i - 1]; i--; }
+        gScrollList[i] = k;
+    }
+    auto sameTop = [&](int j) { while (j > 0 && gScrollVy[gScrollList[j - 1]] == gScrollVy[gScrollList[j]]) j--; return j; };
+    const int end = Imax(colBot[0], colBot[1]) - 12;
+    int maxFirst = 0;                           // the first top from which everything to the end fits
+    while (maxFirst < n - 1 && end - gScrollVy[gScrollList[maxFirst]] > bot - top) maxFirst++;
+    maxFirst = sameTop(maxFirst);
+    const int first = sameTop(Iclamp(*firstSlot, 0, maxFirst));
+    *firstSlot = first;
+    const int stop = gScrollVy[gScrollList[first]], off = stop - top;
+    for (int j = 0; j < n; j++) {               // above the top, or not all of it fits: not shown (the top row always is)
+        const int k = gScrollList[j]; const Section& s2 = gSections[k];
+        gSecScroll[k] = s2.y + (s2.shifts ? RowsDelta() : 0) - gScrollVy[k] + off;
+        gSecHid[k] = gScrollVy[k] < stop || (gScrollVy[k] != stop && gScrollVy[k] + s2.h - stop > bot - top);
+    }
+    gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot; gScrollEnd = end; gScrollTwo = true;
+}
 static void ScrollCompute()                     // which boxes show on this page / sub-tab, scrolled to gScrollFirst
 {
-    for (int k = 0; k < gSectionN; k++) { gSecScroll[k] = 0; gSecHid[k] = false; }
-    gScrollN = 0; gScrollMax = 0; gScrollAt = 0;
+    for (int k = 0; k < gSectionN; k++) { gSecScroll[k] = 0; gSecHid[k] = false; gSecDx[k] = 0; }
+    gScrollN = 0; gScrollMax = 0; gScrollAt = 0; gScrollTwo = false;
+    gTwoNow = TwoColWide();
     GuestCompute();
     if (!gWnd || gCompact || !ScrollsHere(gPage)) return;
     if (gPage == PAGE_MAIN) {                   // (1.92.2) Home > Starred: the boxes you starred, from the top (Overview doesn't scroll)
@@ -18558,6 +18604,7 @@ static void ScrollCompute()                     // which boxes show on this page
             gScrollList[n++] = k; gScrollVy[k] = y; y += gSections[k].h + 12;
         }
         if (!n) return;
+        if (gTwoNow) { ScrollTwoCol(n, top, top, bot, &gScrollFirst[gPage][0]); return; }
         const int lk = gScrollList[n - 1], lastBot = gScrollVy[lk] + gSections[lk].h;
         int maxFirst = 0;
         while (maxFirst < n - 1 && lastBot - gScrollVy[gScrollList[maxFirst]] > bot - top) maxFirst++;
@@ -18569,7 +18616,7 @@ static void ScrollCompute()                     // which boxes show on this page
             gSecScroll[k] = s2.y + (s2.shifts ? RowsDelta() : 0) - gScrollVy[k] + off;
             gSecHid[k] = j < first || (j > first && gScrollVy[k] + s2.h - off > bot);
         }
-        gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot;
+        gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot; gScrollEnd = lastBot;
         return;
     }
     const int sub = CurSub(gPage), top = NewTop(gPage), si = ScrollSi();
@@ -18585,6 +18632,7 @@ static void ScrollCompute()                     // which boxes show on this page
         gScrollList[j] = k;
     }
     if (!n) return;
+    if (gTwoNow) { ScrollTwoCol(n, gSections[gScrollList[0]].y, top, bot, &gScrollFirst[gPage][si]); return; }
     for (int j = 0; j < n; j++) gScrollVy[gScrollList[j]] = gSections[gScrollList[j]].y;
     const Section& last = gSections[gScrollList[n - 1]];
     int maxFirst = 0;                           // the first box from which everything to the end fits
@@ -18597,18 +18645,18 @@ static void ScrollCompute()                     // which boxes show on this page
         gSecScroll[k] = off;
         gSecHid[k] = j < first || (j > first && s.y + s.h - off > bot);
     }
-    gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot;
+    gScrollN = n; gScrollAt = first; gScrollMax = maxFirst; gScrollTop = top; gScrollBot = bot; gScrollEnd = last.y + last.h;
 }
 static RECT gScrollTrack = {}, gScrollThumb = {};   // (client px) where the bar was painted
 static void ScrollPaint(HDC dc)
 {
     SetRectEmpty(&gScrollTrack); SetRectEmpty(&gScrollThumb);
     if (!gScrollN || gScrollMax <= 0) return;
-    const int fk = gScrollList[0], lk = gScrollList[gScrollN - 1], fy = gScrollVy[fk];
-    const int total = Imax(1, gScrollVy[lk] + gSections[lk].h - fy);
+    const int fk = gScrollList[0], fy = gScrollVy[fk];
+    const int total = Imax(1, gScrollEnd - fy);
     int vTop = gScrollVy[gScrollList[gScrollAt]], vBot = vTop;
-    for (int j = gScrollAt; j < gScrollN; j++) { const int k = gScrollList[j]; if (!gSecHid[k]) vBot = gScrollVy[k] + gSections[k].h; }
-    const int x = gOrgX + SC(CLIENT_W - 10), y0 = SC(gScrollTop - 6), y1 = SC(gScrollBot);
+    for (int j = gScrollAt; j < gScrollN; j++) { const int k = gScrollList[j]; if (!gSecHid[k]) vBot = Imax(vBot, gScrollVy[k] + gSections[k].h); }
+    const int x = gOrgX + SC(PageW() - 10), y0 = SC(gScrollTop - 6), y1 = SC(gScrollBot);
     gScrollTrack = { x, y0, x + Imax(3, SC(4)), y1 };
     const int th = y1 - y0;
     gScrollThumb = { x, y0 + MulDiv(th, vTop - fy, total), x + Imax(3, SC(4)), y0 + MulDiv(th, vBot - fy, total) };
@@ -18619,7 +18667,16 @@ static void ScrollPaint(HDC dc)
 static void ScrollBy(int n)                     // a box at a time
 {
     if (!gScrollN || !n) return;
-    const int want = Iclamp(gScrollAt + n, 0, gScrollMax);
+    int want = Iclamp(gScrollAt + n, 0, gScrollMax);
+    if (gScrollTwo) {                           // (1.94.0) two columns: a row of tops at a time (both columns can start at the same place)
+        want = gScrollAt;
+        for (int st = 0; st < abs(n); st++) {
+            int j = want + (n > 0 ? 1 : -1);
+            while (n > 0 && j <= gScrollMax && gScrollVy[gScrollList[j]] == gScrollVy[gScrollList[want]]) j++;
+            if (j < 0 || j > gScrollMax) break;
+            want = j;
+        }
+    }
     if (want == gScrollAt) return;
     gScrollFirst[gPage][ScrollSi()] = want;
     Layout();
@@ -18653,12 +18710,12 @@ static bool ScrollClick(int x, int y)           // a click on the bar: on the th
 static void ScrollDragTo(int y)                 // (while dragging) the box nearest where the thumb is now goes to the top
 {
     if (!gScrollDrag || !gScrollN || IsRectEmpty(&gScrollTrack)) return;
-    const int fk = gScrollList[0], lk = gScrollList[gScrollN - 1];
-    const int total = Imax(1, gScrollVy[lk] + gSections[lk].h - gScrollVy[fk]), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
+    const int fk = gScrollList[0];
+    const int total = Imax(1, gScrollEnd - gScrollVy[fk]), th = Imax(1, (int)(gScrollTrack.bottom - gScrollTrack.top));
     const int want = gScrollDragTop0 + MulDiv(y - gScrollDragY0, total, th);
     int j = 0, best = INT_MAX;
     for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gScrollVy[gScrollList[k]] - want); if (d < best) { best = d; j = k; } }
-    if (j != gScrollAt) ScrollBy(j - gScrollAt);
+    if (j != gScrollAt && gScrollVy[gScrollList[j]] != gScrollVy[gScrollList[gScrollAt]]) { gScrollFirst[gPage][ScrollSi()] = j; Layout(); }   // (1.94.0: not ScrollBy, which goes a row at a time in two columns)
 }
 static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the box it's in shows
 {
@@ -29798,6 +29855,8 @@ static void NewLayoutApply()
         mvId(IDC_OVERLAY, 262, y + 22, 268);
         mvId(IDC_HIDESHARE, 30, y + 46, 220);
         mvId(IDC_COMPACT, 30, y + 68, 220);
+        Ctl(L"BUTTON", L"Two columns when the window is wide", BS_AUTOCHECKBOX | WS_TABSTOP, 262, y + 46, 268, 20, IDC_TWOCOL);   // (1.94.0)
+        CheckDlgButton(gWnd, IDC_TWOCOL, gTwoCol ? BST_CHECKED : BST_UNCHECKED);
         if (lNote >= 0) hideDi(lNote);           // (the checkbox's tooltip says it)
         y = NBox(L"Hotkeys and audio", 90);
         mv(lMute, 30, y + 26, 90);
@@ -31340,7 +31399,7 @@ static void PaintWindow(HDC dc)
     {                                           // line under the tabs
         HPEN sep = CreatePen(PS_SOLID, 1, gDark ? DK_SECTION : LT_BORDER);
         HGDIOBJ op = SelectObject(dc, sep);
-        if (!gCompact) { MoveToEx(dc, gOrgX + SC(14), SC(42), nullptr); LineTo(dc, gOrgX + SC(CLIENT_W - 14), SC(42)); }
+        if (!gCompact) { MoveToEx(dc, gOrgX + SC(14), SC(42), nullptr); LineTo(dc, gOrgX + SC(PageW() - 14), SC(42)); }
         SelectObject(dc, op);
         DeleteObject(sep);
     }
@@ -31359,7 +31418,7 @@ static void PaintWindow(HDC dc)
         if (s.feat && !FeatOn(s.feat)) continue;   // (a feature that's off: not shown)
         if (!CondOn(s.cond)) continue;          // (Synth plugin / Vocode to song: one or the other in the same place)
         if (gScrollN && gSecHid[i]) continue;   // (1.90.0, New: scrolled out of view)
-        int y = SC(s.y + s.oy + (s.shifts ? d : 0) - gSecScroll[i]), sx = SC(s.x + s.ox) + (i == gSecChan || i == gSecOut || i == gSecKeys ? 0 : gOrgX);
+        int y = SC(s.y + s.oy + (s.shifts ? d : 0) - gSecScroll[i]), sx = SC(s.x + s.ox + gSecDx[i]) + (i == gSecChan || i == gSecOut || i == gSecKeys ? 0 : gOrgX);
         RoundRect(dc, sx, y, sx + SC(s.w), y + SC(s.h), 12, 12);
         SIZE sz; GetTextExtentPoint32W(dc, s.title, lstrlenW(s.title), &sz);
         const int q = Imax(SC(13), sz.cy * 3 / 4);  // (1.65.0) the "?" after the title: its help
@@ -31487,6 +31546,29 @@ static void OnCommand(int id, int code)
     if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { if (code == BN_CLICKED) HomeTogClick(id - IDC_HTOG0); return; }   // (1.91.0) Home > What's on
     if (id >= IDC_CLIPWAVE && id < IDC_CLIPWAVE + CLIPS) { if (code == BN_CLICKED) ClipWaveClick(id - IDC_CLIPWAVE); return; }   // (1.92.0) hear a clip on Ears
     if (id == IDC_HMETER) { if (code == STN_CLICKED) SetPage(PAGE_MIC); return; }   // (Home's mic level: the Mic tab)
+    if (id == IDC_TWOCOL) {                     // (1.94.0) boxes in two columns when the window is wide enough
+        if (code == BN_CLICKED) {
+            gTwoCol = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings();
+            if (!IsZoomed(gWnd) && !gCompact) {
+                const int base = Imax(SC(CLIENT_W), MixerNeedW()) + SC(TabSideW());
+                if (gTwoCol) {                  // wide enough for both columns, if the screen has room
+                    MONITORINFO mi = {}; mi.cbSize = sizeof(mi); GetMonitorInfoW(MonitorFromWindow(gWnd, MONITOR_DEFAULTTONEAREST), &mi);
+                    RECT fr = { 0, 0, 0, 0 }; AdjustWindowRect(&fr, (DWORD)GetWindowLongW(gWnd, GWL_STYLE), FALSE);
+                    const int room = (int)(mi.rcWork.right - mi.rcWork.left) - (int)(fr.right - fr.left);
+                    const int need = SC(CLIENT_W + COL2_DX) + SC(TabSideW());
+                    if (need <= room) gExtraW = Imax(gExtraW, need - base);
+                    else CalloutShow(GetDlgItem(gWnd, IDC_TWOCOL), L"Not enough room", L"Your screen isn't wide enough for two columns at this UI size. A smaller UI size (Settings > Look) makes room.", 0, 0, nullptr);
+                } else gExtraW = 0;             // (back to the usual width)
+            }
+            Layout();
+            if (gTwoCol && !IsZoomed(gWnd)) {   // (still on the screen after growing)
+                RECT wr; GetWindowRect(gWnd, &wr);
+                MONITORINFO mi = {}; mi.cbSize = sizeof(mi); GetMonitorInfoW(MonitorFromWindow(gWnd, MONITOR_DEFAULTTONEAREST), &mi);
+                if (wr.right > mi.rcWork.right) SetWindowPos(gWnd, nullptr, Imax((int)mi.rcWork.left, (int)(wr.left - (wr.right - mi.rcWork.right))), wr.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        return;
+    }
     if (id == IDC_NCWHEEL) {                    // (1.90.2) the wheel on knobs / number boxes / faders / lists
         if (code == BN_CLICKED) { gWheelAdj = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings(); }
         return;
@@ -32843,6 +32925,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
                 {                               // (1.90.0, New) taller or shorter: more or fewer boxes fit now
                     static int lastH = -1; RECT c2; GetClientRect(h, &c2);
                     if (gLayoutNew && ScrollsHere(gPage) && c2.bottom != lastH) SetTimer(h, TIMER_SCROLLFIT, 80, nullptr);
+                    if (TwoColWide() != gTwoNow) SetTimer(h, TIMER_SCROLLFIT, 80, nullptr);   // (1.94.0) wide enough for two columns now, or not any more
                     lastH = c2.bottom;
                 }
                 busy = false;
