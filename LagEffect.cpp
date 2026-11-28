@@ -8721,7 +8721,7 @@ static int HomeDy() { return gLayoutNew ? 112 : 0; }   // (1.92.1, New) Home's A
 #define TAB_COUNT 8                             // (1.90.0: + Speech, the New layout's)
 #define TAB_SLOTS 7                             // tabs on show in either layout
 static const int TAB_ORDER_C[TAB_SLOTS] = { 0, 6, 1, 2, 3, 4, 5 };   // Classic, left to right (Mixer sits after Main)
-static const int TAB_ORDER_N[TAB_SLOTS] = { 0, 1, 6, 2, 7, 3, 5 };   // New: Home, Mic, Mixer, Effects, Speech, Sounds, Settings
+static const int TAB_ORDER_N[TAB_SLOTS] = { 0, 1, 6, 2, 3, 7, 5 };   // New: Home, Mic, Mixer, Effects, Sounds, Speech, Settings
 static int TabAt(int slot) { return (gLayoutNew ? TAB_ORDER_N : TAB_ORDER_C)[slot]; }
 enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4, PAGE_SETTINGS = 5, PAGE_MIXER = 6, PAGE_SPEECH = 7,
        PAGE_HIDE = 98, PAGE_STAGE = 99 };      // (New: a Classic control it doesn't use; a new box being built)
@@ -16692,7 +16692,7 @@ static void AddTips()
     TipId(IDC_HDRMETER, L"Your mic's level, on every tab (dim while the gate is shut, red when it's close to too loud). Click: the Mic tab. Turn it off in Settings > Look.");
     TipId(IDC_HDRMETERON, gLayoutNew ? L"Your mic's level at the end of the tab row, so you can see it from any tab."
                                      : L"A thin bar under the tabs showing your mic's level, so you can see it from any tab.");
-    TipId(IDC_LAYOUTSEL, L"New: things grouped by what they do (Home, Mic, Mixer, Effects, Speech, Sounds, Settings). Classic: as it was up to 1.70, "
+    TipId(IDC_LAYOUTSEL, L"New: things grouped by what they do (Home, Mic, Mixer, Effects, Sounds, Speech, Settings). Classic: as it was up to 1.70, "
                          L"with only the features it had then. Switching restarts Lag Effect; your settings stay the same.");
     if (gLayoutNew) {                           // (1.90.0) the New layout's own buttons
         TipId(IDC_NCKEYS,   L"Every hotkey in one list: where it is, clashes in red, go to it or clear it.");
@@ -29649,7 +29649,7 @@ static void NSecMove(int k, int page, int sub, int ny, int addFeat)   // a box a
 static void LayoutSwitch(bool toNew, bool ask = true)   // Settings > Look > Layout / the version's menu: restart in the other layout
 {
     if (ask && MessageBoxW(gWnd, toNew
-            ? L"Switch to the New layout? Things are grouped by what they do: Home, Mic, Mixer, Effects, Speech, Sounds, Settings.\n\n"
+            ? L"Switch to the New layout? Things are grouped by what they do: Home, Mic, Mixer, Effects, Sounds, Speech, Settings.\n\n"
               L"Lag Effect will restart. Your settings, profiles and hotkeys stay exactly the same, and you can switch back any time "
               L"(Settings > Look > Layout)."
             : L"Switch back to the Classic layout (as it was up to 1.70)? Features added since then are only in the New layout.\n\n"
