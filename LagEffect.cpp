@@ -11648,6 +11648,63 @@ static void SetFxStyle(int g, int style);
 static void ApplyCharacter(int c);
 static void ResetFxGroup(int g);
 static void SetKnobVar(volatile int* var, int v);
+// ---- (1.93.1, New) an effect's Reset: hold it for a second (a bar fills along its bottom); a click alone does nothing ----
+#define RESET_HOLD_MS 900
+static HWND  gRhBtn = nullptr; static DWORD gRhStart = 0;
+static void CalloutShow(HWND target, const wchar_t* title, const wchar_t* body, int act, int arg, const wchar_t* btn);
+static void ShowOsd(const wchar_t* text, bool on);
+static void ResetHoldEnd(HWND h, bool done, int g)
+{
+    if (gRhBtn != h) return;
+    const DWORD held = GetTickCount() - gRhStart;
+    gRhBtn = nullptr; KillTimer(h, 7);
+    if (GetCapture() == h) ReleaseCapture();
+    SetWindowTextW(h, L"Reset"); InvalidateRect(h, nullptr, TRUE);
+    if (done) {
+        ResetFxGroup(g);
+        wchar_t t[80]; _snwprintf(t, 79, L"%s: back to its usual settings", gFxGroups[g].title); t[79] = 0; ShowOsd(t, true);
+    } else if (held < 400)                      // a click: say how it works
+        CalloutShow(h, L"Hold to reset", L"Keep holding Reset for a second: it fills up, then the knobs go back to their usual values.", 0, 0, nullptr);
+}
+static LRESULT CALLBACK ResetHoldProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR ref)
+{
+    const int g = (int)ref;
+    switch (m) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+        SetFocus(h); SetCapture(h);
+        gRhBtn = h; gRhStart = GetTickCount(); SetTimer(h, 7, 30, nullptr);
+        SetWindowTextW(h, L"Keep holding..."); InvalidateRect(h, nullptr, TRUE);
+        return 0;                               // (no press of its own: no click)
+    case WM_KEYDOWN:
+        if (w == VK_SPACE && !(l & (1 << 30)) && gRhBtn != h) { gRhBtn = h; gRhStart = GetTickCount(); SetTimer(h, 7, 30, nullptr); SetWindowTextW(h, L"Keep holding..."); InvalidateRect(h, nullptr, TRUE); }
+        if (w == VK_SPACE || w == VK_RETURN) return 0;
+        break;
+    case WM_KEYUP: if (w == VK_SPACE) { ResetHoldEnd(h, false, g); return 0; } break;
+    case WM_CHAR: if (w == L' ' || w == L'\r') return 0; break;
+    case WM_LBUTTONUP: ResetHoldEnd(h, false, g); return 0;
+    case WM_CAPTURECHANGED: case WM_KILLFOCUS: if (gRhBtn == h) ResetHoldEnd(h, false, g); break;
+    case WM_TIMER:
+        if (w == 7) {
+            if (gRhBtn == h && GetTickCount() - gRhStart >= RESET_HOLD_MS) ResetHoldEnd(h, true, g);
+            else InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        break;
+    case WM_PAINT: {
+        const LRESULT r = DefSubclassProc(h, m, w, l);
+        if (gRhBtn == h) {                      // the bar filling along the bottom
+            HDC dc = GetDC(h); RECT rc; GetClientRect(h, &rc);
+            const double f = Min(1.0, (double)(GetTickCount() - gRhStart) / RESET_HOLD_MS);
+            RECT b = { rc.left + 2, rc.bottom - Imax(3, SC(4)) - 1, rc.left + 2 + (int)((rc.right - rc.left - 4) * f), rc.bottom - 1 };
+            HBRUSH ab = CreateSolidBrush(ACCENT); FillRect(dc, &b, ab); DeleteObject(ab);
+            ReleaseDC(h, dc);
+        }
+        return r;
+    }
+    case WM_NCDESTROY: RemoveWindowSubclass(h, ResetHoldProc, 1); break;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
 // ======================= small text prompt (name a character, rename a pad...) =======================
 static HWND gInputWnd = nullptr;
 static bool gInputDone = false, gInputOk = false;
@@ -16764,7 +16821,8 @@ static void AddTips()
         static wchar_t on[FX_GROUPS][96], key[FX_GROUPS][128], rst[FX_GROUPS][96];
         wsprintfW(on[g],  L"Turn %s on or off.", gFxGroups[g].title);
         wsprintfW(key[g], L"Set a hotkey that turns %s on/off from anywhere. If Voice effects is off, only this effect goes on, and turning it off puts things back. Right-click to clear it.", gFxGroups[g].title);
-        wsprintfW(rst[g], L"Put all %s knobs back to their defaults.", gFxGroups[g].title);
+        wsprintfW(rst[g], gLayoutNew ? L"Hold for a second (it fills up): all %s knobs go back to their defaults. Letting go early does nothing."
+                                     : L"Put all %s knobs back to their defaults.", gFxGroups[g].title);
         TipId(IDC_FXGRP_ON + g, on[g]);
         TipId(IDC_FXGRP_KEY + g, key[g]);
         TipId(IDC_FXGRP_RESET + g, rst[g]);
@@ -30520,7 +30578,8 @@ static void CreateUI()
         CheckDlgButton(gWnd, IDC_FXGRP_HOLD + g, gFxHold[1 + g] ? BST_CHECKED : BST_UNCHECKED);
         wchar_t kn[120]; FxKeyButtonText(1 + g, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 38, 104, 26, IDC_FXGRP_KEY + g);
-        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
+        HWND rb = Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
+        if (gLayoutNew && rb) SetWindowSubclass(rb, ResetHoldProc, 1, (DWORD_PTR)g);   // (1.93.1) hold to reset
     }
     gBuildSub = -1;
 
