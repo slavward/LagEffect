@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.93.0"
+#define APP_VERSION L"1.93.1"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -9554,10 +9554,11 @@ static void PaintKnob(HWND h, HDC dc)
     RECT vr = { 0, cy + 29, rc.right, rc.bottom };
     DrawTextW(dc, txt, -1, &vr, DT_SINGLELINE | DT_CENTER | DT_TOP);
     SelectObject(dc, of);
-    if (gLayoutNew && *k.var != k.def) {        // (1.93.0) not its usual value: a dot by the dial (double-click puts it back)
-        HBRUSH db = CreateSolidBrush(ACCENT); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
-        const int dx = Imin(cx + r + 2, (int)rc.right - 8);
-        Ellipse(dc, dx, cy - r - 1, dx + 7, cy - r + 6);
+    if (gLayoutNew && *k.var != k.def) {        // (1.93.0) not its usual value: a dot just inside the ring, where the usual value is
+        const double dang = 225.0 - 270.0 * (double)(k.def - k.lo) / (double)(k.hi - k.lo);   // (1.93.1: it was always top right)
+        int dx, dy; KnobPoint(cx, cy, r - 5, dang, &dx, &dy);   // (between the ring and the knob; double-click puts it back there)
+        HBRUSH db = CreateSolidBrush(TXT_C); HGDIOBJ o1 = SelectObject(dc, db), o2 = SelectObject(dc, GetStockObject(NULL_PEN));
+        Ellipse(dc, dx - 2, dy - 2, dx + 3, dy + 3);
         SelectObject(dc, o1); SelectObject(dc, o2); DeleteObject(db);
     }
 }
@@ -11647,6 +11648,63 @@ static void SetFxStyle(int g, int style);
 static void ApplyCharacter(int c);
 static void ResetFxGroup(int g);
 static void SetKnobVar(volatile int* var, int v);
+// ---- (1.93.1, New) an effect's Reset: hold it for a second (a bar fills along its bottom); a click alone does nothing ----
+#define RESET_HOLD_MS 900
+static HWND  gRhBtn = nullptr; static DWORD gRhStart = 0;
+static void CalloutShow(HWND target, const wchar_t* title, const wchar_t* body, int act, int arg, const wchar_t* btn);
+static void ShowOsd(const wchar_t* text, bool on);
+static void ResetHoldEnd(HWND h, bool done, int g)
+{
+    if (gRhBtn != h) return;
+    const DWORD held = GetTickCount() - gRhStart;
+    gRhBtn = nullptr; KillTimer(h, 7);
+    if (GetCapture() == h) ReleaseCapture();
+    SetWindowTextW(h, L"Reset"); InvalidateRect(h, nullptr, TRUE);
+    if (done) {
+        ResetFxGroup(g);
+        wchar_t t[80]; _snwprintf(t, 79, L"%s: back to its usual settings", gFxGroups[g].title); t[79] = 0; ShowOsd(t, true);
+    } else if (held < 400)                      // a click: say how it works
+        CalloutShow(h, L"Hold to reset", L"Keep holding Reset for a second: it fills up, then the knobs go back to their usual values.", 0, 0, nullptr);
+}
+static LRESULT CALLBACK ResetHoldProc(HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR ref)
+{
+    const int g = (int)ref;
+    switch (m) {
+    case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+        SetFocus(h); SetCapture(h);
+        gRhBtn = h; gRhStart = GetTickCount(); SetTimer(h, 7, 30, nullptr);
+        SetWindowTextW(h, L"Keep holding..."); InvalidateRect(h, nullptr, TRUE);
+        return 0;                               // (no press of its own: no click)
+    case WM_KEYDOWN:
+        if (w == VK_SPACE && !(l & (1 << 30)) && gRhBtn != h) { gRhBtn = h; gRhStart = GetTickCount(); SetTimer(h, 7, 30, nullptr); SetWindowTextW(h, L"Keep holding..."); InvalidateRect(h, nullptr, TRUE); }
+        if (w == VK_SPACE || w == VK_RETURN) return 0;
+        break;
+    case WM_KEYUP: if (w == VK_SPACE) { ResetHoldEnd(h, false, g); return 0; } break;
+    case WM_CHAR: if (w == L' ' || w == L'\r') return 0; break;
+    case WM_LBUTTONUP: ResetHoldEnd(h, false, g); return 0;
+    case WM_CAPTURECHANGED: case WM_KILLFOCUS: if (gRhBtn == h) ResetHoldEnd(h, false, g); break;
+    case WM_TIMER:
+        if (w == 7) {
+            if (gRhBtn == h && GetTickCount() - gRhStart >= RESET_HOLD_MS) ResetHoldEnd(h, true, g);
+            else InvalidateRect(h, nullptr, FALSE);
+            return 0;
+        }
+        break;
+    case WM_PAINT: {
+        const LRESULT r = DefSubclassProc(h, m, w, l);
+        if (gRhBtn == h) {                      // the bar filling along the bottom
+            HDC dc = GetDC(h); RECT rc; GetClientRect(h, &rc);
+            const double f = Min(1.0, (double)(GetTickCount() - gRhStart) / RESET_HOLD_MS);
+            RECT b = { rc.left + 2, rc.bottom - Imax(3, SC(4)) - 1, rc.left + 2 + (int)((rc.right - rc.left - 4) * f), rc.bottom - 1 };
+            HBRUSH ab = CreateSolidBrush(ACCENT); FillRect(dc, &b, ab); DeleteObject(ab);
+            ReleaseDC(h, dc);
+        }
+        return r;
+    }
+    case WM_NCDESTROY: RemoveWindowSubclass(h, ResetHoldProc, 1); break;
+    }
+    return DefSubclassProc(h, m, w, l);
+}
 // ======================= small text prompt (name a character, rename a pad...) =======================
 static HWND gInputWnd = nullptr;
 static bool gInputDone = false, gInputOk = false;
@@ -16763,7 +16821,8 @@ static void AddTips()
         static wchar_t on[FX_GROUPS][96], key[FX_GROUPS][128], rst[FX_GROUPS][96];
         wsprintfW(on[g],  L"Turn %s on or off.", gFxGroups[g].title);
         wsprintfW(key[g], L"Set a hotkey that turns %s on/off from anywhere. If Voice effects is off, only this effect goes on, and turning it off puts things back. Right-click to clear it.", gFxGroups[g].title);
-        wsprintfW(rst[g], L"Put all %s knobs back to their defaults.", gFxGroups[g].title);
+        wsprintfW(rst[g], gLayoutNew ? L"Hold for a second (it fills up): all %s knobs go back to their defaults. Letting go early does nothing."
+                                     : L"Put all %s knobs back to their defaults.", gFxGroups[g].title);
         TipId(IDC_FXGRP_ON + g, on[g]);
         TipId(IDC_FXGRP_KEY + g, key[g]);
         TipId(IDC_FXGRP_RESET + g, rst[g]);
@@ -22648,13 +22707,19 @@ static void RcdShow(); static void RcdWindowSync(); static void RcdTick();
 static int DesignOf(HWND h) { if (h) for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == h) return i; return -1; }
 // ---- (1.93.0, New) U6: a dot on a knob / number that isn't at its usual value, and "Reset" in its box's title ----
 static int  gDiffDi[1024], gDiffN = -1, gDiffBuiltFor = -1;   // the knobs and number boxes (design indices), made once
+static bool gSecOwnReset[128];                  // (1.93.1) boxes with a Reset button of their own (each effect): no title "Reset" too
 static void DiffBuild()
 {
     if (gDiffBuiltFor == gDesignN) return;
     gDiffN = 0; gDiffBuiltFor = gDesignN;
-    for (int i = 0; i < gDesignN && gDiffN < 1024; i++) {
+    memset(gSecOwnReset, 0, sizeof(gSecOwnReset));
+    for (int i = 0; i < gDesignN; i++) {
         wchar_t cls[16]; GetClassNameW(gDesign[i].h, cls, 16);
-        if (!lstrcmpW(cls, L"LagKnob") || !lstrcmpW(cls, L"LagMini")) gDiffDi[gDiffN++] = i;
+        if ((!lstrcmpW(cls, L"LagKnob") || !lstrcmpW(cls, L"LagMini")) && gDiffN < 1024) gDiffDi[gDiffN++] = i;
+        else if (!lstrcmpiW(cls, L"Button") && gDesign[i].sec >= 0 && gDesign[i].sec < 128) {
+            wchar_t t[16]; GetWindowTextW(gDesign[i].h, t, 16);
+            if (!lstrcmpW(t, L"Reset")) gSecOwnReset[gDesign[i].sec] = true;
+        }
     }
 }
 static bool CtlDiff(HWND h)                     // not at its usual value (knobs; number boxes that have one)
@@ -30513,7 +30578,8 @@ static void CreateUI()
         CheckDlgButton(gWnd, IDC_FXGRP_HOLD + g, gFxHold[1 + g] ? BST_CHECKED : BST_UNCHECKED);
         wchar_t kn[120]; FxKeyButtonText(1 + g, kn, 120);
         Ctl(L"BUTTON", kn, WS_TABSTOP, 428, y + 38, 104, 26, IDC_FXGRP_KEY + g);
-        Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
+        HWND rb = Ctl(L"BUTTON", L"Reset", WS_TABSTOP, 428, y + 70, 104, 26, IDC_FXGRP_RESET + g);
+        if (gLayoutNew && rb) SetWindowSubclass(rb, ResetHoldProc, 1, (DWORD_PTR)g);   // (1.93.1) hold to reset
     }
     gBuildSub = -1;
 
@@ -31301,7 +31367,7 @@ static void PaintWindow(HDC dc)
         const bool canStar = StarCan(i);        // (1.91.0) the star after the "?": pin this box to Home
         RECT sr = { qr.right + SC(5), qr.top - 1, qr.right + SC(5) + q + 2, qr.bottom + 1 };
         RECT rr = { 0, 0, 0, 0 };               // (1.93.0) "Reset" after them
-        if (secDiff[i] && i != gSecChan && i != gSecOut && i != gSecKeys) {
+        if (secDiff[i] && i != gSecChan && i != gSecOut && i != gSecKeys && !(i < 128 && gSecOwnReset[i])) {
             HGDIOBJ of2 = SelectObject(dc, gFont); SIZE rz; GetTextExtentPoint32W(dc, L"Reset", 5, &rz); SelectObject(dc, of2);
             const int rx0 = (canStar ? sr.right : qr.right) + SC(8);
             rr = { rx0, y - sz.cy / 2, rx0 + rz.cx, y + sz.cy / 2 + 1 };
