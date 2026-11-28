@@ -22649,13 +22649,19 @@ static void RcdShow(); static void RcdWindowSync(); static void RcdTick();
 static int DesignOf(HWND h) { if (h) for (int i = 0; i < gDesignN; i++) if (gDesign[i].h == h) return i; return -1; }
 // ---- (1.93.0, New) U6: a dot on a knob / number that isn't at its usual value, and "Reset" in its box's title ----
 static int  gDiffDi[1024], gDiffN = -1, gDiffBuiltFor = -1;   // the knobs and number boxes (design indices), made once
+static bool gSecOwnReset[128];                  // (1.93.1) boxes with a Reset button of their own (each effect): no title "Reset" too
 static void DiffBuild()
 {
     if (gDiffBuiltFor == gDesignN) return;
     gDiffN = 0; gDiffBuiltFor = gDesignN;
-    for (int i = 0; i < gDesignN && gDiffN < 1024; i++) {
+    memset(gSecOwnReset, 0, sizeof(gSecOwnReset));
+    for (int i = 0; i < gDesignN; i++) {
         wchar_t cls[16]; GetClassNameW(gDesign[i].h, cls, 16);
-        if (!lstrcmpW(cls, L"LagKnob") || !lstrcmpW(cls, L"LagMini")) gDiffDi[gDiffN++] = i;
+        if ((!lstrcmpW(cls, L"LagKnob") || !lstrcmpW(cls, L"LagMini")) && gDiffN < 1024) gDiffDi[gDiffN++] = i;
+        else if (!lstrcmpiW(cls, L"Button") && gDesign[i].sec >= 0 && gDesign[i].sec < 128) {
+            wchar_t t[16]; GetWindowTextW(gDesign[i].h, t, 16);
+            if (!lstrcmpW(t, L"Reset")) gSecOwnReset[gDesign[i].sec] = true;
+        }
     }
 }
 static bool CtlDiff(HWND h)                     // not at its usual value (knobs; number boxes that have one)
@@ -31302,7 +31308,7 @@ static void PaintWindow(HDC dc)
         const bool canStar = StarCan(i);        // (1.91.0) the star after the "?": pin this box to Home
         RECT sr = { qr.right + SC(5), qr.top - 1, qr.right + SC(5) + q + 2, qr.bottom + 1 };
         RECT rr = { 0, 0, 0, 0 };               // (1.93.0) "Reset" after them
-        if (secDiff[i] && i != gSecChan && i != gSecOut && i != gSecKeys) {
+        if (secDiff[i] && i != gSecChan && i != gSecOut && i != gSecKeys && !(i < 128 && gSecOwnReset[i])) {
             HGDIOBJ of2 = SelectObject(dc, gFont); SIZE rz; GetTextExtentPoint32W(dc, L"Reset", 5, &rz); SelectObject(dc, of2);
             const int rx0 = (canStar ? sr.right : qr.right) + SC(8);
             rr = { rx0, y - sz.cy / 2, rx0 + rz.cx, y + sz.cy / 2 + 1 };
