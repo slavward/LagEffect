@@ -24,7 +24,7 @@
 // Releasing an update: bump APP_VERSION below, build, then create a GitHub release whose tag
 // is the version (e.g. v1.4.0) and attach LagEffect.exe. The app's "Check now" button finds it.
 
-#define APP_VERSION L"1.93.1"
+#define APP_VERSION L"2.0.0"
 #define DEFAULT_UPDATE_REPO L"slavward/LagEffect"
 
 #define UNICODE
@@ -6707,7 +6707,7 @@ static wchar_t  gFontName[40] = L"Segoe UI";
 static int      gOpacity = 100;
 static int      gCbShow = 7;                    // (1.66.1) the command builder's lists that matter now: 1 "Which one", 2 "How", 4 the value
 static int      gWheelAdj = 0;                  // (1.90.2, New) the mouse wheel changes the setting under it (off: it only scrolls)
-static int      gTwoCol = 0;                    // (1.94.0, New) boxes in two columns when the window is wide enough
+static int      gTwoCol = 0;                    // (2.0.0, New) boxes in two columns when the window is wide enough
 static int      gHdrMeter = 1;                  // (1.65.0) a thin mic level bar under the tabs, on every tab (Settings > Look)
 static int      gVolStyle = 0;                  // volume boxes (pads, clips, music, TTS): 0 a number you drag, 1 a small knob (1.63.0)
 static COLORREF gDkTrack, gDkKnob, gLtBg, gLtCard, gLtBorder, gLtTrack, gLtStatus, gAccentNow;
@@ -8739,7 +8739,7 @@ enum { PAGE_MAIN = 0, PAGE_MIC = 1, PAGE_FX = 2, PAGE_SOUND = 3, PAGE_CLIPS = 4,
 #define IDC_NCTRIG    4894
 #define IDC_NCMIDI    4895
 #define IDC_NCWHEEL   4896                      // (1.90.2, New) Settings > Controls: the mouse wheel changes settings
-#define IDC_TWOCOL    4985                      // (1.94.0, New) Settings > General > Window: two columns when wide
+#define IDC_TWOCOL    4985                      // (2.0.0, New) Settings > General > Window: two columns when wide
 #define IDC_HSTARHINT 4980                      // (1.92.2) Home > Starred: "nothing starred yet"
 #define IDC_HMETER    4990                      // (1.91.0, New) Home: your mic's level
 #define IDC_HTOG0     4991                      // .. + HOME_TOGS - 1: Home > What's on switches
@@ -8847,12 +8847,12 @@ static bool CtlShowing(int id)                  // is this control's page / sub-
 // (controls are children of the window itself, so they can't be cut off half-way).
 static int  gSecScroll[MAX_SECTIONS];           // how far up each box is moved (design px)
 static int  gScrollVy[MAX_SECTIONS];            // (1.91.0) where each listed box sits in the page's scrolling list (design px)
-#define COL2_DX 546                             // (1.94.0) the second column: this far right of the first (design px)
-static int  gSecDx[MAX_SECTIONS];               // (1.94.0) how far right each box is moved (design px): 0, or COL2_DX in the second column
-static bool gTwoNow = false;                    // (1.94.0) two columns now (set by ScrollCompute; PlaceAll centres for it)
-static bool gScrollTwo = false;                 // (1.94.0) this page's boxes are in two columns
-static int  gScrollEnd = 0;                     // (1.94.0) the bottom of the last box (scrolling list, design px)
-static int  PageW() { return gTwoNow ? CLIENT_W + COL2_DX : CLIENT_W; }   // (1.94.0) the width the pages are centred for
+#define COL2_DX 546                             // (2.0.0) the second column: this far right of the first (design px)
+static int  gSecDx[MAX_SECTIONS];               // (2.0.0) how far right each box is moved (design px): 0, or COL2_DX in the second column
+static bool gTwoNow = false;                    // (2.0.0) two columns now (set by ScrollCompute; PlaceAll centres for it)
+static bool gScrollTwo = false;                 // (2.0.0) this page's boxes are in two columns
+static int  gScrollEnd = 0;                     // (2.0.0) the bottom of the last box (scrolling list, design px)
+static int  PageW() { return gTwoNow ? CLIENT_W + COL2_DX : CLIENT_W; }   // (2.0.0) the width the pages are centred for
 #define STAR_MAX 24
 static int  gStarSec[STAR_MAX], gStarN = 0;     // (1.91.0) boxes pinned to Home, in the order you starred them
 static bool gSecHid[MAX_SECTIONS];              // scrolled out of view
@@ -18549,13 +18549,13 @@ static void GuestCompute()                      // (1.91.0) which starred boxes 
         if (k >= 0 && gSecGuest[k] && gOrigPage[i] >= 0 && gOrigPage[i] < TAB_COUNT) gGuestHas[gOrigPage[i]] |= (unsigned short)(1u << (gOrigSub[i] + 1));
     }
 }
-static bool TwoColWide()                         // (1.94.0) two columns: on, and the window is wide enough for them
+static bool TwoColWide()                         // (2.0.0) two columns: on, and the window is wide enough for them
 {
     if (!gLayoutNew || !gTwoCol || gCompact || !gWnd) return false;
     RECT c; GetClientRect(gWnd, &c);
     return (int)c.right >= SC(CLIENT_W + COL2_DX) + SC(TabSideW());
 }
-static void ScrollTwoCol(int n, int start, int top, int bot, int* firstSlot)   // (1.94.0) gScrollList[0..n) (in reading order) into two columns
+static void ScrollTwoCol(int n, int start, int top, int bot, int* firstSlot)   // (2.0.0) gScrollList[0..n) (in reading order) into two columns
 {
     int colBot[2] = { start, start };           // each box goes to the column that ends higher (left on a tie)
     for (int j = 0; j < n; j++) {
@@ -18668,7 +18668,7 @@ static void ScrollBy(int n)                     // a box at a time
 {
     if (!gScrollN || !n) return;
     int want = Iclamp(gScrollAt + n, 0, gScrollMax);
-    if (gScrollTwo) {                           // (1.94.0) two columns: a row of tops at a time (both columns can start at the same place)
+    if (gScrollTwo) {                           // (2.0.0) two columns: a row of tops at a time (both columns can start at the same place)
         want = gScrollAt;
         for (int st = 0; st < abs(n); st++) {
             int j = want + (n > 0 ? 1 : -1);
@@ -18715,7 +18715,7 @@ static void ScrollDragTo(int y)                 // (while dragging) the box near
     const int want = gScrollDragTop0 + MulDiv(y - gScrollDragY0, total, th);
     int j = 0, best = INT_MAX;
     for (int k = 0; k <= gScrollMax; k++) { const int d = abs(gScrollVy[gScrollList[k]] - want); if (d < best) { best = d; j = k; } }
-    if (j != gScrollAt && gScrollVy[gScrollList[j]] != gScrollVy[gScrollList[gScrollAt]]) { gScrollFirst[gPage][ScrollSi()] = j; Layout(); }   // (1.94.0: not ScrollBy, which goes a row at a time in two columns)
+    if (j != gScrollAt && gScrollVy[gScrollList[j]] != gScrollVy[gScrollList[gScrollAt]]) { gScrollFirst[gPage][ScrollSi()] = j; Layout(); }   // (2.0.0: not ScrollBy, which goes a row at a time in two columns)
 }
 static void ScrollToCtl(HWND target)            // GoTo / search: scroll so the box it's in shows
 {
@@ -29855,7 +29855,7 @@ static void NewLayoutApply()
         mvId(IDC_OVERLAY, 262, y + 22, 268);
         mvId(IDC_HIDESHARE, 30, y + 46, 220);
         mvId(IDC_COMPACT, 30, y + 68, 220);
-        Ctl(L"BUTTON", L"Two columns when the window is wide", BS_AUTOCHECKBOX | WS_TABSTOP, 262, y + 46, 268, 20, IDC_TWOCOL);   // (1.94.0)
+        Ctl(L"BUTTON", L"Two columns when the window is wide", BS_AUTOCHECKBOX | WS_TABSTOP, 262, y + 46, 268, 20, IDC_TWOCOL);   // (2.0.0)
         CheckDlgButton(gWnd, IDC_TWOCOL, gTwoCol ? BST_CHECKED : BST_UNCHECKED);
         if (lNote >= 0) hideDi(lNote);           // (the checkbox's tooltip says it)
         y = NBox(L"Hotkeys and audio", 90);
@@ -31546,7 +31546,7 @@ static void OnCommand(int id, int code)
     if (id >= IDC_HTOG0 && id < IDC_HTOG0 + HOME_TOGS) { if (code == BN_CLICKED) HomeTogClick(id - IDC_HTOG0); return; }   // (1.91.0) Home > What's on
     if (id >= IDC_CLIPWAVE && id < IDC_CLIPWAVE + CLIPS) { if (code == BN_CLICKED) ClipWaveClick(id - IDC_CLIPWAVE); return; }   // (1.92.0) hear a clip on Ears
     if (id == IDC_HMETER) { if (code == STN_CLICKED) SetPage(PAGE_MIC); return; }   // (Home's mic level: the Mic tab)
-    if (id == IDC_TWOCOL) {                     // (1.94.0) boxes in two columns when the window is wide enough
+    if (id == IDC_TWOCOL) {                     // (2.0.0) boxes in two columns when the window is wide enough
         if (code == BN_CLICKED) {
             gTwoCol = IsDlgButtonChecked(gWnd, id) == BST_CHECKED; SaveSettings();
             if (!IsZoomed(gWnd) && !gCompact) {
@@ -32925,7 +32925,7 @@ static LRESULT CALLBACK WndProcInner(HWND h, UINT m, WPARAM w, LPARAM l)
                 {                               // (1.90.0, New) taller or shorter: more or fewer boxes fit now
                     static int lastH = -1; RECT c2; GetClientRect(h, &c2);
                     if (gLayoutNew && ScrollsHere(gPage) && c2.bottom != lastH) SetTimer(h, TIMER_SCROLLFIT, 80, nullptr);
-                    if (TwoColWide() != gTwoNow) SetTimer(h, TIMER_SCROLLFIT, 80, nullptr);   // (1.94.0) wide enough for two columns now, or not any more
+                    if (TwoColWide() != gTwoNow) SetTimer(h, TIMER_SCROLLFIT, 80, nullptr);   // (2.0.0) wide enough for two columns now, or not any more
                     lastH = c2.bottom;
                 }
                 busy = false;
